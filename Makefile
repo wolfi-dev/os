@@ -8,6 +8,7 @@ GLIBC_VERSION ?= 2.36-r0
 BUILD_BASE_VERSION ?= 1-r3
 OPENSSL_VERSION ?= 3.0.5-r3
 BINUTILS_VERSION ?= 2.39-r1
+FLEX_VERSION ?= 2.6.4-r0
 
 MELANGE_OPTS ?= \
 	--repository-append ${REPO} \
@@ -24,6 +25,7 @@ PACKAGES = \
 	packages/${ARCH}/openssl-${OPENSSL_VERSION}.apk
 	packages/${ARCH}/build-base-${BUILD_BASE_VERSION}.apk
 	packages/${ARCH}/binutils-${BINUTILS_VERSION}.apk \
+	packages/${ARCH}/flex-${FLEX_VERSION}.apk \
 
 all: ${KEY} ${PACKAGES}
 
@@ -44,6 +46,11 @@ packages/${ARCH}/openssl-${OPENSSL_VERSION}.apk:
 	
 packages/${ARCH}/binutils-${BINUTILS_VERSION}.apk:
 	${MELANGE} build binutils.yaml ${MELANGE_OPTS} ${MELANGE_DEFOPTS}
+	apk index -o packages/${ARCH}/APKINDEX.tar.gz packages/${ARCH}/*.apk --allow-untrusted
+	melange sign-index --signing-key ${KEY} packages/${ARCH}/APKINDEX.tar.gz
+
+packages/${ARCH}/flex-${FLEX_VERSION}.apk:
+	${MELANGE} build flex.yaml ${MELANGE_OPTS} ${MELANGE_DEFOPTS}
 	apk index -o packages/${ARCH}/APKINDEX.tar.gz packages/${ARCH}/*.apk --allow-untrusted
 	melange sign-index --signing-key ${KEY} packages/${ARCH}/APKINDEX.tar.gz
 

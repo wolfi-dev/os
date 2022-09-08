@@ -10,6 +10,7 @@ OPENSSL_VERSION ?= 3.0.5-r3
 BINUTILS_VERSION ?= 2.39-r1
 FLEX_VERSION ?= 2.6.4-r0
 BISON_VERSION ?= 3.8.2-r1
+PAXUTILS_VERSION ?= 1.3.4-r0
 TEXINFO_VERSION ?= 6.8-r0
 
 
@@ -30,6 +31,8 @@ PACKAGES = \
 	packages/${ARCH}/flex-${FLEX_VERSION}.apk \
 	packages/${ARCH}/bison-${BISON_VERSION}.apk \
 	packages/${ARCH}/texinfo-${TEXINFO_VERSION}.apk \
+	packages/${ARCH}/pax-utils-${PAXUTILS_VERSION}.apk \
+	packages/${ARCH}/scanelf-utils-${PAXUTILS_VERSION}.apk \ # This is provided by pax-utils as a subpackage so the version is the same
 
 all: ${KEY} ${PACKAGES}
 
@@ -65,6 +68,11 @@ packages/${ARCH}/bison-${BISON_VERSION}.apk:
 
 packages/${ARCH}/texinfo-${TEXINFO_VERSION}.apk:
 	${MELANGE} build texinfo.yaml ${MELANGE_OPTS} ${MELANGE_DEFOPTS}
+	apk index -o packages/${ARCH}/APKINDEX.tar.gz packages/${ARCH}/*.apk --allow-untrusted
+	melange sign-index --signing-key ${KEY} packages/${ARCH}/APKINDEX.tar.gz
+
+packages/${ARCH}/pax-utils-${PAXUTILS_VERSION}.apk:
+	${MELANGE} build pax-utils.yaml ${MELANGE_OPTS} ${MELANGE_DEFOPTS}
 	apk index -o packages/${ARCH}/APKINDEX.tar.gz packages/${ARCH}/*.apk --allow-untrusted
 	melange sign-index --signing-key ${KEY} packages/${ARCH}/APKINDEX.tar.gz
 

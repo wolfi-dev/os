@@ -13,6 +13,7 @@ FLEX_VERSION ?= 2.6.4-r0
 BISON_VERSION ?= 3.8.2-r1
 PAXUTILS_VERSION ?= 1.3.4-r0
 TEXINFO_VERSION ?= 6.8-r0
+GZIP_VERSION ?= 1.12-r1
 
 
 MELANGE_OPTS ?= \
@@ -34,6 +35,7 @@ PACKAGES = \
 	packages/${ARCH}/texinfo-${TEXINFO_VERSION}.apk \
 	packages/${ARCH}/pax-utils-${PAXUTILS_VERSION}.apk \
 	packages/${ARCH}/busybox-${BUSYBOX_VERSION}.apk \
+	packages/${ARCH}/gzip-${GZIP_VERSION}.apk \
 
 all: ${KEY} ${PACKAGES}
 

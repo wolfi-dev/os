@@ -6,6 +6,7 @@ REPO ?= $(shell pwd)/packages
 
 GLIBC_VERSION ?= 2.36-r0
 BUILD_BASE_VERSION ?= 1-r3
+BUSYBOX_VERSION ?= 1.35.0-r2
 OPENSSL_VERSION ?= 3.0.5-r3
 BINUTILS_VERSION ?= 2.39-r1
 FLEX_VERSION ?= 2.6.4-r0
@@ -32,7 +33,7 @@ PACKAGES = \
 	packages/${ARCH}/bison-${BISON_VERSION}.apk \
 	packages/${ARCH}/texinfo-${TEXINFO_VERSION}.apk \
 	packages/${ARCH}/pax-utils-${PAXUTILS_VERSION}.apk \
-	packages/${ARCH}/scanelf-utils-${PAXUTILS_VERSION}.apk \ # This is provided by pax-utils as a subpackage so the version is the same
+	packages/${ARCH}/busybox-${BUSYBOX_VERSION}.apk \
 
 all: ${KEY} ${PACKAGES}
 

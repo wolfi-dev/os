@@ -1,0 +1,17 @@
+console
+tty1
+tty2
+tty3
+tty4
+tty5
+tty6
+tty7
+tty8
+tty9
+tty10
+tty11
+hvc0
+ttyS0
+ttyS1
+ttyAMA0
+ttyAMA1

@@ -10,6 +10,8 @@ OPENSSL_VERSION ?= 3.0.5-r3
 BINUTILS_VERSION ?= 2.39-r1
 FLEX_VERSION ?= 2.6.4-r0
 BISON_VERSION ?= 3.8.2-r1
+TEXINFO_VERSION ?= 6.8-r0
+
 
 MELANGE_OPTS ?= \
 	--repository-append ${REPO} \
@@ -28,6 +30,7 @@ PACKAGES = \
 	packages/${ARCH}/binutils-${BINUTILS_VERSION}.apk \
 	packages/${ARCH}/flex-${FLEX_VERSION}.apk \
 	packages/${ARCH}/bison-${BISON_VERSION}.apk \
+	packages/${ARCH}/texinfo-${TEXINFO_VERSION}.apk \
 
 all: ${KEY} ${PACKAGES}
 
@@ -58,6 +61,11 @@ packages/${ARCH}/flex-${FLEX_VERSION}.apk:
 
 packages/${ARCH}/bison-${BISON_VERSION}.apk:
 	${MELANGE} build bison.yaml ${MELANGE_OPTS} ${MELANGE_DEFOPTS}
+	apk index -o packages/${ARCH}/APKINDEX.tar.gz packages/${ARCH}/*.apk --allow-untrusted
+	melange sign-index --signing-key ${KEY} packages/${ARCH}/APKINDEX.tar.gz
+
+packages/${ARCH}/texinfo-${TEXINFO_VERSION}.apk:
+	${MELANGE} build texinfo.yaml ${MELANGE_OPTS} ${MELANGE_DEFOPTS}
 	apk index -o packages/${ARCH}/APKINDEX.tar.gz packages/${ARCH}/*.apk --allow-untrusted
 	melange sign-index --signing-key ${KEY} packages/${ARCH}/APKINDEX.tar.gz
 

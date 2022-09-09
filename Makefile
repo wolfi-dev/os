@@ -47,6 +47,7 @@ clean:
 $(eval $(call build-empty-package,gmp,6.2.1-r3))
 $(eval $(call build-empty-package,mpfr,4.1.0-r3))
 $(eval $(call build-empty-package,mpc,1.2.1-r2))
+$(eval $(call build-empty-package,isl,0.24-r2))
 $(eval $(call build-package,glibc,2.36-r0))
 $(eval $(call build-empty-package,build-base,1-r3))
 $(eval $(call build-empty-package,openssl,3.0.5-r3))

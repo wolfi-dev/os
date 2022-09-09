@@ -37,6 +37,13 @@ ${KEY}:
 clean:
 	rm -rf packages/${ARCH}
 
+# The list of packages to be built.
+#
+# Use the `build-package` macro for packages which require a source
+# directory, like `glibc/` or `busybox/`.
+#
+# Use the `build-empty-package` macro for packages which do not require
+# a source directory (most of them).
 $(eval $(call build-package,glibc,2.36-r0))
 $(eval $(call build-empty-package,build-base,1-r3))
 $(eval $(call build-empty-package,openssl,3.0.5-r3))

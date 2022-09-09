@@ -44,13 +44,14 @@ clean:
 #
 # Use the `build-empty-package` macro for packages which do not require
 # a source directory (most of them).
+$(eval $(call build-empty-package,gmp,6.2.1-r3))
 $(eval $(call build-package,glibc,2.36-r0))
 $(eval $(call build-empty-package,build-base,1-r3))
 $(eval $(call build-empty-package,openssl,3.0.5-r3))
 $(eval $(call build-empty-package,binutils,2.39-r1))
 $(eval $(call build-empty-package,flex,2.6.4-r0))
 $(eval $(call build-empty-package,bison,3.8.2-r1))
-$(eval $(call build-empty-package,pax-utils,1.3.4-r0))
+$(eval $(call build-empty-package,pax-utils,1.3.4-r1))
 $(eval $(call build-empty-package,texinfo,6.8-r0))
 $(eval $(call build-empty-package,gzip,1.12-r1))
 $(eval $(call build-package,busybox,1.35.0-r2))

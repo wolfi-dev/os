@@ -77,5 +77,6 @@ $(eval $(call build-empty-package,ca-certificates,20220614-r2))
 $(eval $(call build-empty-package,patch,2.7.6-r2))
 $(eval $(call build-empty-package,ncurses,6.3-r2))
 $(eval $(call build-empty-package,pkgconf,1.9.3-r2))
+$(eval $(call build-package,readline,8.1.2-r1))
 
 .build-packages: ${PACKAGES}

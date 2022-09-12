@@ -70,5 +70,6 @@ $(eval $(call build-empty-package,grep,3.7-r2))
 $(eval $(call build-empty-package,gawk,5.1.1-r3))
 $(eval $(call build-empty-package,file,5.42-r3))
 $(eval $(call build-empty-package,expat,2.4.8-r2))
+$(eval $(call build-empty-package,m4,1.4.19-r2))
 
 .build-packages: ${PACKAGES}

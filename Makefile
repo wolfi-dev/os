@@ -84,5 +84,6 @@ $(eval $(call build-empty-package,python3,3.10.7-r0))
 $(eval $(call build-empty-package,scdoc,1.11.2-r1))
 $(eval $(call build-package,linenoise,1.0-r0))
 $(eval $(call build-empty-package,autoconf,2.71-r0))
+$(eval $(call build-empty-package,automake,1.16.5-r0))
 
 .build-packages: ${PACKAGES}

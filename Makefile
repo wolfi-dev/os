@@ -63,5 +63,6 @@ $(eval $(call build-package,busybox,1.35.0-r2))
 $(eval $(call build-empty-package,make,4.3-r1))
 $(eval $(call build-empty-package,sed,4.8-r1))
 $(eval $(call build-empty-package,mpdecimal,2.5.1-r1))
+$(eval $(call build-empty-package,libffi,3.4.2-r1))
 
 .build-packages: ${PACKAGES}

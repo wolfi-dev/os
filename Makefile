@@ -69,5 +69,6 @@ $(eval $(call build-empty-package,gdbm,1.23-r1))
 $(eval $(call build-empty-package,grep,3.7-r2))
 $(eval $(call build-empty-package,gawk,5.1.1-r3))
 $(eval $(call build-empty-package,file,5.42-r2))
+$(eval $(call build-empty-package,expat,2.4.8-r1))
 
 .build-packages: ${PACKAGES}

@@ -67,5 +67,6 @@ $(eval $(call build-empty-package,libffi,3.4.2-r1))
 $(eval $(call build-empty-package,linux-headers,5.16.9-r2))
 $(eval $(call build-empty-package,gdbm,1.23-r1))
 $(eval $(call build-empty-package,grep,3.7-r2))
+$(eval $(call build-empty-package,gawk,5.1.1-r3))
 
 .build-packages: ${PACKAGES}

@@ -81,5 +81,6 @@ $(eval $(call build-package,readline,8.1.2-r1))
 $(eval $(call build-empty-package,sqlite,3.39.2-r1))
 $(eval $(call build-empty-package,xz,5.2.6-r2))
 $(eval $(call build-empty-package,python3,3.10.7-r0))
+$(eval $(call build-empty-package,scdoc,1.11.2-r1))
 
 .build-packages: ${PACKAGES}

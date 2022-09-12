@@ -75,5 +75,6 @@ $(eval $(call build-package,bzip2,1.0.8-r2))
 $(eval $(call build-empty-package,perl,5.36.0-r1))
 $(eval $(call build-empty-package,ca-certificates,20220614-r2))
 $(eval $(call build-empty-package,patch,2.7.6-r2))
+$(eval $(call build-empty-package,ncurses,6.3-r2))
 
 .build-packages: ${PACKAGES}

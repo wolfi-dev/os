@@ -86,5 +86,6 @@ $(eval $(call build-package,linenoise,1.0-r0))
 $(eval $(call build-empty-package,autoconf,2.71-r0))
 $(eval $(call build-empty-package,automake,1.16.5-r0))
 $(eval $(call build-empty-package,help2man,1.49.2-r0))
+$(eval $(call build-package,libtool,2.4.7-r0))
 
 .build-packages: ${PACKAGES}

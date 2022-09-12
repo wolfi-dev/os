@@ -65,5 +65,6 @@ $(eval $(call build-empty-package,sed,4.8-r1))
 $(eval $(call build-empty-package,mpdecimal,2.5.1-r1))
 $(eval $(call build-empty-package,libffi,3.4.2-r1))
 $(eval $(call build-empty-package,linux-headers,5.16.9-r2))
+$(eval $(call build-empty-package,gdbm,1.23-r1))
 
 .build-packages: ${PACKAGES}

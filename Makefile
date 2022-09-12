@@ -90,5 +90,6 @@ $(eval $(call build-package,libtool,2.4.7-r0))
 $(eval $(call build-package,lua5.3,5.3.6-r2))
 $(eval $(call build-empty-package,lua5.3-lzlib,0.4.3-r0))
 $(eval $(call build-empty-package,apk-tools,2.12.9-r2))
+$(eval $(call build-empty-package,wget,1.21.3-r2))
 
 .build-packages: ${PACKAGES}

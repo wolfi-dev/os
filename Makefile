@@ -92,7 +92,7 @@ $(eval $(call build-empty-package,lua5.3-lzlib,0.4.3-r0))
 $(eval $(call build-empty-package,apk-tools,2.12.9-r3))
 $(eval $(call build-empty-package,wget,1.21.3-r2))
 $(eval $(call build-package,wolfi-keys,1-r1))
-$(eval $(call build-package,wolfi-baselayout,20220913-r0))
+$(eval $(call build-package,wolfi-baselayout,20220914-r0))
 $(eval $(call build-empty-package,wolfi-base,1-r1))
 
 .build-packages: ${PACKAGES}

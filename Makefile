@@ -94,5 +94,6 @@ $(eval $(call build-empty-package,wget,1.21.3-r2))
 $(eval $(call build-package,wolfi-keys,1-r1))
 $(eval $(call build-package,wolfi-baselayout,20220914-r0))
 $(eval $(call build-empty-package,wolfi-base,1-r1))
+$(eval $(call build-empty-package,oniguruma,6.9.8-r0))
 
 .build-packages: ${PACKAGES}

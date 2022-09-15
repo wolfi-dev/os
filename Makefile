@@ -97,5 +97,6 @@ $(eval $(call build-empty-package,wolfi-base,1-r1))
 $(eval $(call build-empty-package,oniguruma,6.9.8-r0))
 $(eval $(call build-empty-package,jq,1.6-r0))
 $(eval $(call build-empty-package,brotli,1.0.9-r0))
+$(eval $(call build-package,libev,4.33-r0))
 
 .build-packages: ${PACKAGES}

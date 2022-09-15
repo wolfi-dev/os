@@ -102,5 +102,6 @@ $(eval $(call build-empty-package,c-ares,1.18.1-r0))
 $(eval $(call build-empty-package,nghttp2,1.49.0-r0))
 $(eval $(call build-empty-package,curl,7.85.0-r0))
 $(eval $(call build-empty-package,attr,2.5.1-r0))
+$(eval $(call build-empty-package,acl,2.3.1-r0))
 
 .build-packages: ${PACKAGES}

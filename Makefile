@@ -104,5 +104,6 @@ $(eval $(call build-empty-package,curl,7.85.0-r0))
 $(eval $(call build-empty-package,attr,2.5.1-r0))
 $(eval $(call build-empty-package,acl,2.3.1-r0))
 $(eval $(call build-empty-package,coreutils,9.1-r0))
+$(eval $(call build-empty-package,diffutils,3.8-r0))
 
 .build-packages: ${PACKAGES}

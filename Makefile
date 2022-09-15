@@ -98,5 +98,6 @@ $(eval $(call build-empty-package,oniguruma,6.9.8-r0))
 $(eval $(call build-empty-package,jq,1.6-r0))
 $(eval $(call build-empty-package,brotli,1.0.9-r0))
 $(eval $(call build-package,libev,4.33-r0))
+$(eval $(call build-empty-package,c-ares,1.18.1-r0))
 
 .build-packages: ${PACKAGES}

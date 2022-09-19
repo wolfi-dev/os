@@ -95,5 +95,6 @@ $(eval $(call build-package,acl,2.3.1-r0))
 $(eval $(call build-package,coreutils,9.1-r0))
 $(eval $(call build-package,diffutils,3.8-r0))
 $(eval $(call build-package,findutils,4.9.0-r0))
+$(eval $(call build-package,procps,4.0.0-r0))
 
 .build-packages: ${PACKAGES}

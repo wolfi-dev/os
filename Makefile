@@ -104,5 +104,6 @@ $(eval $(call build-package,libuv,1.44.2-r1))
 $(eval $(call build-package,rhash,1.4.3-r1))
 $(eval $(call build-package,cmake,3.24.2-r0))
 $(eval $(call build-package,py3-appdirs,1.4.4-r0))
+$(eval $(call build-package,py3-ordered-set,4.0.2-r0))
 
 .build-packages: ${PACKAGES}

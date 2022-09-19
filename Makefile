@@ -114,5 +114,6 @@ $(eval $(call build-package,py3-packaging,21.3-r0))
 $(eval $(call build-package,py3-more-itertools,8.13.0-r0))
 $(eval $(call build-package,py3-setuptools-stage0,52.0.0-r0))
 $(eval $(call build-package,py3-setuptools,59.4.0-r0))
+$(eval $(call build-package,py3-pep517,0.13.0-r0))
 
 .build-packages: ${PACKAGES}

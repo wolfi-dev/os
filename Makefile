@@ -98,5 +98,6 @@ $(eval $(call build-package,findutils,4.9.0-r0))
 $(eval $(call build-package,procps,4.0.0-r0))
 $(eval $(call build-package,samurai,1.2-r0))
 $(eval $(call build-package,lz4,1.9.4-r0))
+$(eval $(call build-package,zstd,1.5.2-r0))
 
 .build-packages: ${PACKAGES}

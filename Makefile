@@ -107,5 +107,6 @@ $(eval $(call build-package,py3-appdirs,1.4.4-r0))
 $(eval $(call build-package,py3-ordered-set,4.0.2-r0))
 $(eval $(call build-package,py3-gpep517,9-r0))
 $(eval $(call build-package,py3-installer,0.5.1-r0))
+$(eval $(call build-package,py3-flit-core,3.7.1-r0))
 
 .build-packages: ${PACKAGES}

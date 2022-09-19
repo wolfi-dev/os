@@ -117,5 +117,6 @@ $(eval $(call build-package,py3-setuptools,59.4.0-r0))
 $(eval $(call build-package,py3-pep517,0.13.0-r0))
 $(eval $(call build-package,py3-six,1.16.0-r0))
 $(eval $(call build-package,py3-retrying,1.3.3-r0))
+$(eval $(call build-package,py3-contextlib2,21.6.0-r0))
 
 .build-packages: ${PACKAGES}

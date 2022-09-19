@@ -109,5 +109,6 @@ $(eval $(call build-package,py3-installer,0.5.1-r0))
 $(eval $(call build-package,py3-tomli,2.0.1-r0))
 $(eval $(call build-package,py3-gpep517,9-r1))
 $(eval $(call build-package,py3-flit-core,3.7.1-r0))
+$(eval $(call build-package,py3-parsing,3.0.9-r0))
 
 .build-packages: ${PACKAGES}

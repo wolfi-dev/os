@@ -100,5 +100,6 @@ $(eval $(call build-package,samurai,1.2-r0))
 $(eval $(call build-package,lz4,1.9.4-r0))
 $(eval $(call build-package,zstd,1.5.2-r0))
 $(eval $(call build-package,libarchive,3.6.1-r0))
+$(eval $(call build-package,libuv,1.44.2-r0))
 
 .build-packages: ${PACKAGES}

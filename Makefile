@@ -122,5 +122,6 @@ $(eval $(call build-package,py3-pip,22.2.2-r0))
 $(eval $(call build-package,libedit,3.1-r0))
 $(eval $(call build-package,pcre2,10.40-r0))
 $(eval $(call build-package,git,2.37.3-r0))
+$(eval $(call build-package,bash,5.2_rc4-r0))
 
 .build-packages: ${PACKAGES}

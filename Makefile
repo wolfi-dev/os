@@ -1,6 +1,6 @@
 ARCH := $(shell uname -m)
-MELANGE_DIR ?= ../melange
-MELANGE ?= ${MELANGE_DIR}/melange
+MELANGE ?= $(shell which melange)
+MELANGE_DIR ?= /usr/share/melange
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 
@@ -210,3 +210,13 @@ $(eval $(call build-package,giflib,5.2.1-r0))
 $(eval $(call build-package,jenkins,2.378-r0))
 
 .build-packages: ${PACKAGES}
+
+dev:
+	docker run \
+		-v $(shell pwd):/work \
+		--workdir=/work \
+		--rm -it \
+		--entrypoint=sh \
+		--platform=linux/amd64 \
+		--privileged \
+		cgr.dev/chainguard/sdk

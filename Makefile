@@ -127,5 +127,6 @@ $(eval $(call build-package,go-stage0,1.19.1-r0))
 $(eval $(call build-package,go,1.19.1-r0))
 $(eval $(call build-package,git-lfs,3.1.4-r0))
 $(eval $(call build-package,openssh,9.0_p1-r0))
+$(eval $(call build-package,skalibs,2.12.0.0-r0))
 
 .build-packages: ${PACKAGES}

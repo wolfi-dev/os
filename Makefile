@@ -132,5 +132,6 @@ $(eval $(call build-package,execline,2.9.0.1-r0))
 $(eval $(call build-package,s6,2.11.1.2-r0))
 $(eval $(call build-package,libretls,3.5.2-r0))
 $(eval $(call build-package,grype,0.50.2-r0))
+$(eval $(call build-package,trivy,0.32.0-r0))
 
 .build-packages: ${PACKAGES}

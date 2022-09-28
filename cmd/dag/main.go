@@ -25,8 +25,13 @@ func NewGraph() Graph {
 	}
 }
 
-func (g Graph) Add(pkg string) {
-	g.Nodes[pkg] = struct{}{}
+func (g Graph) Contains(node string) bool {
+	_, found := g.Nodes[node]
+	return found
+}
+
+func (g Graph) Add(node string) {
+	g.Nodes[node] = struct{}{}
 }
 
 func (g Graph) AddEdge(src, dst string) {
@@ -95,41 +100,56 @@ func main() {
 		log.Fatalf("walk: %v", err)
 	}
 
-	log.Println("nodes:", len(g.Nodes))
-	e := 0
-	for node := range g.Nodes {
-		e += len(g.Edges[node])
-	}
-	log.Println("edges:", e)
-
 	// Validate all edges point to existing nodes.
 	for from, to := range g.Edges {
-		if _, found := g.Nodes[from]; !found {
+		if !g.Contains(from) {
 			log.Fatalf("%q", from)
 		}
 		for _, too := range to {
-			if _, found := g.Nodes[too]; !found {
+			if !g.Contains(too) {
 				log.Fatalf("%q -> %q: %q not found", from, too, too)
 			}
 		}
 	}
 
 	if len(os.Args) == 1 {
+		g.summarize()
 		g.Viz()
 	} else {
 		sg := NewGraph()
 		for _, node := range os.Args[1:] {
-			sg.Add(node)
-			for _, dep := range g.Edges[node] {
-				sg.Add(dep)
-				sg.AddEdge(node, dep)
-			}
-			for _, parent := range g.Back[node] {
-				sg.Add(parent)
-				sg.AddEdge(parent, node)
-			}
+			sg.crawl(g, node)
 		}
+		sg.summarize()
 		sg.Viz()
+	}
+}
+
+func (g Graph) summarize() {
+	log.Println("nodes:", len(g.Nodes))
+	e := 0
+	for node := range g.Nodes {
+		e += len(g.Edges[node])
+	}
+	log.Println("edges:", e)
+}
+
+// crawl crawls the given whole graph, starting at the given node, and populating the subgraph as it finds nodes up and down.
+func (sg Graph) crawl(g Graph, node string) {
+	g.Add(node)
+	for _, dep := range g.Edges[node] {
+		if !sg.Contains(dep) {
+			sg.Add(dep)
+			sg.AddEdge(node, dep)
+			sg.crawl(g, dep)
+		}
+	}
+	for _, parent := range g.Back[node] {
+		if !sg.Contains(parent) {
+			sg.Add(parent)
+			sg.AddEdge(parent, node)
+			sg.crawl(g, parent)
+		}
 	}
 }
 

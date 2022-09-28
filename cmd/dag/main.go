@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"io/fs"
 	"log"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"github.com/goccy/go-graphviz"
 	"gopkg.in/yaml.v3"
 )
+
+var out = flag.String("f", "dag.svg", "output file")
 
 type Graph struct {
 	Nodes       map[string]struct{}
@@ -59,6 +62,8 @@ type config struct {
 }
 
 func main() {
+	flag.Parse()
+
 	g := NewGraph()
 	if err := filepath.Walk(".", func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
@@ -112,12 +117,12 @@ func main() {
 		}
 	}
 
-	if len(os.Args) == 1 {
+	if len(flag.Args()) == 0 {
 		g.summarize()
 		g.Viz()
 	} else {
 		sg := NewGraph()
-		for _, node := range os.Args[1:] {
+		for _, node := range flag.Args() {
 			sg.crawl(g, node)
 		}
 		sg.summarize()
@@ -134,7 +139,7 @@ func (g Graph) summarize() {
 	log.Println("edges:", e)
 }
 
-// crawl crawls the given whole graph, starting at the given node, and populating the subgraph as it finds nodes up and down.
+// crawl crawls the given whole graph, starting at the given node, and adds nodes that depend on this node.
 func (sg Graph) crawl(g Graph, node string) {
 	g.Add(node)
 	for _, dep := range g.Edges[node] {
@@ -142,13 +147,6 @@ func (sg Graph) crawl(g Graph, node string) {
 			sg.Add(dep)
 			sg.AddEdge(node, dep)
 			sg.crawl(g, dep)
-		}
-	}
-	for _, parent := range g.Back[node] {
-		if !sg.Contains(parent) {
-			sg.Add(parent)
-			sg.AddEdge(parent, node)
-			sg.crawl(g, parent)
 		}
 	}
 }
@@ -194,7 +192,25 @@ func (g Graph) Viz() {
 			}
 		}
 	}
-	if err := v.Render(gr, "dot", os.Stdout); err != nil {
+
+	outf, err := os.Create(*out)
+	if err != nil {
 		log.Fatal(err)
+	}
+	defer outf.Close()
+
+	if err := v.Render(gr, formatFromFilename(), outf); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func formatFromFilename() graphviz.Format {
+	switch {
+	case strings.HasSuffix(*out, ".svg"):
+		return graphviz.SVG
+	case strings.HasSuffix(*out, ".png"):
+		return graphviz.PNG
+	default:
+		return graphviz.XDOT
 	}
 }

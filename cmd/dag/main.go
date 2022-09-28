@@ -193,24 +193,7 @@ func (g Graph) Viz() {
 		}
 	}
 
-	outf, err := os.Create(*out)
-	if err != nil {
+	if err := v.RenderFilename(gr, graphviz.SVG, *out); err != nil {
 		log.Fatal(err)
-	}
-	defer outf.Close()
-
-	if err := v.Render(gr, formatFromFilename(), outf); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func formatFromFilename() graphviz.Format {
-	switch {
-	case strings.HasSuffix(*out, ".svg"):
-		return graphviz.SVG
-	case strings.HasSuffix(*out, ".png"):
-		return graphviz.PNG
-	default:
-		return graphviz.XDOT
 	}
 }

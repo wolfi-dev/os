@@ -2,7 +2,8 @@ module github.com/wolfi-dev/os
 
 go 1.19
 
-replace github.com/goccy/go-graphviz => github.com/n3wscott/go-graphviz v0.0.9
+// Forked to only support SVG, remove deps that had liceses issues.
+replace github.com/goccy/go-graphviz => github.com/n3wscott/go-graphviz v0.0.10-0.20211216184452-fd4faf331d28
 
 require (
 	github.com/goccy/go-graphviz v0.0.9

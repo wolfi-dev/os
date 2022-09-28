@@ -34,6 +34,4 @@ To change this, pass `-f` _before any positional args_.
 go run ./cmd/dag -f brotli.svg brotli
 ```
 
-If the filename ends in `.png`, a PNG file will be generated.
-If the filename ends in `.svg`, an SVG will be generated.
-If the filename ends in anything else, the output will be DOT format, which the `graphviz` tool can consume.
+It will only generate SVG.

@@ -135,6 +135,6 @@ $(eval $(call build-package,grype,0.50.2-r0))
 $(eval $(call build-package,trivy,0.32.0-r0))
 $(eval $(call build-package,ruby,3.1.2-r0))
 $(eval $(call build-package,rust-stage0,1.64.0-r0))
-$(eval $(call build-package,meson,0.63.2-r0))
+$(eval $(call build-package,meson,0.63.3-r0))
 
 .build-packages: ${PACKAGES}

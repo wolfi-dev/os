@@ -33,7 +33,7 @@ clean:
 #
 # Use the `build-package` macro for packages which require a source
 # directory, like `glibc/` or `busybox/`.
-$(eval $(call build-package,gmp,6.2.1-r3))
+$(eval $(call build-package,gmp,6.2.1-r4))
 $(eval $(call build-package,mpfr,4.1.0-r3))
 $(eval $(call build-package,mpc,1.2.1-r2))
 $(eval $(call build-package,isl,0.24-r2))

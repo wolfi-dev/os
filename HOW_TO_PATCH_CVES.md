@@ -46,7 +46,17 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
 
 1. In the [Makefile](./Makefile), find the line that corresponds to this package, and update the package version to our new release version from the Melange file.
 
-1. Verify that our update package will build successfully by running Melange.
+1. Verify that our update package will build successfully by running Melange. To do this, run (in a container if you're not already on Linux):
+
+    ```shell
+    doas make
+    ```
+
+    Note that currently, this will build the **entire world**. If you want to build just a single package, you can run:
+
+    ```shell
+    doas make packages/${ARCH}/${PACKAGE_NAME}-${PACKAGE_VERSION}.apk
+    ```
 
 1. Open a PR.
 

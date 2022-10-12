@@ -4,12 +4,12 @@ MELANGE ?= ${MELANGE_DIR}/melange
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 
-MELANGE_OPTS ?= \
-	--repository-append ${REPO} \
-	--keyring-append ${KEY}.pub \
-	--signing-key ${KEY} \
-	--pipeline-dir ${MELANGE_DIR}/pipelines \
-	--arch ${ARCH}
+MELANGE_OPTS += --repository-append ${REPO}
+MELANGE_OPTS += --keyring-append ${KEY}.pub
+MELANGE_OPTS += --signing-key ${KEY}
+MELANGE_OPTS += --pipeline-dir ${MELANGE_DIR}/pipelines
+MELANGE_OPTS += --arch ${ARCH}
+MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 define build-package
 

@@ -17,3 +17,9 @@ which uses it to provide [lightweight GNU/Linux runtime images][cgi].
    [melange]: https://github.com/chainguard-dev/melange
    [cg]: https://chainguard.dev/
    [cgi]: https://chainguard.dev/chainguard-images
+
+## Mixing packages with other distributions
+
+Mixing packages with other distributions is not supported and can
+create security problems.  If a package is missing from Wolfi that
+your project requires, please open a bug or send a patch adding it.

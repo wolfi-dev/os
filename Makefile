@@ -136,5 +136,7 @@ $(eval $(call build-package,trivy,0.32.0-r0))
 $(eval $(call build-package,ruby,3.1.2-r0))
 $(eval $(call build-package,rust-stage0,1.64.0-r0))
 $(eval $(call build-package,meson,0.63.3-r0))
+$(eval $(call build-package,libcap,2.26-r0))
+$(eval $(call build-package,bubblewrap,0.6.2-r0))
 
 .build-packages: ${PACKAGES}

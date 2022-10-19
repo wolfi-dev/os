@@ -143,5 +143,9 @@ $(eval $(call build-package,gperf,3.1-r0))
 $(eval $(call build-package,libpthread-stubs,0.4-r0))
 $(eval $(call build-package,libmd,1.0.4-r0))
 $(eval $(call build-package,libbsd,0.11.7-r0))
+$(eval $(call build-package,util-macros,1.19.3-r0))
+$(eval $(call build-package,xorgproto,2022.2-r0))
+$(eval $(call build-package,libgpg-error,1.46-r0))
+$(eval $(call build-package,libgcrypt,1.10.1-r0))
 
 .build-packages: ${PACKAGES}

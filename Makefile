@@ -139,5 +139,9 @@ $(eval $(call build-package,meson,0.63.3-r0))
 $(eval $(call build-package,libcap,2.26-r0))
 $(eval $(call build-package,tree,2.0.4-r0))
 $(eval $(call build-package,bubblewrap,0.6.2-r0))
+$(eval $(call build-package,gperf,3.1-r0))
+$(eval $(call build-package,libpthread-stubs,0.4-r0))
+$(eval $(call build-package,libmd,1.0.4-r0))
+$(eval $(call build-package,libbsd,0.11.7-r0))
 
 .build-packages: ${PACKAGES}

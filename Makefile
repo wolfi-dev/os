@@ -147,5 +147,12 @@ $(eval $(call build-package,util-macros,1.19.3-r0))
 $(eval $(call build-package,xorgproto,2022.2-r0))
 $(eval $(call build-package,libgpg-error,1.46-r0))
 $(eval $(call build-package,libgcrypt,1.10.1-r0))
+$(eval $(call build-package,libxml2,2.10.3-r0))
+$(eval $(call build-package,perl-test-pod,1.52-r0))
+$(eval $(call build-package,perl-yaml-syck,1.34-r0))
+$(eval $(call build-package,libxslt,1.1.37-r0))
+$(eval $(call build-package,xmlto,0.0.28-r0))
+$(eval $(call build-package,libxau,1.0.10-r0))
+$(eval $(call build-package,xtrans,1.4.0-r0))
 
 .build-packages: ${PACKAGES}

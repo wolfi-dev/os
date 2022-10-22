@@ -167,5 +167,9 @@ $(eval $(call build-package,libxtst,1.2.4-r0))
 $(eval $(call build-package,check,0.15.2-r0))
 $(eval $(call build-package,libice,1.0.10-r0))
 $(eval $(call build-package,libsm,1.2.3-r0))
+$(eval $(call build-package,icu,71.1-r0))
+$(eval $(call build-package,py3-markupsafe,2.1.1-r0))
+$(eval $(call build-package,py3-jinja2,3.1.2-r0))
+$(eval $(call build-package,nodejs,16.18.0-r0))
 
 .build-packages: ${PACKAGES}

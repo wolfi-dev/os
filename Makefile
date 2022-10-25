@@ -167,5 +167,11 @@ $(eval $(call build-package,libxtst,1.2.4-r0))
 $(eval $(call build-package,check,0.15.2-r0))
 $(eval $(call build-package,libice,1.0.10-r0))
 $(eval $(call build-package,libsm,1.2.3-r0))
+$(eval $(call build-package,libxt,1.2.1-r0))
+$(eval $(call build-package,libusb,1.0.26-r0))
+$(eval $(call build-package,libevent,2.1.12-r0))
+$(eval $(call build-package,dbus,1.14.4-r0))
+$(eval $(call build-package,libpaper,1.1.28-r0))
+$(eval $(call build-package,cups,2.4.2-r0))
 
 .build-packages: ${PACKAGES}

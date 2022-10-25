@@ -160,5 +160,12 @@ $(eval $(call build-package,libxcb,1.15-r0))
 $(eval $(call build-package,libx11,1.8.1-r0))
 $(eval $(call build-package,libxext,1.3.4-r0))
 $(eval $(call build-package,libxrender,0.9.10-r0))
+$(eval $(call build-package,libxrandr,1.5.2-r0))
+$(eval $(call build-package,libxfixes,6.0.0-r0))
+$(eval $(call build-package,libxi,1.8-r0))
+$(eval $(call build-package,libxtst,1.2.4-r0))
+$(eval $(call build-package,check,0.15.2-r0))
+$(eval $(call build-package,libice,1.0.10-r0))
+$(eval $(call build-package,libsm,1.2.3-r0))
 
 .build-packages: ${PACKAGES}

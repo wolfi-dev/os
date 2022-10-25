@@ -154,5 +154,11 @@ $(eval $(call build-package,libxslt,1.1.37-r0))
 $(eval $(call build-package,xmlto,0.0.28-r0))
 $(eval $(call build-package,libxau,1.0.10-r0))
 $(eval $(call build-package,xtrans,1.4.0-r0))
+$(eval $(call build-package,libxdmcp,1.1.3-r0))
+$(eval $(call build-package,xcb-proto,1.15.2-r0))
+$(eval $(call build-package,libxcb,1.15-r0))
+$(eval $(call build-package,libx11,1.8.1-r0))
+$(eval $(call build-package,libxext,1.3.4-r0))
+$(eval $(call build-package,libxrender,0.9.10-r0))
 
 .build-packages: ${PACKAGES}

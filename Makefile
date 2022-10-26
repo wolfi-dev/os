@@ -171,5 +171,11 @@ $(eval $(call build-package,icu,71.1-r0))
 $(eval $(call build-package,py3-markupsafe,2.1.1-r0))
 $(eval $(call build-package,py3-jinja2,3.1.2-r0))
 $(eval $(call build-package,nodejs,16.18.0-r0))
+$(eval $(call build-package,libxt,1.2.1-r0))
+$(eval $(call build-package,libusb,1.0.26-r0))
+$(eval $(call build-package,libevent,2.1.12-r0))
+$(eval $(call build-package,dbus,1.14.4-r0))
+$(eval $(call build-package,libpaper,1.1.28-r0))
+$(eval $(call build-package,cups,2.4.2-r0))
 
 .build-packages: ${PACKAGES}

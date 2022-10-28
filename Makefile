@@ -182,6 +182,6 @@ $(eval $(call build-package,zip,3.0-r0))
 $(eval $(call build-package,libpng,1.6.38-r0))
 $(eval $(call build-package,freetype,2.12.1-r0))
 $(eval $(call build-package,fontconfig,2.14.0-r0))
-$(eval $(call build-package,openjdk17,17.0.4.1-r0))
+$(eval $(call build-package,openjdk,17.0.4.1-r0))
 
 .build-packages: ${PACKAGES}

@@ -184,5 +184,6 @@ $(eval $(call build-package,freetype,2.12.1-r0))
 $(eval $(call build-package,fontconfig,2.14.0-r0))
 $(eval $(call build-package,openjdk,17.0.4.1-r0))
 $(eval $(call build-package,su-exec,0.2-r0))
+$(eval $(call build-package,maven,3.8.6-r0))
 
 .build-packages: ${PACKAGES}

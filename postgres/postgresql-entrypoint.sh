@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -Eeo pipefail
+
+# This script originated and is accredited to https://github.com/docker-library/postgres/blob/74e51d1/11/alpine/docker-entrypoint.sh
+# The only modification is changing the folder name /docker-entrypoint-initdb.d/ to /var/lib/postgres/initdb/ 
+
 # TODO swap to -Eeuo pipefail above (after handling all potentially-unset variables)
 
 # usage: file_env VAR [DEFAULT]

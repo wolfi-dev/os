@@ -185,5 +185,8 @@ $(eval $(call build-package,fontconfig,2.14.0-r0))
 $(eval $(call build-package,openjdk,17.0.4.1-r0))
 $(eval $(call build-package,su-exec,0.2-r0))
 $(eval $(call build-package,postgresql,11.17-r0))
+$(eval $(call build-package,ko,0.12.0-r0))
+$(eval $(call build-package,apko,0.5.0-r0))
+$(eval $(call build-package,melange,0.1.0-r0))
 
 .build-packages: ${PACKAGES}

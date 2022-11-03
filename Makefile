@@ -186,5 +186,6 @@ $(eval $(call build-package,openjdk,17.0.4.1-r0))
 $(eval $(call build-package,su-exec,0.2-r0))
 $(eval $(call build-package,postgresql,11.17-r0))
 $(eval $(call build-package,llvm15,15.0.3-r0))
+$(eval $(call build-package,cosign,1.13.1-r0))
 
 .build-packages: ${PACKAGES}

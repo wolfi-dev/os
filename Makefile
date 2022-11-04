@@ -13,6 +13,7 @@ MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 define build-package
 
+packages/$(1): packages/${ARCH}/$(1)-$(2).apk
 packages/${ARCH}/$(1)-$(2).apk: ${KEY}
 	mkdir -p ./$(1)/
 	${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(1)/

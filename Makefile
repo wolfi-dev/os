@@ -188,5 +188,6 @@ $(eval $(call build-package,openjdk-17,17.0.5.8-r0))
 $(eval $(call build-package,su-exec,0.2-r0))
 $(eval $(call build-package,postgresql,11.17-r0))
 $(eval $(call build-package,llvm15,15.0.3-r0))
+$(eval $(call build-package,tzdata,2022f-r0))
 
 .build-packages: ${PACKAGES}

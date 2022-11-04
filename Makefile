@@ -13,6 +13,7 @@ MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 define build-package
 
+packages/$(1): packages/${ARCH}/$(1)-$(2).apk
 packages/${ARCH}/$(1)-$(2).apk: ${KEY}
 	mkdir -p ./$(1)/
 	${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(1)/
@@ -38,8 +39,8 @@ $(eval $(call build-package,mpfr,4.1.0-r3))
 $(eval $(call build-package,mpc,1.2.1-r2))
 $(eval $(call build-package,isl,0.24-r2))
 $(eval $(call build-package,zlib,1.2.13-r1))
-$(eval $(call build-package,flex,2.6.4-r1))
-$(eval $(call build-package,glibc,2.36-r1))
+$(eval $(call build-package,flex,2.6.4-r2))
+$(eval $(call build-package,glibc,2.36-r3))
 $(eval $(call build-package,build-base,1-r3))
 $(eval $(call build-package,gcc,12.2.0-r6))
 $(eval $(call build-package,openssl,3.0.7-r0))
@@ -81,7 +82,7 @@ $(eval $(call build-package,lua5.3-lzlib,0.4.3-r0))
 $(eval $(call build-package,apk-tools,2.12.9-r3))
 $(eval $(call build-package,wget,1.21.3-r2))
 $(eval $(call build-package,wolfi-keys,1-r2))
-$(eval $(call build-package,wolfi-baselayout,20220914-r0))
+$(eval $(call build-package,wolfi-baselayout,20221104-r0))
 $(eval $(call build-package,wolfi-base,1-r1))
 $(eval $(call build-package,oniguruma,6.9.8-r0))
 $(eval $(call build-package,jq,1.6-r0))
@@ -133,7 +134,8 @@ $(eval $(call build-package,s6,2.11.1.2-r0))
 $(eval $(call build-package,libretls,3.5.2-r0))
 $(eval $(call build-package,grype,0.50.2-r1))
 $(eval $(call build-package,trivy,0.32.0-r1))
-$(eval $(call build-package,ruby,3.1.2-r0))
+$(eval $(call build-package,ruby-3.0,3.0.4-r0))
+$(eval $(call build-package,ruby-3.1,3.1.2-r0))
 $(eval $(call build-package,rust-stage0,1.64.0-r0))
 $(eval $(call build-package,meson,0.63.3-r0))
 $(eval $(call build-package,libcap,2.26-r0))
@@ -182,10 +184,12 @@ $(eval $(call build-package,zip,3.0-r0))
 $(eval $(call build-package,libpng,1.6.38-r0))
 $(eval $(call build-package,freetype,2.12.1-r0))
 $(eval $(call build-package,fontconfig,2.14.0-r0))
-$(eval $(call build-package,openjdk,17.0.4.1-r0))
+$(eval $(call build-package,openjdk-11,11.0.17.8-r0))
+$(eval $(call build-package,openjdk-17,17.0.5.8-r0))
 $(eval $(call build-package,su-exec,0.2-r0))
 $(eval $(call build-package,postgresql,11.17-r0))
 $(eval $(call build-package,llvm15,15.0.3-r0))
+$(eval $(call build-package,tzdata,2022f-r0))
 $(eval $(call build-package,cosign,1.13.1-r0))
 
 .build-packages: ${PACKAGES}

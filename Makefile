@@ -245,5 +245,6 @@ $(eval $(call build-package,php,8.1.13-r0))
 $(eval $(call build-package,composer,2.4.4-r0))
 $(eval $(call build-package,docker-credential-ecr-login,0.6.0-r1))
 $(eval $(call build-package,wait-for-it,0.20200823-r1))
+$(eval $(call build-package,argon2,20190702))
 
 .build-packages: ${PACKAGES}

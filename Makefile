@@ -198,5 +198,12 @@ $(eval $(call build-package,postgresql-15,15.0-r0,postgresql))
 $(eval $(call build-package,llvm15,15.0.3-r0))
 $(eval $(call build-package,tzdata,2022f-r0))
 $(eval $(call build-package,maven,3.8.6-r0))
+$(eval $(call build-package,tini,0.19.0-r0))
+$(eval $(call build-package,font-util,1.3.2-r0))
+$(eval $(call build-package,libfontenc,1.1.4-r0))
+$(eval $(call build-package,mkfontscale,1.2.1-r0))
+$(eval $(call build-package,mkfontdir,1.0.7-r0))
+$(eval $(call build-package,encodings,1.0.5-r0))
+$(eval $(call build-package,ttf-dejavu,2.37-r0))
 
 .build-packages: ${PACKAGES}

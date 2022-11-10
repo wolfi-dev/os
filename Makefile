@@ -198,5 +198,6 @@ $(eval $(call build-package,postgresql-15,15.0-r0,postgresql))
 $(eval $(call build-package,llvm15,15.0.3-r0))
 $(eval $(call build-package,tzdata,2022f-r0))
 $(eval $(call build-package,maven,3.8.6-r1))
+$(eval $(call build-package,bazel-5,5.3.2-r0))
 
 .build-packages: ${PACKAGES}

@@ -204,5 +204,6 @@ $(eval $(call build-package,libfontenc,1.1.6-r0))
 $(eval $(call build-package,mkfontscale,1.2.2-r0))
 $(eval $(call build-package,encodings,1.0.6-r0))
 $(eval $(call build-package,ttf-dejavu,2.37-r0))
+$(eval $(call build-package,bazel-5,5.3.2-r0))
 
 .build-packages: ${PACKAGES}

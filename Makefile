@@ -16,7 +16,7 @@ define build-package
 packages/$(1): packages/${ARCH}/$(1)-$(2).apk
 packages/${ARCH}/$(1)-$(2).apk: ${KEY}
 	mkdir -p ./$(1)/
-	${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(1)/
+	${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(if $(3),$(3),$(1))/
 
 PACKAGES += packages/${ARCH}/$(1)-$(2).apk
 
@@ -34,6 +34,9 @@ clean:
 #
 # Use the `build-package` macro for packages which require a source
 # directory, like `glibc/` or `busybox/`.
+# arg 1 = package name
+# arg 2 = package version
+# arg 3 = override source directory, defaults to package name, useful if you want to reuse the same subfolder for multiple packages
 $(eval $(call build-package,gmp,6.2.1-r4))
 $(eval $(call build-package,mpfr,4.1.0-r3))
 $(eval $(call build-package,mpc,1.2.1-r2))
@@ -74,7 +77,7 @@ $(eval $(call build-package,pkgconf,1.9.3-r3))
 $(eval $(call build-package,readline,8.1.2-r1))
 $(eval $(call build-package,sqlite,3.39.4-r1))
 $(eval $(call build-package,xz,5.2.6-r2))
-$(eval $(call build-package,python3,3.10.7-r0))
+$(eval $(call build-package,python3,3.10.7-r1))
 $(eval $(call build-package,scdoc,1.11.2-r1))
 $(eval $(call build-package,linenoise,1.0-r0))
 $(eval $(call build-package,lua5.3,5.3.6-r2))
@@ -187,11 +190,14 @@ $(eval $(call build-package,fontconfig,2.14.0-r0))
 $(eval $(call build-package,openjdk-11,11.0.17.8-r0))
 $(eval $(call build-package,openjdk-17,17.0.5.8-r0))
 $(eval $(call build-package,su-exec,0.2-r0))
-$(eval $(call build-package,postgresql-11,11.17-r0))
-$(eval $(call build-package,postgresql-15,15.0-r0))
+$(eval $(call build-package,postgresql-11,11.17-r0,postgresql))
+$(eval $(call build-package,postgresql-12,12.12-r0,postgresql))
+$(eval $(call build-package,postgresql-13,13.8-r0,postgresql))
+$(eval $(call build-package,postgresql-14,14.5-r0,postgresql))
+$(eval $(call build-package,postgresql-15,15.0-r0,postgresql))
 $(eval $(call build-package,llvm15,15.0.3-r0))
 $(eval $(call build-package,tzdata,2022f-r0))
-$(eval $(call build-package,maven,3.8.6-r0))
+$(eval $(call build-package,maven,3.8.6-r1))
 $(eval $(call build-package,cosign,1.13.1-r0))
 
 .build-packages: ${PACKAGES}

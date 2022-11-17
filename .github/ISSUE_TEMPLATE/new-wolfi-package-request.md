@@ -1,0 +1,30 @@
+name: New Wolfi Package Request
+description: Use this form to request the inclusion of wolfi OS. Please review our wolfi [package policy](wolfi.dev/os#if-wolfi-is-missing-a-package-your-require) before requesting a package.
+title: "[Wolfi Package Request]: $PACKAGE_NAME"
+labels: ["wolfi-package-request", "needs-triage"]
+assignees:
+- kanini
+body:
+  - type: textarea
+    id: package-description
+    attributes:
+      label: What software would you like us to add to wolfi-os. Ideally include a URL to the project and its source.
+    validations:
+      required: true
+  - type: input
+    id: package-versions
+    attributes:
+      label: which versions of the software should we include?
+  - type: textarea
+    id: package-justification
+    attributes:
+      label: Add some justification for why this specific package and versions are important.
+  - type: checkboxes
+    id: package-questionnaire:
+    attributes:
+      label: Please check all that apply
+      description: Additional questions to answer
+      options:
+        - label: This package has an un-restrictive license
+        - label: I am interested in adding this package to Wolfi OS myself. 
+        - label: I am willing to be a maintainer for this package. 

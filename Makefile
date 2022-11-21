@@ -208,5 +208,9 @@ $(eval $(call build-package,bazel-5,5.3.2-r1))
 $(eval $(call build-package,clang-15,15.0.4-r0))
 $(eval $(call build-package,giflib,5.2.1-r0))
 $(eval $(call build-package,jenkins,2.378-r0))
+$(eval $(call build-package,go-bindata,3.1.3-r0))
+$(eval $(call build-package,popt,1.19-r0))
+$(eval $(call build-package,rsync,3.2.7-r0))
+$(eval $(call build-package,kubectl,1.25.4-r0))
 
 .build-packages: ${PACKAGES}

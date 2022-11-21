@@ -20,6 +20,14 @@ which uses it to provide [lightweight GNU/Linux runtime images][cgi].
 
 ## Mixing packages with other distributions
 
-Mixing packages with other distributions is not supported and can
-create security problems.  If a package is missing from Wolfi that
-your project requires, please open a bug or send a patch adding it.
+Mixing packages with other distributions is not supported and can create security problems.
+
+## If Wolfi is missing a package you require
+
+Wolfi is not currently intended to be a general purpose desktop operating system. Our priority is to provide packages
+that enable containerized and embedded system workflows. Please keep this in mind when proposing adding packages to
+Wolfi. Also note that some packages may not be appropriately licensed for inclusion. The most restrictive license type
+we will admit is a 'notice' license such as Apache2 or MIT License. Packages with 'Restricted' licenses such as AGPL,
+OSL, and SSPL are inappropriate for inclusion into Wolfi OS.
+
+To request inclusion of a package into Wolfi please use our [New Package Request Template](https://wolfi.dev/os/issues/new/choose).

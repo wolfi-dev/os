@@ -216,6 +216,7 @@ $(eval $(call build-package,popt,1.19-r0))
 $(eval $(call build-package,rsync,3.2.7-r0))
 $(eval $(call build-package,kubectl,1.25.4-r0))
 $(eval $(call build-package,regclient,0.4.5-r0))
+$(eval $(call build-package,lcms,1.19-r0))
 $(eval $(call build-package,skopeo,1.9.3-r0))
 
 .build-packages: ${PACKAGES}

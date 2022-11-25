@@ -222,5 +222,6 @@ $(eval $(call build-package,llvm-libunwind,15.0.5-r0))
 $(eval $(call build-package,llvm-lld,15.0.5-r0))
 $(eval $(call build-package,dumb-init,1.2.5-r0))
 $(eval $(call build-package,envoy,1.24.0-r0))
+$(eval $(call build-package,lcms2,2.14-r0))
 
 .build-packages: ${PACKAGES}

@@ -224,3 +224,6 @@ $(eval $(call build-package,dumb-init,1.2.5-r0))
 $(eval $(call build-package,envoy,1.24.0-r0))
 
 .build-packages: ${PACKAGES}
+
+dev-container:
+	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" cgr.dev/chainguard/sdk

@@ -33,7 +33,7 @@ Add a new entry for your package in the Makefile like this
 $(eval $(call build-package,<your-package-name>,<version>-r<epoch>))
 ```
 
-Once you're done writing the new package, you can test building it with `make packages/<your-package-name>`.
+Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name>`.
 
 ## Some tips
 

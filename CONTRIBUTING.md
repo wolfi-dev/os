@@ -25,7 +25,7 @@ MELANGE ?= $(shell which melange)
 
 Wolfi packages are built using melange. If you want to learn how packages are built, you can see all the details in the [`ci-build`](.github/workflows/ci-build.yaml) workflow and in the [Makefile](Makefile).
 
-Start by creating a YAML file named `<your-package-name>.yaml` in the repo's root directory. If you have patches, create a folder with same name and put patches there.
+Start by cloning this repository and create a YAML file named `<your-package-name>.yaml` in its root directory. If you have any patches, create a folder with the same name and put them there.
 
 Add a new entry for your package in Makefile like this
 

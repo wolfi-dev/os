@@ -37,7 +37,7 @@ Once you're done writing the new package, you can test building it with `make pa
 
 ## Some tips
 
-- melange has a few pipelines included, ready to be used. You can see the the list & source code of the builtin pipelines [here in melange repo](https://github.com/chainguard-dev/melange/tree/main/pkg/build/pipelines).
+- melange has a few built-in pipelines. You can see their source code [in the melange repository](https://github.com/chainguard-dev/melange/tree/main/pkg/build/pipelines).
 
 - Make sure to pump the epoch if you're changing the package's build script without updating the version. Also reset the epoch back to 0 when you update the package version.
 

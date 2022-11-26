@@ -1,6 +1,11 @@
 # Contributing to wolfi-dev/os
 
-* [Setup development environmment](#setup-development-environment)
+<!-- toc -->
+- [Setup development environment](#setup-development-environment)
+- [Write your first Wolfi package](#write-your-first-wolfi-package)
+- [Package versioning](#package-versioning)
+- [Some tips](#some-tips)
+<!-- /toc -->
 
 ## Setup development environment
 
@@ -14,7 +19,7 @@ make dev-container
 
 What it does is start the `chainguard-images/sdk` image and mount the current working directory into it.
 
-Now, the `Makefile` script assume that there're melange folder & melange binary in there. I change it locally to the following because it's where they are in `chainguard-image/sdk`.
+Now, the `Makefile` script assume that there're melange folder & melange binary the upper level dir (`../melange`). I change it locally to the following because it's where they are in `chainguard-image/sdk`.
 
 ```
 MELANGE_DIR ?= /usr/share/melange
@@ -35,11 +40,15 @@ $(eval $(call build-package,<your-package-name>,<version>-r<epoch>))
 
 Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name>`.
 
+## Package versioning
+
+- When bumping version of a package, you will need to update the version, epoch & sha256 in package YAML file as well as Makefile.
+
+- `epoch` needs to be bump when package version remains the same but something else changes. `epoch` needs to be reset to 0 when it's a new version of the package.
+
 ## Some tips
 
 - melange has a few built-in pipelines. You can see their source code [in the melange repository](https://github.com/chainguard-dev/melange/tree/main/pkg/build/pipelines).
-
-- Make sure to pump the epoch if you're changing the package's build script without updating the version. Also reset the epoch back to 0 when you update the package version.
 
 - You don't need to add `environment.contents.repositories` and `environment.contents.keyring`. Those are added automatically in the `ci-build.yaml` script during CI.
 

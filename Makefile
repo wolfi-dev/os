@@ -229,5 +229,6 @@ $(eval $(call build-package,libtbb,2021.7.0-r0))
 $(eval $(call build-package,mold,1.7.1-r0))
 $(eval $(call build-package,dumb-init,1.2.5-r0))
 $(eval $(call build-package,envoy,1.24.0-r0))
+$(eval $(call build-package,lcms2,2.14-r0))
 
 .build-packages: ${PACKAGES}

@@ -232,5 +232,6 @@ $(eval $(call build-package,envoy,1.24.0-r0))
 $(eval $(call build-package,lcms2,2.14-r0))
 $(eval $(call build-package,mailcap,2.1.53-r0))
 $(eval $(call build-package,php,8.1.13-r0))
+$(eval $(call build-package,composer,2.4.4-r0))
 
 .build-packages: ${PACKAGES}

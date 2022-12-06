@@ -3,6 +3,10 @@ MELANGE_DIR ?= ../melange
 MELANGE ?= ${MELANGE_DIR}/melange
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
+SOURCE_DATE_EPOCH ?= 0
+
+WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+WOLFI_PROD ?= https://packages.wolfi.dev/os
 
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
@@ -12,12 +16,17 @@ MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
+ifeq (${BUILDWORLD}, no)
+MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
+MELANGE_OPTS += -r ${WOLFI_PROD}
+endif
+
 define build-package
 
 packages/$(1): packages/${ARCH}/$(1)-$(2).apk
 packages/${ARCH}/$(1)-$(2).apk: ${KEY}
 	mkdir -p ./$(1)/
-	${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(if $(3),$(3),$(1))/
+	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(if $(3),$(3),$(1))/
 
 PACKAGES += packages/${ARCH}/$(1)-$(2).apk
 
@@ -48,7 +57,7 @@ $(eval $(call build-package,glibc,2.36-r3))
 $(eval $(call build-package,build-base,1-r3))
 $(eval $(call build-package,gcc,12.2.0-r6))
 $(eval $(call build-package,openssl,3.0.7-r0))
-$(eval $(call build-package,binutils,2.39-r3))
+$(eval $(call build-package,binutils,2.39-r4))
 $(eval $(call build-package,bison,3.8.2-r1))
 $(eval $(call build-package,pax-utils,1.3.4-r2))
 $(eval $(call build-package,texinfo,6.8-r0))

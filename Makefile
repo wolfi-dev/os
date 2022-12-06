@@ -3,6 +3,7 @@ MELANGE_DIR ?= ../melange
 MELANGE ?= ${MELANGE_DIR}/melange
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
+SOURCE_DATE_EPOCH ?= 0
 
 WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 WOLFI_PROD ?= https://packages.wolfi.dev/os
@@ -25,7 +26,7 @@ define build-package
 packages/$(1): packages/${ARCH}/$(1)-$(2).apk
 packages/${ARCH}/$(1)-$(2).apk: ${KEY}
 	mkdir -p ./$(1)/
-	${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(if $(3),$(3),$(1))/
+	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(if $(3),$(3),$(1))/
 
 PACKAGES += packages/${ARCH}/$(1)-$(2).apk
 

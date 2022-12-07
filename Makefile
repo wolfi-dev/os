@@ -48,7 +48,7 @@ clean:
 # arg 2 = package version
 # arg 3 = override source directory, defaults to package name, useful if you want to reuse the same subfolder for multiple packages
 $(eval $(call build-package,gmp,6.2.1-r4))
-$(eval $(call build-package,mpfr,4.1.0-r3))
+$(eval $(call build-package,mpfr,4.1.1-r0))
 $(eval $(call build-package,mpc,1.2.1-r2))
 $(eval $(call build-package,isl,0.24-r2))
 $(eval $(call build-package,zlib,1.2.13-r1))

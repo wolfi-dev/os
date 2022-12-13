@@ -244,5 +244,7 @@ $(eval $(call build-package,mailcap,2.1.53-r0))
 $(eval $(call build-package,php,8.1.13-r0))
 $(eval $(call build-package,composer,2.4.4-r0))
 $(eval $(call build-package,docker-credential-ecr-login,0.6.0-r1))
+$(eval $(call build-package,jenkins-remoting,3077.vd69cf116da_6f-r0))
+$(eval $(call build-package,jenkins-inbound-agent,3077.vd69cf116da_6f-3-r0))
 
 .build-packages: ${PACKAGES}

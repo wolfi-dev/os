@@ -235,5 +235,6 @@ $(eval $(call build-package,mailcap,2.1.53-r0))
 $(eval $(call build-package,php,8.1.13-r0))
 $(eval $(call build-package,composer,2.4.4-r0))
 $(eval $(call build-package,docker-credential-ecr-login,0.6.0-r0))
+$(eval $(call build-package,mariadb,10.6.11-r0))
 
 .build-packages: ${PACKAGES}

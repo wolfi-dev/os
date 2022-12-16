@@ -1,0 +1,168 @@
+name: Build Packages Staging using dag
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  PROJECT: staging-images-183e
+  CLUSTER_NAME: tmp-cluster-staging
+  CLUSTER_ZONE: us-central1-b
+  SERVICE_ACCOUNT: staging-images-ci
+  FQ_SERVICE_ACCOUNT: staging-images-ci@staging-images-183e.iam.gserviceaccount.com
+  BUCKET: wolfi-registry-source/os/
+
+jobs:
+  setup-cluster:
+    name: Setup build cluster
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: google-github-actions/auth@v0
+        with:
+          workload_identity_provider: "projects/567187841907/locations/global/workloadIdentityPools/staging-shared-9bd2/providers/staging-shared-gha"
+          service_account: ${{env.FQ_SERVICE_ACCOUNT}}
+      - uses: google-github-actions/setup-gcloud@v0
+        with:
+          project_id: ${{env.PROJECT}}
+
+      - uses: actions/checkout@v3
+        with:
+          repository: wolfi-dev/dag
+          path: ${{github.workspace}}/dag
+      - name: Setup Build Cluster
+        working-directory: ${{github.workspace}}/dag
+        run: |
+          gcloud container clusters create "${CLUSTER_NAME}" \
+            --enable-ip-alias \
+            --network                       projects/staging-shared-7864/global/networks/staging-shared-a6474a3 \
+            --subnetwork                    projects/staging-shared-7864/regions/us-central1/subnetworks/staging-shared-imgs-us-c1-209d340 \
+            --cluster-secondary-range-name  gke-a-pods \
+            --services-secondary-range-name gke-a-svcs \
+            --tags                          "egress-inet" \
+            --enable-dataplane-v2 \
+            --enable-intra-node-visibility \
+            --service-account "${FQ_SERVICE_ACCOUNT}" \
+            --zone            "${CLUSTER_ZONE}" \
+            --release-channel rapid \
+            --workload-pool   "${PROJECT}.svc.id.goog" \
+            --machine-type    e2-standard-32 \
+            --num-nodes       1
+
+          gcloud container node-pools create arm-nodes \
+            --cluster         "${CLUSTER_NAME}" \
+            --zone            "${CLUSTER_ZONE}" \
+            --tags            "egress-inet" \
+            --service-account "${FQ_SERVICE_ACCOUNT}" \
+            --machine-type    t2a-standard-32 \
+            --num-nodes       1
+
+          ./scripts/setup-cluster.sh ${SERVICE_ACCOUNT}
+
+  # TODO: Update source cache here, instead of in a separate workflow.
+  #       This likely depends on making the source cache bucket configurable by
+  #       dag, or if we have staging builds reuse the prod source cache, then
+  #       we only need to update it before prod builds.
+
+  # TODO: Add build-amd64
+
+  build-arm64:
+    name: Build (arm64)
+    runs-on: ubuntu-latest
+    needs: setup-cluster
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      # Checkout and build dag from main
+      # Can't `go install` because its go.mod has `replace`s.
+      - uses: actions/setup-go@v3
+        with:
+          go-version: '>=1.19.0'
+      - uses: actions/checkout@v3
+        with:
+          repository: wolfi-dev/dag
+          path: ${{github.workspace}}/dag
+      - working-directory: ${{github.workspace}}/dag
+        run: go install
+
+      - uses: google-github-actions/auth@v0
+        with:
+          workload_identity_provider: "projects/567187841907/locations/global/workloadIdentityPools/staging-shared-9bd2/providers/staging-shared-gha"
+          service_account: ${{env.FQ_SERVICE_ACCOUNT}}
+      - uses: google-github-actions/setup-gcloud@v0
+        with:
+          project_id: ${{env.PROJECT}}
+      - uses: 'google-github-actions/get-gke-credentials@v0'
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_ZONE }}
+      - run: gcloud auth configure-docker --quiet
+
+      - uses: actions/checkout@v3
+        with:
+          repository: wolfi-dev/os
+          path: ${{github.workspace}}/os
+
+      - working-directory: ${{github.workspace}}/os
+        run: |
+          dag pod \
+            --cpu=30 --ram=100Gi \
+            --bucket=${BUCKET} \
+            --secret-key \
+            --arch=arm64
+
+  teardown-cluster:
+    name: Teardown build cluster
+    runs-on: ubuntu-latest
+    needs: [build-arm64]
+    if: always()
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: google-github-actions/auth@v0
+        with:
+          workload_identity_provider: "projects/567187841907/locations/global/workloadIdentityPools/staging-shared-9bd2/providers/staging-shared-gha"
+          service_account: ${{env.FQ_SERVICE_ACCOUNT}}
+      - uses: google-github-actions/setup-gcloud@v0
+        with:
+          project_id: ${{env.PROJECT}}
+      - uses: 'google-github-actions/get-gke-credentials@v0'
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_ZONE }}
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          resources="pods daemonsets serviceaccounts namespaces"
+          for ns in $(kubectl get ns -oname | cut -d'/' -f 2); do
+            for resource in ${resources}; do
+              echo --- $ns $resource ---
+              kubectl get $resource -n${ns}
+              for x in $(kubectl get $resource -n${ns} -oname || true); do
+                echo "::group:: describe $resource $x"
+                # Don't fail if the resource disappears midway.
+                kubectl describe -n${ns} $x || true
+                echo '::endgroup::'
+              done
+            done
+          done
+
+      - name: Teardown Build Cluster
+        if: always()
+        run: |
+          gcloud container clusters delete "${CLUSTER_NAME}" \
+            --zone "${CLUSTER_ZONE}" \
+            --quiet

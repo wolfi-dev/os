@@ -245,5 +245,10 @@ $(eval $(call build-package,php,8.1.13-r0))
 $(eval $(call build-package,composer,2.4.4-r0))
 $(eval $(call build-package,docker-credential-ecr-login,0.6.0-r1))
 $(eval $(call build-package,wait-for-it,0.20200823-r1))
+$(eval $(call build-package,utmps,0.1.2.0-r0))
+$(eval $(call build-package,libcap-ng,0.8.3-r0))
+$(eval $(call build-package,libeconf,0.5.0-r0))
+$(eval $(call build-package,linux-pam,1.5.2-r0))
+$(eval $(call build-package,util-linux,2.38.1-r0))
 
 .build-packages: ${PACKAGES}

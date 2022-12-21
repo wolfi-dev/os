@@ -9,7 +9,7 @@
 
 ## Setup development environment
 
-To ease the development of Wolfi OS, you can use `chainguard-images/sdk` container image that already includes both [apko](https://github.com/chainguard-dev/apko) & [melange](https://github.com/chainguard-dev/melange).
+To ease the development of Wolfi OS, you can use the [`sdk` Chainguard Image](https://github.com/chainguard-images/images/tree/main/images/sdk) that already includes both [apko](https://github.com/chainguard-dev/apko) and [melange](https://github.com/chainguard-dev/melange).
 
 To start a development environment, do
 

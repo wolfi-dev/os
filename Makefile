@@ -251,6 +251,7 @@ $(eval $(call build-package,gettext,0.21.1-r0))
 $(eval $(call build-package,libcap-ng,0.8.3-r0))
 $(eval $(call build-package,libeconf,0.5.0-r0))
 $(eval $(call build-package,linux-pam,1.5.2-r0))
+$(eval $(call build-package,cython,0.29.32-r0))
 $(eval $(call build-package,util-linux,2.38.1-r0))
 
 .build-packages: ${PACKAGES}

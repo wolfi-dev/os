@@ -308,6 +308,7 @@ $(eval $(call build-package,libverto,0.3.2-r0))
 $(eval $(call build-package,keyutils,1.6.3-r0))
 $(eval $(call build-package,krb5-conf,1.0-r0))
 $(eval $(call build-package,krb5,1.20.1-r0))
+$(eval $(call build-package,rustls-ffi,0.8.2-r0))
 $(eval $(call build-package,spire-server,1.5.3-r0))
 
 .build-packages: ${PACKAGES}

@@ -390,6 +390,7 @@ $(eval $(call build-package,s3cmd,2.3.0-r0))
 $(eval $(call build-package,kubevela,1.7.0-r0))
 $(eval $(call build-package,sbom-scorecard,0.0.5-r0))
 $(eval $(call build-package,libaio,0.3.113-r0))
+$(eval $(call build-package,flux,0.38.2-r0))
 
 .build-packages: ${PACKAGES}
 

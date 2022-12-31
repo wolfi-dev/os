@@ -275,5 +275,11 @@ $(eval $(call build-package,cython,0.29.32-r0))
 $(eval $(call build-package,util-linux,2.38.1-r0))
 $(eval $(call build-package,jansson,2.14-r0))
 $(eval $(call build-package,msmtp,1.8.22-r0))
+$(eval $(call build-package,nasm,2.16.01-r0))
+$(eval $(call build-package,libxpm,3.5.14-r0))
+$(eval $(call build-package,dav1d,1.0.0-r0))
+$(eval $(call build-package,aom,3.5.0-r0))
+$(eval $(call build-package,libavif,0.11.1-r0))
+$(eval $(call build-package,gd,2.3.3-r0))
 
 .build-packages: ${PACKAGES}

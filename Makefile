@@ -281,5 +281,6 @@ $(eval $(call build-package,dav1d,1.0.0-r0))
 $(eval $(call build-package,aom,3.5.0-r0))
 $(eval $(call build-package,libavif,0.11.1-r0))
 $(eval $(call build-package,gd,2.3.3-r0))
+$(eval $(call build-package,kyverno-cli,1.8.5-r0))
 
 .build-packages: ${PACKAGES}

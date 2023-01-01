@@ -283,5 +283,10 @@ $(eval $(call build-package,dav1d,1.0.0-r0))
 $(eval $(call build-package,aom,3.5.0-r0))
 $(eval $(call build-package,libavif,0.11.1-r0))
 $(eval $(call build-package,gd,2.3.3-r0))
+$(eval $(call build-package,py3-sphinx,6.0.0-r0))
+$(eval $(call build-package,heimdal,7.8.0-r0))
+$(eval $(call build-package,cyrus-sasl,7.8.0-r0))
+$(eval $(call build-package,py3-sphinx,6.0.0-r0))
+$(eval $(call build-package,memcached,1.6.17-r0))
 
 .build-packages: ${PACKAGES}

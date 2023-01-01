@@ -300,5 +300,6 @@ $(eval $(call build-package,ko,0.12.0-r0))
 $(eval $(call build-package,apko,0.6.0-r0))
 $(eval $(call build-package,melange,0.2.0-r0))
 $(eval $(call build-package,spire-server,1.5.3-r0))
+$(eval $(call build-package,kustomize,4.5.7-r0))
 
 .build-packages: ${PACKAGES}

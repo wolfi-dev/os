@@ -290,5 +290,8 @@ $(eval $(call build-package,py3-sphinx,6.0.0-r0))
 $(eval $(call build-package,heimdal,7.8.0-r0))
 $(eval $(call build-package,cyrus-sasl,2.1.28-r0))
 $(eval $(call build-package,memcached,1.6.17-r0))
+$(eval $(call build-package,ko,0.12.0-r0))
+$(eval $(call build-package,apko,0.6.0-r0))
+$(eval $(call build-package,melange,0.2.0-r0))
 
 .build-packages: ${PACKAGES}

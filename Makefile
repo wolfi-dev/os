@@ -293,5 +293,8 @@ $(eval $(call build-package,memcached,1.6.17-r0))
 $(eval $(call build-package,ko,0.12.0-r0))
 $(eval $(call build-package,apko,0.6.0-r0))
 $(eval $(call build-package,melange,0.2.0-r0))
+$(eval $(call build-package,goreleaser,1.14.1-r0))
+$(eval $(call build-package,nerdctl,1.1.0-r0))
+$(eval $(call build-package,lima,0.14.2-r0))
 
 .build-packages: ${PACKAGES}

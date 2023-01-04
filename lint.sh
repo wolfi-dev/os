@@ -23,4 +23,7 @@ for f in *.yaml; do
     yq -i 'del(.environment.contents.repositories)' $f
     yq -i 'del(.environment.contents.keyring)' $f
   fi
+
+  # Make sure that the file has been yamlfmt-ed.
+  yamlfmt -lint $f
 done

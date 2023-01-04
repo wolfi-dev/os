@@ -293,5 +293,6 @@ $(eval $(call build-package,memcached,1.6.17-r0))
 $(eval $(call build-package,ko,0.12.0-r0))
 $(eval $(call build-package,apko,0.6.0-r0))
 $(eval $(call build-package,melange,0.2.0-r0))
+$(eval $(call build-package,bom,0.4.1-r0))
 
 .build-packages: ${PACKAGES}

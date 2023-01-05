@@ -25,6 +25,7 @@ define build-package
 
 packages/$(1): packages/${ARCH}/$(1)-$(2).apk
 packages/${ARCH}/$(1)-$(2).apk: ${KEY}
+	sleep $(( ( RANDOM % 120 )  + 1 ))
 	mkdir -p ./$(1)/
 	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(1).yaml ${MELANGE_OPTS} --source-dir ./$(if $(3),$(3),$(1))/
 

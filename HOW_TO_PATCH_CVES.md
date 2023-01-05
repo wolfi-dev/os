@@ -42,7 +42,7 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
         patches: CVE-2018-25032.patch
     ```
 
-    For more information on how `patch` works, see [its definition](https://github.com/chainguard-dev/melange/blob/main/pipelines/patch.yaml).
+    For more information on how `patch` works, see [its definition](https://github.com/chainguard-dev/melange/blob/main/pkg/build/pipelines/patch.yaml).
 
 1. In the [Makefile](./Makefile), find the line that corresponds to this package, and update the package version to our new release version from the Melange file.
 

@@ -332,5 +332,6 @@ $(eval $(call build-package,libxmu,1.1.4-r0))
 $(eval $(call build-package,libxaw,1.0.14-r0))
 $(eval $(call build-package,pango,1.50.12-r0))
 $(eval $(call build-package,guile,3.0.8-r0))
+$(eval $(call build-package,scorecard,4.10.2-r0))
 
 .build-packages: ${PACKAGES}

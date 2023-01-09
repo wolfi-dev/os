@@ -314,5 +314,12 @@ $(eval $(call build-package,krb5,1.20.1-r1))
 $(eval $(call build-package,libtirpc,1.3.3-r0))
 $(eval $(call build-package,spire-server,1.5.3-r0))
 $(eval $(call build-package,alpine-keys,2.4-r1))
+$(eval $(call build-package,xcb-util,0.4.1-r0))
+$(eval $(call build-package,pixman,0.42.2-r0))
+$(eval $(call build-package,cairo,1.17.6-r0))
+$(eval $(call build-package,gobject-introspection,1.74.0-r0))
+$(eval $(call build-package,kmod,30-r0))
+$(eval $(call build-package,eudev,3.2.11-r0))
+$(eval $(call build-package,fuse3,3.12.0-r0))
 
 .build-packages: ${PACKAGES}

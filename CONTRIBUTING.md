@@ -42,9 +42,11 @@ Once you're done writing the new package configuration file, you can test it by 
 
 ## Package versioning
 
-- When bumping version of a package, you will need to update the version, epoch & shasum (sha256 or sha512) in package YAML file as well as Makefile.
+- When bumping version of a package, you will need to update the version, epoch & shasum (sha256 or sha512) in package YAML file. The version and epoch also need to be bumped in Makefile.
 
 - `epoch` needs to be bump when package version remains the same but something else changes. `epoch` needs to be reset to 0 when it's a new version of the package.
+
+- `melange` CLI has a command `bump` to make it easier. More details are [available here](https://github.com/chainguard-dev/melange/blob/f52b622351657fd9ccdb7e3bfb124caef61ad651/NEWS.md).
 
 ## Some tips
 

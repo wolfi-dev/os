@@ -335,3 +335,6 @@ $(eval $(call build-package,guile,3.0.8-r0))
 $(eval $(call build-package,scorecard,4.10.2-r0))
 
 .build-packages: ${PACKAGES}
+
+dev-container:
+	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" cgr.dev/chainguard/sdk:latest

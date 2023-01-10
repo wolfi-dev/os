@@ -24,3 +24,13 @@ for f in *.yaml; do
     yq -i 'del(.environment.contents.keyring)' $f
   fi
 done
+
+# Ensure advisory data and secfixes data are in sync.
+echo "
+
+Looking for files with out-of-sync advisory and secfixes data...
+"
+wolfictl advisory sync-secfixes --warn *.yaml
+
+# And if we make it this far...
+echo "All data is in sync!"

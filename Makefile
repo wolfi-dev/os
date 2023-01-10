@@ -335,4 +335,4 @@ $(eval $(call build-package,fuse3,3.12.0-r0))
 .build-packages: ${PACKAGES}
 
 dev-container:
-	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" cgr.dev/chainguard/sdk
+	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" cgr.dev/chainguard/sdk:latest

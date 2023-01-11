@@ -341,6 +341,7 @@ $(eval $(call build-package,vala,0.56.3-r0))
 $(eval $(call build-package,libsecret,0.20.5-r0))
 $(eval $(call build-package,libtasn1,4.19.0-r0))
 $(eval $(call build-package,p11-kit,0.24.1-r0))
+$(eval $(call build-package,wayland,1.21.0-r0))
 $(eval $(call build-package,scorecard,4.10.2-r0))
 
 .build-packages: ${PACKAGES}

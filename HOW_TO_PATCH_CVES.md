@@ -24,17 +24,7 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
 
     a. Increment the "epoch" value. (e.g. change from `2` to `3`)
 
-    b. Add the "secfixes" data to denote that the updated package version will fix the vulnerability. If the `secfixes` top-level YAML field doesn't already exist, create it.
-
-    For example, to show that a new version (e.g. `...-r3` if we just incremented "epoch" to `3`) fixes CVE-2022-37434, the YAML might look like this:
-
-    ```yaml
-    secfixes:
-      1.2.12-r3:
-        - CVE-2022-37434
-    ```
-
-    c. For the new patch, add a `patch` pipeline item in the `pipeline` YAML section. For example, if we downloaded a patch called `CVE-2018-25032.patch` to our package directory above, we'd add an item to `pipeline` that looks like this:
+    b. For the new patch, add a `patch` pipeline item in the `pipeline` YAML section. For example, if we downloaded a patch called `CVE-2018-25032.patch` to our package directory above, we'd add an item to `pipeline` that looks like this:
 
     ```yaml
     - uses: patch
@@ -42,7 +32,20 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
         patches: CVE-2018-25032.patch
     ```
 
-    For more information on how `patch` works, see [its definition](https://github.com/chainguard-dev/melange/blob/main/pipelines/patch.yaml).
+    For more information on how `patch` works, see [its definition](https://github.com/chainguard-dev/melange/blob/main/pkg/build/pipelines/patch.yaml).
+
+    c. Add the advisories data to denote that the updated package version will fix the vulnerability. You can do this using [wolfictl](https://github.com/wolfi-dev/wolfictl/):
+
+
+    ```sh
+    wolfictl advisory create <path-to-melange-config.yaml> --vuln <CVE> --status 'fixed' --fixed-version <new-release-version> --sync
+    ```
+
+    For example, if we're patching CVE-2018-25032 in the "zlib" package, where the `version` is `1.2.3` and the `epoch` is 4, we'd run:
+
+    ```sh
+    wolfictl advisory create ./zlib.yaml --vuln 'CVE-2018-25032' --status 'fixed' --fixed-version '1.2.3-r4' --sync
+    ```
 
 1. In the [Makefile](./Makefile), find the line that corresponds to this package, and update the package version to our new release version from the Melange file.
 
@@ -62,12 +65,12 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
 
 ## NACKing a CVE
 
-To NACK a CVE for a given package, we don't add in any patches or increment the package version. Instead, the only thing we do is add a special entry to the `secfixes` section of the Melange YAML file, where we use a `0` in place of a real version of this package. For example:
+To NACK a CVE for a given package, we don't add in any patches or increment the package version. Instead, we just need to update the advisory data to say that this package is not affected by the vulnerability. As we do this, we also need to provide an accurate ["justification"](https://github.com/chainguard-dev/vex/blob/main/pkg/vex/justification.go#L12-L49) value as to why our package isn't affected. (And, if possible, we should also provide an "impact statement" that explains why we believe our package is not affected—but this is optional.)
 
-```yaml
-secfixes:
-  0:
-    - CVE-2019-6293
+For example:
+
+```sh
+wolfictl advisory create ./zlib.yaml --vuln 'CVE-2023-12345' --status 'not_affected' --justification 'vulnerable_code_not_present' --impact 'Fixed upstream prior to Wolfi packaging.' --sync
 ```
 
 This will notify vulnerability scanners that consume our secdb that this vulnerabitiliy doesn't apply to any of the versions of this package that we've published.

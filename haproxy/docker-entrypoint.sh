@@ -1,6 +1,7 @@
+#!/bin/sh
+
 # src: https://github.com/docker-library/haproxy/blob/817555017600e0dac39d93a75ef920adac450958/2.8/alpine/docker-entrypoint.sh
 
-#!/bin/sh
 set -e
 
 # first arg is `-f` or `--some-option`

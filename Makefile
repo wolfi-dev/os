@@ -382,6 +382,7 @@ $(eval $(call build-package,py3-s3transfer,0.5.1-r0))
 $(eval $(call build-package,py3-urllib3,1.26.13-r0))
 $(eval $(call build-package,py3-yaml,6.0-r0))
 $(eval $(call build-package,aws-cli,1.27.38-r0))
+$(eval $(call build-package,helm,3.10.3-r0))
 $(eval $(call build-package,kubescape,2.0.183-r0))
 
 .build-packages: ${PACKAGES}

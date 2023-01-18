@@ -385,6 +385,7 @@ $(eval $(call build-package,nginx,1.23.3-r1))
 $(eval $(call build-package,aws-cli,1.27.38-r0))
 $(eval $(call build-package,helm,3.10.3-r0))
 $(eval $(call build-package,kubescape,2.0.183-r0))
+$(eval $(call build-package,s3cmd,2.3.0-r0))
 $(eval $(call build-package,kubevela,1.7.0-r0))
 
 .build-packages: ${PACKAGES}

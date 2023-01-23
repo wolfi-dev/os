@@ -1,0 +1,84 @@
+# originated from https://git.alpinelinux.org/aports/plain/main/gnupg/0210-dirmngr-hkp-avoid-potential-race-condition-when-some-host-die.patch
+From: Daniel Kahn Gillmor <dkg@fifthhorseman.net>
+Date: Sat, 29 Oct 2016 01:25:05 -0400
+Subject: dirmngr: hkp: Avoid potential race condition when some hosts die.
+
+* dirmngr/ks-engine-hkp.c (select_random_host): Use atomic pass
+through the host table instead of risking out-of-bounds write.
+
+--
+
+Multiple threads may write to hosttable[x]->dead while
+select_random_host() is running.  For example, a housekeeping thread
+might clear the ->dead bit on some entries, or another connection to
+dirmngr might manually mark a host as alive.
+
+If one or more hosts are resurrected between the two loops over a
+given table in select_random_host(), then the allocation of tbl might
+not be large enough, resulting in a write past the end of tbl on the
+second loop.
+
+This change collapses the two loops into a single loop to avoid this
+discrepancy: each host's "dead" bit is now only checked once.
+
+As Werner points out, this isn't currently strictly necessary, since
+npth will not switch threads unless a blocking system call is made,
+and no blocking system call is made in these two loops.
+
+However, in a subsequent change in this series, we will call a
+function in this loop, and that function may sometimes write(2), or
+call other functions, which may themselves block.  Keeping this as a
+single-pass loop avoids the need to keep track of what might block and
+what might not.
+
+Signed-off-by: Daniel Kahn Gillmor <dkg@fifthhorseman.net>
+---
+ dirmngr/ks-engine-hkp.c | 23 ++++++++++-------------
+ 1 file changed, 10 insertions(+), 13 deletions(-)
+
+Patch-Source: https://sources.debian.org/data/main/g/gnupg2/2.2.27-2/debian/patches/dirmngr-idling/dirmngr-hkp-Avoid-potential-race-condition-when-some.patch
+
+diff --git a/dirmngr/ks-engine-hkp.c b/dirmngr/ks-engine-hkp.c
+index 14859c7..d425363 100644
+--- a/dirmngr/ks-engine-hkp.c
++++ b/dirmngr/ks-engine-hkp.c
+@@ -225,29 +225,26 @@ host_in_pool_p (hostinfo_t hi, int tblidx)
+ static int
+ select_random_host (hostinfo_t hi)
+ {
+-  int *tbl;
+-  size_t tblsize;
++  int *tbl = NULL;
++  size_t tblsize = 0;
+   int pidx, idx;
+ 
+   /* We create a new table so that we randomly select only from
+      currently alive hosts.  */
+-  for (idx = 0, tblsize = 0;
++  for (idx = 0;
+        idx < hi->pool_len && (pidx = hi->pool[idx]) != -1;
+        idx++)
+     if (hosttable[pidx] && !hosttable[pidx]->dead)
+-      tblsize++;
++      {
++        tblsize++;
++        tbl = xtryrealloc(tbl, tblsize * sizeof *tbl);
++        if (!tbl)
++          return -1; /* memory allocation failed! */
++        tbl[tblsize-1] = pidx;
++      }
+   if (!tblsize)
+     return -1; /* No hosts.  */
+ 
+-  tbl = xtrymalloc (tblsize * sizeof *tbl);
+-  if (!tbl)
+-    return -1;
+-  for (idx = 0, tblsize = 0;
+-       idx < hi->pool_len && (pidx = hi->pool[idx]) != -1;
+-       idx++)
+-    if (hosttable[pidx] && !hosttable[pidx]->dead)
+-      tbl[tblsize++] = pidx;
+-
+   if (tblsize == 1)  /* Save a get_uint_nonce.  */
+     pidx = tbl[0];
+   else

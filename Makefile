@@ -388,6 +388,7 @@ $(eval $(call build-package,kubescape,2.0.183-r0))
 $(eval $(call build-package,s3cmd,2.3.0-r0))
 $(eval $(call build-package,kubevela,1.7.0-r0))
 $(eval $(call build-package,sbom-scorecard,0.0.5-r0))
+$(eval $(call build-package,libaio,0.3.113-r0))
 
 .build-packages: ${PACKAGES}
 

@@ -53,7 +53,7 @@ clean:
 $(eval $(call build-package,gmp,6.2.1-r4))
 $(eval $(call build-package,mpfr,4.2.0-r0))
 $(eval $(call build-package,mpc,1.2.1-r2))
-$(eval $(call build-package,isl,0.24-r2))
+$(eval $(call build-package,isl,0.24-r3))
 $(eval $(call build-package,zlib,1.2.13-r1))
 $(eval $(call build-package,flex,2.6.4-r2))
 $(eval $(call build-package,glibc,2.36-r4))

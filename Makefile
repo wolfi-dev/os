@@ -394,6 +394,8 @@ $(eval $(call build-package,flux,0.38.2-r0))
 $(eval $(call build-package,libunwind,1.6.2-r0))
 $(eval $(call build-package,userspace-rcu,0.13.2-r0))
 $(eval $(call build-package,lttng-ust,2.13.5-r0))
+$(eval $(call build-package,docbook-xsl,1.79.2-r0))
+$(eval $(call build-package,jemalloc,5.3.0-r0))
 
 .build-packages: ${PACKAGES}
 

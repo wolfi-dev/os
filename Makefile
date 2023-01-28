@@ -393,6 +393,7 @@ $(eval $(call build-package,libunwind,1.6.2-r0))
 $(eval $(call build-package,userspace-rcu,0.13.2-r0))
 $(eval $(call build-package,lttng-ust,2.13.5-r0))
 $(eval $(call build-package,traefik,2.9.6-r0))
+$(eval $(call build-package,gitsign,0.5.2-r0))
 
 .build-packages: ${PACKAGES}
 

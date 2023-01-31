@@ -1,4 +1,4 @@
-ARCH := $(shell uname -m)
+ARCH ?= $(shell uname -m)
 MELANGE_DIR ?= ../melange
 MELANGE ?= ${MELANGE_DIR}/melange
 KEY ?= local-melange.rsa
@@ -395,6 +395,7 @@ $(eval $(call build-package,userspace-rcu,0.13.2-r0))
 $(eval $(call build-package,lttng-ust,2.13.5-r0))
 $(eval $(call build-package,traefik,2.9.6-r0))
 $(eval $(call build-package,gitsign,0.5.2-r0))
+$(eval $(call build-package,kind,0.17.0-r0))
 
 .build-packages: ${PACKAGES}
 

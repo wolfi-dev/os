@@ -399,6 +399,7 @@ $(eval $(call build-package,snappy,1.1.9-r0))
 $(eval $(call build-package,gitsign,0.5.2-r0))
 $(eval $(call build-package,kind,0.17.0-r0))
 $(eval $(call build-package,policy-controller,0.6.2-r0))
+$(eval $(call build-package,checkov,2.2.330-r0))
 
 .build-packages: ${PACKAGES}
 

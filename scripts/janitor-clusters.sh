@@ -12,9 +12,9 @@ do
   echo "  NAME: ${NAME}"
   echo "  CREATE_TIME: ${CREATE_TIME} / ${FORMATED_CREATE_TIME}"
 
-  YESTERDAY_DATE=$(date -I -d "yesterday")
-  if [[ ${FORMATED_CREATE_TIME} < ${YESTERDAY_DATE} ]]; then
-    echo "Cluster ${NAME}(${FORMATED_CREATE_TIME}) is older than ${YESTERDAY_DATE} will terminate"
+  CUTOFF_DATE=$(date -I -d "7 hours ago")
+  if [[ ${FORMATED_CREATE_TIME} < ${CUTOFF_DATE} ]]; then
+    echo "Cluster ${NAME}(${FORMATED_CREATE_TIME}) is older than ${CUTOFF_DATE} will terminate"
     gcloud container clusters delete "${NAME}" \
     --zone "${ZONE}" \
     --quiet

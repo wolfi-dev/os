@@ -404,7 +404,7 @@ $(eval $(call build-package,kind,0.17.0-r0))
 $(eval $(call build-package,vim,9.0.1275-r0))
 $(eval $(call build-package,policy-controller,0.6.2-r1))
 $(eval $(call build-package,syft,0.70.0-r0))
-$(eval $(call build-package,yq,4.38.8-r0))
+$(eval $(call build-package,yq,4.30.8-r0))
 
 .build-packages: ${PACKAGES}
 

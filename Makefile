@@ -17,6 +17,7 @@ MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --cache-dir ${CACHE_DIR}
 MELANGE_OPTS += --namespace wolfi
+MELANGE_OPTS += --generate-index false
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${BUILDWORLD}, no)

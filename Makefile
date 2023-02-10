@@ -407,6 +407,7 @@ $(eval $(call build-package,vim,9.0.1275-r0))
 $(eval $(call build-package,policy-controller,0.6.2-r1))
 $(eval $(call build-package,syft,0.70.0-r0))
 $(eval $(call build-package,delve,1.20.1-r0))
+$(eval $(call build-package,oras,0.16.0-r0))
 
 .build-packages: ${PACKAGES}
 

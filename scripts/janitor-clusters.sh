@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 for clusters in $(
   gcloud container clusters list --project="${1}" \
     --format="csv[no-heading](name,createTime,zone)")

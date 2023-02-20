@@ -414,6 +414,7 @@ $(eval $(call build-package,yq,4.30.8-r0))
 $(eval $(call build-package,delve,1.20.1-r1))
 $(eval $(call build-package,oras,0.16.0-r0))
 $(eval $(call build-package,step,0.23.1-r0))
+$(eval $(call build-package,netcat-openbsd,1.219-r0))
 $(eval $(call build-package,gnutar,1.34-r0))
 $(eval $(call build-package,dpkg,1.20.12-r0))
 

@@ -434,6 +434,16 @@ $(eval $(call build-package,ruby3.2-strptime,0.2.5-r0))
 $(eval $(call build-package,ruby3.2-tzinfo-data,1.2022.7-r0))
 $(eval $(call build-package,ruby3.2-tzinfo,2.0.6-r0))
 $(eval $(call build-package,ruby3.2-webrick,1.8.1-r0))
+$(eval $(call build-package,ruby3.2-async-http,0.60.1-r0))
+$(eval $(call build-package,ruby3.2-async-pool,0.3.12-r0))
+$(eval $(call build-package,ruby3.2-async,2.3.1-r0))
+$(eval $(call build-package,ruby3.2-console,1.16.2-r0))
+$(eval $(call build-package,ruby3.2-io-event,1.1.6-r0))
+$(eval $(call build-package,ruby3.2-protocol-http1,0.15.0-r0))
+$(eval $(call build-package,ruby3.2-protocol-http2,0.15.1-r0))
+$(eval $(call build-package,ruby3.2-protocol-http,0.24.1-r0))
+$(eval $(call build-package,ruby3.2-timers,4.3.5-r0))
+$(eval $(call build-package,ruby3.2-traces,0.8.0-r0))
 
 .build-packages: ${PACKAGES}
 

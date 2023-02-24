@@ -448,6 +448,8 @@ $(eval $(call build-package,ruby3.2-concurrent-ruby,1.2.0-r0))
 $(eval $(call build-package,ruby3.2-http_parser.rb,0.8.0-r0))
 $(eval $(call build-package,ruby3.2-protocol-hpack,1.4.2-r0))
 $(eval $(call build-package,ruby3.2-yajl-ruby,1.4.3-r0))
+$(eval $(call build-package,gradle-stage0,8.0.1-r0))
+$(eval $(call build-package,gradle-8,8.0.1-r0))
 
 .build-packages: ${PACKAGES}
 

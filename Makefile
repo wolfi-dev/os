@@ -79,6 +79,10 @@ PACKAGES := $(addprefix packages/,$(PKGNAMELIST))
 
 $(foreach pkg,$(PKGLIST),$(eval $(call build-package,$(pkg))))
 
+
+
+$(eval $(call build-package,cilium-cli,0.13.0-r0))
+
 .build-packages: ${PACKAGES}
 
 dev-container:

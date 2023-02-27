@@ -121,6 +121,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	var makefileManualUpdates []string
 	for i := range updates {
 		// index of old makefile entry
 		index := Find(lines, fmt.Sprintf("$(eval $(call build-package,%v,%v-r%v))", updates[i].Package.Name, updates[i].Package.Version, updates[i].Package.Epoch))
@@ -150,14 +151,17 @@ func main() {
 					data, err := os.ReadFile(depFileName)
 					if err != nil {
 						fmt.Printf("Error Opening file %s %s \n", yamlFiles[i].Name(), err)
-						os.Exit(1)
+
+						makefileManualUpdates = append(makefileManualUpdates, depName)
+						//os.Exit(1)
 					}
 
 					var dataYaml GeneratedMelangeConfig
 					err = yaml.Unmarshal(data, &dataYaml)
 					if err != nil {
 						fmt.Printf("Error unmarshalling %s\n", err)
-						os.Exit(1)
+						makefileManualUpdates = append(makefileManualUpdates, depName)
+						//os.Exit(1)
 					}
 
 					dep := fmt.Sprintf("$(eval $(call build-package,%v,%v-r0))", depName, dataYaml.Package.Version)
@@ -176,6 +180,8 @@ func main() {
 	data := []byte(newMakefile)
 	os.WriteFile(dir+"/Makefile2", data, 0644)
 	fmt.Printf("Manual Edits %v\n", manualEdits)
+
+	fmt.Printf("Manual Makefile Edits %v\n", makefileManualUpdates)
 }
 
 func Find(a []string, x string) int {

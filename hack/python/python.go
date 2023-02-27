@@ -125,6 +125,9 @@ func main() {
 	for i := range updates {
 		// index of old makefile entry
 		index := Find(lines, fmt.Sprintf("$(eval $(call build-package,%v,%v-r%v))", updates[i].Package.Name, updates[i].Package.Version, updates[i].Package.Epoch))
+		if index == len(lines) {
+			break
+		}
 		for p := range pythonVersions {
 			updatePackage := strings.Split(updates[i].Package.Name, "-")
 			updateName := fmt.Sprintf("py%v-%v", pythonVersions[p], updatePackage[1])
@@ -142,7 +145,9 @@ func main() {
 					depPackage = depPackageArr[1]
 				}
 
-				if updates[i].Package.Dependencies.Runtime[j] != "python3" && !Contains(manualEdits, depPackage) && strings.HasPrefix(updates[i].Package.Dependencies.Runtime[j], "py3") {
+				if updates[i].Package.Dependencies.Runtime[j] != "python3" &&
+					!Contains(manualEdits, depPackage) &&
+					strings.HasPrefix(updates[i].Package.Dependencies.Runtime[j], "py3") {
 
 					depName := fmt.Sprintf("py%v-%v", pythonVersions[p], depPackage)
 					fmt.Printf("Search %v for its updates %v\n", updates[i].Package.Name, depName)

@@ -454,6 +454,7 @@ $(eval $(call build-package,gradle-8,8.0.1-r0))
 $(eval $(call build-package,python-3.12,3.12.0_alpha5-r0))
 $(eval $(call build-package,doxygen,1.9.6-r0))
 $(eval $(call build-package,jbig2dec,0.19-r0))
+$(eval $(call build-package,scala3,3.2.2-r0))
 
 .build-packages: ${PACKAGES}
 

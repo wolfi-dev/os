@@ -128,57 +128,64 @@ func main() {
 		if index == len(lines) {
 			break
 		}
+
 		for p := range pythonVersions {
 			updatePackage := strings.Split(updates[i].Package.Name, "-")
 			updateName := fmt.Sprintf("py%v-%v", pythonVersions[p], updatePackage[1])
 			//$(eval $(call build-package,py3-botocore,1.21.49-r0))
 			update := fmt.Sprintf("$(eval $(call build-package,%v,%v-r0))", updateName, updates[i].Package.Version)
 			//replace old with new
-			lines[index] = update
+
+			before := lines[0 : index-1]
+			after := lines[index:len(lines)]
+			before = append(before, update)
+			lines = append(before, after...)
 
 			for j := range updates[i].Package.Dependencies.Runtime {
-				fmt.Printf("Checking Run Time Dep %s\n", updates[i].Package.Dependencies.Runtime[j])
-				//ignore python3 and manual edits files since those yamls done exist
-				var depPackage string
 				if strings.HasPrefix(updates[i].Package.Dependencies.Runtime[j], "py3") {
-					depPackageArr := strings.Split(updates[i].Package.Dependencies.Runtime[j], "-")
-					depPackage = depPackageArr[1]
-				}
-
-				if updates[i].Package.Dependencies.Runtime[j] != "python3" &&
-					!Contains(manualEdits, depPackage) &&
-					strings.HasPrefix(updates[i].Package.Dependencies.Runtime[j], "py3") {
-
-					depName := fmt.Sprintf("py%v-%v", pythonVersions[p], depPackage)
-					fmt.Printf("Search %v for its updates %v\n", updates[i].Package.Name, depName)
-
-					depFileName := fmt.Sprintf("%s/generated/%s.yaml", cwd, depName)
-					data, err := os.ReadFile(depFileName)
-					if err != nil {
-						fmt.Printf("Error Opening file %s %s \n", yamlFiles[i].Name(), err)
-
-						makefileManualUpdates = append(makefileManualUpdates, depName)
-						//os.Exit(1)
+					fmt.Printf("Checking Run Time Dep %s\n", updates[i].Package.Dependencies.Runtime[j])
+					//ignore python3 and manual edits files since those yamls done exist
+					var depPackage string
+					if strings.HasPrefix(updates[i].Package.Dependencies.Runtime[j], "py3") {
+						depPackageArr := strings.Split(updates[i].Package.Dependencies.Runtime[j], "-")
+						depPackage = depPackageArr[1]
 					}
 
-					var dataYaml GeneratedMelangeConfig
-					err = yaml.Unmarshal(data, &dataYaml)
-					if err != nil {
-						fmt.Printf("Error unmarshalling %s\n", err)
-						makefileManualUpdates = append(makefileManualUpdates, depName)
-						//os.Exit(1)
+					if updates[i].Package.Dependencies.Runtime[j] != "python3" && !Contains(manualEdits, depPackage) {
+
+						depName := fmt.Sprintf("py%v-%v", pythonVersions[p], depPackage)
+						fmt.Printf("Search %v for its updates %v\n", updates[i].Package.Name, depName)
+
+						depFileName := fmt.Sprintf("%s/generated/%s.yaml", cwd, depName)
+						data, err := os.ReadFile(depFileName)
+						if err != nil {
+							fmt.Printf("Error Opening file %s %s \n", yamlFiles[i].Name(), err)
+
+							makefileManualUpdates = append(makefileManualUpdates, depName)
+							//os.Exit(1)
+						}
+
+						var dataYaml GeneratedMelangeConfig
+						err = yaml.Unmarshal(data, &dataYaml)
+						if err != nil {
+							fmt.Printf("Error unmarshalling %s\n", err)
+							makefileManualUpdates = append(makefileManualUpdates, depName)
+							//os.Exit(1)
+						}
+
+						dep := fmt.Sprintf("$(eval $(call build-package,%v,%v-r0))", depName, dataYaml.Package.Version)
+
+						//add it to the makefile before itself
+						before := lines[0 : index-1]
+						after := lines[index:len(lines)]
+						before = append(before, dep)
+						lines = append(before, after...)
 					}
-
-					dep := fmt.Sprintf("$(eval $(call build-package,%v,%v-r0))", depName, dataYaml.Package.Version)
-
-					//add it to the makefile before itself
-					before := lines[0 : index-1]
-					after := lines[index:len(lines)]
-					before = append(before, dep)
-					lines = append(before, after...)
 				}
 			}
 		}
+		lines[index] =
+
 	}
 
 	newMakefile := strings.Join(lines, "\n")

@@ -455,6 +455,7 @@ $(eval $(call build-package,python-3.12,3.12.0_alpha5-r0))
 $(eval $(call build-package,doxygen,1.9.6-r0))
 $(eval $(call build-package,jbig2dec,0.19-r0))
 $(eval $(call build-package,dataplaneapi,2.7.2-r0))
+$(eval $(call build-package,wasmtime,6.0.0-r0))
 
 .build-packages: ${PACKAGES}
 

@@ -456,6 +456,7 @@ $(eval $(call build-package,golangci-lint,1.51.1-r0))
 $(eval $(call build-package,doxygen,1.9.6-r0))
 $(eval $(call build-package,jbig2dec,0.19-r0))
 $(eval $(call build-package,wasmtime,6.0.0-r0))
+$(eval $(call build-package,poetry,1.3.2-r0))
 
 .build-packages: ${PACKAGES}
 

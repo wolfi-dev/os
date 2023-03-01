@@ -460,6 +460,10 @@ $(eval $(call build-package,dataplaneapi,2.7.2-r0))
 $(eval $(call build-package,wasmtime,6.0.0-r0))
 $(eval $(call build-package,poetry,1.3.2-r0))
 
+
+$(eval $(call build-package,zot,1.4.3-r0))
+
+
 .build-packages: ${PACKAGES}
 
 dev-container:

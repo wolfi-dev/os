@@ -462,6 +462,8 @@ $(eval $(call build-package,poetry,1.3.2-r0))
 $(eval $(call build-package,zot,1.4.3-r0))
 $(eval $(call build-package,terraform,1.3.9-r0))
 $(eval $(call build-package,prometheus-node-exporter,1.5.0-r1))
+$(eval $(call build-package,rekor-cli,1.0.1-r0))
+$(eval $(call build-package,rekor-server,1.0.1-r0))
 
 .build-packages: ${PACKAGES}
 

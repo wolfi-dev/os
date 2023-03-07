@@ -468,6 +468,7 @@ $(eval $(call build-package,prometheus-alertmanager,0.25.0-r0))
 $(eval $(call build-package,prometheus-mysqld-exporter,0.14.0-r0))
 $(eval $(call build-package,sbt-stage0,1.8.2-r0))
 $(eval $(call build-package,sbt,1.8.2-r0))
+$(eval $(call build-package,kafka,3.4.0-r0))
 
 .build-packages: ${PACKAGES}
 

@@ -252,7 +252,7 @@ $(eval $(call build-package,bazel-5,5.4.0-r2,bazel))
 $(eval $(call build-package,bazel-6,6.0.0-r3,bazel))
 $(eval $(call build-package,libmaxminddb,1.7.1-r1))
 $(eval $(call build-package,clang-15,15.0.6-r1))
-$(eval $(call build-package,jenkins,2.393-r0))
+$(eval $(call build-package,jenkins,2.394-r0))
 $(eval $(call build-package,cosign,2.0.0-r0))
 $(eval $(call build-package,yasm,1.3.0-r0))
 $(eval $(call build-package,crane,0.13.0-r1))
@@ -467,6 +467,8 @@ $(eval $(call build-package,prometheus-node-exporter,1.5.0-r1))
 $(eval $(call build-package,prometheus-alertmanager,0.25.0-r0))
 $(eval $(call build-package,prometheus-mysqld-exporter,0.14.0-r0))
 $(eval $(call build-package,socat,1.7.4.4-r0))
+$(eval $(call build-package,sbt-stage0,1.8.2-r0))
+$(eval $(call build-package,sbt,1.8.2-r0))
 
 .build-packages: ${PACKAGES}
 

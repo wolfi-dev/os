@@ -469,6 +469,15 @@ $(eval $(call build-package,prometheus-mysqld-exporter,0.14.0-r1))
 $(eval $(call build-package,sbt-stage0,1.8.2-r0))
 $(eval $(call build-package,sbt,1.8.2-r0))
 $(eval $(call build-package,kafka,3.4.0-r0))
+$(eval $(call build-package,ctop,0.7.7-r0))
+$(eval $(call build-package,dhcping,1.2-r0))
+$(eval $(call build-package,grpcurl,1.8.7-r0))
+$(eval $(call build-package,iperf,2.1.8-r0))
+$(eval $(call build-package,iperf3,3.13-r0))
+$(eval $(call build-package,libmnl,1.0.5-r0))
+$(eval $(call build-package,libnet,1.2-r0))
+$(eval $(call build-package,libpcap,1.10.3-r0))
+$(eval $(call build-package,libssh,0.10.4-r0))
 
 .build-packages: ${PACKAGES}
 

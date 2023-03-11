@@ -478,6 +478,7 @@ $(eval $(call build-package,libmnl,1.0.5-r0))
 $(eval $(call build-package,libnet,1.2-r0))
 $(eval $(call build-package,libpcap,1.10.3-r0))
 $(eval $(call build-package,libssh,0.10.4-r0))
+$(eval $(call build-package,slsa-verifier,2.0.1-r0))
 
 .build-packages: ${PACKAGES}
 

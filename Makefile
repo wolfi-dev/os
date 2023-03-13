@@ -483,6 +483,7 @@ $(eval $(call build-package,fping,5.1-r0))
 $(eval $(call build-package,ethtool,6.2-r0))
 $(eval $(call build-package,iftop,0.17-r0))
 $(eval $(call build-package,tcpdump,4.99.3-r0))
+$(eval $(call build-package,zookeeper,3.8.1-r0))
 
 .build-packages: ${PACKAGES}
 

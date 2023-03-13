@@ -480,6 +480,9 @@ $(eval $(call build-package,libpcap,1.10.3-r0))
 $(eval $(call build-package,libssh,0.10.4-r0))
 $(eval $(call build-package,libnl3,3.7.0-r0))
 $(eval $(call build-package,fping,5.1-r0))
+$(eval $(call build-package,ethtool,6.2-r0))
+$(eval $(call build-package,iftop,0.17-r0))
+$(eval $(call build-package,tcpdump,4.99.3-r0))
 
 .build-packages: ${PACKAGES}
 

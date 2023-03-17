@@ -45,6 +45,9 @@ packages/${ARCH}/$(1)-$(2).apk: ${KEY}
 
 PACKAGES += packages/${ARCH}/$(1)-$(2).apk
 
+# don't use += as it includes a leading space
+PACKAGES_LOG := $(PACKAGES_LOG)"${ARCH}|$(1)|$(2)\n"
+
 endef
 
 all: ${KEY} .build-packages
@@ -497,7 +500,9 @@ $(eval $(call build-package,nats,0.0.35-r0))
 $(eval $(call build-package,nsc,2.7.8-r0))
 $(eval $(call build-package,json-c,0.16-r0))
 
-.build-packages: ${PACKAGES}
 
+.build-packages: ${PACKAGES}
+	# write built packages list to file for wolfictl checks
+	echo ${PACKAGES_LOG} > packages.log
 dev-container:
 	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" cgr.dev/chainguard/sdk:latest

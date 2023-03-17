@@ -1,4 +1,12 @@
+USE_CACHE ?= yes
 ARCH ?= $(shell uname -m)
+ifeq (${ARCH}, arm64)
+	ARCH = aarch64
+	# Presently buggy because --cache-dir is presumed to be both a source
+	# and a destination.  See melange#329.
+	USE_CACHE = no
+endif
+
 MELANGE_DIR ?= ../melange
 MELANGE ?= ${MELANGE_DIR}/melange
 KEY ?= local-melange.rsa
@@ -15,10 +23,13 @@ MELANGE_OPTS += --signing-key ${KEY}
 MELANGE_OPTS += --pipeline-dir ${MELANGE_DIR}/pipelines
 MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
-MELANGE_OPTS += --cache-dir ${CACHE_DIR}
 MELANGE_OPTS += --namespace wolfi
 MELANGE_OPTS += --generate-index false
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
+
+ifeq (${USE_CACHE}, yes)
+	MELANGE_OPTS += --cache-dir ${CACHE_DIR}
+endif
 
 ifeq (${BUILDWORLD}, no)
 MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}

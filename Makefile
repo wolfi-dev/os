@@ -497,6 +497,7 @@ $(eval $(call build-package,nats-server,2.9.15-r0))
 $(eval $(call build-package,nats,0.0.35-r0))
 $(eval $(call build-package,nsc,2.7.8-r1))
 $(eval $(call build-package,json-c,0.16-r0))
+$(eval $(call build-package,libmspack,0.11_alpha-r0))
 
 .build-packages: ${PACKAGES}
 

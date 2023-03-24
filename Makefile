@@ -513,6 +513,10 @@ $(eval $(call build-package,opensearch-2,2.6.0-r0))
 $(eval $(call build-package,libmspack,0.11_alpha-r0))
 $(eval $(call build-package,libmilter,1.0.2-r0))
 $(eval $(call build-package,telegraf,1.26.0-r0))
+$(eval $(call build-package,bird,2.0.12-r0))
+$(eval $(call build-package,ipvsadm,1.31-r0))
+$(eval $(call build-package,ldns,1.8.3-r0))
+$(eval $(call build-package,tcptraceroute,1.5b7-r0))
 
 .build-packages: ${PACKAGES}
 

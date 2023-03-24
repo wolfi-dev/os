@@ -8,9 +8,9 @@ Provide a short summary in the Title above. Examples of good PR titles:
 Please include references to any related issues or delete this section otherwise.
  -->
 
-Fixes: 
+Fixes:
 
-Related: 
+Related:
 
 ### Pre-review Checklist
 
@@ -26,7 +26,7 @@ addressed, and remove any items that are not relevant to this PR.
 
 -->
 
-#### For new package PRs only 
+#### For new package PRs only
 <!-- remove if unrelated -->
 - [ ] This PR is marked as fixing a pre-existing package request bug
   - [ ] Alternatively, the PR is marked as related to a pre-existing package request bug, such as a dependency
@@ -40,3 +40,4 @@ addressed, and remove any items that are not relevant to this PR.
 #### For version bump PRs
 <!-- remove if unrelated -->
 - [ ] The `epoch` field is reset to 0
+- [ ] Patch source: _patch source here_

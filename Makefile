@@ -513,6 +513,7 @@ $(eval $(call build-package,opensearch-2,2.6.0-r0))
 $(eval $(call build-package,libmspack,0.11_alpha-r0))
 $(eval $(call build-package,libmilter,1.0.2-r0))
 $(eval $(call build-package,telegraf,1.26.0-r0))
+$(eval $(call build-package,dotnet-7,7.0.104-r0))
 
 .build-packages: ${PACKAGES}
 

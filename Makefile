@@ -517,6 +517,8 @@ $(eval $(call build-package,dotnet-7,7.0.104-r1))
 $(eval $(call build-package,gtest,1.13.0-r0))
 $(eval $(call build-package,libpsl-native,7.3.1-r0))
 $(eval $(call build-package,powershell,7.3.3-r0))
+$(eval $(call build-package,py3-wheel,0.40.0-r0))
+$(eval $(call build-package,mercurial,6.4-r0))
 
 .build-packages: ${PACKAGES}
 

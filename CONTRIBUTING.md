@@ -10,8 +10,9 @@
 ## Setup development environment
 
 To ease the development of Wolfi OS, you can use the [`sdk` Chainguard Image](https://github.com/chainguard-images/images/tree/main/images/sdk) that already includes both [apko](https://github.com/chainguard-dev/apko) and [melange](https://github.com/chainguard-dev/melange).
+On Linux and Mac it is also possible to install both the above tools directly into your system.
 
-To start a development environment, do
+If you choose not to install the tooling onto your local machine, you can start a container based development environment using
 
 ```sh
 make dev-container
@@ -38,7 +39,10 @@ Add a new entry for your package in the Makefile like this
 $(eval $(call build-package,<your-package-name>,<version>-r<epoch>))
 ```
 
-Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name>`.
+Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name> BUILDWORLD=no`.
+note: If you see GCS auth related errors, your gcloud auth credentials might be the issue. Try running `gcloud auth login && gcloud auth application-default login`.
+
+Your build packages should be found in the generated `./packages` directory.
 
 ## Package versioning
 
@@ -63,3 +67,5 @@ gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages
 ```
 
 - If you dont want to install `gsutil` locally, you can use this image `gcr.io/google.com/cloudsdktool/google-cloud-cli:slim` which is the official SDK image from GCP and already include `gsutil` in there.
+
+- 

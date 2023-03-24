@@ -514,6 +514,9 @@ $(eval $(call build-package,libmspack,0.11_alpha-r0))
 $(eval $(call build-package,libmilter,1.0.2-r0))
 $(eval $(call build-package,telegraf,1.26.0-r0))
 $(eval $(call build-package,dotnet-7,7.0.104-r0))
+$(eval $(call build-package,gtest,1.13.0-r0))
+$(eval $(call build-package,libpsl-native,7.3.1-r0))
+$(eval $(call build-package,powershell,7.3.3-r0))
 
 .build-packages: ${PACKAGES}
 

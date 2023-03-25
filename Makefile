@@ -524,6 +524,7 @@ $(eval $(call build-package,clamav,1.0.1-r0))
 $(eval $(call build-package,py3-wheel,0.40.0-r0))
 $(eval $(call build-package,mercurial,6.4-r0))
 $(eval $(call build-package,mongo-tools,100.7.0-r0))
+$(eval $(call build-package,minio,0.20230324.214123-r0))
 
 .build-packages: ${PACKAGES}
 

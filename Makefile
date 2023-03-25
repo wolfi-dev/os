@@ -523,6 +523,7 @@ $(eval $(call build-package,powershell,7.3.3-r0))
 $(eval $(call build-package,py3-wheel,0.40.0-r0))
 $(eval $(call build-package,mercurial,6.4-r0))
 $(eval $(call build-package,mongo-tools,100.7.0-r0))
+$(eval $(call build-package,checkov,2.3.114-r0))
 
 .build-packages: ${PACKAGES}
 

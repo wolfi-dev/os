@@ -530,6 +530,7 @@ $(eval $(call build-package,thanos,0.31.0-r0))
 $(eval $(call build-package,secrets-store-csi-driver-provider-gcp,1.2.0-r0))
 $(eval $(call build-package,secrets-store-csi-driver,1.3.2-r0))
 $(eval $(call build-package,cluster-autoscaler,9.26.0-r0))
+$(eval $(call build-package,rqlite,7.14.1-r0,rqlite))
 
 .build-packages: ${PACKAGES}
 

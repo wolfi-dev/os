@@ -527,6 +527,7 @@ $(eval $(call build-package,mongo-tools,100.7.0-r0))
 $(eval $(call build-package,minio,0.20230324.214123-r0))
 $(eval $(call build-package,mc,0.20230323.200304-r0))
 $(eval $(call build-package,thanos,0.31.0-r0))
+$(eval $(call build-package,secrets-store-csi-driver-provider-gcp,1.2.0-r0))
 
 .build-packages: ${PACKAGES}
 

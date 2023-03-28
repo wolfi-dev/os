@@ -534,6 +534,7 @@ $(eval $(call build-package,rqlite,7.14.1-r0,rqlite))
 $(eval $(call build-package,karpenter,0.27.0-r0))
 $(eval $(call build-package,kube-state-metrics,2.8.2-r0))
 $(eval $(call build-package,consul,1.15.1-r0))
+$(eval $(call build-package,restic,0.15.1-r0))
 
 .build-packages: ${PACKAGES}
 

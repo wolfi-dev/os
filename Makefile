@@ -540,6 +540,7 @@ $(eval $(call build-package,tdb,1.4.8-r0))
 $(eval $(call build-package,mariadb-connector-c,3.3.4-r0))
 $(eval $(call build-package,libspf2,1.2.11-r0,libspf2))
 $(eval $(call build-package,exim,4.96-r0,exim))
+$(eval $(call build-package,external-dns,0.13.4-r0))
 
 .build-packages: ${PACKAGES}
 

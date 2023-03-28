@@ -535,6 +535,11 @@ $(eval $(call build-package,karpenter,0.27.0-r0))
 $(eval $(call build-package,kube-state-metrics,2.8.2-r0))
 $(eval $(call build-package,consul,1.15.1-r0))
 $(eval $(call build-package,restic,0.15.1-r0))
+$(eval $(call build-package,libidn,1.41-r0))
+$(eval $(call build-package,tdb,1.4.8-r0))
+$(eval $(call build-package,mariadb-connector-c,3.3.4-r0))
+$(eval $(call build-package,libspf2,1.2.11-r0,libspf2))
+$(eval $(call build-package,exim,4.96-r0,exim))
 
 .build-packages: ${PACKAGES}
 

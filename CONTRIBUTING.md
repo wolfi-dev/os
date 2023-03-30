@@ -67,3 +67,5 @@ gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages
 ```
 
 - If you dont want to install `gsutil` locally, you can use this image `gcr.io/google.com/cloudsdktool/google-cloud-cli:slim` which is the official SDK image from GCP and already include `gsutil` in there.
+
+- When deciding how to add `update:` configuration see the [update docs](./docs/UPDATES.md)

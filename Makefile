@@ -2,9 +2,6 @@ USE_CACHE ?= yes
 ARCH ?= $(shell uname -m)
 ifeq (${ARCH}, arm64)
 	ARCH = aarch64
-	# Presently buggy because --cache-dir is presumed to be both a source
-	# and a destination.  See melange#329.
-	USE_CACHE = no
 endif
 
 MELANGE_DIR ?= ../melange
@@ -28,7 +25,7 @@ MELANGE_OPTS += --generate-index false
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
-	MELANGE_OPTS += --cache-dir ${CACHE_DIR}
+	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
 
 ifeq (${BUILDWORLD}, no)

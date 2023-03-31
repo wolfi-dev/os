@@ -544,6 +544,8 @@ $(eval $(call build-package,prometheus-postgres-exporter,0.12.0-r0))
 $(eval $(call build-package,external-dns,0.13.4-r0))
 $(eval $(call build-package,metrics-server,0.6.3-r0))
 $(eval $(call build-package,k8s-sidecar,1.23.1-r0))
+$(eval $(call build-package,prometheus-config-reloader,0.64.0-r0))
+$(eval $(call build-package,prometheus-operator,0.64.0-r0))
 $(eval $(call build-package,ratelimit,0.0_git20230331-r0))
 
 .build-packages: ${PACKAGES}

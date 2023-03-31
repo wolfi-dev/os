@@ -542,6 +542,8 @@ $(eval $(call build-package,exim,4.96-r0,exim))
 $(eval $(call build-package,external-dns,0.13.4-r0))
 $(eval $(call build-package,metrics-server,0.6.3-r0))
 $(eval $(call build-package,k8s-sidecar,1.23.1-r0))
+$(eval $(call build-package,prometheus-config-reloader,0.64.0-r0))
+$(eval $(call build-package,prometheus-operator,0.64.0-r0))
 
 .build-packages: ${PACKAGES}
 

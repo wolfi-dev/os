@@ -552,6 +552,7 @@ $(eval $(call build-package,ratelimit,0.0_git20230331-r0))
 $(eval $(call build-package,logstash,8.7.0-r0))
 $(eval $(call build-package,ntpd-rs,0.2.1-r0))
 $(eval $(call build-package,trust-dns,0.22.0-r0))
+$(eval $(call build-package,unbound,1.17.1-r0))
 
 .build-packages: ${PACKAGES}
 

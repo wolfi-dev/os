@@ -548,6 +548,7 @@ $(eval $(call build-package,k8s-sidecar,1.23.1-r0))
 $(eval $(call build-package,prometheus-config-reloader,0.64.0-r0))
 $(eval $(call build-package,prometheus-operator,0.64.0-r0))
 $(eval $(call build-package,ratelimit,0.0_git20230331-r0))
+$(eval $(call build-package,logstash,8.7.0-r0))
 $(eval $(call build-package,ntpd-rs,0.2.1-r0))
 $(eval $(call build-package,trust-dns,0.22.0-r0))
 

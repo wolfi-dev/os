@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+makepkgs=$(make list-yaml)
 for f in *.yaml; do
   echo "---" $f
 
@@ -9,9 +10,8 @@ for f in *.yaml; do
   name=$(yq '.package.name' $f)
   version=$(yq '.package.version' $f)
   epoch=$(yq '.package.epoch' $f)
-  want="build-package,${name},${version}-r${epoch}"
-  if ! grep -q $want Makefile; then
-    echo "missing $want in Makefile"
+  if ! echo $makepkgs | grep -wq $f; then
+    echo "missing $f in Makefile"
     exit 1
   fi
 

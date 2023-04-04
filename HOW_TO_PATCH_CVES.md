@@ -55,12 +55,7 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
     doas make
     ```
 
-    Note that currently, this will build the **entire world**. If you want to build just a single package, first ensure that you have a `doas` configuration line that passes the `BUILDWORLD` variable through similar to this:
-    ```
-    permit setenv { BUILDWORLD=$BUILDWORLD } ...
-    ```
-
-    Then you can run the following to build the package:
+    Note that currently, this will build the **entire world**. If you want to build just a single package, you can run the following to build the package:
 
     ```shell
     BUILDWORLD=no doas make packages/${ARCH}/${PACKAGE_NAME}-${PACKAGE_VERSION}.apk

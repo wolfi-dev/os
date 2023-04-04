@@ -58,7 +58,7 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
     Note that currently, this will build the **entire world**. If you want to build just a single package, you can run the following to build the package:
 
     ```shell
-    BUILDWORLD=no doas make packages/${ARCH}/${PACKAGE_NAME}-${PACKAGE_VERSION}.apk
+    BUILDWORLD=no make packages/${ARCH}/${PACKAGE_NAME}-${PACKAGE_VERSION}.apk
     ```
 
 1. Open a PR.

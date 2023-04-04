@@ -58,6 +58,7 @@ ${KEY}:
 
 clean:
 	rm -rf packages/${ARCH}
+
 .PHONY: list list-yaml
 list:
 	$(info $(PKGNAMELIST))

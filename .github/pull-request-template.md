@@ -32,10 +32,11 @@ addressed, and remove any items that are not relevant to this PR.
   - [ ] Alternatively, the PR is marked as related to a pre-existing package request bug, such as a dependency
 - [ ] REQUIRED - The package is available under an OSI-approved or FSF-approved license
 - [ ] REQUIRED - The version of the package is still receiving security updates
+- [ ] REQUIRED - The package is added to `packages.txt`
 
 #### For security-related PRs
 <!-- remove if unrelated -->
-- [ ] The security fix is recorded in `annotations` and `secfixes`
+- [ ] The security fix is recorded in `advisories` and `secfixes`
 
 #### For version bump PRs
 <!-- remove if unrelated -->

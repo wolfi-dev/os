@@ -68,6 +68,10 @@ list-yaml:
 	$(info $(addsuffix .yaml,$(PKGNAMELIST)))
 	@printf ''
 
+.PHONY: list-versions
+list-versions:
+	@./all-versions.sh
+
 comma := ,
 comma-split = $(word $2,$(subst ${comma}, ,$1))
 

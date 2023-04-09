@@ -14,6 +14,11 @@ CACHE_DIR ?= gs://wolfi-sources/
 WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 WOLFI_PROD ?= https://packages.wolfi.dev/os
 
+ifeq (${BUILDWORLD}, no)
+MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
+MELANGE_OPTS += -r ${WOLFI_PROD}
+endif
+
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
@@ -25,11 +30,6 @@ MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
-endif
-
-ifeq (${BUILDWORLD}, no)
-MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
-MELANGE_OPTS += -r ${WOLFI_PROD}
 endif
 
 define build-package

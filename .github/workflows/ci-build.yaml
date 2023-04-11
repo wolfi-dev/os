@@ -3,43 +3,70 @@ name: CI build action
 on:
   pull_request:
     branches: ['main']
+  push:
+    branches:
+      - gh-readonly-queue/main/**
 
 jobs:
+  changes:
+    name: Determine packages to test building
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{steps.package-list.outputs.packages}}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Look for changed files
+        id: changes
+        uses: tj-actions/changed-files@v35
+        with:
+          files: ./*.yaml
+
+      # Assuming that we have a list of changed files such as `foo.yaml` and `bar.yaml`, this
+      # strips the list down into `foo` and `bar`.
+      - name: Build package list
+        id: package-list
+        run: |
+          # Ensure there is a newline at the end of packages.txt to avoid `read` from ignoring
+          # the last entry.
+          echo >> $GITHUB_WORKSPACE/packages.txt
+
+          printf "packages=" >> $GITHUB_OUTPUT
+
+          while read pkg; do
+            for file in ${{ steps.changes.outputs.all_changed_files }}; do
+              [ "${file%.yaml}" = "$pkg" ] && printf "%s " ${file%.yaml} >> $GITHUB_OUTPUT
+            done
+          done < $GITHUB_WORKSPACE/packages.txt
+
+          printf "\n" >> $GITHUB_OUTPUT
+
   build:
-    name: Build changed OS packages (CI)
+    name: Test building of packages
     runs-on: ubuntu-16-core
+    needs: changes
+    container:
+      image: ghcr.io/wolfi-dev/sdk:latest
+      options: |
+        --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor:unconfined
 
     permissions:
       packages: write
       contents: read
 
     steps:
-      - name: Generate snapshot date
-        id: snapshot-date
-        run: |
-          echo "date=$(date -u +%Y%m%d)" >> $GITHUB_OUTPUT
-          echo "epoch=$(date -u +%s)" >> $GITHUB_OUTPUT
-        shell: bash
-
       - uses: actions/checkout@v3
-
-      - uses: chainguard-dev/actions/setup-melange@main
-
-      - uses: google-github-actions/setup-gcloud@v0
 
       - name: 'Generate local signing key'
         run: |
           make MELANGE="melange" local-melange.rsa
 
-      - name: 'Sync public package repository'
-        run: |
-          mkdir "${{ github.workspace }}/packages"
-          gsutil -m rsync -x "aarch64/.*" -r gs://wolfi-production-registry-destination/os/ "${{ github.workspace }}/packages/"
-          find "${{ github.workspace }}/packages" -print -exec touch \{} \;
-
       - name: 'Build Wolfi'
         run: |
-          make --debug MELANGE="sudo melange" MELANGE_DIR=/usr/share/melange MELANGE_EXTRA_OPTS="--create-build-log --keyring-append ${{ github.workspace }}/wolfi-signing.rsa.pub" REPO="${{ github.workspace }}/packages" -j1
+          for package in ${{needs.changes.outputs.packages}}; do
+            make MELANGE="melange" MELANGE_EXTRA_OPTS="--create-build-log" REPO="$GITHUB_WORKSPACE/packages" BUILDWORLD=no packages/$package -j1
+          done
 
       - name: Check for file
         id: file_check
@@ -57,6 +84,17 @@ jobs:
         with:
           entrypoint: wolfictl
           args: check so-name
+
+  dag:
+    name: Dependency analysis
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v3
 
       - name: Generate dependency svg
         id: svg

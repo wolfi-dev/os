@@ -27,6 +27,12 @@ ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
 
+ifeq (${BOOTSTRAP}, yes)
+	MELANGE_OPTS += --repository-append https://packages.wolfi.dev/bootstrap/stage3
+	MELANGE_OPTS += --keyring-append    https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
+
+endif
+
 ifeq (${BUILDWORLD}, no)
 MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
 MELANGE_OPTS += -r ${WOLFI_PROD}

@@ -38,9 +38,8 @@ $(eval sourcedir = $(call comma-split,$(1),2))
 $(eval sourcedir = $(or $(sourcedir),$(pkgname)))
 $(eval pkgtarget = $(TARGETDIR)/$(shell $(MELANGE) package-version $(pkgname).yaml).apk)
 packages/$(pkgname): $(pkgtarget)
-./${sourcedir}/:
-	mkdir -p ./${sourcedir}/
-$(pkgtarget): ${KEY} ./${sourcedir}/
+$(pkgtarget): ${KEY}
+	mkdir -p ./$(sourcedir)/
 	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/
 
 endef

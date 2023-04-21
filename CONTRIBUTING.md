@@ -60,7 +60,7 @@ Your build packages should be found in the generated `./packages` directory.
 
 - For patching CVEs, you can follow the [documentation here](HOW_TO_PATCH_CVES.md).
 
-- If you don't want to build all the packages locally, you can install `gsutil` and use it to sync the prebuilt packages from `gs://wolfi-production-registry-destination/os/` bucket: 
+- If you don't want to build all the packages locally, you can install `gsutil` and use it to sync the prebuilt packages from `gs://wolfi-production-registry-destination/os/` bucket:
 
 ```sh
 gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages
@@ -69,3 +69,5 @@ gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages
 - If you dont want to install `gsutil` locally, you can use this image `gcr.io/google.com/cloudsdktool/google-cloud-cli:slim` which is the official SDK image from GCP and already include `gsutil` in there.
 
 - When deciding how to add `update:` configuration see the [update docs](./docs/UPDATES.md)
+
+- When you're ready to submit a PR for a new package or to update a package, make sure your YAML file(s) are **formatted correctly**, so that they'll pass CI. We use [yam](https://github.com/chainguard-dev/yam) for YAML formatting. You should be able to run the `yam` command from the root of this repo to get all files formatted correctly.

@@ -47,7 +47,7 @@ endef
 # The list of packages to be built. The order matters.
 # At some point, when ready, this should be replaced with `wolfictl text -t name .`
 # non-standard source directories are provided by adding them separated by a comma,
-# e.g. 
+# e.g.
 # postgres-11,postgres
 PKGLIST ?= $(shell cat packages.txt | grep -v '^\#' )
 
@@ -82,4 +82,4 @@ $(foreach pkg,$(PKGLIST),$(eval $(call build-package,$(pkg))))
 .build-packages: ${PACKAGES}
 
 dev-container:
-	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" cgr.dev/chainguard/sdk:latest
+	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:515a2c5072753f81ce2cbb81bda54b035aefcdb41d7249070009fc018fecd4c9

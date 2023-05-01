@@ -18,6 +18,8 @@ which uses it to provide [lightweight GNU/Linux runtime images][cgi].
    [cg]: https://chainguard.dev/
    [cgi]: https://chainguard.dev/chainguard-images
 
+The Wolfi APK package repository is located at https://packages.wolfi.dev/os and the signing public key is at https://packages.wolfi.dev/os/wolfi-signing.rsa.pub.
+
 ## Mixing packages with other distributions
 
 Mixing packages with other distributions is not supported and can create security problems.

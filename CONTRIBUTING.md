@@ -33,10 +33,10 @@ Wolfi packages are built using melange. If you want to learn how packages are bu
 
 Start by cloning this repository and create a YAML file named `<your-package-name>.yaml` in its root directory. If you have any patches, create a folder with the same name and put them there.
 
-Add a new entry for your package in the Makefile like this
+Add a new entry for your package near the bottom of [`packages.txt`](packages.txt) like this:
 
 ```
-$(eval $(call build-package,<your-package-name>,<version>-r<epoch>))
+your-package-name
 ```
 
 Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name> BUILDWORLD=no`.

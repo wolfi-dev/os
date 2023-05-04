@@ -62,3 +62,16 @@ docker context create remote-wolfi-os-dev --docker "host=ssh://compute.${INSTANC
 ```
 
 From there, initialize the dev container as you would for a local setup. The connection will respect the current `docker context`, and spawn the container on the remote machine.
+
+## FAQ
+
+Collection of random FAQs that may or may not be helpful when dealing with everyday `os` development and maintenance.
+
+Q: How do I bump the epoch of all packages that depend on a certain package?
+
+A: Any of the following should work:
+
+```bash
+# Bump the epoch of all packages that depend on the latest version of go
+grep -l " - go$" *.yaml | xargs wolfictl bump
+```

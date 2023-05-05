@@ -36,11 +36,12 @@ define build-package
 $(eval pkgname = $(call comma-split,$(1),1))
 $(eval sourcedir = $(call comma-split,$(1),2))
 $(eval sourcedir = $(or $(sourcedir),$(pkgname)))
-$(eval pkgtarget = $(TARGETDIR)/$(shell $(MELANGE) package-version $(pkgname).yaml).apk)
+$(eval pkgfullname = $(shell $(MELANGE) package-version $(pkgname).yaml))
+$(eval pkgtarget = $(TARGETDIR)/$(pkgfullname).apk)
 packages/$(pkgname): $(pkgtarget)
 $(pkgtarget): ${KEY}
 	mkdir -p ./$(sourcedir)/
-	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/
+	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
 
 endef
 

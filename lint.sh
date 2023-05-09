@@ -6,12 +6,9 @@ makepkgs=$(make list-yaml)
 for f in *.yaml; do
   echo "---" $f
 
-  # Check that every name-version-epoch is defined in Makefile
-  name=$(yq '.package.name' $f)
-  version=$(yq '.package.version' $f)
-  epoch=$(yq '.package.epoch' $f)
-  if ! echo $makepkgs | grep -wq $f; then
-    echo "missing $f in Makefile"
+  # Check that every package is listed in packages.txt
+  if ! echo "$makepkgs" | grep -wq "$f"; then
+    echo "missing $f in packages.txt"
     exit 1
   fi
 

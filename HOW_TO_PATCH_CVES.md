@@ -34,20 +34,20 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
 
     For more information on how `patch` works, see [its definition](https://github.com/chainguard-dev/melange/blob/main/pkg/build/pipelines/patch.yaml).
 
-    c. Add the advisories data to denote that the updated package version will fix the vulnerability. You can do this using [wolfictl](https://github.com/wolfi-dev/wolfictl/):
+1. Add the advisories data to denote that the updated package version will fix the vulnerability. You can do this using [wolfictl](https://github.com/wolfi-dev/wolfictl/):
+
+    > **Tip!** Avoid the need to specify the `--advisories-repo-dir` flag every time. Tell `wolfictl` where your local clone of https://github.com/wolfi-dev/advisories is using the `WOLFICTL_ADVISORIES_REPO_DIR` environment variable.
 
 
     ```sh
-    wolfictl advisory create <path-to-melange-config.yaml> --vuln <CVE> --status 'fixed' --fixed-version <new-release-version> --sync
+    wolfictl advisory create --advisories-repo-dir <path-to-local-clone-of-advisories-repo> --package <package-name> --vuln <CVE> --status 'fixed' --fixed-version <new-release-version> --sync
     ```
 
     For example, if we're patching CVE-2018-25032 in the "zlib" package, where the `version` is `1.2.3` and the `epoch` is 4, we'd run:
 
     ```sh
-    wolfictl advisory create ./zlib.yaml --vuln 'CVE-2018-25032' --status 'fixed' --fixed-version '1.2.3-r4' --sync
+    wolfictl advisory create --advisories-repo-dir "$HOME/code/wolfi-advisories" --package 'zlib'  --vuln 'CVE-2018-25032' --status 'fixed' --fixed-version '1.2.3-r4' --sync
     ```
-
-1. In the [Makefile](./Makefile), find the line that corresponds to this package, and update the package version to our new release version from the Melange file.
 
 1. Verify that our update package will build successfully by running Melange. To do this, run (in a container if you're not already on Linux):
 
@@ -70,7 +70,7 @@ To NACK a CVE for a given package, we don't add in any patches or increment the 
 For example:
 
 ```sh
-wolfictl advisory create ./zlib.yaml --vuln 'CVE-2023-12345' --status 'not_affected' --justification 'vulnerable_code_not_present' --impact 'Fixed upstream prior to Wolfi packaging.' --sync
+wolfictl advisory create --advisories-repo-dir "$HOME/code/wolfi-advisories" --package 'zlib' --vuln 'CVE-2023-12345' --status 'not_affected' --justification 'vulnerable_code_not_present' --impact 'Fixed upstream prior to Wolfi packaging.' --sync
 ```
 
 This will notify vulnerability scanners that consume our secdb that this vulnerabitiliy doesn't apply to any of the versions of this package that we've published.

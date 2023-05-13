@@ -74,3 +74,43 @@ wolfictl advisory create --advisories-repo-dir "$HOME/code/wolfi-advisories" --p
 ```
 
 This will notify vulnerability scanners that consume our secdb that this vulnerabitiliy doesn't apply to any of the versions of this package that we've published.
+
+## Language Specific Tips
+
+### Go
+
+For go apps, we often bump dependencies to pick up fixes.
+There are a few ways to do this, but most typically involve running the `go get` command with a specific version.
+
+This can be done inside a `runs` block in a melange pipeline, or using the `deps` feature of the `go/build` pipeline.
+
+To do it manually (in the `runs` block), use something like this:
+
+```yaml
+go get golang.org/x/text@v0.3.8
+go mod tidy
+```
+
+Note that this must come **after** the source has been fetched, and **before** the build takes place.
+
+You typically need a `go mod tidy` at the end of a series of `go get` invocations.
+
+If the app uses a `vendor` directory (this is rare), you'll need to run `go mod vendor` instead of `go mod tidy`.
+
+These steps usually work, but occassionaly dependencies can become tangled and you'll need to bump a few more before you can bump the one you want to get a build to work.
+
+In these cases it's best to clone the app and test it all locally outside of melange.
+
+If you get stuck, ask for help!
+
+### Java
+
+Java apps mostly use either maven or gradle, which use different version declaration schemes.
+
+If you're patching a vulnerable dependency, you'll first need to figure out which package manager you're using.
+
+From there, you can manually edit the file (either `pom.xml` or `build.gradle`) to contain the new version.
+
+After that, test the build and package as usual, and generate a `.patch` file, following the instructions above.
+
+In some cases, you might also be able to get away with using a `sed` command instead of generating a patch file.

@@ -40,8 +40,12 @@ $(eval pkgtarget = $(TARGETDIR)/$(pkgfullname).apk)
 packages/$(pkgname): $(pkgtarget)
 $(pkgtarget): ${KEY}
 	mkdir -p ./$(sourcedir)/
-	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(pkgname).yaml))
-	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
+ifdef SOURCE_DATE_EPOCH
+	$(eval CONFIG_DATE_EPOCH := $(SOURCE_DATE_EPOCH))
+oelse
+	$(eval CONFIG_DATE_EPOCH := $(shell git log -1 --pretty=%ct --follow $(pkgname).yaml))
+endif
+	SOURCE_DATE_EPOCH=${CONFIG_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
 
 endef
 

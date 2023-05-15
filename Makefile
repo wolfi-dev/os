@@ -8,7 +8,6 @@ TARGETDIR = packages/${ARCH}
 MELANGE ?= ../melange/melange
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
-SOURCE_DATE_EPOCH ?= 0
 CACHE_DIR ?= gs://wolfi-sources/
 
 WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
@@ -41,6 +40,7 @@ $(eval pkgtarget = $(TARGETDIR)/$(pkgfullname).apk)
 packages/$(pkgname): $(pkgtarget)
 $(pkgtarget): ${KEY}
 	mkdir -p ./$(sourcedir)/
+	$(eval SOURCE_DATE_EPOCH := $(shell git log -1 --pretty=%ct --follow $(pkgname).yaml))
 	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
 
 endef

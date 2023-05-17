@@ -33,9 +33,8 @@ MELANGE_OPTS += -r ${WOLFI_PROD}
 endif
 
 define build-package
-$(eval pkgname = $(call comma-split,$(1),1))
-$(eval sourcedir = $(call comma-split,$(1),2))
-$(eval sourcedir = $(or $(sourcedir),$(pkgname)))
+$(eval pkgname = $(1))
+$(eval sourcedir = $(pkgname))
 $(eval pkgfullname = $(shell $(MELANGE) package-version $(pkgname).yaml))
 $(eval pkgtarget = $(TARGETDIR)/$(pkgfullname).apk)
 packages/$(pkgname): $(pkgtarget)
@@ -47,9 +46,6 @@ endef
 
 # The list of packages to be built. The order matters.
 # At some point, when ready, this should be replaced with `wolfictl text -t name .`
-# non-standard source directories are provided by adding them separated by a comma,
-# e.g.
-# postgres-11,postgres
 PKGLIST ?= $(shell cat packages.txt | grep -v '^\#' )
 
 all: ${KEY} .build-packages
@@ -62,21 +58,14 @@ clean:
 
 .PHONY: list list-yaml
 list:
-	$(info $(PKGNAMELIST))
+	$(info $(PKGLIST))
 	@printf ''
 
 list-yaml:
-	$(info $(addsuffix .yaml,$(PKGNAMELIST)))
+	$(info $(addsuffix .yaml,$(PKGLIST)))
 	@printf ''
 
-comma := ,
-comma-split = $(word $2,$(subst ${comma}, ,$1))
-
-# PKGLIST includes the optional directory e.g. mariadb-10.6,mariadb
-# PKGNAMELIST is only the names
-PKGNAMELIST = $(foreach F,$(PKGLIST), $(firstword $(subst ${comma}, ,${F})))
-
-PACKAGES := $(addprefix packages/,$(PKGNAMELIST))
+PACKAGES := $(addprefix packages/,$(PKGLIST))
 
 $(foreach pkg,$(PKGLIST),$(eval $(call build-package,$(pkg))))
 

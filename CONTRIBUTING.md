@@ -52,6 +52,37 @@ Your build packages should be found in the generated `./packages` directory.
 
 - `melange` CLI has a command `bump` to make it easier. More details are [available here](https://github.com/chainguard-dev/melange/blob/f52b622351657fd9ccdb7e3bfb124caef61ad651/NEWS.md).
 
+## Source Directory
+
+If your package needs some additional files to include in the package, you can create a folder with the
+same name as the package.yaml and put them there. For example, if you have a file named `foo.yaml`, you can
+create a folder named `foo/` and put all the files you want to include in the package there.
+
+If the directory does not exist, it will _not_ be an error; it simply will be ignored.
+
+You should **not** put additional source files for your package in this root directory, as it
+will pollute it for source from too many packages.
+
+For example, see [busybox.yaml](./busybox.yaml) and the source directory [busybox/](./busybox/).
+
+If multiple packages share a source, create a single directory and symlink the others to the source.
+The name of the symlink must be the name of the package in `<package>.yaml`. For example,
+all of the following files share the same source directory, [postgres/](./postgres/):
+
+* [postgres-11.yaml](./postgres-11.yaml)
+* [postgres-12.yaml](./postgres-12.yaml)
+* [postgres-13.yaml](./postgres-13.yaml)
+* [postgres-14.yaml](./postgres-14.yaml)
+* [postgres-15.yaml](./postgres-15.yaml)
+
+And all have symlinks:
+
+* `postgres-11` -> `postgres/`
+* `postgres-12` -> `postgres/`
+* `postgres-13` -> `postgres/`
+* `postgres-14` -> `postgres/`
+* `postgres-15` -> `postgres/`
+
 ## Some tips
 
 - melange has a few built-in pipelines. You can see their source code [in the melange repository](https://github.com/chainguard-dev/melange/tree/main/pkg/build/pipelines).
@@ -66,7 +97,7 @@ Your build packages should be found in the generated `./packages` directory.
 gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages
 ```
 
-- If you dont want to install `gsutil` locally, you can use this image `gcr.io/google.com/cloudsdktool/google-cloud-cli:slim` which is the official SDK image from GCP and already include `gsutil` in there.
+- If you don't want to install `gsutil` locally, you can use this image `gcr.io/google.com/cloudsdktool/google-cloud-cli:slim` which is the official SDK image from GCP and already include `gsutil` in there.
 
 - When deciding how to add `update:` configuration see the [update docs](./docs/UPDATES.md)
 

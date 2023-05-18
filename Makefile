@@ -5,7 +5,7 @@ ifeq (${ARCH}, arm64)
 endif
 TARGETDIR = packages/${ARCH}
 
-MELANGE ?= ../melange/melange
+MELANGE ?= $(shell which melange)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 SOURCE_DATE_EPOCH ?= 0
@@ -83,4 +83,4 @@ $(foreach pkg,$(PKGLIST),$(eval $(call build-package,$(pkg))))
 .build-packages: ${PACKAGES}
 
 dev-container:
-	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:515a2c5072753f81ce2cbb81bda54b035aefcdb41d7249070009fc018fecd4c9
+	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:3ef78225a85ab45f46faac66603c9da2877489deb643174ba1e42d8cbf0e0644

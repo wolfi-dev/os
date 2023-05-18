@@ -9,7 +9,7 @@
 
 ## Setup development environment
 
-To ease the development of Wolfi OS, you can use the [`sdk` Chainguard Image](https://github.com/chainguard-images/images/tree/main/images/sdk) that already includes both [apko](https://github.com/chainguard-dev/apko) and [melange](https://github.com/chainguard-dev/melange).
+To ease the development of Wolfi OS, you can use the [Wolfi `sdk` image](https://github.com/wolfi-dev/tools/pkgs/container/sdk) that already includes both [apko](https://github.com/chainguard-dev/apko) and [melange](https://github.com/chainguard-dev/melange).
 On Linux and Mac it is also possible to install both the above tools directly into your system.
 
 If you choose not to install the tooling onto your local machine, you can start a container based development environment using
@@ -18,14 +18,7 @@ If you choose not to install the tooling onto your local machine, you can start 
 make dev-container
 ```
 
-What it does is start the `chainguard-images/sdk` image and mount the current working directory into it.
-
-Now, the `Makefile` script assume that there're melange folder & melange binary the upper level dir (`../melange`). I change it locally to the following because it's where they are in `chainguard-image/sdk`.
-
-```
-MELANGE_DIR ?= /usr/share/melange
-MELANGE ?= $(shell which melange)
-```
+What it does is start the `ghcr.io/wolfi-dev/sdk` image and mount the current working directory into it.
 
 ## Write your first Wolfi package
 

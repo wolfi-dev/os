@@ -37,6 +37,14 @@ note: If you see GCS auth related errors, your gcloud auth credentials might be 
 
 Your build packages should be found in the generated `./packages` directory.
 
+While you're here, you can scan the package you just built for vulnerabilities, using [Grype](https://github.com/anchore/grype) for example.
+
+```
+grype packages/<arch>/<your-package-name-and-version>.apk
+```
+
+Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CVES.md).
+
 ## Package versioning
 
 - When bumping version of a package, you will need to update the version, epoch & shasum (sha256 or sha512) in package YAML file. The version and epoch also need to be bumped in Makefile.

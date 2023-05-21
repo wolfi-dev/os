@@ -37,7 +37,7 @@ note: If you see GCS auth related errors, your gcloud auth credentials might be 
 
 Your build packages should be found in the generated `./packages` directory.
 
-While you're here, you can scan the package you just built for vulnerabilities, using [Grype](https://github.com/anchore/grype) for example.
+While you're here, you can scan the package you just built for vulnerabilities, such as by using an experimental [Grype](https://github.com/anchore/grype)-based scanning script we provide: `./scripts/grype-scan-apk.sh`.
 
 ```
 ./scripts/grype-scan-apk.sh packages/<arch>/<your-package-name-and-version>.apk

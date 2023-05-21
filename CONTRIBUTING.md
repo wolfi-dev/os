@@ -40,7 +40,7 @@ Your build packages should be found in the generated `./packages` directory.
 While you're here, you can scan the package you just built for vulnerabilities, using [Grype](https://github.com/anchore/grype) for example.
 
 ```
-grype packages/<arch>/<your-package-name-and-version>.apk
+./scripts/grype-scan-apk.sh packages/<arch>/<your-package-name-and-version>.apk
 ```
 
 Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CVES.md).

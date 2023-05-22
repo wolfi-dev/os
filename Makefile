@@ -5,10 +5,9 @@ ifeq (${ARCH}, arm64)
 endif
 TARGETDIR = packages/${ARCH}
 
-MELANGE ?= ../melange/melange
+MELANGE ?= $(shell which melange)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
-SOURCE_DATE_EPOCH ?= 0
 CACHE_DIR ?= gs://wolfi-sources/
 
 WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
@@ -41,7 +40,13 @@ $(eval pkgtarget = $(TARGETDIR)/$(pkgfullname).apk)
 packages/$(pkgname): $(pkgtarget)
 $(pkgtarget): ${KEY}
 	mkdir -p ./$(sourcedir)/
-	SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
+ifdef SOURCE_DATE_EPOCH
+	$(eval CONFIG_DATE_EPOCH := $(SOURCE_DATE_EPOCH))
+else
+	# Grab the files last commit timestamp, if it's not in git, use the current timestamp
+	$(eval CONFIG_DATE_EPOCH := $(shell git ls-files --error-unmatch $(pkgname).yaml &>/dev/null && git log -1 --pretty=%ct --follow $(pkgname).yaml || date +%s))
+endif
+	SOURCE_DATE_EPOCH=${CONFIG_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
 
 endef
 
@@ -83,4 +88,4 @@ $(foreach pkg,$(PKGLIST),$(eval $(call build-package,$(pkg))))
 .build-packages: ${PACKAGES}
 
 dev-container:
-	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:515a2c5072753f81ce2cbb81bda54b035aefcdb41d7249070009fc018fecd4c9
+	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:3ef78225a85ab45f46faac66603c9da2877489deb643174ba1e42d8cbf0e0644

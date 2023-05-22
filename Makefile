@@ -43,8 +43,7 @@ $(pkgtarget): ${KEY}
 ifdef SOURCE_DATE_EPOCH
 	$(eval CONFIG_DATE_EPOCH := $(SOURCE_DATE_EPOCH))
 else
-	# Grab the files last commit timestamp, if it's not in git, use the current timestamp
-	$(eval CONFIG_DATE_EPOCH := $(shell git ls-files --error-unmatch $(pkgname).yaml &>/dev/null && git log -1 --pretty=%ct --follow $(pkgname).yaml || date +%s))
+	$(eval CONFIG_DATE_EPOCH := $(shell git log -1 --pretty=%ct --follow $(pkgname).yaml))
 endif
 	SOURCE_DATE_EPOCH=${CONFIG_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
 

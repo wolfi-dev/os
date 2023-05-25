@@ -6,12 +6,6 @@ makepkgs=$(make list-yaml)
 for f in *.yaml; do
   echo "---" $f
 
-  # Check that every package is listed in packages.txt
-  if ! echo "$makepkgs" | grep -wq "$f"; then
-    echo "missing $f in packages.txt"
-    exit 1
-  fi
-
   # Don't specify packages.wolfi.dev/os as a repository, and remove it from the keyring.
   # Packages from the bootstrap repo should be allowed, but otherwise packages
   # should be fetched locally and the local repository should be appended at

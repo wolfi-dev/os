@@ -32,8 +32,11 @@ Add a new entry for your package near the bottom of [`packages.txt`](packages.tx
 your-package-name
 ```
 
-Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name> BUILDWORLD=no`.
-note: If you see GCS auth related errors, your gcloud auth credentials might be the issue. Try running `gcloud auth login && gcloud auth application-default login`.
+Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name> BUILDWORLD=no USE_CACHE=no`.
+
+note: `USE_CACHE=no` disables using a GCP cloud bucket for caching pipeline sources.  This is mainly used for production setups and not needed for local development.
+
+If you do use a cache for your sources and see GCS auth related errors, your gcloud auth credentials might be the issue. Try running `gcloud auth login && gcloud auth application-default login`.
 
 Your build packages should be found in the generated `./packages` directory.
 
@@ -72,3 +75,5 @@ gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages
 - When deciding how to add `update:` configuration see the [update docs](./docs/UPDATES.md)
 
 - When you're ready to submit a PR for a new package or to update a package, make sure your YAML file(s) are **formatted correctly**, so that they'll pass CI. We use [yam](https://github.com/chainguard-dev/yam) for YAML formatting. You should be able to run the `yam` command from the root of this repo to get all files formatted correctly.
+
+- When running a lot of melange builds using `docker` as a runner (default on Mac) you may want to increase the Docker VM CPU, Memory and especially storage resources, else Docker can easily run out of disk space.

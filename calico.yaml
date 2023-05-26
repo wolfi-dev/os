@@ -1,0 +1,446 @@
+package:
+  name: calico
+  version: 3.26.1
+  epoch: 1
+  description: "Cloud native networking and network security"
+  target-architecture:
+    - x86_64
+    - aarch64
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - build-base
+      - bash
+      - go
+      # for felix
+      - elfutils-dev
+      - zlib-dev
+      - iproute2
+      - zstd-dev
+      - llvm15
+      - clang-15
+      - libbpf
+      - linux-headers
+      # for BIRD
+      - flex
+      - bison
+      - autoconf
+      - automake
+      # TODO: Can remove this when cni-plugins are built from source
+      - curl
+
+# The calico build process is heavily tailored towards using Makefiles to
+# orchestrate docker commands. This makes for a less than ideal
+# experience replicating it in melange. To try to maintain some level of
+# sanity while packaging and updating calico, the approach here chooses to
+# use the upstream Makefile whenever possible, and only when necessary,
+# use the equivalent evaluated `docker run ...` commands within
+# independent pipeline blocks. Throughout this file you'll see the relevant
+# comments denoting the equivalent Makefile targets that each pipeline
+# block is trying to match, if applicable.
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/projectcalico/calico
+      tag: v${{package.version}}
+      expected-commit: b1d192c95c89288e163038c5095fd23f9adfb8c1
+  - runs: |
+      # Remediate GHSA-hqxw-f8mx-cpmw
+      go get github.com/docker/distribution@v2.8.2-beta.1
+      go mod tidy
+  - working-directory: felix
+    pipeline:
+      # Equivalent to target: "build-bpf"
+      - runs: |
+          # NOTE: This forces 64bit compilation (and the __x86_64__ macro) to bypasses the following error:
+          #   /usr/include/gnu/stubs.h:7:11: fatal error: 'gnu/stubs-32.h' file not found
+          # This is a hack, but feels safe enough given we already assume and restrict this package to 64bit archs
+          # NOTE: This disables Wolfi's default host level CFLAGS since this is BPF bytecode, instead, we pick up the defaults specified in the Makefiles
+          export CFLAGS="-Wno-error=unused-but-set-variable -m64 -D__x86_64__"
+          make -C bpf-gpl CC=clang LD=llc
+          make -C bpf-apache CC=clang LD=llc
+      # Equivalent to target: "libbpf"
+      - runs: |
+          _arch=$(uname -m); case $_arch in aarch64) _arch="arm64" ;; x86_64) _arch="amd64" ;; esac
+          mkdir -p bpf-gpl/include/libbpf/src/$_arch
+
+          # NOTE: This disables Wolfi's default host level CFLAGS since this is BPF bytecode, instead, we pick up the defaults specified in the Makefiles
+          export CFLAGS="-Wno-error=sign-compare -m64"
+          make -C bpf-gpl/include/libbpf/src BUILD_STATIC_ONLY=2 OBJDIR=$_arch
+  # This fetches and builds the statically compiled calico fork of BIRD
+  - working-directory: bird
+    pipeline:
+      - uses: fetch
+        with:
+          # Reference: https://github.com/projectcalico/calico/blob/master/metadata.mk#L26
+          # TODO: Build this from source and load in as a package runtime dependency
+          uri: https://github.com/projectcalico/bird/tarball/v0.3.3-202-g7a77fb73
+          expected-sha512: 87d03464163459154dce11952025f4a0de316dbfe0d1f6a3f19a82e951dfca2eb5d0cd18d95eda3abd38d44a9967fbb4b017158d8a5f48951683e3dc87dcd914
+      - runs: |
+          ARCH=${{build.arch}} DIST=dist/ ./create_binaries.sh
+  - working-directory: node
+    pipeline:
+      # Equivalent to target: "filesystem/etc/calico/confd/conf.d"
+      - runs: |
+          _target="filesystem/etc/calico/confd/conf.d"
+          rm -rf $_target && cp -r ../confd/etc/calico/confd/conf.d $_target
+          chmod +w $_target
+      # Equivalent to target: "filesystem/etc/calico/confd/templates"
+      - runs: |
+          _target="filesystem/etc/calico/confd/templates"
+          rm -rf $_target && cp -r ../confd/etc/calico/confd/templates $_target
+          chmod +w $_target
+      # Equivalent to target: "filesystem/usr/lib/calico/bpf"
+      - runs: |
+          _target="filesystem/usr/lib/calico/bpf"
+          rm -rf $_target && mkdir -p $_target
+
+          # This is handled in the felix build pipeline above
+          # make -C ../felix build-bpf ARCH=$(ARCH)
+          cp -r ../felix/bpf-gpl/bin/* $_target
+          cp -r ../felix/bpf-apache/bin/* $_target
+
+subpackages:
+  - name: "calico-node"
+    dependencies:
+      runtime:
+        - runit
+        - iptables
+        - ip6tables
+        - ipset
+        - libpcap
+        - libelf
+        - zlib
+        - libbpf
+        # listed in Dockerfile, but not sure if they're build dependencies (for iptables) or runtime
+        - libmnl
+        - libnfnetlink
+        - libnetfilter_conntrack
+        - iproute2
+        - procps
+        - conntrack-tools
+        - libnetfilter_cthelper
+        - libnetfilter_cttimeout
+        - libnetfilter_queue
+    pipeline:
+      - assertions:
+          required-steps: 1
+        pipeline:
+          # Equivalent to target: "$(NODE_CONTAINER_BINARY)"
+          - if: ${{build.arch}} == 'x86_64' || ${{build.arch}} == 'aarch64' # Essentially a guard to make sure we never try to build beyond x86_64 and aarch64
+            runs: |
+              _arch=$(uname -m); case $_arch in aarch64) _arch="arm64" ;; x86_64) _arch="amd64" ;; esac
+
+              LIBBPF_CONTAINER_PATH=/home/build/felix/bpf-gpl/include/libbpf/src
+              BPFGPL_CONTAINER_PATH=/home/build/felix/bpf-gpl
+
+              CGO_LDFLAGS="-L$LIBBPF_CONTAINER_PATH/$_arch -lbpf -lelf -lz"
+              CGO_CFLAGS="-I$LIBBPF_CONTAINER_PATH -I$BPFGPL_CONTAINER_PATH"
+
+              LDFLAGS="-s -w"
+              LDFLAGS="$LDFLAGS -X node/pkg/lifecycle/startup.VERSION=${{package.version}}"
+              LDFLAGS="$LDFLAGS -X node/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+              LDFLAGS="$LDFLAGS -X node/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+              LDFLAGS="$LDFLAGS -X node/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+
+              CGO_ENABLED=1 \
+                CGO_LDFLAGS="$CGO_LDFLAGS" \
+                CGO_CFLAGS="$CGO_CFLAGS" \
+                go build -v -tags cgo -v -buildvcs=false \
+                -ldflags "$LDFLAGS" \
+                -o "${{targets.subpkgdir}}"/bin/calico-node \
+                ./node/cmd/calico-node
+          # Equivalent to target: "$(TOOLS_MOUNTNS_BINARY)"
+          - runs: |
+              _arch=$(uname -m); case $_arch in aarch64) _arch="arm64" ;; x86_64) _arch="amd64" ;; esac
+
+              LIBBPF_CONTAINER_PATH=/home/build/felix/bpf-gpl/include/libbpf/src
+              BPFGPL_CONTAINER_PATH=/home/build/felix/bpf-gpl
+
+              CGO_LDFLAGS="-L$LIBBPF_CONTAINER_PATH/$_arch -lbpf -lelf -lz"
+              CGO_CFLAGS="-I$LIBBPF_CONTAINER_PATH -I$BPFGPL_CONTAINER_PATH"
+              CGO_ENABLED=1 \
+                CGO_LDFLAGS="$CGO_LDFLAGS" \
+                CGO_CFLAGS="$CGO_CFLAGS" \
+                go build -v -tags cgo -v -buildvcs=false \
+                -o "${{targets.subpkgdir}}"/bin/mountns \
+                ./node/cmd/mountns
+      # Equivalent to target: "$(FELIX_GPL_SOURCE)"
+      - working-directory: node
+        runs: |
+          _target="filesystem/included-source/felix-ebpf-gpl.tar.gz"
+
+          rm -rf filesystem/included-source/felix*
+          mkdir -p filesystem/included-source/
+
+          tar cf $_target ../felix/bpf-gpl
+          touch $_target
+      # Filesystem prep
+      - runs: |
+          # BIRD needs to run with root permissions, so put them in /bin/ to remember
+          mkdir -p "${{targets.subpkgdir}}"/bin
+          find bird/dist -type f -name 'bird*' -exec cp {} "${{targets.subpkgdir}}"/bin \;
+
+          mkdir -p "${{targets.subpkgdir}}"/etc \
+                   "${{targets.subpkgdir}}"/included-source \
+                   "${{targets.subpkgdir}}"/licenses \
+                   "${{targets.subpkgdir}}"/usr/sbin
+
+          cp -avR ./node/filesystem/etc "${{targets.subpkgdir}}"/
+          cp -avR ./node/filesystem/included-source "${{targets.subpkgdir}}"/
+          cp -avR ./node/filesystem/licenses "${{targets.subpkgdir}}"/
+          cp -avR ./node/filesystem/usr "${{targets.subpkgdir}}"/
+          cp -avR ./node/filesystem/sbin/* "${{targets.subpkgdir}}"/usr/sbin/
+          cp ./node/LICENSE "${{targets.subpkgdir}}"/licenses/
+
+          # TODO: Proper fix for this
+          rm -f "${{targets.subpkgdir}}"/etc/nsswitch.conf
+
+  # The felix binaries aren't actually shipped, but they contain some useful testing utilities
+  - name: "calico-felix"
+    dependencies:
+      runtime:
+        - iproute2
+        - libelf
+        - zlib
+        - libbpf
+    pipeline:
+      - working-directory: felix
+      - runs: |
+          _arch=$(uname -m); case $_arch in aarch64) _arch="arm64" ;; x86_64) _arch="amd64" ;; esac
+
+          LIBBPF_CONTAINER_PATH=$(pwd)/felix/bpf-gpl/include/libbpf/src
+          BPFGPL_CONTAINER_PATH=$(pwd)/felix/bpf-gpl
+
+          CGO_LDFLAGS="-L$LIBBPF_CONTAINER_PATH/$_arch -lbpf -lelf -lz"
+          CGO_CFLAGS="-I$LIBBPF_CONTAINER_PATH -I$BPFGPL_CONTAINER_PATH"
+
+          LDFLAGS="-s -w"
+          LDFLAGS="$LDFLAGS -X node/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -X node/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+          LDFLAGS="$LDFLAGS -X node/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/felix \
+            ./felix/cmd/calico-felix
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/calico-bpf \
+            ./felix/cmd/calico-bpf
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/pktgen \
+            ./felix/fv/pktgen
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/iptables-locker \
+            ./felix/fv/iptables-locker
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/test-connection \
+            ./felix/fv/test-connection
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/test-workload \
+            ./felix/fv/test-workload
+
+  - name: "calico-cni"
+    pipeline:
+      # NOTE: cni is a multicall binary: https://github.com/projectcalico/calico/blob/master/cni-plugin/cmd/calico/calico.go
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./cni-plugin/cmd/calico
+          output: calico-cni # this is a dead target, but "calico" isn't a useful leg in this subpackage, so append -cni to prevent naming conflicts
+          subpackage: "true"
+          ldflags: "-s -w -X main.VERSION=$(git describe --tags --dirty --always --abbrev=12)"
+      - runs: |
+          ln -sf /usr/bin/calico-cni "${{targets.subpkgdir}}"/usr/bin/calico-ipam
+          ln -sf /usr/bin/calico-cni "${{targets.subpkgdir}}"/usr/bin/install
+      # TODO: Build these from source
+      - working-directory: cni-plugin
+        runs: |
+          make fetch-cni-bins
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          cp bin/**/* "${{targets.subpkgdir}}"/usr/bin/
+
+  - name: "calico-cni-compat"
+    dependencies:
+      runtime:
+        - calico-cni
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/opt/cni/bin/
+          ln -sf /usr/bin/calico-cni "${{targets.subpkgdir}}"/opt/cni/bin/calico-ipam
+          ln -sf /usr/bin/calico-cni "${{targets.subpkgdir}}"/opt/cni/bin/install
+
+  - name: "calico-apiserver"
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./apiserver/cmd/apiserver
+          output: calico-apiserver
+          subpackage: "true"
+          ldflags: "-s -w -X github.com/projectcalico/calico/cmd/apiserver/server.VERSION=${{package.version}}) -X github.com/projectcalico/calico/cmd/apiserver/server.BUILD_DATE=$(date -u +'%FT%T%z') -X github.com/projectcalico/calico/cmd/apiserver/server.GIT_DESCRIPTION=$(git describe --tags) -X github.com/projectcalico/calico/cmd/apiserver/server.GIT_REVISION=$(git rev-parse --short HEAD)"
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./apiserver/cmd/filecheck
+          output: calico-filecheck
+          subpackage: "true"
+          ldflags: "-s -w -X github.com/projectcalico/calico/cmd/apiserver/server.VERSION=${{package.version}}) -X github.com/projectcalico/calico/cmd/apiserver/server.BUILD_DATE=$(date -u +'%FT%T%z') -X github.com/projectcalico/calico/cmd/apiserver/server.GIT_DESCRIPTION=$(git describe --tags) -X github.com/projectcalico/calico/cmd/apiserver/server.GIT_REVISION=$(git rev-parse --short HEAD)"
+
+  - name: "calico-app-policy"
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./app-policy/cmd/dikastes
+          output: calico-dikastes
+          subpackage: "true"
+          ldflags: "-s -w -X github.com/projectcalico/calico/app-policy/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>') -X github.com/projectcalico/calico/app-policy/buildinfo.BuildDate=$(date -u +'%FT%T%z') -X github.com/projectcalico/calico/app-policy/GitRevision=$(git rev-parse HEAD || echo '<unknown>') -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./app-policy/cmd/healthz
+          output: calico-healthz
+          subpackage: "true"
+
+  - name: "calico-kube-controllers"
+    dependencies:
+      runtime:
+        - glibc-dev
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./kube-controllers/cmd/kube-controllers
+          output: calico-kube-controllers
+          subpackage: "true"
+          ldflags: "-s -w -X main.VERSION=$(git describe --tags --dirty --always --abbrev=12)"
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./kube-controllers/cmd/check-status
+          output: check-status # keep naming convention as "check-status" is usually harded to /usr/bin/check-status
+          subpackage: "true"
+          ldflags: "-s -w -X main.VERSION=$(git describe --tags --dirty --always --abbrev=12)"
+
+  - name: "calico-pod2daemon"
+    description: "The calico pod2daemon components"
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./pod2daemon/flexvol
+          output: calico-pod2daemon-flexvol
+          subpackage: "true"
+          ldflags: "-s -w"
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./pod2daemon/csidriver
+          output: calico-pod2daemon-csidriver
+          subpackage: "true"
+          ldflags: "-s -w"
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./pod2daemon/nodeagent
+          output: calico-pod2daemon-nodeagent
+          subpackage: "true"
+          ldflags: "-s -w"
+
+  - name: "calicoctl"
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./calicoctl/calicoctl
+          output: calicoctl
+          subpackage: "true"
+          ldflags: "-s -w -X github.com/projectcalico/calico/calicoctl/commands.VERSION=$(git describe --tags --dirty --always --abbrev=12) -X github.com/projectcalico/calico/calicoctl/commands.GIT_REVISION=$(git rev-parse --short HEAD) -X github.com/projectcalico/calico/calicoctl/commands/common.VERSION=$(git describe --tags --dirty --always --abbrev=12) -X main.VERSION=$(git describe --tags --dirty --always --abbrev=12)"
+
+  - name: "calico-typhad"
+    description: "The calico typha daemon"
+    dependencies:
+      runtime:
+        - glibc
+    pipeline:
+      # TODO: I'm not sure yet if this actually needs CGO, or is just enabled upstream because of go-fips
+      - runs: |
+          LDFLAGS="-s -w"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin/
+          CGO_ENABLED=1 \
+            go build -v -tags cgo -v -buildvcs=false \
+            -o "${{targets.subpkgdir}}"/usr/bin/calico-typha \
+            ./typha/cmd/calico-typha
+
+          mkdir -p "${{targets.subpkgdir}}"/etc/calico
+          cp ./typha/docker-image/nsswitch.conf "${{targets.subpkgdir}}"/etc/nsswitch.conf
+          cp ./typha/docker-image/typha.cfg "${{targets.subpkgdir}}"/etc/calico/typha.cfg
+
+          mkdir -p "${{targets.subpkgdir}}"/licenses
+          cp ./typha/LICENSE "${{targets.subpkgdir}}"/licenses
+
+  - name: "calico-typha-client"
+    description: "The calico typha client"
+    dependencies:
+      runtime:
+        - glibc
+    pipeline:
+      # TODO: I'm not sure yet if this actually needs CGO, or is just enabled upstream because of go-fips
+      - runs: |
+          LDFLAGS="-s -w"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+
+          CGO_ENABLED=1 \
+            go build -v -tags cgo -v -buildvcs=false \
+            -o "${{targets.subpkgdir}}"/bin/typha-client \
+            ./typha/cmd/typha-client
+
+update:
+  enabled: true
+  github:
+    identifier: projectcalico/calico
+    strip-prefix: v

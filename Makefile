@@ -31,24 +31,6 @@ MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
 MELANGE_OPTS += -r ${WOLFI_PROD}
 endif
 
-define build-package
-$(eval pkgname = $(call comma-split,$(1),1))
-$(eval sourcedir = $(call comma-split,$(1),2))
-$(eval sourcedir = $(or $(sourcedir),$(pkgname)))
-$(eval pkgfullname = $(shell $(MELANGE) package-version $(pkgname).yaml))
-$(eval pkgtarget = $(TARGETDIR)/$(pkgfullname).apk)
-packages/$(pkgname): $(pkgtarget)
-$(pkgtarget): ${KEY}
-	mkdir -p ./$(sourcedir)/
-ifdef SOURCE_DATE_EPOCH
-	$(eval CONFIG_DATE_EPOCH := $(SOURCE_DATE_EPOCH))
-else
-	$(eval CONFIG_DATE_EPOCH := $(shell git log -1 --pretty=%ct --follow $(pkgname).yaml))
-endif
-	SOURCE_DATE_EPOCH=${CONFIG_DATE_EPOCH} ${MELANGE} build $(pkgname).yaml ${MELANGE_OPTS} --source-dir ./$(sourcedir)/ --log-policy builtin:stderr,${TARGETDIR}/buildlogs/$(pkgfullname).log
-
-endef
-
 # The list of packages to be built. The order matters.
 # At some point, when ready, this should be replaced with `wolfictl text -t name .`
 # non-standard source directories are provided by adding them separated by a comma,
@@ -73,18 +55,24 @@ list-yaml:
 	$(info $(addsuffix .yaml,$(PKGNAMELIST)))
 	@printf ''
 
-comma := ,
-comma-split = $(word $2,$(subst ${comma}, ,$1))
+.packagerules: Makefile packages.txt
+	@echo "Solving build order, please wait..."
+	@grep -v '^\#' packages.txt | while read pkg; do		\
+		pkgname=`echo $$pkg | cut -d, -f1`;			\
+		pkgdir=`echo $$pkg | cut -d, -f2`;			\
+		[ -z "$$pkgdir" ] && pkgdir=$$pkgname;			\
+		pkgver=`${MELANGE} package-version $${pkgname}.yaml`;	\
+		pkgtarget="${TARGETDIR}/$${pkgver}.yaml";		\
+		echo "PKGNAMELIST += $$pkgname";			\
+		echo ".build-packages: $$pkgtarget";			\
+		echo "packages/$$pkgname: $$pkgtarget";			\
+		echo "$$pkgtarget: $${pkgname}.yaml \$${KEY}";		\
+		printf "\t%s\n" "@mkdir -p ./$${pkgdir}/";		\
+		printf "\t%s" "SDE=\$${SOURCE_DATE_EPOCH}; [ -z \"\$$\$$SDE\" ] && SDE=\`git log -1 --pretty=%ct --follow $${pkgname}.yaml\`;"; \
+		printf "\t%s\n\n" "SOURCE_DATE_EPOCH=\$$\$$SDE \$${MELANGE} build $${pkgname}.yaml \$${MELANGE_OPTS} --source-dir ./$${pkgdir}/ --log-policy builtin:stderr,\$${TARGETDIR}/buildlogs/$${pkgfullname}.log"; \
+	done > .packagerules
 
-# PKGLIST includes the optional directory e.g. mariadb-10.6,mariadb
-# PKGNAMELIST is only the names
-PKGNAMELIST = $(foreach F,$(PKGLIST), $(firstword $(subst ${comma}, ,${F})))
-
-PACKAGES := $(addprefix packages/,$(PKGNAMELIST))
-
-$(foreach pkg,$(PKGLIST),$(eval $(call build-package,$(pkg))))
-
-.build-packages: ${PACKAGES}
+-include .packagerules
 
 dev-container:
 	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:3ef78225a85ab45f46faac66603c9da2877489deb643174ba1e42d8cbf0e0644

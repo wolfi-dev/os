@@ -55,14 +55,14 @@ list-yaml:
 	$(info $(addsuffix .yaml,$(PKGNAMELIST)))
 	@printf ''
 
-.packagerules: Makefile packages.txt
+.packagerules: Makefile .git/HEAD packages.txt
 	@echo "Solving build order, please wait..."
 	@grep -v '^\#' packages.txt | while read pkg; do		\
 		pkgname=`echo $$pkg | cut -d, -f1`;			\
 		pkgdir=`echo $$pkg | cut -d, -f2`;			\
 		[ -z "$$pkgdir" ] && pkgdir=$$pkgname;			\
 		pkgver=`${MELANGE} package-version $${pkgname}.yaml`;	\
-		pkgtarget="${TARGETDIR}/$${pkgver}.yaml";		\
+		pkgtarget="${TARGETDIR}/$${pkgver}.apk";		\
 		echo "PKGNAMELIST += $$pkgname";			\
 		echo ".build-packages: $$pkgtarget";			\
 		echo "packages/$$pkgname: $$pkgtarget";			\

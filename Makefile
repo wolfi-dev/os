@@ -76,3 +76,7 @@ list-yaml:
 
 dev-container:
 	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:3ef78225a85ab45f46faac66603c9da2877489deb643174ba1e42d8cbf0e0644
+
+lint:
+	wolfictl lint
+	./lint.sh

@@ -21,18 +21,18 @@ ulimit -c 0
 get_addr () {
     local if_name=$1
     local uri_template=$2
-    ip addr show dev $if_name | awk -v uri=$uri_template '/\s*inet\s/ { \
+    ip addr show dev "$if_name" | awk -v uri="$uri_template" '/\s*inet\s/ { \
       ip=gensub(/(.+)\/.+/, "\\1", "g", $2); \
       print gensub(/^(.+:\/\/).+(:.+)$/, "\\1" ip "\\2", "g", uri); \
       exit}'
 }
 
 if [ -n "$VAULT_REDIRECT_INTERFACE" ]; then
-    export VAULT_REDIRECT_ADDR=$(get_addr $VAULT_REDIRECT_INTERFACE ${VAULT_REDIRECT_ADDR:-"http://0.0.0.0:8200"})
+    export VAULT_REDIRECT_ADDR=$(get_addr "$VAULT_REDIRECT_INTERFACE" ${VAULT_REDIRECT_ADDR:-"http://0.0.0.0:8200"})
     echo "Using $VAULT_REDIRECT_INTERFACE for VAULT_REDIRECT_ADDR: $VAULT_REDIRECT_ADDR"
 fi
 if [ -n "$VAULT_CLUSTER_INTERFACE" ]; then
-    export VAULT_CLUSTER_ADDR=$(get_addr $VAULT_CLUSTER_INTERFACE ${VAULT_CLUSTER_ADDR:-"https://0.0.0.0:8201"})
+    export VAULT_CLUSTER_ADDR=$(get_addr "$VAULT_CLUSTER_INTERFACE" ${VAULT_CLUSTER_ADDR:-"https://0.0.0.0:8201"})
     echo "Using $VAULT_CLUSTER_INTERFACE for VAULT_CLUSTER_ADDR: $VAULT_CLUSTER_ADDR"
 fi
 
@@ -108,10 +108,19 @@ if [ "$1" = 'vault' ] && [ "$(id -u)" = '0' ]; then
     # Note this will probably require running as root and setcap
     if ! vault -version 1>/dev/null 2>/dev/null; then
 	>&2 echo "Couldn't start vault with IPC_LOCK. Disabling IPC_LOCK, please use --cap-add IPC_LOCK"
-	setcap cap_ipc_lock=-ep $(readlink -f $(which vault))
+	setcap cap_ipc_lock=-ep "$(readlink -f $(which vault))"
     fi
 
     set -- su-exec vault "$@"
+fi
+
+# Check if we can run (have IPC_LOCK cap)
+if [ "$1" = 'vault' ]; then
+    if ! vault -version 1>/dev/null 2>/dev/null; then
+	>&2 echo "Vault requires the IPC_LOCK capability. Use --cap-add IPC_LOCK or equivalent to run Vault." 
+	>&2 echo "If this isn't possible, use --user=root to disable IPC_LOCK."
+	exit 1
+    fi
 fi
 
 exec "$@"

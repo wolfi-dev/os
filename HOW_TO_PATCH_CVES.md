@@ -34,20 +34,23 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
 
     For more information on how `patch` works, see [its definition](https://github.com/chainguard-dev/melange/blob/main/pkg/build/pipelines/patch.yaml).
 
-1. Add the advisories data to denote that the updated package version will fix the vulnerability. You can do this using [wolfictl](https://github.com/wolfi-dev/wolfictl/):
+1. Add the advisories data to denote that the updated package version will fix the vulnerability. This is done using [wolfictl](https://github.com/wolfi-dev/wolfictl/).
 
-    > **Tip!** Avoid the need to specify the `--advisories-repo-dir` flag every time. Tell `wolfictl` where your local clone of https://github.com/wolfi-dev/advisories is using the `WOLFICTL_ADVISORIES_REPO_DIR` environment variable.
+    **Note:** You'll need to have already cloned the [Wolfi Advisories](https://github.com/wolfi-dev/advisories) repo locally. We recommend you clone it to a sibling directory to where you've cloned this (`os`) repo (e.g., you'd end up with `.../foo/os` and `.../foo/advisories`.)
 
+    Run `wolfictl adv create` (or, if an advisory for this CVE is already present, run `wolfictl adv update`).
 
-    ```sh
-    wolfictl advisory create --advisories-repo-dir <path-to-local-clone-of-advisories-repo> --package <package-name> --vuln <CVE> --status 'fixed' --fixed-version <new-release-version> --sync
+    ```console
+    $ wolfictl adv create
+    Auto-detected distro: Wolfi
+
+    Package: █
+    Type to find a package. Ctrl+C to quit.
     ```
 
-    For example, if we're patching CVE-2018-25032 in the "zlib" package, where the `version` is `1.2.3` and the `epoch` is 4, we'd run:
+    From there, follow the prompts. The exact prompts will change from time to time as we iterate on the system, but the general flow should be intuitive.
 
-    ```sh
-    wolfictl advisory create --advisories-repo-dir "$HOME/code/wolfi-advisories" --package 'zlib'  --vuln 'CVE-2018-25032' --status 'fixed' --fixed-version '1.2.3-r4' --sync
-    ```
+    For example, if we're patching CVE-2018-25032 in the "zlib" package, where the version is 1.2.3 and the epoch is 4, we'd enter `zlib` as the package, `CVE-2018-25032` as the vulnerability and `1.2.3-r4` as the fixed version.
 
 1. Verify that our update package will build successfully by running Melange. To do this, run (in a container if you're not already on Linux):
 
@@ -65,12 +68,22 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
 
 ## NACKing a CVE
 
-To NACK a CVE for a given package, we don't add in any patches or increment the package version. Instead, we just need to update the advisory data to say that this package is not affected by the vulnerability. As we do this, we also need to provide an accurate ["justification"](https://github.com/chainguard-dev/vex/blob/main/pkg/vex/justification.go#L12-L49) value as to why our package isn't affected. (And, if possible, we should also provide an "impact statement" that explains why we believe our package is not affected—but this is optional.)
+To NACK a CVE for a given package, we don't add in any patches or increment the package version. Instead, we just need to update the advisory data to say that this package is not affected by the vulnerability. As we do this, we also need to provide an accurate ["justification"](https://github.com/chainguard-dev/vex/blob/main/pkg/vex/justification.go#L12-L49) value as to why our package isn't affected.
+
+Recording the NACK is done with the `wolfictl adv create` command (or `wolfictl adv update` if an advisory already exists for this package and CVE).
 
 For example:
 
-```sh
-wolfictl advisory create --advisories-repo-dir "$HOME/code/wolfi-advisories" --package 'zlib' --vuln 'CVE-2023-12345' --status 'not_affected' --justification 'vulnerable_code_not_present' --impact 'Fixed upstream prior to Wolfi packaging.' --sync
+```console
+$ wolfictl adv create
+Auto-detected distro: Wolfi
+
+Package: zlib
+Vulnerability: CVE-2023-77777
+Status:
+  not_affected
+Justification:
+  vulnerable_code_not_present
 ```
 
 This will notify vulnerability scanners that consume our secdb that this vulnerabitiliy doesn't apply to any of the versions of this package that we've published.

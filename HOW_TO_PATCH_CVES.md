@@ -52,16 +52,10 @@ For the ease of explanation, we'll assume we're addressing a single reported vul
 
     For example, if we're patching CVE-2018-25032 in the "zlib" package, where the version is 1.2.3 and the epoch is 4, we'd enter `zlib` as the package, `CVE-2018-25032` as the vulnerability and `1.2.3-r4` as the fixed version.
 
-1. Verify that our update package will build successfully by running Melange. To do this, run (in a container if you're not already on Linux):
+1. Verify that our update package will build successfully by running Melange. To do this, run:
 
     ```shell
-    make
-    ```
-
-    Note that currently, this will build the **entire world**. If you want to build just a single package, you can run the following to build the package:
-
-    ```shell
-    BUILDWORLD=no make packages/${ARCH}/${PACKAGE_NAME}-${PACKAGE_VERSION}.apk
+    make packages/${PACKAGE_NAME}
     ```
 
 1. Open a PR.

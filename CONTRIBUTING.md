@@ -32,11 +32,9 @@ Add a new entry for your package near the bottom of [`packages.txt`](packages.tx
 your-package-name
 ```
 
-Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name> BUILDWORLD=no USE_CACHE=no`.
+Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name>`.
 
-note: `USE_CACHE=no` disables using a GCP cloud bucket for caching pipeline sources.  This is mainly used for production setups and not needed for local development.
-
-If you do use a cache for your sources and see GCS auth related errors, your gcloud auth credentials might be the issue. Try running `gcloud auth login && gcloud auth application-default login`.
+If you do use a cache for your sources and see GCS auth related errors, your gcloud auth credentials might be the issue. Try running `gcloud auth login && gcloud auth application-default login`, then add `USE_CACHE=yes` to your `make` invocation.
 
 Your build packages should be found in the generated `./packages` directory.
 

@@ -30,8 +30,11 @@ There are presently some caveats, however:
 # Reproducing the entire OS
 
 The easiest way to verify reproducibility in the build system is to
-simply build the OS twice with the same key.  Or you can download the
-entire Wolfi package collection using `gsutil -m rsync`:
+simply build the OS twice with the same key. To build all packages, run `make
+BUILDWORLD=yes`.
+
+Or you can download the entire Wolfi package collection using `gsutil -m
+rsync`:
 
     gsutil -m rsync gs://wolfi-production-registry-destination/os/ wolfi-packages/os/
 
@@ -48,12 +51,12 @@ comparing the package directories.
 If you just want to test an individual Wolfi package for reproducibility,
 the same caveats above still apply.  But you can ask the build system to
 build just a single package, without building dependencies, by using the
-`BUILDWORLD=no` knob.  For example, with `execline`:
+`=no` knob.  For example, with `execline`:
 
-    # doas make packages/execline BUILDWORLD=no
+    # doas make packages/execline
     ...
     # doas mv packages packages-1
-    # doas make packages/execline BUILDWORLD=no
+    # doas make packages/execline
     ...
     # doas mv packages packages-2
     # sha256sum packages-1/$(uname -m)/*.apk | sed -e s:packages-1:packages-2:g | sha256sum -c

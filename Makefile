@@ -26,7 +26,7 @@ ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
 
-ifeq (${BUILDWORLD}, no)
+ifneq (${BUILDWORLD}, yes)
 MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
 MELANGE_OPTS += -r ${WOLFI_PROD}
 endif

@@ -14,13 +14,14 @@
  *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *   GNU General Public License for more details.
  *
- * Source: https://github.com/ago/pps-tools/ - Retreived Dec 2013
+ * Source: https://github.com/ago/pps-tools/ - Retreived jun 2023
  */
 
 #ifndef _SYS_TIMEPPS_H_
 #define _SYS_TIMEPPS_H_
 
 #include <errno.h>
+#include <unistd.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <linux/types.h>
@@ -117,7 +118,7 @@ static __inline int time_pps_getparams(pps_handle_t handle,
 					pps_params_t *ppsparams)
 {
 	int ret;
-	struct pps_kparams __ppsparams;
+	struct pps_kparams __ppsparams = {};
 
 	ret = ioctl(handle, PPS_GETPARAMS, &__ppsparams);
 
@@ -134,7 +135,7 @@ static __inline int time_pps_getparams(pps_handle_t handle,
 static __inline int time_pps_setparams(pps_handle_t handle,
 					const pps_params_t *ppsparams)
 {
-	struct pps_kparams __ppsparams;
+	struct pps_kparams __ppsparams = {};
 
 	__ppsparams.api_version = ppsparams->api_version;
 	__ppsparams.mode = ppsparams->mode;
@@ -156,7 +157,7 @@ static __inline int time_pps_fetch(pps_handle_t handle, const int tsformat,
 					pps_info_t *ppsinfobuf,
 					const struct timespec *timeout)
 {
-	struct pps_fdata __fdata;
+	struct pps_fdata __fdata = {};
 	int ret;
 
 	/* Sanity checks */
@@ -168,7 +169,6 @@ static __inline int time_pps_fetch(pps_handle_t handle, const int tsformat,
 	if (timeout) {
 		__fdata.timeout.sec = timeout->tv_sec;
 		__fdata.timeout.nsec = timeout->tv_nsec;
-		__fdata.timeout.flags = ~PPS_TIME_INVALID;
 	} else
 		__fdata.timeout.flags = PPS_TIME_INVALID;
 
@@ -191,7 +191,7 @@ static __inline int time_pps_kcbind(pps_handle_t handle,
 					const int kernel_consumer,
 					const int edge, const int tsformat)
 {
-	struct pps_bind_args __bind_args;
+	struct pps_bind_args __bind_args = {};
 
 	__bind_args.tsformat = tsformat;
 	__bind_args.edge = edge;

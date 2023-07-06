@@ -6,6 +6,7 @@ endif
 TARGETDIR = packages/${ARCH}
 
 MELANGE ?= $(shell which melange)
+WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
@@ -32,11 +33,8 @@ MELANGE_OPTS += -r ${WOLFI_PROD}
 endif
 
 # The list of packages to be built. The order matters.
-# At some point, when ready, this should be replaced with `wolfictl text -t name .`
-# non-standard source directories are provided by adding them separated by a comma,
-# e.g.
-# postgres-11,postgres
-PKGLIST ?= $(shell cat packages.txt | grep -v '^\#' )
+# wolfictl determines the list and order
+PKGLIST ?= $(shell $(WOLFICTL) text --dir . --type name)
 
 all: ${KEY} .build-packages
 
@@ -48,31 +46,24 @@ clean:
 
 .PHONY: list list-yaml
 list:
-	$(info $(PKGNAMELIST))
+	$(info $(PKGLIST))
 	@printf ''
 
 list-yaml:
-	$(info $(addsuffix .yaml,$(PKGNAMELIST)))
+	$(info $(addsuffix .yaml,$(PKGLIST)))
 	@printf ''
 
-.packagerules: Makefile .git/HEAD packages.txt
-	@echo "Solving build order, please wait..."
-	@grep -v '^\#' packages.txt | while read pkg; do		\
-		pkgname=`echo $$pkg | cut -d, -f1`;			\
-		pkgdir=`echo $$pkg | cut -d, -f2`;			\
-		[ -z "$$pkgdir" ] && pkgdir=$$pkgname;			\
-		pkgver=`${MELANGE} package-version $${pkgname}.yaml`;	\
-		pkgtarget="${TARGETDIR}/$${pkgver}.apk";		\
-		echo "PKGNAMELIST += $$pkgname";			\
-		echo ".build-packages: $$pkgtarget";			\
-		echo "packages/$$pkgname: $$pkgtarget";			\
-		echo "$$pkgtarget: $${pkgname}.yaml \$${KEY}";		\
-		printf "\t%s\n" "@mkdir -p ./$${pkgdir}/";		\
-		printf "\t%s" "SDE=\$${SOURCE_DATE_EPOCH}; [ -z \"\$$\$$SDE\" ] && SDE=\`git log -1 --pretty=%ct --follow $${pkgname}.yaml\`;"; \
-		printf "\t%s\n\n" "SOURCE_DATE_EPOCH=\$$\$$SDE \$${MELANGE} build $${pkgname}.yaml \$${MELANGE_OPTS} --source-dir ./$${pkgdir}/ --log-policy builtin:stderr,\$${TARGETDIR}/buildlogs/$${pkgver}.log"; \
-	done > .packagerules
+.build-packages: $(addprefix package/,${PKGLIST})
 
--include .packagerules
+package/%:
+	$(eval yamlfile := $*.yaml)
+	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
+
+packages/$(ARCH)/%.apk: $(KEY)
+	@mkdir -p ./$(pkgname)/
+	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
+	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/ --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
 
 dev-container:
-	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:3ef78225a85ab45f46faac66603c9da2877489deb643174ba1e42d8cbf0e0644
+	docker run --privileged --rm -it -v "${PWD}:${PWD}" -w "${PWD}" ghcr.io/wolfi-dev/sdk:latest@sha256:3ba6e392eff7f09493c62b8a6bff4b9378ecccc27e5dc4ba0fa9f2a0e95c666f

@@ -26,12 +26,6 @@ Wolfi packages are built using melange. If you want to learn how packages are bu
 
 Start by cloning this repository and create a YAML file named `<your-package-name>.yaml` in its root directory. If you have any patches, create a folder with the same name and put them there.
 
-Add a new entry for your package near the bottom of [`packages.txt`](packages.txt) like this:
-
-```
-your-package-name
-```
-
 Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name> BUILDWORLD=no USE_CACHE=no`.
 
 note: `USE_CACHE=no` disables using a GCP cloud bucket for caching pipeline sources.  This is mainly used for production setups and not needed for local development.

@@ -34,7 +34,7 @@ endif
 
 # The list of packages to be built. The order matters.
 # wolfictl determines the list and order
-PKGLIST ?= $(shell $(WOLFICTL) text --dir . --type name)
+PKG_FULL_LIST ?= $(shell $(WOLFICTL) text --dir . --type name-version)
 
 all: ${KEY} .build-packages
 
@@ -46,21 +46,25 @@ clean:
 
 .PHONY: list list-yaml
 list:
+	$(eval PKGLIST ?= $(shell $(WOLFICTL) text --dir . --type name))
 	$(info $(PKGLIST))
 	@printf ''
 
 list-yaml:
+	$(eval PKGLIST ?= $(shell $(WOLFICTL) text --dir . --type name))
 	$(info $(addsuffix .yaml,$(PKGLIST)))
 	@printf ''
 
-.build-packages: $(addprefix package/,${PKGLIST})
+.build-packages: $(addsuffix .apk,$(addprefix packages/$(ARCH)/,${PKG_FULL_LIST}))
 
 package/%:
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
+	$(MAKE) packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: $(KEY)
+	$(eval pkgname := $(word 1, $(subst -, , $*)))
+	$(eval yamlfile := $(pkgname).yaml)
 	@mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/ --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log

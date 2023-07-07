@@ -34,9 +34,17 @@ endif
 
 # The list of packages to be built. The order matters.
 # wolfictl determines the list and order
-PKGLIST ?= $(shell $(WOLFICTL) text --dir . --type name)
+# set only to be called when needed, so make can be instant to run
+# when it is not
+PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name
 
 all: ${KEY} .build-packages
+ifeq ($(MAKECMDGOALS),all)
+  PKGLIST := $(addprefix package/,$(shell $(PKGLISTCMD)))
+else
+  PKGLIST :=
+endif
+.build-packages: $(PKGLIST)
 
 ${KEY}:
 	${MELANGE} keygen ${KEY}
@@ -46,14 +54,12 @@ clean:
 
 .PHONY: list list-yaml
 list:
-	$(info $(PKGLIST))
+	$(info $(shell $(PKGLISTCMD)))
 	@printf ''
 
 list-yaml:
-	$(info $(addsuffix .yaml,$(PKGLIST)))
+	$(info $(addsuffix .yaml,$(shell $(PKGLISTCMD))))
 	@printf ''
-
-.build-packages: $(addprefix package/,${PKGLIST})
 
 package/%:
 	$(eval yamlfile := $*.yaml)

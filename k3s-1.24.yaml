@@ -1,0 +1,169 @@
+package:
+  name: k3s-1.24
+  version: 1.24.15
+  epoch: 0
+  description:
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - k3s=1.24
+    runtime:
+      - containerd
+      - busybox
+      - ip6tables
+      - libseccomp
+      - conntrack-tools
+      # TODO:
+      # - slirp4netns # rootless support
+      # containerd-shim-runc-v2 # can save some size without packaging containerd-shim and containerd-shim-runc-v1
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - go
+      - curl
+      - libseccomp-dev
+      - sqlite-dev
+      - zstd
+      - yq
+      - runc # for buildtime version info
+      - containerd # for buildtime version info
+      - crictl # for buildtime version info
+      - crane
+
+var-transforms:
+  # TODO: This transforms the version into the real k3s version. It's needed
+  # because the wolfictl update bot doesn't yet support the k3s version format
+  # (+k3s#). This is a hack, and means if upstream ships a >k3s1 revision, we
+  # won't automatically pick it up. However, this is rare, and this solution
+  # buys us enough time to add support for the k3s version scheme.
+  - from: ${{package.version}}
+    match: ^(.+)$
+    replace: $1+k3s1 # NOTE: Update k3s# if upstream ships a >k3s# revision
+    to: full-package-version
+
+# Upstream uses `dapper` to initialize build environments, but since melange
+# already provides a consistent build environment, we adopt upstreams
+# ./scripts as much as possible. Additionally, we try to replace all k3s
+# built third party components with Wolfi replacements.
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/k3s-io/k3s
+      tag: v${{vars.full-package-version}}
+      expected-commit: 20e246114f2a632fa485b9ad1e5e72ebf3aeaf73
+  # First build things (almost) identical to upstream, with the k3s components embedded in the "outer" multicall binary.
+  - runs: |
+      # Don't include the k3s-root since it conflicts with wolfi variants (ie: busybox and ip6tables)
+      sed -e '/curl --compressed/d' -i scripts/download
+      mkdir -p build/static bin/aux etc
+      ./scripts/download
+
+      ./scripts/build
+
+      sed -e '/scripts\/build-upload/d' -i scripts/package-cli
+      ./scripts/package-cli
+
+      # Move the "outer" embedded k3s multicall binary into a new name to avoid overwriting
+      mv dist/artifacts/k3s* dist/artifacts/embedded-k3s
+  # Next build things using wolfi components.
+  - uses: patch
+    with:
+      patches: 0001-PATCH-Wolfi-support.patch
+  - runs: |
+      go mod tidy
+
+      ./scripts/build
+
+      # Move the "inner" k3s binary out of the bundle dir and into some place permanent
+      mkdir -p "${{targets.destdir}}"/bin/
+      mv bin/k3s "${{targets.destdir}}"/bin/_k3s
+
+      # This time around, we use a mostly empty bin/ dir with only symlinks to the "inner" k3s binary
+      ./scripts/package-cli
+
+      # Finally, install the "outer" k3s multicall binary
+      install -Dm755 dist/artifacts/k3s* "${{targets.destdir}}"/bin/k3s
+  - uses: strip
+
+subpackages:
+  - name: k3s-embedded-1.24
+    description: "k3s with embedded components"
+    dependencies:
+      runtime:
+        - busybox
+        - ip6tables
+        - libseccomp
+        - conntrack-tools
+      provides:
+        - k3s-embedded=1.24
+    pipeline:
+      - runs: |
+          # Install the "outer" k3s multicall binary into the package path
+          install -Dm755 dist/artifacts/embedded-k3s "${{targets.subpkgdir}}"/bin/k3s
+
+  - name: k3s-images-1.24
+    description: "k3s images, pre-bundled"
+    dependencies:
+      provides:
+        - k3s-images=1.24
+    pipeline:
+      - runs: |
+          set -e -u -x
+
+          _arch=$(go env GOARCH)
+
+          images=""
+          while read -r line
+          do
+            repo=$(echo $line | cut -d ':' -f 1)
+            tag=$(echo $line | cut -d ':' -f 2)
+
+            # Replace upstream images with cgr.dev equivalents only if they exist
+            case $repo in
+              docker.io/rancher/klipper-helm|docker.io/rancher/klipper-lb|docker.io/rancher/local-path-provisioner|docker.io/rancher/mirrored-pause)
+                # TODO: Replace these known gaps with cgr variants
+                image="$repo:$tag@$(crane digest $repo:$tag)"
+                ;;
+              docker.io/rancher/mirrored-metrics-server)
+                image=$(crane digest --full-ref cgr.dev/chainguard/metrics-server:latest)
+                ;;
+              docker.io/rancher/mirrored-coredns-coredns)
+                image=$(crane digest --full-ref cgr.dev/chainguard/coredns:latest)
+                ;;
+              docker.io/rancher/mirrored-library-busybox)
+                image=$(crane digest --full-ref cgr.dev/chainguard/busybox:latest)
+                ;;
+              docker.io/rancher/mirrored-library-traefik)
+                image=$(crane digest --full-ref cgr.dev/chainguard/traefik:latest)
+                ;;
+              *)
+                echo "unaccounted for image: $repo:$tag"
+                exit 1
+                ;;
+            esac
+
+            images="$images $image"
+          done < ./scripts/airgap/image-list.txt
+
+          echo "Pulling images locally..."
+          echo $images
+          crane pull $images dist/artifacts/k3s-airgap-images-$_arch.tar
+
+          _images_path="${{targets.subpkgdir}}"/var/lib/rancher/k3s/agent/images
+          mkdir -p $_images_path
+
+          # Compression doesn't really do much for overall size since it's mostly already compressed image layers, but follow how upstream does it
+          zstd --no-progress -T0 -16 -f --long=25 dist/artifacts/k3s-airgap-images-$_arch.tar -o $_images_path/k3s-airgap-images-$_arch.tar.zst
+
+update:
+  enabled: true
+  github:
+    identifier: k3s-io/k3s
+    strip-prefix: v
+    strip-suffix: "+k3s1" # NOTE: Update k3s# if upstream ships a >k3s1 revision
+    tag-filter: v1.24

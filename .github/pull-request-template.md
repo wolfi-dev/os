@@ -35,7 +35,7 @@ addressed, and remove any items that are not relevant to this PR.
 
 #### For security-related PRs
 <!-- remove if unrelated -->
-- [ ] The security fix is recorded in `advisories` and `secfixes`
+- [ ] The security fix is recorded in the [advisories](https://github.com/wolfi-dev/advisories) repo
 
 #### For version bump PRs
 <!-- remove if unrelated -->

@@ -21,6 +21,7 @@ MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
 MELANGE_OPTS += --generate-index false
+MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
@@ -36,7 +37,7 @@ endif
 # wolfictl determines the list and order
 # set only to be called when needed, so make can be instant to run
 # when it is not
-PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name
+PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
 
 all: ${KEY} .build-packages
 ifeq ($(MAKECMDGOALS),all)

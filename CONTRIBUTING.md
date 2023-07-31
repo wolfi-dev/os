@@ -24,20 +24,22 @@ What it does is start the `ghcr.io/wolfi-dev/sdk` image and mount the current wo
 
 Wolfi packages are built using melange. If you want to learn how packages are built, you can see all the details in the [`ci-build`](.github/workflows/ci-build.yaml) workflow and in the [Makefile](Makefile).
 
-Start by cloning this repository and create a YAML file named `<your-package-name>.yaml` in its root directory. If you have any patches, create a folder with the same name and put them there.
+Start by cloning this repository and create a YAML file named `<your-package-name>.yaml` in its root directory. If you have any patches, create a folder at the root of the repository with the same name as the package and put the patches there.
 
-Once you're done writing the new package configuration file, you can test it by triggering a build with `make packages/<your-package-name> BUILDWORLD=no USE_CACHE=no`.
+Once you're done writing the new package configuration file, you can test it by building the new package:
 
-note: `USE_CACHE=no` disables using a GCP cloud bucket for caching pipeline sources.  This is mainly used for production setups and not needed for local development.
-
-If you do use a cache for your sources and see GCS auth related errors, your gcloud auth credentials might be the issue. Try running `gcloud auth login && gcloud auth application-default login`.
-
-Your build packages should be found in the generated `./packages` directory.
-
-While you're here, you can scan the package you just built for vulnerabilities, such as by using an experimental [Grype](https://github.com/anchore/grype)-based scanning script we provide: `./scripts/grype-scan-apk.sh`.
-
+```shell
+make package/your-package-name BUILDWORLD=no
 ```
-./scripts/grype-scan-apk.sh packages/<arch>/<your-package-name-and-version>.apk
+
+**Note:** If you encounter an authentication error, it might be caused by a Melange caching feature. You can append `USE_CACHE=no` to the make commmand, so that it won't ask Melange to retrieve cached pipeline sources from a GCP cloud bucket.
+
+When the build finishes, your package(s) should be found in the generated `./packages` directory.
+
+While you're here, you can scan the package you just built for vulnerabilities, such as by using `wolfictl scan`:
+
+```shell
+wolfictl scan ./packages/some-architecture/your-package-name-and-version.apk
 ```
 
 Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CVES.md).

@@ -26,17 +26,26 @@ Wolfi packages are built using melange. If you want to learn how packages are bu
 
 Start by cloning this repository and create a YAML file named `<your-package-name>.yaml` in its root directory. If you have any patches, create a folder at the root of the repository with the same name as the package and put the patches there.
 
-Once you're done writing the new package configuration file, you can test it by building the new package:
+
+Once you're done writing the new package configuration file, you can test it by building the new package.
+
+## Building a package
+
+To build an individual package, you can use a `make` command like this:
 
 ```shell
 make package/your-package-name BUILDWORLD=no
 ```
 
+This will build the package by invoking [melange](https://github.com/chainguard-dev/melange) in a particular way. This invocation is defined in the [Makefile](Makefile), if you're interested to see how this is wired up. Also, you can run Melange _directly_ without using `make` if you understand what you're doing.
+
 **Note:** If you encounter an authentication error, it might be caused by a Melange caching feature. You can append `USE_CACHE=no` to the make commmand, so that it won't ask Melange to retrieve cached pipeline sources from a GCP cloud bucket.
 
 When the build finishes, your package(s) should be found in the generated `./packages` directory.
 
-While you're here, you can scan the package you just built for vulnerabilities, such as by using `wolfictl scan`:
+## Scanning your package for vulnerabilities
+
+While you're here, you can scan the package you just built for vulnerabilities, using [wolfictl](https://github.com/wolfi-dev/wolfictl)'s `scan` command:
 
 ```shell
 wolfictl scan ./packages/some-architecture/your-package-name-and-version.apk

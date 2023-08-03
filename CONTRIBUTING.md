@@ -43,7 +43,9 @@ This will build the package by invoking [melange](https://github.com/chainguard-
 
 When the build finishes, your package(s) should be found in the generated `./packages` directory.
 
-While you're here, you can scan the package you just built for vulnerabilities, such as by using `wolfictl scan`:
+## Scanning your package for vulnerabilities
+
+While you're here, you can scan the package you just built for vulnerabilities, using [wolfictl](https://github.com/wolfi-dev/wolfictl)'s `scan` command:
 
 ```shell
 wolfictl scan ./packages/some-architecture/your-package-name-and-version.apk

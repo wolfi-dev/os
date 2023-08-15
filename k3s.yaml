@@ -1,20 +1,18 @@
 package:
   name: k3s
-  version: 1.27.3
-  epoch: 1
+  version: 1.27.4
+  epoch: 2
   description:
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
-      - containerd
+      - runc
+      - containerd-shim-runc-v2
       - busybox
-      - ip6tables
+      - ip6tables # this pulls in iptables as well
       - libseccomp
       - conntrack-tools
-      # TODO:
-      # - slirp4netns # rootless support
-      # containerd-shim-runc-v2 # can save some size without packaging containerd-shim and containerd-shim-runc-v1
 
 environment:
   contents:
@@ -28,9 +26,6 @@ environment:
       - sqlite-dev
       - zstd
       - yq
-      - runc # for buildtime version info
-      - containerd # for buildtime version info
-      - crictl # for buildtime version info
       - crane
 
 var-transforms:
@@ -45,65 +40,68 @@ var-transforms:
     to: full-package-version
 
 # Upstream uses `dapper` to initialize build environments, but since melange
-# already provides a consistent build environment, we adopt upstreams
-# ./scripts as much as possible. Additionally, we try to replace all k3s
-# built third party components with Wolfi replacements.
+# already provides a consistent build environment, we adopt upstreams ./scripts
+# as much as possible.
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/k3s-io/k3s
       tag: v${{vars.full-package-version}}
-      expected-commit: fe9604cac119216e67f8bd5f14eb5608e3bcd3cf
-  # First build things (almost) identical to upstream, with the k3s components embedded in the "outer" multicall binary.
+      expected-commit: 36645e7311e9bdbbf2adb79ecd8bd68556bc86f6
+  # Build things (almost) identical to upstream, with the k3s components
+  # embedded in the "outer" multicall binary.
   - runs: |
       # Don't include the k3s-root since it conflicts with wolfi variants (ie: busybox and ip6tables)
       sed -e '/curl --compressed/d' -i scripts/download
       mkdir -p build/static bin/aux etc
       ./scripts/download
 
-      ./scripts/build
-
-      sed -e '/scripts\/build-upload/d' -i scripts/package-cli
-      ./scripts/package-cli
-
-      # Move the "outer" embedded k3s multicall binary into a new name to avoid overwriting
-      mv dist/artifacts/k3s* dist/artifacts/embedded-k3s
-  # Next build things using wolfi components.
-  - uses: patch
-    with:
-      patches: 0001-PATCH-Wolfi-support.patch
-  - runs: |
+      # Patch things that need patching
+      go mod edit -dropreplace=github.com/docker/distribution # CVE-2023-2253 GHSA-hqxw-f8mx-cpmw
+      go get github.com/docker/distribution@v2.8.2
       go mod tidy
 
       ./scripts/build
+  # k3s embedds a lot of useful components (containerd, kubectl, etc...) in a
+  # very efficient manner that can't be replicated with external runtime
+  # components. To ensure we have an optimally packaged k3s, we try to mimic
+  # as much of the upstream k3s space savings while still building all the
+  # components from source. We use some light sed surgery instead of
+  # maintaining patches for every version. Ultimately this means Wolfi's
+  # version of k3s should feel identical to upstream (with containerd,
+  # kubectl, crictl, etc...) all embedded, but with Wolfi variants where
+  # applicable (runc).
+  - runs: |
+      # Remove non-embedded components and replace with Wolfi variants at runtime
+      rm -rf bin/runc
+      rm -rf bin/containerd-shim-runc-v2
 
-      # Move the "inner" k3s binary out of the bundle dir and into some place permanent
+      # Move the "inner" k3s binary out of the bundle dir to avoid packaging it
+      # twice. Give it a weird but semi-descriptive name to discourage users from
+      # calling it directly
       mkdir -p "${{targets.destdir}}"/bin/
-      mv bin/k3s "${{targets.destdir}}"/bin/_k3s
+      mv bin/k3s "${{targets.destdir}}"/bin/_k3s-inner
 
-      # This time around, we use a mostly empty bin/ dir with only symlinks to the "inner" k3s binary
+      # Modify the packaging script to exclusively use symlinks to our moved "inner" binary
+      sed -i 's|ln -s k3s bin/$i|ln -s /bin/_k3s-inner bin/$i|g' ./scripts/package-cli
+
+      # Remove the upload portion from the upstream package-cli script
+      sed -e '/scripts\/build-upload/d' -i scripts/package-cli
+
       ./scripts/package-cli
 
-      # Finally, install the "outer" k3s multicall binary
+      # Finally, install the "outer" k3s multicall binary. This should only
+      # contain the go runtime plus the self extracting multicall logic, and
+      # should be a relatively small binary (~<15Mb).
       install -Dm755 dist/artifacts/k3s* "${{targets.destdir}}"/bin/k3s
+
+      # Assert a max multicall size since it's a good sign that packaging happened correctly.
+      [ $(stat -c%s "${{targets.destdir}}"/bin/k3s) -le $((15 * 1024 * 1024)) ] || { echo "Error: multicall k3s exceeds 15MB" >&2; exit 1; }
   - uses: strip
 
 subpackages:
-  - name: k3s-embedded
-    description: "k3s with embedded components"
-    dependencies:
-      runtime:
-        - busybox
-        - ip6tables
-        - libseccomp
-        - conntrack-tools
-    pipeline:
-      - runs: |
-          # Install the "outer" k3s multicall binary into the package path
-          install -Dm755 dist/artifacts/embedded-k3s "${{targets.subpkgdir}}"/bin/k3s
-
   - name: k3s-images
-    description: "k3s images, pre-bundled"
+    description: "pre-packaged k3s core runtime images"
     pipeline:
       - runs: |
           set -e -u -x
@@ -118,15 +116,10 @@ subpackages:
 
             # Replace upstream images with cgr.dev equivalents only if they exist
             case $repo in
-              # docker.io/rancher/klipper-helm)
-              #   image=$(crane digest --full-ref cgr.dev/chainguard/klipper-helm:latest)
-              #   ;;
-              # docker.io/rancher/klipper-lb)
-              #   image=$(crane digest --full-ref cgr.dev/chainguard/klipper-lb:latest)
-              #   ;;
-              # docker.io/rancher/local-path-provisioner)
-              #   image=$(crane digest --full-ref cgr.dev/chainguard/local-path-provisioner:latest)
-              #   ;;
+              docker.io/rancher/klipper-helm|docker.io/rancher/klipper-lb|docker.io/rancher/local-path-provisioner|docker.io/rancher/mirrored-pause)
+                # TODO: Replace these known gaps with cgr variants
+                image="$repo:$tag@$(crane digest $repo:$tag)"
+                ;;
               docker.io/rancher/mirrored-metrics-server)
                 image=$(crane digest --full-ref cgr.dev/chainguard/metrics-server:latest)
                 ;;
@@ -140,7 +133,8 @@ subpackages:
                 image=$(crane digest --full-ref cgr.dev/chainguard/traefik:latest)
                 ;;
               *)
-                image="$repo:$tag@$(crane digest $repo:$tag)"
+                echo "unaccounted for image: $repo:$tag"
+                exit 1
                 ;;
             esac
 
@@ -149,13 +143,11 @@ subpackages:
 
           echo "Pulling images locally..."
           echo $images
-          crane pull $images dist/artifacts/k3s-airgap-images-$_arch.tar
 
           _images_path="${{targets.subpkgdir}}"/var/lib/rancher/k3s/agent/images
           mkdir -p $_images_path
 
-          # Compression doesn't really do much for overall size since it's mostly already compressed image layers, but follow how upstream does it
-          zstd --no-progress -T0 -16 -f --long=25 dist/artifacts/k3s-airgap-images-$_arch.tar -o $_images_path/k3s-airgap-images-$_arch.tar.zst
+          crane pull $images $_images_path/k3s-airgap-images-$_arch.tar
 
 update:
   enabled: true

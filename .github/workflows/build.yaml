@@ -1,0 +1,189 @@
+name: Build Wolfi OS
+
+on:
+  # TODO: Enable this when we're ready to go live
+  # push:
+  #   branches: ['main']
+  #   paths-ignore:
+  #     - README.md
+
+  workflow_dispatch:
+
+# Only run one build at a time to prevent out of sync signatures
+concurrency:
+  group: build-${{ github.ref }}
+
+jobs:
+  build:
+    name: Build packages
+    if: github.repository == 'wolfi-dev/os'
+
+    strategy:
+      matrix:
+        arch: [ "x86_64", "aarch64" ]
+      fail-fast: false
+
+    runs-on: 
+      - self-hosted
+      - ${{ matrix.arch }}
+
+    # Ensure this is deprivileged, isolated job
+    # permissions:
+
+    container:
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:228a7b2d145f5fe64da22948feab8137bd46bdd418ca1993467373b7b363a453
+      # TODO: Deprivilege
+      options: |
+        --cap-add NET_ADMIN --cap-add SYS_ADMIN --device /dev/fuse --security-opt seccomp=unconfined --security-opt apparmor:unconfined
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 'Trust the github workspace'
+        run: |
+          # This is to avoid fatal errors about "dubious ownership" because we are
+          # running inside of a container action with the workspace mounted in.
+          git config --global --add safe.directory "$(pwd)"
+
+      # Build with a local key, we'll resign this with the real key later
+      - name: 'Generate local signing key'
+        run: |
+          make local-melange.rsa
+
+          # Touch it with the epoch date to convince `make` that we don't need to
+          # rebuild the targets that depend on this (all)
+          touch -d @0 local-melange.rsa
+
+      - name: 'Prepare package repository'
+        run: |
+          # yay wolfi!
+          apk add gcsfuse
+
+          # Set up a gcsfuse RO mount to the public bucket. This is a cheap and
+          # cheerful way to recreate the make targets (class A HEADs) locally
+          # without syncing the whole bucket (class A+B).
+          mkdir -p /gcsfuse/wolfi-registry
+          gcsfuse -o ro --implicit-dirs --only-dir os wolfi-production-registry-destination /gcsfuse/wolfi-registry
+
+          mkdir -p ./packages/${{ matrix.arch }}
+          # Symlink the gcsfuse mount to ./packages/ to workaround the Makefile CWD assumptions
+          ln -s /gcsfuse/wolfi-registry/${{ matrix.arch }}/*.apk ./packages/${{ matrix.arch }}/
+
+          # Make a copy of the APKINDEX.* since we'll need to write to it on package builds
+          cp /gcsfuse/wolfi-registry/${{ matrix.arch }}/APKINDEX.* ./packages/${{ matrix.arch }}/
+
+      # TODO: Replace this with wolfictl build, since the current make build
+      # method doesn't trigger new builds for dependent updates.
+      - name: 'Build Wolfi'
+        run: |
+          make \
+            ARCH=${{ matrix.arch }} \
+            MELANGE_EXTRA_OPTS="--keyring-append=/gcsfuse/wolfi-registry/wolfi-signing.rsa.pub" \
+            all -j1
+
+      - run: |
+          # Clean up the symlinks and create an archive for uploading
+          find ./packages/${{ matrix.arch }} -type l -exec rm -f {} \;
+          tar -cvzf /tmp/packages-${{ matrix.arch }}.tar.gz ./packages/${{ matrix.arch }}
+
+      - name: 'Upload built packages archive to Github Artifacts'
+        uses: actions/upload-artifact@v3
+        with:
+          name: packages-${{ matrix.arch }}
+          path: /tmp/packages-${{ matrix.arch }}.tar.gz
+          retention-days: 1 # Low ttl since this is just an intermediary used once
+          if-no-files-found: warn
+
+  upload:
+    # reindexing is cpu intensive
+    runs-on: ubuntu-16-core
+    needs: build
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - id: auth
+        name: 'Authenticate to Google Cloud'
+        uses: google-github-actions/auth@v0
+        with:
+          workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
+          service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
+
+      - uses: google-github-actions/setup-gcloud@v0
+        with:
+          project_id: prod-images-c6e5
+
+      - uses: chainguard-dev/actions/setup-melange@main
+
+      - name: 'Sync public package repository'
+        run: |
+          mkdir -p ./packages/
+          gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages/
+          find ./packages -print -exec touch \{} \;
+
+      - name: 'Download x86_64 package archives'
+        uses: actions/download-artifact@v3
+        with:
+          path: /tmp/artifacts/
+          name: packages-x86_64
+
+      - name: 'Download aarch64 package archives'
+        uses: actions/download-artifact@v3
+        with:
+          path: /tmp/artifacts/
+          name: packages-aarch64
+
+      - run: echo "${{ secrets.MELANGE_RSA }}" > ./wolfi-signing.rsa
+      - run: |
+          sudo mkdir -p /etc/apk/keys
+          sudo cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
+
+      - name: 'Update the APKINDEX'
+        run: |
+          for arch in "x86_64" "aarch64"; do
+            # Consolidate with the built artifacts
+            tar xvf /tmp/artifacts/packages-${arch}.tar.gz
+
+            # Sign the indexes
+            melange sign-index --signing-key ./wolfi-signing.rsa "./packages/${arch}/APKINDEX.tar.gz"
+          done
+
+      # TODO: Enable this when we're ready to go live
+      # - name: 'Upload the repository to the bucket'
+      #   run: |
+      #     cp /etc/apk/keys/wolfi-signing.rsa.pub ./packages/wolfi-signing.rsa.pub
+      #
+      #     for arch in "x86_64" "aarch64"; do
+      #       # Don't cache the APKINDEX.
+      #       gcloud --quiet storage cp \
+      #           --cache-control=no-store \
+      #           "./packages/${arch}/APKINDEX.tar.gz" "gs://wolfi-production-registry-destination/os/${arch}/"
+      #
+      #     gcloud --quiet storage cp \
+      #         --cache-control=no-store \
+      #         "./packages/${arch}/APKINDEX.json" "gs://wolfi-production-registry-destination/os/${arch}/"
+      #
+      #     # apks will be cached in CDN for an hour by default.
+      #     # Don't upload the object if it already exists.
+      #     gcloud --quiet storage cp \
+      #         --no-clobber \
+      #         "./packages/${arch}/*.apk" "gs://wolfi-production-registry-destination/os/${arch}/"
+      #     done
+
+  # TODO: Enable this when we're ready to go live
+  # postrun:
+  #   name: Build Wolfi OS
+  #   runs-on: ubuntu-latest
+  #   if: failure()
+  #   steps:
+  #     - uses: slackapi/slack-github-action@007b2c3c751a190b6f0f040e47ed024deaa72844 # v1.23.0
+  #       id: slack
+  #       with:
+  #         payload: '{"text": "[build-wolfi-os] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+  #       env:
+  #         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  #         SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

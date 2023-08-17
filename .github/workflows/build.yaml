@@ -31,7 +31,7 @@ jobs:
     # permissions:
 
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:228a7b2d145f5fe64da22948feab8137bd46bdd418ca1993467373b7b363a453
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:e23b8182ca33f7715b94aa9a004dd172d804073f95b2d77d4576e46cc951cc19
       # TODO: Deprivilege
       options: |
         --cap-add NET_ADMIN --cap-add SYS_ADMIN --device /dev/fuse --security-opt seccomp=unconfined --security-opt apparmor:unconfined
@@ -95,16 +95,25 @@ jobs:
           if-no-files-found: warn
 
   upload:
-    # reindexing is cpu intensive
-    runs-on: ubuntu-16-core
+    runs-on: ubuntu-latest
     needs: build
 
     permissions:
       id-token: write
       contents: read
 
+    container:
+      # NOTE: This step only signs and uploads, so it doesn't need any privileges
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:e23b8182ca33f7715b94aa9a004dd172d804073f95b2d77d4576e46cc951cc19
+
     steps:
       - uses: actions/checkout@v3
+
+      - name: 'Trust the github workspace'
+        run: |
+          # This is to avoid fatal errors about "dubious ownership" because we are
+          # running inside of a container action with the workspace mounted in.
+          git config --global --add safe.directory "$(pwd)"
 
       - id: auth
         name: 'Authenticate to Google Cloud'
@@ -116,14 +125,6 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v0
         with:
           project_id: prod-images-c6e5
-
-      - uses: chainguard-dev/actions/setup-melange@main
-
-      - name: 'Sync public package repository'
-        run: |
-          mkdir -p ./packages/
-          gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages/
-          find ./packages -print -exec touch \{} \;
 
       - name: 'Download x86_64 package archives'
         uses: actions/download-artifact@v3
@@ -139,17 +140,25 @@ jobs:
 
       - run: echo "${{ secrets.MELANGE_RSA }}" > ./wolfi-signing.rsa
       - run: |
-          sudo mkdir -p /etc/apk/keys
-          sudo cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
+          mkdir -p /etc/apk/keys
+          cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
 
       - name: 'Update the APKINDEX'
         run: |
           for arch in "x86_64" "aarch64"; do
+            mkdir -p ./packages/${{ matrix.arch }}
+
             # Consolidate with the built artifacts
             tar xvf /tmp/artifacts/packages-${arch}.tar.gz
 
-            # Sign the indexes
-            melange sign-index --signing-key ./wolfi-signing.rsa "./packages/${arch}/APKINDEX.tar.gz"
+            # Sign the apks built in the `build` step with the real key
+            melange sign --signing-key ./wolfi-signing.rsa ./packages/${{ matrix.arch }}/*.apk
+
+            # NOTE: Everything below is for debugging purposes, we can chose to remove it in the future if we'd like
+            ls -lah ./packages/${{ matrix.arch }}
+
+            # Compare the "old" APKIDNEX.tar.gz with the new one
+            diff <(curl -sfL https://packages.wolfi.dev/os/${{ matrix.arch }}/APKINDEX.tar.gz | tar -xOzf - APKINDEX) <(tar -xOzf packages/${{ matrix.arch }}/APKINDEX.tar.gz APKINDEX)
           done
 
       # TODO: Enable this when we're ready to go live

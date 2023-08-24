@@ -1,0 +1,138 @@
+package:
+  name: rust-1.54
+  version: 1.54.0
+  epoch: 0
+  description: "Empowering everyone to build reliable and efficient software. (version 1.54.x)"
+  copyright:
+    - license: Apache-2.0 AND MIT
+  dependencies:
+    runtime:
+      - libLLVM-15
+    provides:
+      - rust-bootstrap=${{package.version}}
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - build-base
+      - libgit2-dev
+      - coreutils
+      - curl-dev
+      - file
+      - python3
+      - xz-dev
+      - zlib-dev
+      - patch
+      - cmake
+      - perl
+
+pipeline:
+  - name: Build vendored OpenSSL 1.1
+    working-directory: /home/build/vendored-deps/openssl
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://www.openssl.org/source/openssl-1.1.1v.tar.gz
+          expected-sha256: d6697e2871e77238460402e9362d47d18382b15ef9f246aba6c7bd780d38a6b0
+      - name: Configure and build
+        runs: |
+          export CC=${{host.triplet.gnu}}-gcc
+          export CXX=${{host.triplet.gnu}}-g++
+          export CPP=${{host.triplet.gnu}}-cpp
+
+          perl ./Configure \
+            linux-${{build.arch}} \
+            --prefix=/home/build/sysroot \
+            --libdir=lib \
+            --openssldir=/etc/ssl1.1 \
+            no-shared \
+            no-zlib \
+            no-async \
+            no-comp \
+            no-idea \
+            no-mdc2 \
+            no-rc5 \
+            no-ec2m \
+            no-sm2 \
+            no-sm4 \
+            no-ssl3 \
+            no-seed \
+            no-weak-ssl-ciphers \
+            -fPIC -Wa,--noexecstack
+
+          make -j$(nproc)
+          make install
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/thepowersgang/mrustc
+      tag: master
+      expected-commit: b6754f574f8846eb842feba4ccbeeecb10bdfacc
+
+  - name: Build mrustc
+    runs: |
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=1.54
+      make -j$PARLEVEL
+
+  - name: Build minicargo
+    runs: |
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=1.54
+      make -j$PARLEVEL -C tools/minicargo
+
+  - name: Prepare rustc-1.54 sources
+    working-directory: /home/build/rustc-${{package.version}}-src
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://static.rust-lang.org/dist/rustc-${{package.version}}-src.tar.gz
+          expected-sha256: ac8511633e9b5a65ad030a1a2e5bdaa841fdfe3132f2baaa52cc04e71c6c6976
+      # The patch is bundled with mrustc.
+      - uses: patch
+        with:
+          patches: /home/build/rustc-1.54.0-src.patch
+          strip-components: 0
+      # Patch vendored LLVM 13 sources to work with GCC 13
+      - uses: patch
+        with:
+          patches: /home/build/llvm13-cstdint.patch
+
+  - name: Build bootstrap standard libs
+    runs: |
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=1.54 MRUSTC=/home/build/bin/mrustc MINICARGO=/home/build/bin/minicargo
+
+      touch -r minicargo.mk rustc-1.54.0-src.patch
+      touch -r minicargo.mk rustc-1.54.0-src.tar.gz
+      touch rustc-1.54.0-src/dl-version
+
+      make -f minicargo.mk LIBS
+
+  - name: Build bootstrap rustc with mrustc
+    runs: |
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=1.54 MRUSTC=/home/build/bin/mrustc MINICARGO=/home/build/bin/minicargo
+      RUSTC_INSTALL_BINDIR=bin make -f minicargo.mk output-${{package.version}}/rustc
+
+  - name: Build bootstrap cargo with mrustc
+    runs: |
+      # Inject the sysroot containing the vendored OpenSSL
+      export PKG_CONFIG_LIBDIR=/home/build/sysroot/lib/pkgconfig:/home/build/sysroot/share/pkgconfig
+      export CFLAGS="$CFLAGS -I/home/build/sysroot/include"
+      export CPPFLAGS="$CPPFLAGS -I/home/build/sysroot/include"
+      export CPPFLAGS="$CXXFLAGS -I/home/build/sysroot/include"
+
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=1.54 MRUSTC=/home/build/bin/mrustc MINICARGO=/home/build/bin/minicargo
+      RUSTC_INSTALL_BINDIR=bin make -f minicargo.mk output-${{package.version}}/cargo
+
+  - name: Build final rustc/cargo with bootstrap rustc
+    label: rustc
+    runs: |
+      # Inject the sysroot containing the vendored OpenSSL
+      export PKG_CONFIG_LIBDIR=/home/build/sysroot/lib/pkgconfig:/home/build/sysroot/share/pkgconfig
+      export CFLAGS="$CFLAGS -I/home/build/sysroot/include"
+      export CPPFLAGS="$CPPFLAGS -I/home/build/sysroot/include"
+      export CPPFLAGS="$CXXFLAGS -I/home/build/sysroot/include"
+
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=1.54 MRUSTC=/home/build/bin/mrustc MINICARGO=/home/build/bin/minicargo
+      make -C run_rustc

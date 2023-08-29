@@ -1,11 +1,11 @@
 name: Build Wolfi OS
 
 on:
-  # TODO: Enable this when we're ready to go live
-  # push:
-  #   branches: ['main']
-  #   paths-ignore:
-  #     - README.md
+  push:
+    branches: ['main']
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
 
   workflow_dispatch:
 
@@ -31,7 +31,7 @@ jobs:
     # permissions:
 
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:228a7b2d145f5fe64da22948feab8137bd46bdd418ca1993467373b7b363a453
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:30f10892576d3ec9579655cf2e6b39a147b998d48bbc9f09a83d1b8879e84093
       # TODO: Deprivilege
       options: |
         --cap-add NET_ADMIN --cap-add SYS_ADMIN --device /dev/fuse --security-opt seccomp=unconfined --security-opt apparmor:unconfined
@@ -95,16 +95,25 @@ jobs:
           if-no-files-found: warn
 
   upload:
-    # reindexing is cpu intensive
-    runs-on: ubuntu-16-core
+    runs-on: ubuntu-latest
     needs: build
 
     permissions:
       id-token: write
       contents: read
 
+    container:
+      # NOTE: This step only signs and uploads, so it doesn't need any privileges
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:30f10892576d3ec9579655cf2e6b39a147b998d48bbc9f09a83d1b8879e84093
+
     steps:
       - uses: actions/checkout@v3
+
+      - name: 'Trust the github workspace'
+        run: |
+          # This is to avoid fatal errors about "dubious ownership" because we are
+          # running inside of a container action with the workspace mounted in.
+          git config --global --add safe.directory "$(pwd)"
 
       - id: auth
         name: 'Authenticate to Google Cloud'
@@ -116,14 +125,6 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v0
         with:
           project_id: prod-images-c6e5
-
-      - uses: chainguard-dev/actions/setup-melange@main
-
-      - name: 'Sync public package repository'
-        run: |
-          mkdir -p ./packages/
-          gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages/
-          find ./packages -print -exec touch \{} \;
 
       - name: 'Download x86_64 package archives'
         uses: actions/download-artifact@v3
@@ -139,51 +140,66 @@ jobs:
 
       - run: echo "${{ secrets.MELANGE_RSA }}" > ./wolfi-signing.rsa
       - run: |
-          sudo mkdir -p /etc/apk/keys
-          sudo cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
+          mkdir -p /etc/apk/keys
+          cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
 
       - name: 'Update the APKINDEX'
         run: |
           for arch in "x86_64" "aarch64"; do
+            mkdir -p ./packages/${arch}
+
             # Consolidate with the built artifacts
             tar xvf /tmp/artifacts/packages-${arch}.tar.gz
 
-            # Sign the indexes
-            melange sign-index --signing-key ./wolfi-signing.rsa "./packages/${arch}/APKINDEX.tar.gz"
+            # Sign the APK index
+            melange sign-index -f --signing-key ./wolfi-signing.rsa packages/${arch}/APKINDEX.tar.gz
+
+            # Only attempt to sign when *.apk's exist
+            apks=$(ls ./packages/${arch}/*.apk 2>/dev/null)
+            if [ -n "$apks" ]; then
+              # Sign the apks built in the `build` step with the real key
+              melange sign --signing-key ./wolfi-signing.rsa ./packages/${arch}/*.apk
+            fi
+
+            # NOTE: Everything below is for debugging purposes, we can chose to remove it in the future if we'd like
+            ls -lah ./packages/${arch}
+
+            # Compare the "old" APKIDNEX.tar.gz with the new one
+            diff <(curl -sfL https://packages.wolfi.dev/os/${arch}/APKINDEX.tar.gz | tar -xOzf - APKINDEX) <(tar -xOzf packages/${arch}/APKINDEX.tar.gz APKINDEX) || true
           done
 
-      # TODO: Enable this when we're ready to go live
-      # - name: 'Upload the repository to the bucket'
-      #   run: |
-      #     cp /etc/apk/keys/wolfi-signing.rsa.pub ./packages/wolfi-signing.rsa.pub
-      #
-      #     for arch in "x86_64" "aarch64"; do
-      #       # Don't cache the APKINDEX.
-      #       gcloud --quiet storage cp \
-      #           --cache-control=no-store \
-      #           "./packages/${arch}/APKINDEX.tar.gz" "gs://wolfi-production-registry-destination/os/${arch}/"
-      #
-      #     gcloud --quiet storage cp \
-      #         --cache-control=no-store \
-      #         "./packages/${arch}/APKINDEX.json" "gs://wolfi-production-registry-destination/os/${arch}/"
-      #
-      #     # apks will be cached in CDN for an hour by default.
-      #     # Don't upload the object if it already exists.
-      #     gcloud --quiet storage cp \
-      #         --no-clobber \
-      #         "./packages/${arch}/*.apk" "gs://wolfi-production-registry-destination/os/${arch}/"
-      #     done
+      - name: 'Upload the repository to the bucket'
+        run: |
+          for arch in "x86_64" "aarch64"; do
+            # Don't cache the APKINDEX.
+            gcloud --quiet storage cp \
+                --cache-control=no-store \
+                "./packages/${arch}/APKINDEX.tar.gz" "gs://wolfi-production-registry-destination/os/${arch}/"
 
-  # TODO: Enable this when we're ready to go live
-  # postrun:
-  #   name: Build Wolfi OS
-  #   runs-on: ubuntu-latest
-  #   if: failure()
-  #   steps:
-  #     - uses: slackapi/slack-github-action@007b2c3c751a190b6f0f040e47ed024deaa72844 # v1.23.0
-  #       id: slack
-  #       with:
-  #         payload: '{"text": "[build-wolfi-os] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
-  #       env:
-  #         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-  #         SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+            gcloud --quiet storage cp \
+                --cache-control=no-store \
+                "./packages/${arch}/APKINDEX.json" "gs://wolfi-production-registry-destination/os/${arch}/"
+
+            # Only attempt to sign when *.apk's exist
+            apks=$(ls ./packages/${arch}/*.apk 2>/dev/null)
+            if [ -n "$apks" ]; then
+              # apks will be cached in CDN for an hour by default.
+              # Don't upload the object if it already exists.
+              gcloud --quiet storage cp \
+                  --no-clobber \
+                  "./packages/${arch}/*.apk" "gs://wolfi-production-registry-destination/os/${arch}/"
+            fi
+          done
+
+  postrun:
+    name: Build Wolfi OS
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - uses: slackapi/slack-github-action@007b2c3c751a190b6f0f040e47ed024deaa72844 # v1.23.0
+        id: slack
+        with:
+          payload: '{"text": "[build-wolfi-os] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

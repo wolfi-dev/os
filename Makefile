@@ -78,3 +78,18 @@ dev-container:
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
 	    ghcr.io/wolfi-dev/sdk:latest@sha256:a55fdbc2778d43134309dfdacb6dcd7d2ae44bff14f1a20a215308faf11dc200
+
+PACKAGES_CONTAINER_FOLDER ?= /work/packages
+TMP_REPOSITORIES_DIR := $(shell mktemp -d)
+TMP_REPOSITORIES_FILE := $(TMP_REPOSITORIES_DIR)/repositories
+local-wolfi:
+	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOSITORIES_FILE)
+	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOSITORIES_FILE)
+	docker run --rm -it \
+		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
+		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
+		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
+		-w "$(PACKAGES_CONTAINER_FOLDER)" \
+		cgr.dev/chainguard/wolfi-base:latest
+	@rm "$(TMP_REPOSITORIES_FILE)"
+	@rmdir "$(TMP_REPOSITORIES_DIR)"

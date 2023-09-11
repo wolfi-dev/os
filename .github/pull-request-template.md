@@ -40,4 +40,7 @@ addressed, and remove any items that are not relevant to this PR.
 #### For version bump PRs
 <!-- remove if unrelated -->
 - [ ] The `epoch` field is reset to 0
-- [ ] Patch source: _patch source here_
+
+#### For PRs that add patches
+<!-- remove if unrelated -->
+- [ ] Patch source is documented

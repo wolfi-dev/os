@@ -2,7 +2,7 @@
 package:
   name: ingress-nginx-controller
   version: 1.8.0
-  epoch: 5
+  epoch: 6
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -45,6 +45,7 @@ package:
       - libmaxminddb-dev
       - libxml2-dev
       - libxslt-dev
+      - modsecurity
 
 environment:
   contents:
@@ -123,6 +124,7 @@ environment:
       - lua-resty-redis
       - lua-resty-string
       - lua-resty-upload
+      - modsecurity
 
 vars:
   NGINX_VERSION: "1.21.6"
@@ -157,6 +159,7 @@ vars:
   GEOIP2_VERSION_SHA: "4c1933434572226942c65b2f2b26c8a536ab76aa771a3c7f6c2629faa764976b"
   NGINX_AJP_VERSION: "fcbb2ccca4901d317ecd7a9dabb3fec9378ff40f"
   NGINX_AJP_VERSION_SHA: "778fcca851bd69dabfb382dc827d2ee07662f7eca36b5e66e67d5512bad75ef8"
+  NGX_BROTLI_SHA: 63ca02abdcf79c9e788d2eedcc388d2335902e52
 
 pipeline:
   - uses: git-checkout
@@ -282,6 +285,13 @@ pipeline:
       expected-sha256: ${{vars.GEOIP2_VERSION_SHA}}
       strip-components: 0
 
+  - runs: |
+      git clone --depth=1 https://github.com/google/ngx_brotli.git
+      cd ngx_brotli
+      git checkout ${{vars.NGX_BROTLI_SHA}}
+      git submodule init
+      git submodule update
+
   - name: Build NGINX
     runs: |
       export BUILD_PATH="${PWD}"
@@ -304,54 +314,13 @@ pipeline:
       cat /etc/ld.so.conf
 
       mkdir -p ${{targets.destdir}}/etc/nginx/
+      cp -ar /etc/nginx/ ${{targets.destdir}}/etc/nginx/
 
       # Geo ip data from nginx image
       cp -ar images/nginx/rootfs/etc/nginx/. ${{targets.destdir}}/etc/nginx/
 
       # Lua code copied into the target
       cp -ar rootfs/etc/nginx/. ${{targets.destdir}}/etc/nginx/
-
-      # Get Brotli source and deps
-      echo "::::::::::::::::::::::::::::::::::::::"
-      echo ":::: ngx_brotl ::::"
-      echo "::::::::::::::::::::::::::::::::::::::"
-      cd "$BUILD_PATH"
-      git clone --depth=1 https://github.com/google/ngx_brotli.git
-      cd ngx_brotli
-      git submodule init
-      git submodule update
-
-      cd "$BUILD_PATH"
-      git clone -n https://github.com/SpiderLabs/ModSecurity
-      cd ModSecurity/
-      git branch
-      git checkout ${{vars.MODSECURITY_LIB_VERSION}}
-      git submodule init
-      git submodule update
-
-      sh build.sh
-
-      # https://github.com/SpiderLabs/ModSecurity/issues/1909#issuecomment-465926762
-      sed -i '115i LUA_CFLAGS="${LUA_CFLAGS} -DWITH_LUA_JIT_2_1"' build/lua.m4
-      sed -i '117i AC_SUBST(LUA_CFLAGS)' build/lua.m4
-
-      ./configure \
-      --disable-doxygen-doc \
-      --disable-doxygen-html \
-      --disable-examples
-
-      make -j$(nproc)
-      make install
-
-      mkdir -p ${{targets.destdir}}/etc/nginx/modsecurity
-      cp modsecurity.conf-recommended ${{targets.destdir}}/etc/nginx/modsecurity/modsecurity.conf
-      cp unicode.mapping ${{targets.destdir}}/etc/nginx/modsecurity/unicode.mapping
-
-      # Replace serial logging with concurrent
-      sed -i 's|SecAuditLogType Serial|SecAuditLogType Concurrent|g' ${{targets.destdir}}/etc/nginx/modsecurity/modsecurity.conf
-
-      # Concurrent logging implies the log is stored in several files
-      echo "SecAuditLogStorageDir /var/log/audit/" >> ${{targets.destdir}}/etc/nginx/modsecurity/modsecurity.conf
 
       # Download owasp modsecurity crs
       cd ${{targets.destdir}}/etc/nginx/
@@ -556,20 +525,28 @@ pipeline:
       ${BUILD_PATH}/ngx_http_geoip2_module-"${{vars.GEOIP2_VERSION}}"  \
       ${BUILD_PATH}/ngx_brotli
 
-      # Create symlinks to redirect nginx logs to stdout and stderr docker log collector
-      ln -sf /dev/stdout /var/log/nginx/access.log \
-      && ln -sf /dev/stderr /var/log/nginx/error.log
-
 subpackages:
   - name: ingress-nginx-controller-compat
     description: Compatibility package for ingress-nginx-controller
+    dependencies:
+      runtime:
+        - modsecurity-config
     pipeline:
       - runs: |
-          mkdir -p ${{targets.destdir}}/usr/local/bin
-          ln -s /usr/local/nginx/sbin/nginx ${{targets.destdir}}/usr/local/bin/nginx
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          ln -s /usr/local/nginx/sbin/nginx ${{targets.subpkgdir}}/usr/local/bin/nginx
 
-          mkdir -p ${{targets.destdir}}/usr/bin
-          ln -s /usr/local/nginx/sbin/nginx ${{targets.destdir}}/usr/bin/nginx
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          ln -s /usr/local/nginx/sbin/nginx ${{targets.subpkgdir}}/usr/bin/nginx
+
+          mkdir -p ${{targets.subpkgdir}}/etc/nginx/modsecurity
+          ln -s /etc/modsecurity/modsecurity.conf-concurrent ${{targets.subpkgdir}}/etc/nginx/modsecurity/modsecurity.conf
+          ln -s /etc/modsecurity/unicode.mapping ${{targets.subpkgdir}}/etc/nginx/modsecurity/unicode.mapping
+
+          mkdir -p ${{targets.subpkgdir}}/var/log/nginx
+          # Create symlinks to redirect nginx logs to stdout and stderr docker log collector
+          ln -sf /dev/stdout ${{targets.subpkgdir}}/var/log/nginx/access.log
+          ln -sf /dev/stderr ${{targets.subpkgdir}}/var/log/nginx/error.log
 
 update:
   enabled: true

@@ -82,6 +82,10 @@ dev-container:
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
 TMP_REPOSITORIES_FILE := $(TMP_REPOSITORIES_DIR)/repositories
+# This target spins up a docker container that is helpful for testing local
+# changes to the packages. It mounts the local packages folder as a read-only,
+# and sets up the necessary keys for you to run `apk add` commands, and then
+# test the packages however you see fit.
 local-wolfi:
 	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOSITORIES_FILE)
 	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOSITORIES_FILE)
@@ -91,5 +95,53 @@ local-wolfi:
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
 		cgr.dev/chainguard/wolfi-base:latest
+	@rm "$(TMP_REPOSITORIES_FILE)"
+	@rmdir "$(TMP_REPOSITORIES_DIR)"
+
+# This target spins up a docker container that is helpful for building images
+# using local packages.
+# It mounts the:
+#  - local packages dir (default: pwd) as a read-only, as /work/packages. This
+#    is where the local packages are set up to be fetched from.
+#  - local os dir (default: pwd) as a read-only, as /work/os. This is where
+#    apko config files should live in. Note that this can be the current
+#    directory also.
+# Both of these can be overridden with PACKAGES_CONTAINER_FOLDER and OS_DIR
+# respectively.
+# It sets up the necessary tools, keys, and repositories for you to run
+# apko to build images and then test them. Currently, the apko tool requires a
+# few flags to get the image built, but we'll work on getting the viper config
+# set up to make this easier.
+#
+# The resulting image will be in the OUT_DIR, and it is best to specify the
+# OUT_DIR as a directory in the host system, so that it will persist after the
+# container is done, as well as you can test / iterate with the image and run
+# tests in the host.
+#
+# Example invocation for
+# mkdir /tmp/out && OUT_DIR=/tmp/out make dev-container-wolfi
+# Then in the container, you could build an image like this:
+# apko -C /work/out build --keyring-append /etc/apk/keys/wolfi-signing.rsa.pub \
+#  --keyring-append /etc/apk/keys/local-melange.rsa.pub --arch host \
+# /work/os/conda-IMAGE.yaml conda-test:test /work/out/conda-test.tar
+#
+# Then from the host you can run:
+# docker load -i /tmp/out/conda-test.tar
+# docker run -it
+OUT_LOCAL_DIR ?= /work/out
+OUT_DIR ?= $(shell mktemp -d)
+OS_LOCAL_DIR ?= /work/os
+OS_DIR ?= ${PWD}
+dev-container-wolfi:
+	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOSITORIES_FILE)
+	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOSITORIES_FILE)
+	docker run --rm -it \
+		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
+		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
+		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
+		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
+		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
+		-w "$(PACKAGES_CONTAINER_FOLDER)" \
+		ghcr.io/wolfi-dev/sdk:latest@sha256:8a4c6c54d3cbdd3fd0207f629facc9df8b080605a6d30bd6474be5455633994e
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

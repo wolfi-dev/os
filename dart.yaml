@@ -1,0 +1,142 @@
+package:
+  name: dart
+  version: 3.1.1
+  epoch: 0
+  description: "Dart is a client-optimized language for fast apps on any platform"
+  copyright:
+    - license: BSD-3-Clause
+  dependencies:
+    runtime:
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - dart-stage0
+      - gcc
+      - git
+      - gn
+      - llvm-lld-16
+      - llvm16
+      - patch
+      - python-3.11
+      - samurai
+      - teapot-tools
+      - zip
+      - zlib-dev
+      - zstd
+
+pipeline:
+  - runs: |
+      cat <<EOT >> .gclient
+      solutions = [{
+        'name': 'sdk',
+        'url': 'https://dart.googlesource.com/sdk.git@${{package.version}}',
+      }]
+      target_cpu = ['x64', 'arm64']
+      target_cpu_only = True
+      EOT
+
+      gclient sync --no-history --nohooks --tpot-cipd-ignore-platformed
+
+  # apply patches (src is in sdk folder hence we cannot use patch action from melange)
+  - runs: |
+      cp -R *.patch sdk/
+      cd sdk
+      patch '-p1' < no-werror.patch
+      patch '-p1' < gcc-13.patch
+      patch '-p1' < build-config.patch
+
+  - working-directory: sdk
+    runs: |
+      rm -rf tools/sdks/dart-sdk
+      ln -s /usr/lib/dart tools/sdks/dart-sdk
+
+      mkdir -p buildtools/ninja
+      ln -s /usr/bin/gn buildtools/gn
+      ln -s /usr/bin/samu buildtools/ninja/ninja
+
+      python3 tools/generate_package_config.py
+      python3 tools/generate_sdk_version_file.py
+
+      echo '' > tools/bots/dartdoc_footer.html
+      rm third_party/devtools/web/devtools_analytics.js
+
+  - if: ${{build.arch}} == "aarch64"
+    runs: |
+      for i in gcc g++ strip ar; do
+        ln -sf /usr/bin/$i /usr/bin/aarch64-linux-gnu-$i
+      done
+
+  - working-directory: sdk
+    runs: |
+      # default LDFLAGS cause an issue with dart. We need to remove '-z, noexecheap' from LDFLAGS
+      LDFLAGS="$(echo $LDFLAGS | sed 's/,-z,noexecheap//g')"
+
+      export gn_args="
+        create_kernel_service_snapshot=true
+        dart_snapshot_kind=\"app-jit\"
+        dart_sysroot=\"\"
+        dart_use_tcmalloc=false
+      "
+      case ${{build.arch}} in
+        aarch64)
+          _arch=arm64
+          _out="$(pwd)/out/ReleaseARM64"
+          ;;
+        x86_64)
+          _arch=x64
+          _out="$(pwd)/out/ReleaseX64"
+          ;;
+        *)
+          echo "unsupported arch"
+          exit -1
+          ;;
+      esac
+
+      python3 ./tools/build.py \
+        --no-clang \
+        --arch="$_arch" \
+        --mode=release \
+        --no-goma \
+        --no-verify-sdk-hash \
+        --gn-args="$(echo $gn_args)" \
+        create_sdk runtime
+
+      mkdir -p ${{targets.destdir}}/usr/bin
+      mkdir -p ${{targets.destdir}}/usr/include
+
+      ln -s ../lib/dart/include ${{targets.destdir}}/usr/include/dart
+      ln -s ../lib/dart/bin/dart ${{targets.destdir}}/usr/bin/dart
+      ln -s ../lib/dart/bin/dartaotruntime ${{targets.destdir}}/usr/bin/dartaotruntime
+
+  - uses: strip
+
+subpackages:
+  - name: "dart-sdk"
+    description: "dart SDK"
+    pipeline:
+      - working-directory: sdk
+        runs: |
+          case ${{build.arch}} in
+            aarch64)
+              _out="$(pwd)/out/ReleaseARM64"
+              ;;
+            x86_64)
+              _out="$(pwd)/out/ReleaseX64"
+              ;;
+            *)
+              echo "unsupported arch"
+              exit -1
+              ;;
+          esac
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          cp -r "$_out"/dart-sdk ${{targets.subpkgdir}}/usr/lib/dart
+
+# turn off for now, since wolfictl doesnt seem to support tag filter regex yet (we only want major release, not -dev suffix tag)
+update:
+  enabled: false

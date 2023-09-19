@@ -75,9 +75,10 @@ packages/$(ARCH)/%.apk: $(KEY)
 dev-container:
 	docker run --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
+			-v "${HOME}/.cache/wolfictl/dev-container-wolfi/root:/root" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:8a4c6c54d3cbdd3fd0207f629facc9df8b080605a6d30bd6474be5455633994e
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:f0df69f51e1a2de2f3fef0d3aca3fa951a408f8d42983598bfac784db934d430
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -142,6 +143,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:8a4c6c54d3cbdd3fd0207f629facc9df8b080605a6d30bd6474be5455633994e
+		ghcr.io/wolfi-dev/sdk:latest@sha256:f0df69f51e1a2de2f3fef0d3aca3fa951a408f8d42983598bfac784db934d430
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

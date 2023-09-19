@@ -32,6 +32,13 @@ addressed, and remove any items that are not relevant to this PR.
   - [ ] Alternatively, the PR is marked as related to a pre-existing package request bug, such as a dependency
 - [ ] REQUIRED - The package is available under an OSI-approved or FSF-approved license
 - [ ] REQUIRED - The version of the package is still receiving security updates
+- [ ] This PR links to the upstream project's support policy (e.g. `endoflife.date`)
+
+#### For new version streams
+<!-- remove if unrelated -->
+- [ ] The upstream project actually supports multiple concurrent versions.
+- [ ] Any subpackages include the version string in their package name (e.g. `name: ${{package.name}}-compat`)
+- [ ] The package (and subpackages) `provides:` logical unversioned forms of the package (e.g. `nodejs`, `nodejs-lts`)
 
 #### For security-related PRs
 <!-- remove if unrelated -->

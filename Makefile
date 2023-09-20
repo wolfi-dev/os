@@ -11,6 +11,9 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
+# Assign a default XDG_CACHE_HOME value for darwin.
+XDG_CACHE_HOME ?= ${HOME}/.cache
+
 WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 WOLFI_PROD ?= https://packages.wolfi.dev/os
 
@@ -75,7 +78,7 @@ packages/$(ARCH)/%.apk: $(KEY)
 dev-container:
 	docker run --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
-			-v "${HOME}/.cache/wolfictl/dev-container-wolfi/root:/root" \
+	    -v "${XDG_CACHE_HOME}/wolfictl/dev-container-wolfi/root:/root" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
 	    ghcr.io/wolfi-dev/sdk:latest@sha256:f0df69f51e1a2de2f3fef0d3aca3fa951a408f8d42983598bfac784db934d430

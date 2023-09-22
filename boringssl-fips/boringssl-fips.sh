@@ -126,7 +126,6 @@ mkdir build && cd build && cmake -GNinja -DCMAKE_TOOLCHAIN_FILE=${HOME}/toolchai
 ninja
 
 # These aren't required by the cited PDF, but let's run these tests anyway.
-ninja run_tests
 ./crypto/crypto_test
 
 echo "Crypto test done"

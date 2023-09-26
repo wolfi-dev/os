@@ -11,9 +11,6 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
-WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
-WOLFI_PROD ?= https://packages.wolfi.dev/os
-
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
@@ -28,16 +25,29 @@ ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
 
-ifeq (${BUILDWORLD}, no)
-MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
-MELANGE_OPTS += -r ${WOLFI_PROD}
-endif
-
 # The list of packages to be built. The order matters.
 # wolfictl determines the list and order
 # set only to be called when needed, so make can be instant to run
 # when it is not
 PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
+
+BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
+BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
+WOLFI_REPO ?= https://packages.wolfi.dev/os
+WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+BOOTSTRAP ?= no
+
+ifeq (${BOOTSTRAP}, yes)
+	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
+	MELANGE_OPTS += -r ${BOOTSTRAP_REPO}
+	PKGLISTCMD += -k ${BOOTSTRAP_KEY}
+	PKGLISTCMD += -r ${BOOTSTRAP_REPO}
+else
+	MELANGE_OPTS += -k ${WOLFI_KEY}
+	MELANGE_OPTS += -r ${WOLFI_REPO}
+	PKGLISTCMD += -k ${WOLFI_KEY}
+	PKGLISTCMD += -r ${WOLFI_REPO}
+endif
 
 all: ${KEY} .build-packages
 ifeq ($(MAKECMDGOALS),all)

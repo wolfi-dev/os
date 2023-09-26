@@ -46,14 +46,12 @@ comparing the package directories.
 # Reproducing individual Wolfi packages
 
 If you just want to test an individual Wolfi package for reproducibility,
-the same caveats above still apply.  But you can ask the build system to
-build just a single package, without building dependencies, by using the
-`BUILDWORLD=no` knob.  For example, with `execline`:
+the same caveats above still apply. For example, with `execline`:
 
-    # doas make packages/execline BUILDWORLD=no
+    # doas make package/execline
     ...
     # doas mv packages packages-1
-    # doas make packages/execline BUILDWORLD=no
+    # doas make package/execline
     ...
     # doas mv packages packages-2
     # sha256sum packages-1/$(uname -m)/*.apk | sed -e s:packages-1:packages-2:g | sha256sum -c

@@ -33,10 +33,10 @@ Once you're done writing the new package configuration file, you can test it by 
 To build an individual package, you can use a `make` command like this:
 
 ```text
-make package/<your-new-package-name> BUILDWORLD=no USE_CACHE=no
+make package/<your-new-package-name> USE_CACHE=no
 ```
 
-For example, if your package name is "foo", run `make package/foo BUILDWORLD=no USE_CACHE=no`.
+For example, if your package name is "foo", run `make package/foo USE_CACHE=no`.
 
 This will build the package by invoking [melange](https://github.com/chainguard-dev/melange) in a particular way. This invocation is defined in the [Makefile](Makefile), if you're interested to see how this is wired up. Also, you can run Melange _directly_ without using `make` if you understand what you're doing.
 

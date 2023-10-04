@@ -1,4 +1,4 @@
-USE_CACHE ?= yes
+USE_CACHE ?= no
 ARCH ?= $(shell uname -m)
 ifeq (${ARCH}, arm64)
 	ARCH = aarch64

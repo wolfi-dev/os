@@ -80,12 +80,14 @@ jobs:
             MELANGE_EXTRA_OPTS="--keyring-append=/gcsfuse/wolfi-registry/wolfi-signing.rsa.pub" \
             all -j1
 
-      - run: |
+      - if: always()
+        run: |
           # Clean up the symlinks and create an archive for uploading
           find ./packages/${{ matrix.arch }} -type l -exec rm -f {} \;
           tar -cvzf /tmp/packages-${{ matrix.arch }}.tar.gz ./packages/${{ matrix.arch }}
 
-      - name: 'Upload built packages archive to Github Artifacts'
+      - if: always()
+        name: 'Upload built packages archive to Github Artifacts'
         uses: actions/upload-artifact@v3
         with:
           name: packages-${{ matrix.arch }}
@@ -186,6 +188,68 @@ jobs:
           gcloud --quiet storage cp \
               --cache-control=no-store \
               "./packages/${arch}/APKINDEX.json" "gs://wolfi-production-registry-destination/os/${arch}/"
+
+  build-failure:
+    runs-on: ubuntu-latest
+    needs: build
+    if: failure()
+
+    permissions:
+      id-token: write
+      contents: read
+
+    container:
+      # NOTE: This step only signs and uploads, so it doesn't need any privileges
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:d00394feb1574663700eb9dc62da2d4dbe7a904430875c710d1fe051957bf932
+
+    steps:
+      - name: 'Trust the github workspace'
+        run: |
+          # This is to avoid fatal errors about "dubious ownership" because we are
+          # running inside of a container action with the workspace mounted in.
+          git config --global --add safe.directory "$(pwd)"
+
+      - id: auth
+        name: 'Authenticate to Google Cloud'
+        uses: google-github-actions/auth@v0
+        with:
+          workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
+          service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
+
+      - uses: google-github-actions/setup-gcloud@v0
+        with:
+          project_id: prod-images-c6e5
+
+      - name: 'Download x86_64 package archives'
+        uses: actions/download-artifact@v3
+        with:
+          path: /tmp/artifacts/
+          name: packages-x86_64
+
+      - name: 'Download aarch64 package archives'
+        uses: actions/download-artifact@v3
+        with:
+          path: /tmp/artifacts/
+          name: packages-aarch64
+
+      - name: 'Upload APKs to the bucket'
+        run: |
+          for arch in "x86_64" "aarch64"; do
+          mkdir -p ./packages/${arch}
+
+          # Consolidate with the built artifacts
+          tar xvf /tmp/artifacts/packages-${arch}.tar.gz
+
+            # Upload any APKs we were able to build.
+            apks=$(ls ./packages/${arch}/*.apk 2>/dev/null)
+            if [ -n "$apks" ]; then
+              # apks will be cached in CDN for an hour by default.
+              # Don't upload the object if it already exists.
+              gcloud --quiet storage cp \
+                  --no-clobber \
+                  "./packages/${arch}/*.apk" "gs://wolfi-production-registry-destination/os/${arch}/"
+            fi
+          done
 
   postrun:
     name: Build Wolfi OS

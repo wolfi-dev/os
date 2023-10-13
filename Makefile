@@ -25,6 +25,10 @@ ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
 
+ifeq (${LINT}, yes)
+	MELANGE_OPTS += --fail-on-lint-warning
+endif
+
 # The list of packages to be built. The order matters.
 # wolfictl determines the list and order
 # set only to be called when needed, so make can be instant to run

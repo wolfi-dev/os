@@ -1,0 +1,148 @@
+#!/sbin/openrc-run
+
+extra_commands="checkconfig"
+extra_started_commands="reload stats"
+
+description_reload="Reload OpenVPN using SIGUSR1"
+description_stats="Dump OpenVPN statistics to syslog"
+
+instance_name=${RC_SVCNAME#*.}
+[ "$instance_name" != "openvpn" ] \
+	&& name="OpenVPN ($instance_name)" \
+	|| name="OpenVPN"
+
+# Upper case variables are for backward compatibility with Alpine < v3.8.
+: ${cfgdir:=${VPNDIR:-"/etc/openvpn"}}
+: ${cfgfile:="$cfgdir/$instance_name.conf"}
+: ${detect_client:="${DETECT_CLIENT:-yes}"}
+: ${up_script:="$cfgdir/up.sh"}
+: ${down_script:="$cfgdir/down.sh"}
+: ${peer_dns:=${PEER_DNS:-"yes"}}
+
+pidfile="/run/$RC_SVCNAME.pid"
+command="/usr/sbin/openvpn"
+command_args="
+	--daemon $instance_name
+	--cd $cfgdir
+	--config $cfgfile
+	--writepid $pidfile
+	--setenv RC_SVCNAME $RC_SVCNAME
+	--setenv PEER_DNS $peer_dns
+	$command_args"
+
+required_dirs="$cfgdir"
+required_files="$cfgfile"
+
+
+depend() {
+	need localmount net
+	use dns
+	after bootmisc
+}
+
+checkconfig() {
+	# Note: This is not just a check; we need to detect the mode both for
+	# "start" and "checkconfig" commands, that's why it's here.
+	if [ -z "$client_mode" ] && yesno "$detect_client"; then
+		cfgfile_has_option 'remote' \
+			&& client_mode=yes \
+			|| client_mode=no
+	fi
+
+	if [ ! -e /dev/net/tun ]; then
+		if ! modprobe tun; then
+			eerror "TUN/TAP support is not available in this kernel"
+			return 1
+		fi
+	fi
+	if [ -h /dev/net/tun ] && [ -c /dev/misc/net/tun ]; then
+		ebegin "Detected broken /dev/net/tun symlink, fixing"
+		rm -f /dev/net/tun
+		ln -s /dev/misc/net/tun /dev/net/tun
+		eend $?
+	fi
+
+	if yesno "$client_mode"; then
+		local f; for f in "$up_script" "$down_script"; do
+			[ -r "$f" ] || { eerror "'$f' is not readable"; return 1; }
+		done
+
+		# Warn about setting scripts as we override them
+		if cfgfile_has_option "(up|down)"; then
+			ewarn "WARNING: You have defined your own up/down scripts"
+			ewarn "As you're running as a client, we now force Alpine specific"
+			ewarn "scripts to be run for up and down events."
+			ewarn "These scripts will call /etc/openvpn/$RC_SVCNAME-{up,down}.sh"
+			ewarn "where you can put your own code."
+		fi
+		# Warn about the inability to change ip/route/dns information when
+		# dropping privs
+		if cfgfile_has_option "user"; then
+			ewarn "WARNING: You are dropping root privileges!"
+			ewarn "As such openvpn may not be able to change ip, routing"
+			ewarn "or DNS configuration."
+		fi
+	fi
+}
+
+start_pre() {
+	checkconfig || return 1
+
+	if yesno "$client_mode"; then
+		command_args="$command_args
+			--up-delay
+			--up-restart
+			--down-pre
+			--script-security 2
+			--up $up_script
+			--down $down_script"
+		start_inactive="yes"
+	else
+		# Run as openvpn unless otherwise specified.
+		cfgfile_has_option "user" || command_args="$command_args --user openvpn"
+		cfgfile_has_option "group" || command_args="$command_args --group openvpn"
+	fi
+
+	# If the config file does not specify the cd option, we do.
+	# But if we specify it, we override the config option which we do not want.
+	if cfgfile_has_option "cd"; then
+		command_args="$command_args --cd $cfgdir"
+	fi
+}
+
+start() {
+	# If we are re-called by the up.sh script, then we don't actually want
+	# to start OpenVPN. We do this so we can "start" ourselves from
+	# inactive (from the up.sh script) which then triggers other
+	# services to start which depend on us.
+	yesno "$IN_BACKGROUND" && return 0
+
+	default_start
+}
+
+stop() {
+	# If we are re-called by the down.sh script, then we don't actually
+	# want to stop OpenVPN.
+	if yesno "$IN_BACKGROUND"; then
+		mark_service_inactive "$RC_SVCNAME"
+		return 0
+	fi
+
+	default_stop
+}
+
+reload() {
+	ebegin "Reloading $name"
+	start-stop-daemon --signal USR1 --pidfile "$pidfile"
+	eend $?
+}
+
+stats() {
+	ebegin "Dumping $name statistics to syslog"
+	start-stop-daemon --signal USR2 --pidfile "$pidfile"
+	eend $?
+}
+
+cfgfile_has_option() {
+	grep -Eq "^\s*$1\s" "$cfgfile"
+}

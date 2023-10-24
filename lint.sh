@@ -15,6 +15,15 @@ for f in *.yaml; do
     yq -i 'del(.environment.contents.keyring)' $f
   fi
 
+  if grep -q "targets.destdir" $f; then
+    echo "Don't use targets.destdir; use targets.contextdir instead"
+    exit 1
+  fi
+  if grep -q "targets.subpkgdir" $f; then
+    echo "Don't use targets.subpkgdir; use targets.contextdir instead"
+    exit 1
+  fi
+
   # With the introduction of https://github.com/wolfi-dev/advisories,
   # package config files should no longer contain any advisory data.
   if [[ "$(yq 'keys | contains(["advisories"])' "$f")" == "true" ]]; then

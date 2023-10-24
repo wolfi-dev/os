@@ -11,7 +11,7 @@ likely to need to withdraw packages.
 To do so:
 
 1. Add the package names that need to be withdrawn to `withdrawn-packages.txt`.
-2. Run the ]"Withdraw packages"](https://github.com/wolfi-dev/os/actions/workflows/withdraw-packages.yaml) workflow on GitHub.
+2. Run the ["Withdraw packages"](https://github.com/wolfi-dev/os/actions/workflows/withdraw-packages.yaml) workflow on GitHub.
 
 ## Technical details
 

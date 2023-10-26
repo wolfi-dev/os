@@ -52,3 +52,45 @@ Wolfi also aims to keep its package set as up-to-date with security patches as p
 package/version contributed to Wolfi has an actively maintained upstream. 
 
 To request inclusion of a package into Wolfi please use our [New Package Request Template](https://wolfi.dev/os/issues/new/choose).
+
+
+
+ - # Contribution guidelines 
+
+Welcome to [os]! We're thrilled that you'd like to contribute. Your help is essential for making it better.
+
+## Getting Started
+
+Before you start contributing, please make sure you have read and understood our [Code of Conduct].
+
+### Fork the Repository
+
+First, fork the [repository](https://github.com/wolfi-dev/os) to your own GitHub account. This will create a copy of the project under your account.
+
+
+### Clone the Repository
+```
+git clone https://github.com/wolfi-dev/os
+```
+### Navigate to the project directory 📁
+```
+cd os
+```
+Create a new branch for your feature or bug fix:
+```
+ git checkout -b feature-branch
+ ```
+
+Make your changes and commit them:
+```
+git add .
+git commit -m "Description of your changes"
+```
+Push your changes to your fork:
+```
+git push origin feature-branch
+```
+Finally Click on Create Pull request to contribute on this repository.
+
+
+

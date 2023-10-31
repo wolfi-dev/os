@@ -25,6 +25,10 @@ ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
 
+ifeq (${LINT}, yes)
+	MELANGE_OPTS += --fail-on-lint-warning
+endif
+
 # The list of packages to be built. The order matters.
 # wolfictl determines the list and order
 # set only to be called when needed, so make can be instant to run
@@ -87,7 +91,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:d00394feb1574663700eb9dc62da2d4dbe7a904430875c710d1fe051957bf932
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:8a15d99eef77dfa5087aaca1c1faf66446c85cfb392e73042a48782daf40cbe6
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -152,6 +156,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:d00394feb1574663700eb9dc62da2d4dbe7a904430875c710d1fe051957bf932
+		ghcr.io/wolfi-dev/sdk:latest@sha256:8a15d99eef77dfa5087aaca1c1faf66446c85cfb392e73042a48782daf40cbe6
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

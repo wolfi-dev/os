@@ -108,7 +108,7 @@ local-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		cgr.dev/chainguard/wolfi-base:latest
+	    	ghcr.io/wolfi-dev/sdk:latest@sha256:a7966875dc19b44de59ce2e2b3b4cea2038204b6adccb88365d45553a97f1503
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"
 

@@ -77,8 +77,9 @@ list-yaml:
 	@printf ''
 
 package/%:
-	$(eval yamlfile := $*.yaml)
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: $(KEY)

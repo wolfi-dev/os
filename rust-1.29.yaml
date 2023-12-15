@@ -1,0 +1,273 @@
+#nolint:valid-pipeline-git-checkout-commit,valid-pipeline-git-checkout-tag
+package:
+  name: rust-1.29
+  version: 1.29.0
+  epoch: 0
+  description: "Empowering everyone to build reliable and efficient software. (version 1.29.0)"
+  copyright:
+    - license: Apache-2.0 AND MIT
+  dependencies:
+    provides:
+      - rust=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cmake
+      - coreutils
+      - curl-dev
+      - file
+      - git
+      - libgit2-dev
+      - patch
+      - perl
+      - python3
+      - wasi-libc
+      - xz-dev
+      - zlib-dev
+
+pipeline:
+  - name: Build vendored OpenSSL 1.1
+    working-directory: /home/build/vendored-deps/openssl
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://www.openssl.org/source/openssl-${{vars.openssl-version}}.tar.gz
+          expected-sha256: cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8
+      - name: Configure and build
+        runs: |
+          export CC=${{host.triplet.gnu}}-gcc
+          export CXX=${{host.triplet.gnu}}-g++
+          export CPP=${{host.triplet.gnu}}-cpp
+
+          perl ./Configure \
+            linux-${{build.arch}} \
+            --prefix=${{vars.sysroot}} \
+            --libdir=lib \
+            --openssldir=/etc/ssl1.1 \
+            no-shared \
+            no-zlib \
+            no-async \
+            no-comp \
+            no-idea \
+            no-mdc2 \
+            no-rc5 \
+            no-ec2m \
+            no-sm2 \
+            no-sm4 \
+            no-ssl3 \
+            no-seed \
+            no-weak-ssl-ciphers \
+            -fPIC -Wa,--noexecstack
+
+          make -j$(nproc)
+          make install_sw install_ssldirs
+
+  - name: Build vendored libssh2 1.11
+    working-directory: /home/build/vendored-deps/libssh2
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://www.libssh2.org/download/libssh2-${{vars.libssh2-version}}.tar.gz
+          expected-sha256: 3736161e41e2693324deb38c26cfdc3efe6209d634ba4258db1cecff6a5ad461
+      - runs: |
+          ./configure \
+            --prefix=${{vars.sysroot}} \
+            --with-libssl-prefix=/home/build/sysroot \
+            --with-crypto=openssl
+          make -j$(nproc)
+          make install
+
+  # The releases are too out of date to be usable in bootstrap, so use a known good commit
+  # git-checkout uses a shallow clone, so do it ourselves.
+  - runs: git clone https://github.com/thepowersgang/mrustc ${{vars.mrustc-build}}
+
+  - working-directory: ${{vars.mrustc-build}}
+    runs: git checkout ${{vars.commit}}
+
+  - name: Prepare rustc sources
+    working-directory: ${{vars.mrustc-build}}/rustc-${{package.version}}-src
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://static.rust-lang.org/dist/rustc-${{package.version}}-src.tar.gz
+          expected-sha256: a4eb34ffd47f76afe2abd813f398512d5a19ef00989d37306217c9c9ec2f61e9
+      # The patch is bundled with mrustc.
+      - uses: patch
+        with:
+          patches: ${{vars.mrustc-build}}/rustc-${{package.version}}-src.patch
+          strip-components: 0
+
+  - name: Build libs
+    working-directory: ${{vars.mrustc-build}}
+    runs: |
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=${{vars.short-package-version}} OUTDIR_SUF=-${{package.version}}
+
+      touch -r minicargo.mk rustc-${{package.version}}-src.patch
+      touch -r minicargo.mk rustc-${{package.version}}-src.tar.gz
+      touch rustc-${{package.version}}-src/dl-version
+      make -f minicargo.mk LIBS
+
+  - name: Build rustc
+    working-directory: ${{vars.mrustc-build}}
+    runs: |
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=${{vars.short-package-version}} OUTDIR_SUF=-${{package.version}}
+      make -f minicargo.mk output-${{package.version}}/rustc
+
+  - name: Build cargo
+    working-directory: ${{vars.mrustc-build}}
+    runs: |
+      export PKG_CONFIG_LIBDIR="${{vars.PKG_CONFIG_LIBDIR}}"
+      export CFLAGS="${{vars.CFLAGS}}"
+      export CPPFLAGS="${{vars.CPPFLAGS}}"
+      export CXXFLAGS="${{vars.CXXFLAGS}}"
+
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=${{vars.short-package-version}} OUTDIR_SUF=-${{package.version}}
+      make -f minicargo.mk output-${{package.version}}/cargo
+
+  - name: Build bootstrap rustc with mrustc
+    working-directory: ${{vars.mrustc-build}}
+    runs: |
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=${{vars.short-package-version}} OUTDIR_SUF=-${{package.version}} MRUSTC=${{vars.mrustc-bin}} MINICARGO=${{vars.minicargo-bin}}
+      RUSTC_INSTALL_BINDIR=bin make -f minicargo.mk output-${{package.version}}/rustc
+
+  - name: Build bootstrap cargo with mrustc
+    working-directory: ${{vars.mrustc-build}}
+    runs: |
+      # Inject the sysroot containing the vendored OpenSSL
+      export PKG_CONFIG_LIBDIR="${{vars.PKG_CONFIG_LIBDIR}}"
+      export CFLAGS="${{vars.CFLAGS}}"
+      export CPPFLAGS="${{vars.CPPFLAGS}}"
+      export CXXFLAGS="${{vars.CXXFLAGS}}"
+
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=${{vars.short-package-version}} OUTDIR_SUF=-${{package.version}} MRUSTC=${{vars.mrustc-bin}} MINICARGO=${{vars.minicargo-bin}}
+      RUSTC_INSTALL_BINDIR=bin make -f minicargo.mk output-${{package.version}}/cargo
+
+  - name: Build rustc/cargo with bootstrap rustc
+    working-directory: ${{vars.mrustc-build}}
+    runs: |
+      # Inject the sysroot containing the vendored OpenSSL
+      export PKG_CONFIG_LIBDIR="${{vars.PKG_CONFIG_LIBDIR}}"
+      export CFLAGS="${{vars.CFLAGS}}"
+      export CPPFLAGS="${{vars.CPPFLAGS}}"
+      export CXXFLAGS="${{vars.CXXFLAGS}}"
+
+      export PARLEVEL=$(nproc) RUSTC_TARGET=${{host.triplet.rust}} RUSTC_VERSION=${{package.version}} MRUSTC_TARGET_VER=${{vars.short-package-version}} OUTDIR_SUF=-${{package.version}} MRUSTC=${{vars.mrustc-bin}} MINICARGO=${{vars.minicargo-bin}}
+      make -C run_rustc
+
+  # Because the toolchain built by mrustc only runs within mrustc itself, and not outside mrustc, we
+  # use the mrustc it has built to build system Rust.
+  - name: Unpack rustc sources (pristine)
+    working-directory: ${{vars.rustc-build}}
+    runs: |
+      tar -xzf ${{vars.mrustc-build}}/rustc-${{package.version}}-src/rustc-${{package.version}}-src.tar.gz
+      patch -p0 < /home/build/llvm-add-limits.patch
+
+  - name: Configure rustc with mrustc-built rustc
+    working-directory: ${{vars.rustc-build}}
+    runs: |
+      export PKG_CONFIG_LIBDIR="${{vars.PKG_CONFIG_LIBDIR}}"
+      export CFLAGS="${{vars.CFLAGS}}"
+      export CPPFLAGS="${{vars.CPPFLAGS}}"
+      export CXXFLAGS="${{vars.CXXFLAGS}}"
+
+      export OPENSSL_NO_VENDOR=1
+      export RUST_BACKTRACE=1
+      export ARCH=${{host.triplet.rust}}
+
+      cd rustc-${{package.version}}-src
+
+      ./configure \
+        --host="${ARCH}" \
+        --target="${ARCH}" \
+        --prefix="/usr" \
+        --local-rust-root="${{vars.mrustc-build}}/run_rustc/output-${{package.version}}/prefix" \
+        --release-channel="stable" \
+        --enable-local-rust \
+        --disable-docs \
+        --enable-extended \
+        --tools="cargo,src" \
+        --enable-option-checking \
+        --enable-locked-deps \
+        --enable-profiler \
+        --enable-vendor \
+        --python="python3" \
+        --set="rust.codegen-units=1" \
+        --set="target.${ARCH}.crt-static=false"
+
+      # Fix up config
+      sed -ri'' "s/(codegen-units =) '1'/\1 1/" config.toml
+
+  - name: Build rustc with mrustc-built rustc
+    working-directory: ${{vars.rustc-build}}
+    runs: |
+      cd rustc-${{package.version}}-src
+      sed 's/#deny-warnings = .*/deny-warnings = false/' -i config.toml
+      sed 's|deny(warnings,|deny(|' -i src/bootstrap/lib.rs
+      mkdir -p "${{targets.destdir}}/usr"
+      unset CARGO_PROFILE_RELEASE_LTO
+      unset CARGO_PROFILE_RELEASE_OPT_LEVEL
+      unset CARGO_PROFILE_RELEASE_PANIC
+      unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+
+      export PKG_CONFIG_LIBDIR="${{vars.PKG_CONFIG_LIBDIR}}"
+      export LIBSSH2_SYS_USE_PKG_CONFIG=1
+      export CFLAGS="${{vars.CFLAGS}}"
+      export CPPFLAGS="${{vars.CPPFLAGS}}"
+      export CXXFLAGS="${{vars.CXXFLAGS}}"
+
+      export OPENSSL_NO_VENDOR=1
+      export RUST_BACKTRACE=1
+      DESTDIR=${{targets.destdir}} python3 ./x.py install --jobs $(nproc)
+
+  - uses: strip
+
+  # delete uneeded files such as uninstallation scripts
+  - runs: |
+      # Remove vendored LLVM stored in /home/build, not needed as rustc is statically linked
+      rm -r ${{targets.destdir}}/home
+
+      rm ${{targets.destdir}}/usr/lib/rustlib/components
+      rm ${{targets.destdir}}/usr/lib/rustlib/install.log
+      rm ${{targets.destdir}}/usr/lib/rustlib/rust-installer-version
+      rm ${{targets.destdir}}/usr/lib/rustlib/uninstall.sh
+      rm ${{targets.destdir}}/usr/lib/rustlib/manifest-*
+
+  # rustbuild always installs copies of the shared libraries to /usr/lib,
+  # overwrite them with symlinks to the per-architecture versions
+  - if: ${{build.arch}} == 'x86_64'
+    runs: |
+      cd ${{targets.destdir}}
+      mkdir -p ${{targets.destdir}}/usr/lib32
+      ln -srft usr/lib32 usr/lib/rustlib/i686-unknown-linux-gnu/lib/*.so
+
+  - runs: |
+      cd ${{targets.destdir}}
+      ln -srft usr/lib usr/lib/rustlib/${{build.arch}}-unknown-linux-gnu/lib/*.so
+
+vars:
+  openssl-version: 1.1.1w
+  libssh2-version: 1.11.0
+  mrustc-bin: /home/build/mrustc-build/bin/mrustc
+  minicargo-bin: /home/build/mrustc-build/bin/minicargo
+  mrustc-build: /home/build/mrustc-build
+  rustc-build: /home/build/rustc-build
+  sysroot: /home/build/sysroot
+  commit: 8a5ffd03dc5c7cc1de4c1f89cc5fb2be46b81cec
+  PKG_CONFIG_LIBDIR: "/home/build/sysroot/lib/pkgconfig:/home/build/sysroot/share/pkgconfig:/usr/lib/pkgconfig"
+  CFLAGS: "$CFLAGS -I/home/build/sysroot/include"
+  CPPFLAGS: "$CPPFLAGS -I/home/build/sysroot/include"
+  CXXFLAGS: "$CXXFLAGS -I/home/build/sysroot/include"
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: short-package-version
+
+update:
+  enabled: false

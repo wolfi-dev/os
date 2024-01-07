@@ -1,0 +1,160 @@
+package:
+  name: docker
+  version: 24.0.7
+  epoch: 1
+  description: A meta package for Docker Engine and Docker CLI
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - docker-cli
+      - dockerd
+  checks:
+    disabled:
+      # docker is a meta package pulling in several subpackages at runtime
+      - empty
+
+environment:
+  contents:
+    packages:
+      - bash
+      - btrfs-progs-dev
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - containerd
+      - coreutils
+      - go
+      - libseccomp-dev
+      - libtool
+      - linux-headers
+      - lvm2-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/moby/moby
+      tag: v${{package.version}}
+      expected-commit: 311b9ff0aa93aa55880e1e5f8871c4fb69583426
+
+  - runs: |
+      # moby/moby uses a non-standard `vendor.mod` and helper scripts instead
+      # of the standard `go.mod`. the only way to modify dependencies is to
+      # manually change them in the provided `vendor.mod`. To ensure we don't
+      # pin to older dependencies when this package auto updates, we use sed with
+      # the specific replacement version.
+
+      # GHSA-6xv5-86q9-7xr8
+      sed -i 's|github.com/cyphar/filepath-securejoin v0.2.3|github.com/cyphar/filepath-securejoin v0.2.4|' vendor.mod
+
+      # GHSA-m425-mq94-257g
+      sed -i 's|google.golang.org/grpc v1.50.1|google.golang.org/grpc v1.58.3|' vendor.mod
+
+      # CVE-2023-47108 GHSA-8pgv-569h-w5rw CVE-2023-45142 GHSA-rcjv-mgp8-qvmr
+      sed -i 's|go.opentelemetry.io/otel v1.14.0|go.opentelemetry.io/otel v1.21.0|' vendor.mod
+      sed -i 's|go.opentelemetry.io/otel/sdk v1.14.0|go.opentelemetry.io/otel/sdk v1.21.0|' vendor.mod
+      sed -i 's|go.opentelemetry.io/otel/trace v1.14.0|go.opentelemetry.io/otel/trace v1.21.0|' vendor.mod
+      sed -i 's|go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.14.0|go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.21.0|' vendor.mod
+      sed -i 's|go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.29.0|go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.44.0|' vendor.mod
+      sed -i 's|go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace v0.29.0|go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace v0.44.0|' vendor.mod
+      sed -i 's|go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.29.0|go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.44.0|' vendor.mod
+
+      ./hack/vendor.sh
+
+      # Replicate the environment setup performed by docker
+      export DOCKER_BUILDTAGS="seccomp"
+
+      ./hack/make.sh dynbinary
+
+  # Independently managed from moby/moby, but contains many utility scripts needed for the official docker images.
+  # TODO: Figure out a way to autobump this as required
+  # https://github.com/docker-library/docker/tree/master
+  - working-directory: /home/docker-library
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://github.com/docker-library/docker/archive/5c2833e7ce9e5af0921154416d59ee13c6185cbf.zip
+          expected-sha256: c3c19de4c83fcd3543463c0e94f67cc8590e2aeb7c85f37335a31f702c0db012
+          extract: false
+      - runs: |
+          unzip -q 5c2833e7ce9e5af0921154416d59ee13c6185cbf.zip
+          mv */** .
+
+  # Docker is vehemenetly against stripping the resulting binary
+  # Ref: https://github.com/moby/moby/blob/d8a51d2887cbc465ab8d76ed98f7a86996ab3c22/project/PACKAGERS.md#stripping-binaries
+  # - uses: strip
+  - runs: |
+      # this exists to appease yam
+
+subpackages:
+  - name: dockerd
+    description: "Docker Engine (dockerd)"
+    dependencies:
+      runtime:
+        # https://github.com/docker/docker/blob/master/project/PACKAGERS.md#runtime-dependencies
+        - btrfs-progs
+        - e2fsprogs
+        - e2fsprogs-extra
+        - ip6tables
+        - iptables
+        - openssl
+        - xfsprogs
+        - xz
+        - pigz
+        - zfs
+        - containerd
+        - ctr
+        - tini-static
+    pipeline:
+      - runs: |
+          install -Dm755 bundles/dynbinary-daemon/docker-proxy ${{targets.destdir}}/usr/bin/docker-proxy
+          install -Dm755 bundles/dynbinary-daemon/dockerd ${{targets.destdir}}/usr/bin/dockerd
+          ln -sf /sbin/tini-static ${{targets.destdir}}/usr/bin/docker-init
+
+  - name: docker-oci-entrypoint
+    description: "docker OCI entrypoint"
+    dependencies:
+      runtime:
+        - docker
+    pipeline:
+      - runs: |
+          install -Dm755 /home/docker-library/docker-entrypoint.sh "${{targets.subpkgdir}}"/usr/bin/docker-entrypoint.sh
+
+  - name: dockerd-oci-entrypoint
+    description: "dockerd OCI entrypoint"
+    dependencies:
+      runtime:
+        - docker
+        # Used as a fallback in the dockerd-entrypoint.sh script
+        - docker-oci-entrypoint
+        # Used as a fallback in the dockerd-entrypoint.sh script
+        - docker-dind
+    pipeline:
+      - runs: |
+          install -Dm755 /home/docker-library/dockerd-entrypoint.sh "${{targets.subpkgdir}}"/usr/bin/dockerd-entrypoint.sh
+
+  # Ref: https://github.com/docker-library/docker/blob/master/Dockerfile-dind.template
+  - name: docker-dind
+    description: "Docker in Docker"
+    dependencies:
+      runtime:
+        - docker
+    pipeline:
+      - runs: |
+          install -Dm755 /home/build/hack/dind "${{targets.subpkgdir}}"/usr/bin/dind
+
+  # I can't believe this is a real thing
+  - name: docker-modprobe-compat
+    dependencies:
+      runtime:
+        - docker
+    pipeline:
+      - runs: |
+          install -Dm755 /home/docker-library/modprobe.sh "${{targets.subpkgdir}}"/usr/bin/modprobe
+
+update:
+  enabled: true
+  github:
+    identifier: moby/moby
+    strip-prefix: v
+    tag-filter: v

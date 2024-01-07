@@ -9,13 +9,16 @@ on:
 
 jobs:
   changes:
+    permissions:
+      contents: read
+
     name: Determine packages to test building
     runs-on: ubuntu-latest
     outputs:
       packages: ${{steps.package-list.outputs.packages}}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Look for changed files
         id: changes
@@ -27,7 +30,7 @@ jobs:
         run: |
           # Copy wolfictl out of the wolfictl image and onto PATH
           TMP=$(mktemp -d)
-          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:954e0b8b77c9cbe82792c321787f5b73ab5765ee887df921a13778c9c0d30714 -c "cp /usr/bin/wolfictl /out"
+          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc -c "cp /usr/bin/wolfictl /out"
           echo "$TMP" >> $GITHUB_PATH
 
       # Assuming that we have a list of changed files such as `foo.yaml` and `bar.yaml`, this
@@ -58,19 +61,18 @@ jobs:
       group: wolfi-builder-${{ matrix.arch }}
     needs: changes
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:954e0b8b77c9cbe82792c321787f5b73ab5765ee887df921a13778c9c0d30714
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc
       options: |
         --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor:unconfined
     outputs:
       packages_were_built: ${{ steps.file_check.outputs.exists }}
 
     permissions:
-      packages: write
       contents: read
       pull-requests: write # so we have permission to comment on pull requests
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: 'Trust the github workspace'
         run: |
@@ -84,8 +86,10 @@ jobs:
 
       - name: 'Build Wolfi'
         run: |
+          # Setup the melange cache dir on the host so we can use that in subsequent builds
+          mkdir ../.melangecache
           for package in ${{needs.changes.outputs.packages}}; do
-            make MELANGE="melange" MELANGE_EXTRA_OPTS="--create-build-log" REPO="$GITHUB_WORKSPACE/packages" package/$package -j1
+            make MELANGE="melange" MELANGE_EXTRA_OPTS="--create-build-log --cache-dir=$(pwd)/../.melangecache" REPO="$GITHUB_WORKSPACE/packages" package/$package -j1
           done
 
       - name: Check for file
@@ -96,11 +100,6 @@ jobs:
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
-
-      - name: Check sonames
-        if: steps.file_check.outputs.exists == 'true'
-        run: |
-          wolfictl check so-name
 
       - name: Check diff
         if: steps.file_check.outputs.exists == 'true'
@@ -138,11 +137,52 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
 
+  so_check:
+    permissions:
+      contents: read
+
+    name: "ABI Compatibility check"
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc
+    needs: build
+    if: needs.build.outputs.packages_were_built == 'true'
+
+    steps:
+      - name: 'Retrieve x86_64 packages'
+        uses: actions/download-artifact@v3
+        with:
+          name: packages-x86_64
+          path: /tmp/artifacts-1/
+
+      - name: 'Retrieve aarch64 packages'
+        uses: actions/download-artifact@v3
+        with:
+          name: packages-aarch64
+          path: /tmp/artifacts-2/
+
+      - name: 'Collect packages from all architectures into one place'
+        run: |
+          cd /tmp/artifacts-1
+
+          # Put the packages into one place
+          mv /tmp/artifacts-2/packages/* ./packages/
+
+          # Merge the build log ("packages.log") files
+          cat /tmp/artifacts-2/packages.log >> ./packages.log
+
+      - name: Soname check
+        run: |
+          wolfictl check so-name --packages-dir /tmp/artifacts-1/packages --package-list-file /tmp/artifacts-1/packages.log
+
   scan:
+    permissions:
+      contents: read
+
     name: "Scan packages for CVEs"
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:24f764649829f811cde1fe914431a2b949a0a9a69a317fb7eb31ca165df914fa
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc
     needs: build
     if: needs.build.outputs.packages_were_built == 'true'
 

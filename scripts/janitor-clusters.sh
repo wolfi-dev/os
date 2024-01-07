@@ -4,6 +4,7 @@ set -euo pipefail
 
 for clusters in $(
   gcloud container clusters list --project="${1}" \
+    --filter="name~^tmp-" \
     --format="csv[no-heading](name,createTime,zone)")
 do
   IFS=',' read -r -a infoArray<<< "${clusters}"

@@ -1,0 +1,180 @@
+name: Lint Wolfi OS World
+
+on:
+  workflow_dispatch:
+
+env:
+  EPHEMERAL_BUILD_PROJECT_ID: "prod-wolfi-os"
+  EPHEMERAL_BUILD_SERVICE_ACCOUNT: "wolfi-build-ephemeral-ci@prod-wolfi-os.iam.gserviceaccount.com"
+  EPHEMERAL_BUILD_WORKLOAD_IDENTITY_PROVIDER: "projects/728015869174/locations/global/workloadIdentityPools/github/providers/github"
+  EPHEMERAL_BUILD_NETWORK: "wolfi-build-ephemeral-vpc"
+  EPHEMERAL_BUILD_REGION: "us-central1"
+
+jobs:
+  build:
+    name: Build packages
+    if: github.repository == 'wolfi-dev/os'
+
+    strategy:
+      matrix:
+        arch: [ "x86_64", "aarch64" ]
+      fail-fast: false
+
+    permissions:
+      id-token: write
+      contents: read
+
+    runs-on:
+      # The host arch doesn't really matter, but use the self hosted runners because we want beefier machines. The network/io bandwidth for these builds are intense.
+      group: wolfi-os-builder-${{ matrix.arch }}
+
+    container:
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Trust the github workspace'
+        run: |
+          # This is to avoid fatal errors about "dubious ownership" because we are
+          # running inside of a container action with the workspace mounted in.
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: 'Authenticate to Google Cloud'
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ env.EPHEMERAL_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.EPHEMERAL_BUILD_SERVICE_ACCOUNT }}
+
+      - run: apk add google-cloud-sdk gke-gcloud-auth-plugin kubectl-default
+      - uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.EPHEMERAL_BUILD_PROJECT_ID }}
+          skip_install: true
+
+      - name: Configure GCR auth
+        run: gcloud auth configure-docker
+
+      - name: 'Setup workflow variables'
+        run: |
+          # Create a globally unique cluster name for each run (including retries)
+          echo "cluster_name=tmp-world-builder-$(date +%s)" >> "$GITHUB_ENV"
+
+      # Build with a local key, we'll resign this with the real key later
+      - name: 'Generate local signing key'
+        run: |
+          make local-melange.rsa
+
+      - name: Setup k8s runner configs
+        run: |
+          cat > .melange.k8s.yaml <<EOF
+          provider: gke
+          repo: gcr.io/${{ env.EPHEMERAL_BUILD_PROJECT_ID }}/world-builds
+          # Fully utilize {t2a,n2d}-standard-44
+          resources:
+            cpu: 43
+            memory: 172Gi
+            ephemeral-storage: 9Gi
+          podTemplate:
+            nodeSelector:
+              cloud.google.com/compute-class: "Scale-Out"
+              cloud.google.com/gke-spot: "true"
+            volumeMounts:
+              - name: scratch
+                mountPath: /tmp
+            volumes:
+              - name: mount-0 # the default volume for /home/build
+                ephemeral:
+                  volumeClaimTemplate:
+                    metadata:
+                      labels:
+                        type: build
+                    spec:
+                      accessModes: [ "ReadWriteOnce" ]
+                      storageClassName: "premium-rwo" # Majority of builds are very I/O intensive, so this ends up being a significant boost
+                      resources:
+                        requests:
+                          # The vast majority of builds don't need this, but some do and
+                          # it's really annoying to make it all the way through only to
+                          # fill up the disk at the end
+                          storage: 15Gi
+              - name: scratch
+                ephemeral:
+                  volumeClaimTemplate:
+                    metadata:
+                      labels:
+                        type: scratch
+                    spec:
+                      accessModes: [ "ReadWriteOnce" ]
+                      storageClassName: "premium-rwo" # Majority of builds are very I/O intensive, so this ends up being a significant boost
+                      resources:
+                        requests:
+                          # The vast majority of builds don't need this, but some do and
+                          # it's really annoying to make it all the way through only to
+                          # fill up the disk at the end
+                          storage: 15Gi
+          EOF
+
+      - name: Create ephemeral build cluster
+        run: |
+          # Get the IP of the runner, used to ensure only this is the only source IP allowed by the api server
+          ip=$(curl -s https://api.ipify.org)
+
+          gcloud container clusters create-auto "$cluster_name" \
+            --region "${{ env.EPHEMERAL_BUILD_REGION }}" \
+            --project "${{ env.EPHEMERAL_BUILD_PROJECT_ID }}" \
+            --enable-master-authorized-networks --master-authorized-networks "$ip/32" \
+            --network "${{ env.EPHEMERAL_BUILD_NETWORK }}" \
+            --create-subnetwork "" \
+            --service-account "wolfi-build-ephemeral-default@prod-wolfi-os.iam.gserviceaccount.com"
+
+          gcloud container clusters update "$cluster_name" --region "${{ env.EPHEMERAL_BUILD_REGION }}" --project "${{ env.EPHEMERAL_BUILD_PROJECT_ID }}" \
+            --update-labels="wolfi-dev_ephemeral-builder_github-run-id=${{ github.GITHUB_RUN_ID }},wolfi-dev_ephemeral-builder_github-run-number=${{ github.GITHUB_RUN_NUMBER }}"
+
+      - uses: 'google-github-actions/get-gke-credentials@v1'
+        with:
+          cluster_name: ${{ env.cluster_name }}
+          location: ${{ env.EPHEMERAL_BUILD_REGION }}
+          project_id: ${{ env.EPHEMERAL_BUILD_PROJECT_ID }}
+
+      - name: 'Build the world from existing state'
+        run: |
+          make \
+            MELANGE_EXTRA_OPTS="--runner kubernetes" \
+            BUILDWORLD=no \
+            all -j30 -k
+
+          # Remove the build logs for packages that succeeded
+          find ./packages/${{ matrix.arch }}/buildlogs -name "*.log" -exec sh -c 'tail -n 1 "$1" | grep -q "generating apk index from packages in packages"' _ {} \; -exec rm {} \;
+
+      - name: Upload failed build logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          path: ./packages/${{ matrix.arch }}/buildlogs/*.log
+          retention-days: 7
+
+      - name: Janitor the builder clusters
+        if: always()
+        run: |
+          # Delete any stragler builder pods, they already lack grace periods, so we can be forceful here
+          kubectl delete pods --all -n default --wait=false --now=true --force=true
+
+          gcloud container clusters delete $cluster_name \
+            --region "${{ env.EPHEMERAL_BUILD_REGION }}" \
+            --project "${{ env.EPHEMERAL_BUILD_PROJECT_ID }}" \
+            --async \
+            --quiet
+
+  # TODO: Enable when workflow is more mature
+  # postrun:
+  #  runs-on: ubuntu-latest
+  #  needs: [build]
+  #  steps:
+  #    - uses: slackapi/slack-github-action@007b2c3c751a190b6f0f040e47ed024deaa72844 # v1.23.0
+  #      id: slack
+  #      with:
+  #        payload: '{"text": "[build-wolfi-world-parallel] results: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+  #      env:
+  #        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  #        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

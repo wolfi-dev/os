@@ -9,9 +9,8 @@ on:
 
   workflow_dispatch:
 
-# Only run one build at a time to prevent out of sync signatures
-concurrency:
-  group: build-${{ github.ref }}
+# Only run one build at a time to prevent out of sync signatures.
+concurrency: build
 
 jobs:
   build:
@@ -23,19 +22,20 @@ jobs:
         arch: [ "x86_64", "aarch64" ]
       fail-fast: false
 
-    runs-on: wolfi-os-builder-${{ matrix.arch }}
+    runs-on:
+      group: wolfi-os-builder-${{ matrix.arch }}
 
-    # Ensure this is deprivileged, isolated job
-    # permissions:
+    permissions:
+      contents: read
 
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:9c9df8727d77bd8c154fdd0867bfe2c9d94a4601a52dc631c8107245eb998d0e
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc
       # TODO: Deprivilege
       options: |
         --cap-add NET_ADMIN --cap-add SYS_ADMIN --device /dev/fuse --security-opt seccomp=unconfined --security-opt apparmor:unconfined
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: 'Trust the github workspace'
         run: |
@@ -55,7 +55,7 @@ jobs:
       - name: 'Prepare package repository'
         run: |
           # yay wolfi!
-          apk add gcsfuse
+          apk add gcsfuse google-cloud-sdk
 
           # Set up a gcsfuse RO mount to the public bucket. This is a cheap and
           # cheerful way to recreate the make targets (class A HEADs) locally
@@ -65,7 +65,9 @@ jobs:
 
           mkdir -p ./packages/${{ matrix.arch }}
           # Symlink the gcsfuse mount to ./packages/ to workaround the Makefile CWD assumptions
-          ln -s /gcsfuse/wolfi-registry/${{ matrix.arch }}/*.apk ./packages/${{ matrix.arch }}/
+          for f in /gcsfuse/wolfi-registry/${{ matrix.arch }}/*.apk; do
+            ln -s "$f" ./packages/${{ matrix.arch }}/
+          done
 
           # Make a copy of the APKINDEX.* since we'll need to write to it on package builds
           cp /gcsfuse/wolfi-registry/${{ matrix.arch }}/APKINDEX.* ./packages/${{ matrix.arch }}/
@@ -79,12 +81,47 @@ jobs:
             MELANGE_EXTRA_OPTS="--keyring-append=/gcsfuse/wolfi-registry/wolfi-signing.rsa.pub" \
             all -j1
 
-      - run: |
-          # Clean up the symlinks and create an archive for uploading
+      # Always run this step for https://github.com/wolfi-dev/os/issues/8698
+      - if: ${{ always() }}
+        name: 'Create artifacts tarball'
+        run: |
+          set -x
+          set -e
+          set -o pipefail
+
+          # Pick up any stragglers that didn't get uploaded in previous builds.
+          cat ./packages/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$1 == "P" {printf "%s-", $2} $1 == "V" {printf "%s.apk\n", $2}' | sort > indexed.txt
+          # TODO: Figure out why ls through gcsfuse is so slow.
+          gcloud storage ls gs://wolfi-production-registry-destination/os/${{ matrix.arch }} | grep ".apk$" | xargs -n1 basename | sort > uploaded.txt
+
+          # Lines that are only in uploaded.txt and not indexed.txt.
+          comm -13 indexed.txt uploaded.txt > missing.txt
+
+          # Clean up the symlinks to keep only packages we built.
           find ./packages/${{ matrix.arch }} -type l -exec rm -f {} \;
+
+          # Merge any missing APKs into our new index.
+          for missed in $(cat missing.txt); do
+            # We could do this in one command instead of a loop, but it takes things on argv, which is a bit annoying.
+            melange index --merge \
+              --source ./packages/${{ matrix.arch }}/APKINDEX.tar.gz \
+              --output new.tar.gz \
+              /gcsfuse/wolfi-registry/${{ matrix.arch }}/${missed}
+
+            # Overwrite what we're going to upload (and for the next loop).
+            mv new.tar.gz ./packages/${{ matrix.arch }}/APKINDEX.tar.gz
+          done
+
+          diff \
+            <(cat /gcsfuse/wolfi-registry/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX) \
+            <(cat ./packages/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX) || true
+
+          # Create an archive for uploading
           tar -cvzf /tmp/packages-${{ matrix.arch }}.tar.gz ./packages/${{ matrix.arch }}
 
-      - name: 'Upload built packages archive to Github Artifacts'
+      # Always run this step for https://github.com/wolfi-dev/os/issues/8698
+      - if: ${{ always() }}
+        name: 'Upload built packages archive to GitHub Artifacts'
         uses: actions/upload-artifact@v3
         with:
           name: packages-${{ matrix.arch }}
@@ -92,9 +129,12 @@ jobs:
           retention-days: 1 # Low ttl since this is just an intermediary used once
           if-no-files-found: warn
 
-  upload:
+  upload-packages:
     runs-on: ubuntu-latest
     needs: build
+
+    # Always run this job for https://github.com/wolfi-dev/os/issues/8698
+    if: ${{ always() }}
 
     permissions:
       id-token: write
@@ -102,10 +142,10 @@ jobs:
 
     container:
       # NOTE: This step only signs and uploads, so it doesn't need any privileges
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:9c9df8727d77bd8c154fdd0867bfe2c9d94a4601a52dc631c8107245eb998d0e
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: 'Trust the github workspace'
         run: |
@@ -115,12 +155,12 @@ jobs:
 
       - id: auth
         name: 'Authenticate to Google Cloud'
-        uses: google-github-actions/auth@v0
+        uses: google-github-actions/auth@v1
         with:
           workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
           service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
 
-      - uses: google-github-actions/setup-gcloud@v0
+      - uses: google-github-actions/setup-gcloud@v1
         with:
           project_id: prod-images-c6e5
 
@@ -152,34 +192,22 @@ jobs:
             # Sign the APK index
             melange sign-index -f --signing-key ./wolfi-signing.rsa packages/${arch}/APKINDEX.tar.gz
 
-            # Only attempt to sign when *.apk's exist
-            apks=$(ls ./packages/${arch}/*.apk 2>/dev/null)
+            # Only attempt to sign when *.apk's exist.
+            apks=$(ls ./packages/${arch}/*.apk 2>/dev/null || true)
             if [ -n "$apks" ]; then
-              # Sign the apks built in the `build` step with the real key
               melange sign --signing-key ./wolfi-signing.rsa ./packages/${arch}/*.apk
             fi
-
-            # NOTE: Everything below is for debugging purposes, we can chose to remove it in the future if we'd like
-            ls -lah ./packages/${arch}
-
-            # Compare the "old" APKIDNEX.tar.gz with the new one
-            diff <(curl -sfL https://packages.wolfi.dev/os/${arch}/APKINDEX.tar.gz | tar -xOzf - APKINDEX) <(tar -xOzf packages/${arch}/APKINDEX.tar.gz APKINDEX) || true
           done
 
-      - name: 'Upload the repository to the bucket'
+      # Clean up the signing key before uploading to storage out
+      # of an abundance of caution.
+      - run: rm ./wolfi-signing.rsa
+
+      - name: 'Upload packages to GCS'
         run: |
           for arch in "x86_64" "aarch64"; do
-            # Don't cache the APKINDEX.
-            gcloud --quiet storage cp \
-                --cache-control=no-store \
-                "./packages/${arch}/APKINDEX.tar.gz" "gs://wolfi-production-registry-destination/os/${arch}/"
-
-            gcloud --quiet storage cp \
-                --cache-control=no-store \
-                "./packages/${arch}/APKINDEX.json" "gs://wolfi-production-registry-destination/os/${arch}/"
-
-            # Only attempt to sign when *.apk's exist
-            apks=$(ls ./packages/${arch}/*.apk 2>/dev/null)
+            # Only attempt to upload when *.apk's exist
+            apks=$(ls ./packages/${arch}/*.apk 2>/dev/null || true)
             if [ -n "$apks" ]; then
               # apks will be cached in CDN for an hour by default.
               # Don't upload the object if it already exists.
@@ -189,15 +217,88 @@ jobs:
             fi
           done
 
+      - name: 'Create APKINDEX tarball'
+        run: |
+          # Tar up any 'APKINDEX.*' files {aarch64,x86_64} x {tar.gz,json}
+          find ./packages/ -name 'APKINDEX.*' > to-include
+          tar -cvzf /tmp/indexes.tar.gz --files-from to-include
+
+      - name: 'Upload APKINDEX archive to GitHub Artifacts'
+        uses: actions/upload-artifact@v3
+        with:
+          name: indexes
+          path: /tmp/indexes.tar.gz
+          retention-days: 1 # Low ttl since this is just an intermediary used once
+          if-no-files-found: warn
+
+  upload-index:
+    runs-on: ubuntu-latest
+    needs: upload-packages
+
+    permissions:
+      id-token: write
+      contents: read
+
+    container:
+      # NOTE: This step only signs and uploads, so it doesn't need any privileges
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:05c92bc51cf3c81f484a06111c4c499bf8a8fe0ddda68c46ae3b31f4802f24fc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Trust the github workspace'
+        run: |
+          # This is to avoid fatal errors about "dubious ownership" because we are
+          # running inside of a container action with the workspace mounted in.
+          git config --global --add safe.directory "$(pwd)"
+
+      - id: auth
+        name: 'Authenticate to Google Cloud'
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
+          service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
+
+      - uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: prod-images-c6e5
+
+      - name: 'Download index archive'
+        uses: actions/download-artifact@v3
+        with:
+          path: /tmp/artifacts/
+          name: indexes
+
+      - name: 'Upload indexes to GCS'
+        run: |
+          tar xvf /tmp/artifacts/indexes.tar.gz
+
+          for arch in "x86_64" "aarch64"; do
+            # Don't cache the APKINDEX.
+            gcloud --quiet storage cp \
+                --cache-control=no-store \
+                "./packages/${arch}/APKINDEX.tar.gz" "gs://wolfi-production-registry-destination/os/${arch}/"
+
+            gcloud --quiet storage cp \
+                --cache-control=no-store \
+                "./packages/${arch}/APKINDEX.json" "gs://wolfi-production-registry-destination/os/${arch}/"
+          done
+
   postrun:
-    name: Build Wolfi OS
+    name: Notify Slack
     runs-on: ubuntu-latest
     if: failure()
+    needs: [build, upload-packages, upload-index]
     steps:
-      - uses: slackapi/slack-github-action@007b2c3c751a190b6f0f040e47ed024deaa72844 # v1.23.0
-        id: slack
-        with:
-          payload: '{"text": "[build-wolfi-os] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+      - uses: rtCamp/action-slack-notify@v2.2.1
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_ICON: http://github.com/chainguard-dev.png?size=48
+          SLACK_USERNAME: guardian
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_CHANNEL: C047DK5BUNP
+          SLACK_MSG_AUTHOR: wolfi-bot
+          SLACK_COLOR: '#8E1600'
+          MSG_MINIMAL: 'true'
+          SLACK_TITLE: '[build-wolfi-os] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          SLACK_MESSAGE: |
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

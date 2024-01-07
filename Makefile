@@ -1,4 +1,4 @@
-USE_CACHE ?= yes
+USE_CACHE ?= no
 ARCH ?= $(shell uname -m)
 ifeq (${ARCH}, arm64)
 	ARCH = aarch64
@@ -11,9 +11,6 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
-WOLFI_SIGNING_PUBKEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
-WOLFI_PROD ?= https://packages.wolfi.dev/os
-
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
@@ -24,13 +21,22 @@ MELANGE_OPTS += --generate-index false
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
+# These are separate from MELANGE_OPTS because for building we need additional
+# ones that are not defined for tests.
+MELANGE_TEST_OPTS += --repository-append ${REPO}
+MELANGE_TEST_OPTS += --keyring-append ${KEY}.pub
+MELANGE_TEST_OPTS += --arch ${ARCH}
+MELANGE_TEST_OPTS += --pipeline-dirs ./pipelines/
+MELANGE_TEST_OPTS += --repository-append https://packages.wolfi.dev/os
+MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
+
 ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
 
-ifeq (${BUILDWORLD}, no)
-MELANGE_OPTS += -k ${WOLFI_SIGNING_PUBKEY}
-MELANGE_OPTS += -r ${WOLFI_PROD}
+ifeq (${LINT}, yes)
+	MELANGE_OPTS += --fail-on-lint-warning
 endif
 
 # The list of packages to be built. The order matters.
@@ -38,6 +44,24 @@ endif
 # set only to be called when needed, so make can be instant to run
 # when it is not
 PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
+
+BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
+BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
+WOLFI_REPO ?= https://packages.wolfi.dev/os
+WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+BOOTSTRAP ?= no
+
+ifeq (${BOOTSTRAP}, yes)
+	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
+	MELANGE_OPTS += -r ${BOOTSTRAP_REPO}
+	PKGLISTCMD += -k ${BOOTSTRAP_KEY}
+	PKGLISTCMD += -r ${BOOTSTRAP_REPO}
+else
+	MELANGE_OPTS += -k ${WOLFI_KEY}
+	MELANGE_OPTS += -r ${WOLFI_REPO}
+	PKGLISTCMD += -k ${WOLFI_KEY}
+	PKGLISTCMD += -r ${WOLFI_REPO}
+endif
 
 all: ${KEY} .build-packages
 ifeq ($(MAKECMDGOALS),all)
@@ -63,9 +87,16 @@ list-yaml:
 	@printf ''
 
 package/%:
-	$(eval yamlfile := $*.yaml)
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
+
+test/%:
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
+	$(MELANGE) test $(yamlfile) --source-dir ./$*/ $(MELANGE_TEST_OPTS) --log-policy builtin:stderr
 
 packages/$(ARCH)/%.apk: $(KEY)
 	@mkdir -p ./$(pkgname)/
@@ -77,7 +108,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:8a4c6c54d3cbdd3fd0207f629facc9df8b080605a6d30bd6474be5455633994e
+	    ghcr.io/wolfi-dev/sdk@sha256:d4dd58e64afeecc9705a3b4219d25fc17fcd44464674e356a44a04773c3762d9
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -142,6 +173,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:8a4c6c54d3cbdd3fd0207f629facc9df8b080605a6d30bd6474be5455633994e
+		ghcr.io/wolfi-dev/sdk@sha256:d4dd58e64afeecc9705a3b4219d25fc17fcd44464674e356a44a04773c3762d9
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

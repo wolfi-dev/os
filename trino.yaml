@@ -1,87 +1,58 @@
 package:
   name: trino
-  version: "426"
+  version: "435"
   epoch: 0
-  description: Official repository of Trino, the distributed SQL query engine for big data, formerly known as PrestoSQL
+  description: The distributed SQL query engine for big data, formerly known as PrestoSQL
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
-      - bash # some helper scripts use bash
       - openjdk-17-default-jvm
       - python3 # required by trino launcher script
+      - trino-config
 
 environment:
   contents:
     packages:
-      - wolfi-base
+      - build-base
       - busybox
       - ca-certificates-bundle
       - curl
-      - maven
-      - build-base
-      - openjdk-17
+      - diffutils
       - git
-      - rsync
       - jvmkill
+      - maven
+      - openjdk-17
+      - wolfi-base
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/trinodb/trino.git
       tag: ${{package.version}}
-      expected-commit: 47f9fa50e1172699643fbbdb57f6fd7570c053d0
+      expected-commit: c11e77e08431999ec80c636224889ddcf8d6267d
+
+  - uses: patch
+    with:
+      patches: CVE-2023-5072.patch CVE-2023-34062.patch CVE-2023-6378.patch
 
   - runs: |
+      set -x
+
       export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
-      export LANG=en_US.UTF-8
-      export INCLUDE="-I${JAVA_HOME}/include -I${JAVA_HOME}/include/linux"
-      export CFLAGS="-Wall -Werror -fPIC -shared ${INCLUDE}"
 
-      mkdir -p ${{targets.destdir}}/data/trino
-      mkdir -p ${{targets.destdir}}/etc/trino/catalog
-      mkdir -p ${{targets.destdir}}/usr/bin
-      mkdir -p ${{targets.destdir}}/usr/lib/trino/bin
-      mkdir -p ${{targets.destdir}}/usr/lib/trino/lib
-      mkdir -p ${{targets.destdir}}/usr/lib/trino/plugin
-      mkdir -p ${{targets.destdir}}/var/lib/trino
-      mkdir -p ${{targets.destdir}}/etc/security/
-      mkdir -p /home/build/trino-all
-      mkdir -p /home/build/plugins/default/
-      mkdir -p /home/build/plugins/optional/
+      ./mvnw package -q -DskipTests -Dmaven.source.skip=true -Dair.check.skip-all -T 8  -pl '!:trino-docs,!:trino-server-rpm,!:trino-tests,!:trino-product-tests,!:trino-product-tests-launcher' -am
 
-      cd /home/build/
-      mvn package -q -DskipTests -T $(nproc) -pl ':trino-server'
-      tar -C /home/build/trino-all/ --strip-components 1 -xf core/trino-server/target/trino-server-${{package.version}}.tar.gz
+      mkdir -p ${{targets.destdir}}/usr/lib/trino
+      cp ./core/trino-server/target/trino-server-${{package.version}}/NOTICE ${{targets.destdir}}/usr/lib/trino/
+      cp ./core/trino-server/target/trino-server-${{package.version}}/README.txt ${{targets.destdir}}/usr/lib/trino/
+      cp -r ./core/trino-server/target/trino-server-${{package.version}}/bin ${{targets.destdir}}/usr/lib/trino/bin/
+      cp -r ./core/trino-server/target/trino-server-${{package.version}}/lib ${{targets.destdir}}/usr/lib/trino/lib/
+      mkdir ${{targets.destdir}}/usr/lib/trino/plugin
 
-      mvn package -q -DskipTests -T $(nproc) -pl ':trino-cli'
-      chmod +x client/trino-cli/target/trino-cli-${{package.version}}-executable.jar
-
-      rsync -av /home/build/trino-all/plugin/* /home/build/plugins/optional/
-      rm -rf /home/build/trino-all/plugin/*
-      rsync -av --ignore-existing /home/build/trino-all/* ${{targets.destdir}}/usr/lib/trino/
-      # rsync -av --ignore-existing /home/build/plugins/default/* ${{targets.destdir}}/usr/lib/trino/plugin/
-
-      rsync -av --ignore-existing core/docker/default/etc/* ${{targets.destdir}}/etc/trino/
-      rsync -av --force core/docker/bin/* ${{targets.destdir}}/usr/lib/trino/bin/
-      rsync -av --ignore-existing client/trino-cli/target/trino-cli-${{package.version}}-executable.jar ${{targets.destdir}}/usr/bin/
-      rsync -av --ignore-existing /usr/lib/libjvmkill.so ${{targets.destdir}}/usr/lib/trino/bin/
-
-      cd ${{targets.destdir}}/usr/lib/trino/bin
-      for file in *; do
-        if [[ -f $file ]]; then
-          ln -sf ../lib/trino/bin/$file ${{targets.destdir}}/usr/bin/$file
-        fi
-      done
-      cd /home/build/
-
-      touch ${{targets.destdir}}/etc/security/limits.conf
-      cat << EOF >> ${{targets.destdir}}/etc/security/limits.conf
-      trino soft nofile 131072
-      trino hard nofile 131072
-      trino soft nproc 128000
-      trino hard nproc 128000
-      EOF
+      mkdir -p ${{targets.destdir}}/usr/bin/
+      cp ./client/trino-cli/target/trino-cli-*-executable.jar ${{targets.destdir}}/usr/bin/trino
+      chmod 0755 ${{targets.destdir}}/usr/bin/trino
 
 data:
   - name: plugins
@@ -135,6 +106,39 @@ data:
       tpch: tpch
 
 subpackages:
+  - name: ${{package.name}}-config
+    description: Creates trino config step that can then be overridden.
+    dependencies:
+      runtime:
+        - trino
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc
+          cp -r core/docker/default/etc ${{targets.subpkgdir}}/etc/trino
+
+  - name: ${{package.name}}-oci-entrypoint
+    dependencies:
+      runtime:
+        - trino
+        - bash # run-trino script needs bash
+        - curl # health-check needs curl
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/trino/bin
+          cp ./core/docker/bin/* ${{targets.subpkgdir}}/usr/lib/trino/bin/
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          ln -s /usr/lib/trino/bin/run-trino ${{targets.subpkgdir}}/usr/bin/
+          cp /usr/lib/libjvmkill.so ${{targets.subpkgdir}}/usr/lib/trino/bin/
+
+          mkdir -p ${{targets.subpkgdir}}/etc/security/
+          touch ${{targets.subpkgdir}}/etc/security/limits.conf
+          cat << EOF >> ${{targets.subpkgdir}}/etc/security/limits.conf
+          trino soft nofile 131072
+          trino hard nofile 131072
+          trino soft nproc 128000
+          trino hard nproc 128000
+          EOF
+
   - range: plugins
     name: trino-plugin-${{range.key}}
     description: Trino Plugin ${{range.key}}
@@ -143,9 +147,14 @@ subpackages:
         - trino
     pipeline:
       - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/trino/lib
+          cp -r ./core/trino-server/target/trino-server-${{package.version}}/plugin/${{range.value}}/* ${{targets.subpkgdir}}/usr/lib/trino/lib/
+
           mkdir -p ${{targets.subpkgdir}}/usr/lib/trino/plugin/${{range.value}}
-          cd /home/build/plugins/optional/
-          cp -R ./${{range.value}}/* ${{targets.subpkgdir}}/usr/lib/trino/plugin/${{range.value}}/
+          for path in ./core/trino-server/target/trino-server-${{package.version}}/plugin/${{range.value}}/*; do
+            filename=$(basename $path)
+            ln -s "../../lib/${filename}" "${{targets.subpkgdir}}/usr/lib/trino/plugin/${{range.value}}/${filename}"
+          done
 
 update:
   enabled: true

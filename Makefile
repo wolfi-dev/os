@@ -21,6 +21,16 @@ MELANGE_OPTS += --generate-index false
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
+# These are separate from MELANGE_OPTS because for building we need additional
+# ones that are not defined for tests.
+MELANGE_TEST_OPTS += --repository-append ${REPO}
+MELANGE_TEST_OPTS += --keyring-append ${KEY}.pub
+MELANGE_TEST_OPTS += --arch ${ARCH}
+MELANGE_TEST_OPTS += --pipeline-dirs ./pipelines/
+MELANGE_TEST_OPTS += --repository-append https://packages.wolfi.dev/os
+MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
+
 ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
 endif
@@ -77,9 +87,16 @@ list-yaml:
 	@printf ''
 
 package/%:
-	$(eval yamlfile := $*.yaml)
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
+
+test/%:
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
+	$(MELANGE) test $(yamlfile) --source-dir ./$*/ $(MELANGE_TEST_OPTS) --log-policy builtin:stderr
 
 packages/$(ARCH)/%.apk: $(KEY)
 	@mkdir -p ./$(pkgname)/
@@ -91,7 +108,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:99babbe4897d68ec1a342bd958fda7274a072bf112670fa691f64753b04774a9
+	    ghcr.io/wolfi-dev/sdk@sha256:d4dd58e64afeecc9705a3b4219d25fc17fcd44464674e356a44a04773c3762d9
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -156,6 +173,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:99babbe4897d68ec1a342bd958fda7274a072bf112670fa691f64753b04774a9
+		ghcr.io/wolfi-dev/sdk@sha256:d4dd58e64afeecc9705a3b4219d25fc17fcd44464674e356a44a04773c3762d9
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

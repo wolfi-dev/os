@@ -4,6 +4,7 @@ ifeq (${ARCH}, arm64)
 	ARCH = aarch64
 endif
 TARGETDIR = packages/${ARCH}
+SHELL := /bin/bash
 
 MELANGE ?= $(shell which melange)
 WOLFICTL ?= $(shell which wolfictl)

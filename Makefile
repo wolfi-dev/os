@@ -115,12 +115,12 @@ endef
 #$(call get-source-dir,ret-variable-for-source-dir,package-dir,package-name)
 define get-source-dir
 	$(info getting source dir for package $(3) with dir $(2))
-	$(1) := $(shell if [ "." == "$(2)" ]; then \
-		if [ -d "./$(3)" ]; then \
+	$(1) := $(shell if [[ "." == "$(2)" ]]; then \
+		if [[ -d "./$(3)" ]]; then \
 			echo "--source-dir ./$(3)"; \
 		fi \
 	else \
-		if [ -d "$(2)" ]; then \
+		if [[ -d "$(2)" ]]; then \
 			echo "--source-dir $(2)"; \
 		fi \
 	fi)

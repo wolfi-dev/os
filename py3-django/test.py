@@ -2,19 +2,21 @@ import django
 from django.conf import settings
 from django.db import models
 
+
 # Setup minimal Django configuration
 def setup_django_environment():
     settings.configure(
         DEBUG=True,
-        INSTALLED_APPS=['__main__'],
+        INSTALLED_APPS=["__main__"],
         DATABASES={
-            'default': {
-                'ENGINE': 'django.db.backends.sqlite3',
-                'NAME': ':memory:',
+            "default": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": ":memory:",
             }
-        }
+        },
     )
     django.setup()
+
 
 def define_and_test_model():
     # Define a simple Django model
@@ -35,9 +37,7 @@ def define_and_test_model():
     except Exception as e:
         print(f"ERROR: {e}")
 
+
 if __name__ == "__main__":
     setup_django_environment()
     define_and_test_model()
-
-
-

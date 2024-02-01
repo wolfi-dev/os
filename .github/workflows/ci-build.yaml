@@ -33,7 +33,7 @@ jobs:
         run: |
           # Copy wolfictl out of the wolfictl image and onto PATH
           TMP=$(mktemp -d)
-          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:23b783a9420d2a659e0517718dfbc58b6d3c6b1503334fa20781d4edebd7f850 -c "cp /usr/bin/wolfictl /out"
+          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:b916ae8b4e2b073261352044b495797bec9be073ed188e92daf7264b331e7ed8 -c "cp /usr/bin/wolfictl /out"
           echo "$TMP" >> $GITHUB_PATH
 
       # Assuming that we have a list of changed files such as `foo.yaml` and `bar.yaml`, this
@@ -70,7 +70,7 @@ jobs:
       group: wolfi-builder-${{ matrix.arch }}
     needs: changes
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:23b783a9420d2a659e0517718dfbc58b6d3c6b1503334fa20781d4edebd7f850
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:b916ae8b4e2b073261352044b495797bec9be073ed188e92daf7264b331e7ed8
       options: |
         --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor:unconfined
     outputs:
@@ -98,7 +98,39 @@ jobs:
           # Setup the melange cache dir on the host so we can use that in subsequent builds
           mkdir ../.melangecache
           for package in ${{needs.changes.outputs.packages}}; do
-            make MELANGE="melange" MELANGE_EXTRA_OPTS="--create-build-log --cache-dir=$(pwd)/../.melangecache" REPO="$GITHUB_WORKSPACE/packages" package/$package -j1
+            make MELANGE_EXTRA_OPTS="--create-build-log --cache-dir=$(pwd)/../.melangecache" REPO="$GITHUB_WORKSPACE/packages" package/$package -j1
+            make REPO="$GITHUB_WORKSPACE/packages" test/$package -j1
+          done
+
+      - name: "Check that packages can be installed with apk add"
+        run: |
+          # Create a fake linux fs under /tmp/emptyroot to pass to `apk --root`.
+          mkdir -p /tmp/emptyroot/etc/apk
+          cp -r /etc/apk/* /tmp/emptyroot/etc/apk/
+          cat /dev/null > /tmp/emptyroot/etc/apk/world
+
+          mkdir -p /tmp/emptyroot/lib/apk/db
+          touch /tmp/emptyroot/lib/apk/db/{installed,lock,scripts.tar,triggers}
+
+          mkdir -p /tmp/emptyroot/var/cache/apk
+          apk update --root /tmp/emptyroot
+
+          # Find .apk files and add them to the string
+          for f in $(find packages -name '*.apk'); do
+              tar -Oxf $f .PKGINFO
+              apk add --root /tmp/emptyroot --repository "$GITHUB_WORKSPACE/packages" --allow-untrusted --simulate $f
+          done
+
+      - name: Check SBOMs
+        run: |
+          apk add py3-ntia-conformance-checker
+          for f in $(find packages -name '*.apk'); do
+              echo ==== Checking SBOM for $f ====
+              tar -Oxf $f var/lib/db/sbom/ > sbom.json
+              echo ::group::sbom.json
+              cat sbom.json
+              echo ::endgroup::
+              ntia-checker -v --file sbom.json
           done
 
       - name: Check for file
@@ -155,7 +187,7 @@ jobs:
     name: "ABI Compatibility check"
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:23b783a9420d2a659e0517718dfbc58b6d3c6b1503334fa20781d4edebd7f850
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:b916ae8b4e2b073261352044b495797bec9be073ed188e92daf7264b331e7ed8
     needs: build
     if: needs.build.outputs.packages_were_built == 'true'
 
@@ -176,11 +208,12 @@ jobs:
         run: |
           cd /tmp/artifacts-1
 
-          # Put the packages into one place
-          mv /tmp/artifacts-2/packages/* ./packages/
-
-          # Merge the build log ("packages.log") files
-          cat /tmp/artifacts-2/packages.log >> ./packages.log
+          # Put the packages into one place (if aarch64 logs exist)
+          if test -f "/tmp/artifacts-2/packages"; then
+            mv /tmp/artifacts-2/packages/* ./packages/
+            # Merge the build log ("packages.log") files
+            cat /tmp/artifacts-2/packages.log >> ./packages.log
+          fi
 
       - name: Soname check
         run: |
@@ -193,7 +226,7 @@ jobs:
     name: "Scan packages for CVEs"
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:23b783a9420d2a659e0517718dfbc58b6d3c6b1503334fa20781d4edebd7f850
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:b916ae8b4e2b073261352044b495797bec9be073ed188e92daf7264b331e7ed8
     needs: build
     if: needs.build.outputs.packages_were_built == 'true'
 
@@ -214,11 +247,12 @@ jobs:
         run: |
           cd /tmp/artifacts-1
 
-          # Put the packages into one place
-          mv /tmp/artifacts-2/packages/* ./packages/
-
-          # Merge the build log ("packages.log") files
-          cat /tmp/artifacts-2/packages.log >> ./packages.log
+          # Put the packages into one place (if aarch64 logs exist)
+          if test -f "/tmp/artifacts-2/packages"; then
+            mv /tmp/artifacts-2/packages/* ./packages/
+            # Merge the build log ("packages.log") files
+            cat /tmp/artifacts-2/packages.log >> ./packages.log
+          fi
 
       - name: 'Retrieve Wolfi advisory data'
         uses: actions/checkout@v4
@@ -231,7 +265,7 @@ jobs:
           wolfictl scan \
             --build-log \
             --advisories-repo-dir 'data/wolfi-advisories' \
-            --advisory-filter 'all' \
+            --advisory-filter 'resolved' \
             --require-zero \
             /tmp/artifacts-1 \
             2> /dev/null # The error message renders strangely on GitHub Actions, and the important information is already being sent to stdout.

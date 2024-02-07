@@ -1,14 +1,29 @@
+# Logstash is a bit of a behemoth becuase of the way the plugin system works.
+# Usually, patched plugins would be dropped on the filesystem as APK's and the
+# application could just pick them up. Logstash's plugin system requires the
+# plugins to be added by the logstash-plugin cli tool since it uses a generated
+# Gemfile.
+#
+# In order to patch plugins we can do a few things
+#
+# 1. If the plugin is a default plugin, patch it out of the plugins-metadata.json
+#    file so the upstream plugin is not installed. Add the plugin apk to the build
+#    environment and use logstash-plugin to install the .gem file before packaging
+#    the dist into a tarball (and eventually apk). All of this should be done in
+#    the main pipeline so the changes are picked up by all subpackages.
+#
+# 2. If the plugin is not a default plugin, do the same as above, but in a
+#    subpackage to be installed separately.
 package:
   name: logstash
   version: 8.12.1
-  epoch: 0
+  epoch: 2
   description: Logstash - transport and process your logs, events, or other data
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
       - bash # some helper scripts use bash
-      - logstash-integration-jdbc
       - openjdk-11-jre
 
 environment:
@@ -19,10 +34,18 @@ environment:
       - ca-certificates-bundle
       - curl
       - gradle
-      - logstash-integration-jdbc
       - openjdk-11
       - openjdk-11-default-jvm
-      - ruby-3.2
+
+      # logstash plugins to load at build-time
+      - logstash-integration-jdbc
+      - ruby3.2-logstash-output-opensearch
+  environment:
+    OSS: "true"
+    LOGSTASH_SOURCE: "1"
+    LANG: en_US.UTF-8
+    JAVA_HOME: /usr/lib/jvm/default-jvm
+    LS_JAVA_HOME: /usr/lib/jvm/default-jvm
 
 pipeline:
   - uses: git-checkout
@@ -31,46 +54,95 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: c7e185a56af665671d38ad8dbf37bb5817f50678
 
-  - runs: |
-      # disable the logstash-integration-jdbc plugin download as we build and package it separately
+  - name: Patch sources
+    runs: |
+      # Disable the logstash-integration-jdbc plugin download as we build and package it separately
       sed -i '/"logstash-integration-jdbc":/,/},/ s/"default-plugins": true/"default-plugins": false/' rakelib/plugins-metadata.json
-
-  - runs: |
-      export OSS=true
-      export LOGSTASH_SOURCE=1
-      export LANG=en_US.UTF-8
-      export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
-      export LS_JAVA_HOME=/usr/lib/jvm/java-11-openjdk
 
       # Disable -Werror which means that warnings are not treated as errors during compilation.  Required for Java 21.
       sed -i '/options.compilerArgs.add("-Werror")/s/^/\/\//' build.gradle
 
-      gem install rake
-      gem install bundler
-
       # A hack-fix to tackle with `Could not find method enabled() for arguments [true] on Report xml` error starting after 8.11.x.
       sed -i '/enabled/d' logstash-core/build.gradle
 
-      gradle installDevelopmentGems
-      gradle installDefaultGems
-      rake bootstrap
-      rake plugin:install-default
+  - name: Install all the proper gems and build the tarball dist
+    runs: |
+      ./gradlew installDevelopmentGems
+      ./gradlew installDefaultGems
 
-      gradle assembleOssTarDistribution -Pjdk_bundle_os=linux
-
-      mkdir -p ${{targets.destdir}}/usr/share/java/logstash
-      tar --strip-components 1 -C ${{targets.destdir}}/usr/share/java/logstash -xf build/logstash-oss-*-SNAPSHOT-no-jdk.tar.gz
-
-      mkdir -p ${{targets.destdir}}/usr/bin/$name
-      for i in ${{targets.destdir}}/usr/share/java/logstash/bin/*; do
-        name=$(basename $i)
-        ln -sf /usr/share/java/logstash/bin/$name ${{targets.destdir}}/usr/bin/$name
+  - name: Re-inject default plugins that have been patched
+      gems=(
+        logstash-integration-jdbc
+      )
+      for gem in "${gems[@]}; do
+        bin/logstash-plugin install $(find / -type f -name "${gem}-*.gem")
       done
 
+  - name: Patch out the windows and mac tarball creation
+    uses: patch
+    with:
+      patches: create_archive_pack.patch
+
+  - name: Build tarball distribution
+      ./gradlew assembleOssTarDistribution -Pjdk_bundle_os=linux
+      find build
+
+  - name: Package distribution
+    runs: |
+      mkdir -p ${{targets.contextdir}}/usr/share/java/logstash
+      tar --strip-components 1 \
+        -C ${{targets.contextdir}}/usr/share/java/logstash \
+        -xf build/logstash-oss-${{package.version}}-SNAPSHOT-no-jdk.tar.gz
+
+      mkdir -p ${{targets.contextdir}}/usr/bin/$name
+      for i in ${{targets.contextdir}}/usr/share/java/logstash/bin/*; do
+        name=$(basename $i)
+        ln -sf /usr/share/java/logstash/bin/$name ${{targets.contextdir}}/usr/bin/$name
+      done
+
+  - name: Patch CVEs
+    runs: |
       # Hack-fix to reduce CVE count: https://github.com/elastic/logstash/pull/3855
-      rm -rf ${{targets.destdir}}/usr/share/java/logstash/vendor/bundle/jruby/*/gems/ruby-maven-libs-*/maven-home/lib
+      rm -rf ${{targets.contextdir}}/usr/share/java/logstash/vendor/bundle/jruby/*/gems/ruby-maven-libs-*/maven-home/lib
 
 subpackages:
+  - name: ${{package.name}}-with-output-opensearch
+    description: Merge environment variables into logstash.yml
+    pipeline:
+      - name: subpkg Re-inject default plugins that have been patched
+          gems=(
+            logstash-output-opensearch
+          )
+          for gem in "${gems[@]}; do
+            bin/logstash-plugin install $(find / -type f -name "${gem}-*.gem")
+          done
+
+      - name: Patch out the windows and mac tarball creation
+        uses: patch
+        with:
+          patches: create_archive_pack.patch
+
+      - name: subpkg Build tarball distribution
+          ./gradlew assembleOssTarDistribution -Pjdk_bundle_os=linux
+
+      - name: subpkg package it all
+        runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/java/logstash
+          tar --strip-components 1 \
+            -C ${{targets.contextdir}}/usr/share/java/logstash \
+            -xf build/logstash-oss-${{package.version}}-SNAPSHOT-no-jdk.tar.gz
+
+          mkdir -p ${{targets.contextdir}}/usr/bin/$name
+          for i in ${{targets.contextdir}}/usr/share/java/logstash/bin/*; do
+            name=$(basename $i)
+            ln -sf /usr/share/java/logstash/bin/$name ${{targets.contextdir}}/usr/bin/$name
+          done
+
+      - name: subpkg fix vulns
+        runs: |
+          # Hack-fix to reduce CVE count: https://github.com/elastic/logstash/pull/3855
+          rm -rf ${{targets.contextdir}}/usr/share/java/logstash/vendor/bundle/jruby/*/gems/ruby-maven-libs-*/maven-home/lib
+
   - name: ${{package.name}}-env2yaml
     description: Merge environment variables into logstash.yml
     pipeline:
@@ -86,6 +158,17 @@ subpackages:
               ldflags: -s -w
               subpackage: "true"
       - uses: strip
+
+test:
+  environment:
+    contents:
+      packages:
+        - wolfi-base
+  pipeline:
+    - runs: |
+        echo "hello" | \
+          logstash -e 'input { stdin { } } output { stdout {} }' | \
+          grep 'message.*hello'
 
 update:
   enabled: true

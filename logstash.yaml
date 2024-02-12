@@ -1,4 +1,4 @@
-# Logstash is a bit of a behemoth becuase of the way the plugin system works.
+# Logstash is a bit of a behemoth because of the way the plugin system works.
 # Usually, patched plugins would be dropped on the filesystem as APK's and the
 # application could just pick them up. Logstash's plugin system requires the
 # plugins to be added by the logstash-plugin cli tool since it uses a generated
@@ -37,6 +37,7 @@ environment:
       - curl
       - gradle
       - jq
+      - jruby-9.4
       # logstash plugins to load at build-time
       - logstash-integration-jdbc
       - logstash-output-opensearch
@@ -68,6 +69,11 @@ pipeline:
       jq 'del(.["logstash-integration-jdbc"])' rakelib/plugins-metadata.json > /tmp/plugins-metadata.json
       mv /tmp/plugins-metadata.json rakelib/
 
+      # Disable the logstash-filter-xml plugin download as we build and
+      # package it separately
+      jq 'del(.["logstash-filter-xml"])' rakelib/plugins-metadata.json > /tmp/plugins-metadata.json
+      mv /tmp/plugins-metadata.json rakelib/
+
       # Disable -Werror which means that warnings are not treated as errors
       # during compilation.  Required for Java 21.
       sed -i '/options.compilerArgs.add("-Werror")/s/^/\/\//' build.gradle
@@ -76,23 +82,23 @@ pipeline:
       # arguments [true] on Report xml` error starting after 8.11.x.
       sed -i '/enabled/d' logstash-core/build.gradle
 
-  - name: Install all the proper gems and build the tarball dist
-    runs: |
-      ./gradlew installDevelopmentGems
-      ./gradlew installDefaultGems
-
-  - name: Re-inject default plugins that have been patched
-    runs: |
-      bin/logstash-plugin install $(find / -type f -name "logstash-integration-jdbc-*.gem")
-
   - name: Patch out the windows and mac tarball creation
     uses: patch
     with:
       patches: create_archive_pack.patch
 
+  - name: Install all the default plugins
+    runs: |
+      ./gradlew installDefaultGems
+
+  - name: Re-inject default plugins that have been patched
+    runs: |
+      bin/logstash-plugin install $(find / -type f -name "logstash-integration-jdbc-*.gem")
+      bin/logstash-plugin install $(find / -type f -name "logstash-filter-xml-*.gem")
+
   - name: Build tarball distribution
     runs: |
-      ./gradlew assembleOssTarDistribution -Pjdk_bundle_os=linux --stacktrace
+      ./gradlew assembleOssTarDistribution -Pjdk_bundle_os=linux
 
   - name: Package distribution
     runs: |
@@ -111,6 +117,12 @@ pipeline:
     runs: |
       # Hack-fix to reduce CVE count: https://github.com/elastic/logstash/pull/3855
       rm -rf ${{targets.contextdir}}/${LS_DESTINATION}/vendor/bundle/jruby/*/gems/ruby-maven-libs-*/maven-home/lib
+
+      # Hack-fix to install our jruby in-place of the upstream bundled version
+      # to fix the uri vuln in the stdlib
+      rm -rf ${{targets.contextdir}}/${LS_DESTINATION}/vendor/jruby
+      mkdir -p ${{targets.contextdir}}/${LS_DESTINATION}/vendor/jruby
+      cp -r /usr/share/jruby/* ${{targets.contextdir}}/${LS_DESTINATION}/vendor/jruby/
 
 subpackages:
   - name: ${{package.name}}-compat
@@ -137,13 +149,13 @@ subpackages:
   - name: ${{package.name}}-with-output-opensearch
     description: Build logstash with logstash-output-opensearch plugin
     pipeline:
-      - name: subpkg Re-inject default plugins that have been patched
+      - name: Re-inject default plugins that have been patched
         runs: |
           bin/logstash-plugin install $(find / -type f -name "logstash-output-opensearch-*.gem")
-      - name: subpkg Build tarball distribution
+      - name: Build tarball distribution
         runs: |
-          ./gradlew assembleOssTarDistribution -Pjdk_bundle_os=linux --stacktrace
-      - name: subpkg package it all
+          ./gradlew assembleOssTarDistribution -Pjdk_bundle_os=linux
+      - name: Package distribution
         runs: |
           mkdir -p ${{targets.contextdir}}/${LS_DESTINATION}
           tar --strip-components 1 \
@@ -155,10 +167,16 @@ subpackages:
             name=$(basename $i)
             ln -sf /${LS_DESTINATION}/bin/$name ${{targets.contextdir}}/usr/bin/$name
           done
-      - name: subpkg fix vulns
+      - name: Patch CVEs
         runs: |
           # Hack-fix to reduce CVE count: https://github.com/elastic/logstash/pull/3855
           rm -rf ${{targets.contextdir}}/${LS_DESTINATION}/vendor/bundle/jruby/*/gems/ruby-maven-libs-*/maven-home/lib
+
+          # Hack-fix to install our jruby in-place of the upstream bundled version
+          # to fix the uri vuln in the stdlib
+          rm -rf ${{targets.contextdir}}/${LS_DESTINATION}/vendor/jruby
+          mkdir -p ${{targets.contextdir}}/${LS_DESTINATION}/vendor/jruby
+          cp -r /usr/share/jruby/* ${{targets.contextdir}}/${LS_DESTINATION}/vendor/jruby/
     dependencies:
       provides:
         - ${{package.name}}-base=${{package.full-version}}

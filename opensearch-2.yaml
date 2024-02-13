@@ -1,26 +1,83 @@
 package:
   name: opensearch-2
   version: 2.11.1
-  epoch: 3 # Remove CVE-2022-45146 patch when bumping to 2.12 or later
+  epoch: 4 # Remove CVE-2022-45146 patch when bumping to 2.12 or later
   description: Open source distributed and RESTful search engine.
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
       - bash # some helper scripts use bash
+      - busybox # some helper scripts use busybox
       - openjdk-11-jre
+
+vars:
+  plugin_version_qualifier: "0"
 
 environment:
   contents:
     packages:
+      - bash
       - busybox
       - ca-certificates-bundle
       - curl
       - gradle
       - openjdk-11
+      - openjdk-11-default-jvm
+      - patch
+      - unzip
   environment:
     JAVA_HOME: /usr/lib/jvm/java-11-openjdk
     LANG: "en_US.UTF-8"
+
+data:
+  - name: internal-plugins
+    items:
+      # plugin_name: cve patch list
+      analysis-icu: ""
+      analysis-kuromoji: ""
+      analysis-nori: ""
+      analysis-phonetic: ""
+      analysis-smartcn: ""
+      analysis-stempel: ""
+      analysis-ukrainian: ""
+      crypto-kms: ""
+      discovery-azure-classic: ""
+      discovery-ec2: ""
+      discovery-gce: ""
+      identity-shiro: ""
+      ingest-attachment: ""
+      mapper-annotated-text: ""
+      mapper-murmur3: ""
+      mapper-size: ""
+      repository-azure: ""
+      repository-gcs: ""
+      repository-s3: ""
+      store-smb: ""
+      telemetry-otel: ""
+      transport-nio: ""
+
+  - name: external-plugins
+    items:
+      # plugin_name: cve patch list
+      alerting: ""
+      anomaly-detection: ""
+      asynchronous-search: ""
+      cross-cluster-replication: ""
+      custom-codecs: ""
+      geospatial: ""
+      index-management: ""
+      job-scheduler: ""
+      k-nn: ""
+      ml-commons: "CVE-2023-51074.patch"
+      neural-search: "CVE-2023-5072.patch"
+      notifications: ""
+      observability: ""
+      performance-analyzer: ""
+      reporting: ""
+      security: "CVE-2023-44483.patch"
+      security-analytics: ""
+      sql: "CVE-2023-5072-sql.patch"
 
 pipeline:
   - uses: git-checkout
@@ -33,6 +90,14 @@ pipeline:
     with:
       # Patch from: https://patch-diff.githubusercontent.com/raw/opensearch-project/OpenSearch/pull/10297.patch
       patches: CVE-2022-45146.patch
+
+  - uses: patch
+    with:
+      patches: CVE-2023-46749.patch
+
+  - uses: patch
+    with:
+      patches: CVE-2023-34054.patch
 
   - runs: |
       echo "org.gradle.daemon=false" >> gradle.properties
@@ -62,6 +127,110 @@ pipeline:
 
       # Manually set this to docker: https://github.com/opensearch-project/OpenSearch/blob/5f8193021215cd6979fde66474ec8d74d32ac91a/distribution/docker/src/docker/Dockerfile#LL49C90-L49C129
       sed -i -e 's/OPENSEARCH_DISTRIBUTION_TYPE=tar/OPENSEARCH_DISTRIBUTION_TYPE=docker/'  ${{targets.destdir}}/usr/share/opensearch/bin/opensearch-env
+
+  - runs: |
+      cd plugins
+      gradle assemble -Dbuild.snapshot="false" -Dbuild.version_qualifier="" --stacktrace
+
+      # useful for finding generated zip file we use to extract into the final apk
+      find . -name "*.zip"
+
+  - runs: |
+      # Remove files so they don't conflict with subpackages
+      echo "Removing files that conflict with subpackages"
+      rm -rf /home/build/settings.gradle
+
+  - uses: strip
+
+subpackages:
+  - range: internal-plugins
+    name: ${{package.name}}-${{range.key}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/opensearch/plugins/opensearch-${{range.key}}
+          unzip "./plugins/${{range.key}}/build/distributions/${{range.key}}-${{package.version}}.zip" -d "${{targets.contextdir}}/usr/share/opensearch/plugins/opensearch-${{range.key}}"
+
+  - range: external-plugins
+    name: ${{package.name}}-${{range.key}}
+    pipeline:
+      # Delete other plugins. Opensearch can only build one at a time, otherwise we run into conflicting dependencies version issues with yarn.
+      - runs: |
+          rm -r plugins/* || true
+      - uses: git-checkout
+        with:
+          repository: https://github.com/opensearch-project/${{range.key}}.git
+          tag: ${{package.version}}.${{vars.plugin_version_qualifier}}
+          destination: ./plugins/${{range.key}}
+      - runs: |
+          cd ./plugins/${{range.key}}
+
+          # apply any CVE patches
+          if [ -n "${{range.value}}" ]; then
+              patch -p1 < "../../${{range.value}}"
+          fi
+
+          # notifications source live in a subfolder
+          if [ "${{range.key}}" = "notifications" ]; then
+            cd ./notifications
+          fi
+
+          # skip check task, using -x doesn't append to an existing list
+          # job scheduler requires a test cluster to connect to so skip verification checks
+          if [ "${{range.key}}" = "job-scheduler" ]; then
+            sed -i '/startParameter.excludedTaskNames=\[/ s/]/, "check"]/g' settings.gradle
+          fi
+
+          echo "org.gradle.daemon=false" >> gradle.properties
+          ./gradlew clean assemble -Dbuild.snapshot="false" -Dbuild.version_qualifier="" -x check -x integTest -x javadoc -PfailOnJavadocWarning=false --stacktrace
+
+          # useful for finding generated zip file we use to extract into the final apk
+          find . -name "*.zip"
+
+          mkdir -p "${{targets.contextdir}}/usr/share/opensearch/plugins"
+
+          # Define the base path for the unzip destination
+          destination_base="${{targets.contextdir}}/usr/share/opensearch/plugins"
+
+          # Extract the value of rootProject.name, this is because the key is not always the same as the plugin name
+          # note: not all plugins have a settings.gradle file
+          plugin_name=$(grep "^rootProject.name" settings.gradle 2>/dev/null | awk -F" = " '{print $2}' | tr -d "'" | tr -d '"')
+
+          # Check if plugin_name is empty and assign default if it is
+          if [ -z "$plugin_name" ]; then
+              plugin_name=${{range.key}}
+          fi
+
+          echo "Plugin name: $plugin_name"
+
+          # Remove any existing "opensearch-" prefix before adding it to ensure it's not duplicated
+          plugin_name=$(echo $plugin_name | sed 's/^opensearch-//')
+
+          # Ensure the plugin_name has the "opensearch-" prefix
+          plugin_name="opensearch-$plugin_name"
+
+          echo "Final plugin name: $plugin_name"
+
+          # Determine the source directory based on the plugin key
+          case "${{range.key}}" in
+              "alerting")
+                  zip_dir="./alerting"
+                  ;;
+              "ml-commons"|"sql")
+                  zip_dir="./plugin"
+                  ;;
+              "notifications")
+                  zip_dir="./notifications"
+                  # Special handling for notifications core
+                  unzip "./core/build/distributions/${plugin_name}-core-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/${plugin_name}-core"
+                  ;;
+              *)
+                  zip_dir="."
+                  ;;
+          esac
+
+          # Unzip the main plugin distribution
+          unzip "${zip_dir}/build/distributions/${plugin_name}-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/${plugin_name}"
+      - uses: strip
 
 update:
   enabled: true

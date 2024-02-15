@@ -10,6 +10,7 @@ WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
+INTERACTIVE ?= no
 
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
@@ -37,6 +38,10 @@ endif
 
 ifeq (${LINT}, yes)
 	MELANGE_OPTS += --fail-on-lint-warning
+endif
+
+ifeq (${INTERACTIVE}, yes)
+	MELANGE_OPTS += --interactive
 endif
 
 # The list of packages to be built. The order matters.

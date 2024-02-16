@@ -7,38 +7,58 @@ on:
 concurrency: build
 
 jobs:
-  build:
+  withdraw:
     name: Withdraw packages
-    runs-on: ubuntu-16-core
+    runs-on: ubuntu-latest
 
     permissions:
       id-token: write
-      packages: write
       contents: read
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
+        with:
+          fetch-depth: 0 # We want the full history for uploading withdrawn-packages.txt to GCS. If this takes too long, we look at merging both files.
 
-      - uses: chainguard-dev/actions/setup-melange@main
+      - name: "Install wolfictl onto PATH"
+        run: |
+          # Copy wolfictl out of the wolfictl image and onto PATH
+          TMP=$(mktemp -d)
+          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:9fbf11e704651089810dfd14acd7a70e589c18c216df8de607a6583b39b1f1e1 -c "cp /usr/bin/wolfictl /out"
+          echo "$TMP" >> $GITHUB_PATH
 
-      - id: auth
-        name: 'Authenticate to Google Cloud'
-        uses: google-github-actions/auth@v0
+      - name: 'Authenticate to Google Cloud'
+        id: auth
+        uses: google-github-actions/auth@f6de81663f7788d05bd15bcce18f0e57f23f0846 # v2.0.1
         with:
           workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
           service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
 
-      - uses: google-github-actions/setup-gcloud@v0
+      - uses: google-github-actions/setup-gcloud@5a5f7b85fca43e76e53463acaa9d408a03c98d3a # v2.0.1
         with:
-          project_id: prod-images-c6e5
+          project_id: "prod-images-c6e5"
 
-      - run: echo "${{ secrets.MELANGE_RSA }}" > ./wolfi-signing.rsa
+      - uses: 'google-github-actions/get-secretmanager-secrets@ae0d4054c32840e2ced71207a9df55161ae3debc' # v2.0.0
+        id: secrets
+        with:
+          secrets: |-
+            token:prod-images-c6e5/melange-signing-key
+      - run: echo "${{ steps.secrets.outputs.token }}" > ./wolfi-signing.rsa
       - run: |
           sudo mkdir -p /etc/apk/keys
           sudo cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
 
-      - name: 'Delete withdrawn packages'
+      - name: Withdraw from index
         run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            mkdir -p $arch
+            curl https://packages.wolfi.dev/os/$arch/APKINDEX.tar.gz | wolfictl withdraw $(grep -v '\#' withdrawn-packages.txt) --signing-key="${{ github.workspace }}/wolfi-signing.rsa" > $arch/APKINDEX.tar.gz
+          done
+
+      - name: Delete withdrawn packages
+        run: |
+          set -euo pipefail
           for arch in x86_64 aarch64; do
             for pkg in $(grep -v '\#' withdrawn-packages.txt); do
               echo "=> $pkg"
@@ -46,19 +66,30 @@ jobs:
             done
           done
 
-      - name: 'Sync public package repository'
+      - name: Upload modified index
         run: |
-          mkdir "${{ github.workspace }}/packages"
-          gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ "${{ github.workspace }}/packages/"
-          find "${{ github.workspace }}/packages" -print -exec touch \{} \;
-
-      - name: 'Reconcile Wolfi index'
-        run: |
+          set -euxo pipefail
           for arch in x86_64 aarch64; do
-            pushd "${{ github.workspace }}/packages/"$arch
-              melange index -o APKINDEX.tar.gz -a $arch *.apk
-              melange sign-index --signing-key="${{ github.workspace }}/wolfi-signing.rsa" APKINDEX.tar.gz
-              gsutil -h "Cache-Control:no-store" cp "${{ github.workspace }}/packages/${arch}/APKINDEX.tar.gz" gs://wolfi-production-registry-destination/os/${arch}/APKINDEX.tar.gz
-              gsutil -h "Cache-Control:no-store" cp "${{ github.workspace }}/packages/${arch}/APKINDEX.json" gs://wolfi-production-registry-destination/os/${arch}/APKINDEX.json
-            popd
+            gsutil -h "Cache-Control:no-store" cp $arch/APKINDEX.tar.gz gs://wolfi-production-registry-destination/os/$arch/APKINDEX.tar.gz || true
           done
+
+      - name: Upload full withdrawn packages list
+        run: |
+          set -euxo pipefail
+          git log -p -- withdrawn-packages.txt | grep "^+" | grep ".apk$" | cut -c2- | sort | uniq > all-withdrawn-packages.txt
+          gsutil cp \
+            all-withdrawn-packages.txt \
+            gs://wolfi-production-registry-destination/os/withdrawn-packages.txt
+
+      - uses: rtCamp/action-slack-notify@v2.2.1
+        if: failure()
+        env:
+          SLACK_ICON: http://github.com/chainguard-dev.png?size=48
+          SLACK_USERNAME: guardian
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: chainguard-images-alerts
+          SLACK_COLOR: '#8E1600'
+          MSG_MINIMAL: 'true'
+          SLACK_TITLE: '[withdraw-packages] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          SLACK_MESSAGE: |
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

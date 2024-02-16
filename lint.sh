@@ -2,26 +2,26 @@
 
 set -euo pipefail
 
-makepkgs=$(make list-yaml)
-for f in *.yaml; do
-  echo "---" $f
+for p in $(make list); do
+  echo "--- package" $p
 
-  # Don't specify packages.wolfi.dev/os as a repository, and remove it from the keyring.
-  # Packages from the bootstrap repo should be allowed, but otherwise packages
-  # should be fetched locally and the local repository should be appended at
-  # build time.
-  if grep -q packages.wolfi.dev/os $f; then
-    yq -i 'del(.environment.contents.repositories)' $f
-    yq -i 'del(.environment.contents.keyring)' $f
+  if [ -f ${p}.yaml ]; then
+    if [ -f **/${p}/${p}.melange.yaml ]; then
+      echo "ERROR: ${p}.yaml and **/${p}/${p}.melange.yaml both exist"
+      exit 1
+    fi
+
+    fn=${p}.yaml
+  elif [ -f **/${p}/${p}.melange.yaml ]; then
+    fn=$(ls **/${p}/${p}.melange.yaml | head -n 1)
+  else
+    echo "ERROR: ${p}.yaml or **/${p}/${p}.melange.yaml does not exist, or multiple matches found"
+    exit 1
   fi
 
-  # With the introduction of https://github.com/wolfi-dev/advisories,
-  # package config files should no longer contain any advisory data.
-  if [[ "$(yq 'keys | contains(["advisories"])' "$f")" == "true" ]]; then
-    echo "
-$f has an 'advisories' section, but advisory data should now be stored in https://github.com/wolfi-dev/advisories.
-
-To learn about how to create advisory data in the advisories repo, run 'wolfictl advisory create -h', and check out the '--advisories-repo-dir' flag."
-    exit 1
+  # Don't specify repositories or keyring for os packages
+  if grep -q packages.wolfi.dev/os ${fn}; then
+    yq -i 'del(.environment.contents.repositories)' ${fn}
+    yq -i 'del(.environment.contents.keyring)' ${fn}
   fi
 done

@@ -13,4 +13,3 @@ def test_help_message():
     # Validate the presence of expected text in the help message
     expected_text = 'Usage:'
     assert expected_text in result.stdout, "Help message does not contain expected text"
-

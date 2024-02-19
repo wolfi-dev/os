@@ -2,6 +2,7 @@
 
 # Use a modified entrypoint script as the official one duplicates env vars and system properties used by the JVM on startup
 # This means we avoid errors like: ERROR: setting [discovery.seed_hosts] already set, saw [opensearch-cluster-master-headless] and [opensearch-cluster-master-headless]
+# This is based on the upstream script from https://raw.githubusercontent.com/opensearch-project/opensearch-build/2.11.1/docker/release/config/opensearch/opensearch-docker-entrypoint.sh
 
 # Copyright OpenSearch Contributors
 # SPDX-License-Identifier: Apache-2.0
@@ -34,18 +35,19 @@ function setupSecurityPlugin {
     SECURITY_PLUGIN="opensearch-security"
 
     if [ -d "$OPENSEARCH_HOME/plugins/$SECURITY_PLUGIN" ]; then
+        if [ "$DISABLE_INSTALL_DEMO_CONFIG" = "true" ]; then
+            echo "Disabling execution of install_demo_configuration.sh for OpenSearch Security Plugin"
+        else
+            echo "Enabling execution of install_demo_configuration.sh for OpenSearch Security Plugin"
+            bash $OPENSEARCH_HOME/plugins/$SECURITY_PLUGIN/tools/install_demo_configuration.sh -y -i -s
+        fi
+
         if [ "$DISABLE_SECURITY_PLUGIN" = "true" ]; then
             echo "Disabling OpenSearch Security Plugin"
             opensearch_opt="-Eplugins.security.disabled=true"
             opensearch_opts+=("${opensearch_opt}")
         else
             echo "Enabling OpenSearch Security Plugin"
-            if [ "$DISABLE_INSTALL_DEMO_CONFIG" = "true" ]; then
-                echo "Disabling execution of install_demo_configuration.sh for OpenSearch Security Plugin"
-            else
-                echo -e "Enabling execution of install_demo_configuration.sh for OpenSearch Security Plugin \nOpenSearch 2.12.0 onwards, the OpenSearch Security Plugin a change that requires an initial password for 'admin' user. \nPlease define an environment variable 'OPENSEARCH_INITIAL_ADMIN_PASSWORD' with a strong password string. \nIf a password is not provided, the setup will quit. \n For more details, please visit: https://opensearch.org/docs/latest/install-and-configure/install-opensearch/docker/"
-                bash $OPENSEARCH_HOME/plugins/$SECURITY_PLUGIN/tools/install_demo_configuration.sh -y -i -s || exit 1
-            fi
         fi
     else
         echo "OpenSearch Security Plugin does not exist, disable by default"
@@ -82,21 +84,20 @@ function runOpensearch {
     #
     # e.g. Setting the env var cluster.name=testcluster
     # will cause OpenSearch to be invoked with -Ecluster.name=testcluster
-    opensearch_opts=()
-
     # DISABLE THIS FOR WOLFI
-    # while IFS='=' read -r envvar_key envvar_value
-    # do
-    #     # OpenSearch settings need to have at least two dot separated lowercase
-    #     # words, e.g. `cluster.name`, except for `processors` which we handle
-    #     # specially
-    #     if [[ "$envvar_key" =~ ^[a-z0-9_]+\.[a-z0-9_]+ || "$envvar_key" == "processors" ]]; then
-    #         if [[ ! -z $envvar_value ]]; then
-    #         opensearch_opt="-E${envvar_key}=${envvar_value}"
-    #         opensearch_opts+=("${opensearch_opt}")
-    #         fi
-    #     fi
-    # done < <(env)
+    opensearch_opts=()
+    #while IFS='=' read -r envvar_key envvar_value
+    #do
+    #    # OpenSearch settings need to have at least two dot separated lowercase
+    #    # words, e.g. `cluster.name`, except for `processors` which we handle
+    #    # specially
+    #    if [[ "$envvar_key" =~ ^[a-z0-9_]+\.[a-z0-9_]+ || "$envvar_key" == "processors" ]]; then
+    #        if [[ ! -z $envvar_value ]]; then
+    #        opensearch_opt="-E${envvar_key}=${envvar_value}"
+    #        opensearch_opts+=("${opensearch_opt}")
+    #        fi
+    #    fi
+    #done < <(env)
 
     setupSecurityPlugin
     setupPerformanceAnalyzerPlugin

@@ -24,4 +24,8 @@ for p in $(make list); do
     yq -i 'del(.environment.contents.repositories)' ${fn}
     yq -i 'del(.environment.contents.keyring)' ${fn}
   fi
+
+  if grep -q 'test:' ${fn}; then
+    yq -i 'del(.test.environment)' ${fn}
+  fi
 done

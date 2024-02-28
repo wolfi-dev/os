@@ -1,7 +1,7 @@
 package:
   name: cilium-1.14
   version: 1.14.6
-  epoch: 0
+  epoch: 1
   description: Cilium is a networking, observability, and security solution with an eBPF-based dataplane
   copyright:
     - license: Apache-2.0
@@ -23,16 +23,36 @@ package:
 environment:
   contents:
     packages:
+      - bash
+      - bazel-6
+      - binutils
       - build-base
       - busybox
-      - clang
+      - ca-certificates-bundle
+      - clang~15
+      - cmake
       - coreutils # for GNU install
+      # We need to stick to gcc 12 for now, envoy doesn't build with gcc >= 13
+      - gcc-12-default
       - git
       - go
       - grep
       - iptables # for cilium-iptables
+      - libtool
+      - llvm-lld-15
       - llvm15
+      - llvm15-cmake-default
+      - llvm15-dev
       - llvm15-tools
+      - openjdk-11
+      - patch
+      - python3-dev
+      - samurai
+      - wolfi-baselayout
+
+vars:
+  # https://github.com/cilium/cilium/blob/v1.14.6/images/cilium/Dockerfile
+  CILIUM_PROXY_COMMIT: "ad82c7c56e88989992fd25d8d67747de865c823b"
 
 pipeline:
   - uses: git-checkout
@@ -52,6 +72,62 @@ pipeline:
 
       DESTDIR=${{targets.destdir}} DISABLE_ENVOY_INSTALLATION=1 make build-container
       DESTDIR=${{targets.destdir}} DISABLE_ENVOY_INSTALLATION=1 make install-container
+
+  - runs: |
+      # Check the Dockerfile for a SHA and match against the proxy SHA
+      ENVOY_SHA=$(grep 'FROM.*cilium-envoy' ./images/cilium/Dockerfile \
+        | sed "s/^FROM.*:v[0-9.]\+-//g" | cut -d@ -f1)
+
+      if [ "$ENVOY_SHA" != "${{vars.CILIUM_PROXY_COMMIT}}" ]; then
+        echo "Expected vars.CILIUM_PROXY_COMMIT to be $ENVOY_SHA. Please update" 1>&2
+        exit 1
+      fi
+
+  - runs: |
+      # TODO: Replace with git-checkout when `commit` parameter
+      #       is supported.
+      tmpdir=$(mktemp -d)
+      git config --global --add safe.directory $tmpdir
+      git config --global --add safe.directory /home/build
+      git clone https://github.com/cilium/proxy $tmpdir
+      cd $tmpdir
+      git reset --hard ${{vars.CILIUM_PROXY_COMMIT}}
+
+      mkdir -p /home/build/envoy
+      tar -c . | (cd /home/build/envoy && tar -x)
+      rm -rf $tmpdir
+
+  - uses: patch
+    with:
+      patches: toolchains-paths.patch
+
+  - uses: go/bump
+    with:
+      modroot: /home/build/envoy
+      deps: golang.org/x/net@v0.17.0
+
+  - runs: |
+      cd /home/build/envoy/proxylib
+      make
+      mkdir -p ${{targets.destdir}}/usr/lib
+      cp -v libcilium.so ${{targets.destdir}}/usr/lib/libcilium.so
+
+      cd /home/build/envoy
+
+      export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+      mkdir -p .cache/bazel/_bazel_root
+
+      ./bazel/setup_clang.sh /usr
+
+      mkdir -p ${{targets.destdir}}/usr/bin
+      bazel build --fission=no --config=clang \
+        --discard_analysis_cache \
+        --nokeep_state_after_build \
+        --notrack_incremental_state \
+        --conlyopt="-Wno-strict-prototypes" \
+        --verbose_failures -c opt //:cilium-envoy
+
+      cp -v bazel-bin/cilium-envoy ${{targets.destdir}}/usr/bin/cilium-envoy
 
   - uses: strip
 

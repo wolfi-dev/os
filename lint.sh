@@ -24,4 +24,16 @@ for p in $(make list); do
     yq -i 'del(.environment.contents.repositories)' ${fn}
     yq -i 'del(.environment.contents.keyring)' ${fn}
   fi
+
+  # Don't specify wolfi-base or any of its packages, or the main package, for test pipelines.
+  for pkg in wolfi-base busybox apk-tools wolfi-keys ${p}; do
+    yq -i 'del(.test.environment.contents.packages[] | select(. == "'${pkg}'"))' ${fn}
+    yam ${fn}
+  done
+
+  # If .test.environment.contents.packages is empty, remove it all.
+  if [ "$(yq -r '.test.environment.contents.packages | length' ${fn})" == "0" ]; then
+    yq -i 'del(.test.environment)' ${fn}
+    yam ${fn}
+  fi
 done

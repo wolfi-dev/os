@@ -30,11 +30,7 @@ jobs:
               - ./*/*/*.melange.yaml # Support recursive melange files with the new naming convention.
 
       - name: "Install wolfictl onto PATH"
-        run: |
-          # Copy wolfictl out of the wolfictl image and onto PATH
-          TMP=$(mktemp -d)
-          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:7c1012eb43ee829351f3b33eb0f150ca2d2e176545bd58a398a7427f5645d9c9 -c "cp /usr/bin/wolfictl /out"
-          echo "$TMP" >> $GITHUB_PATH
+        uses: wolfi-dev/actions/install-wolfictl@main
 
       # Assuming that we have a list of changed files such as `foo.yaml` and `bar.yaml`, this
       # strips the list down into `foo` and `bar`.
@@ -62,129 +58,27 @@ jobs:
 
   build:
     name: Test building of packages
-    strategy:
-      matrix:
-        arch: [ "x86_64", "aarch64" ]
-      fail-fast: false
-    runs-on:
-      group: wolfi-builder-${{ matrix.arch }}
     needs: changes
-    container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:7c1012eb43ee829351f3b33eb0f150ca2d2e176545bd58a398a7427f5645d9c9
-      options: |
-        --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor:unconfined
-    outputs:
-      packages_were_built: ${{ steps.file_check.outputs.exists }}
 
     permissions:
       contents: read
       pull-requests: write # so we have permission to comment on pull requests
 
-    steps:
-      - name: Free up runner disk space
-        run: |
-          set -x
-          rm -rf /usr/share/dotnet
-          rm -rf "$AGENT_TOOLSDIRECTORY"
-      - uses: actions/checkout@v4
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - "x86_64"
+          - "aarch64"
 
-      - name: 'Trust the github workspace'
-        run: |
-          # This is to avoid fatal errors about "dubious ownership" because we are
-          # running inside of a container action with the workspace mounted in.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: 'Generate local signing key'
-        run: |
-          make MELANGE="melange" local-melange.rsa
-
-      - name: 'Build Wolfi'
-        run: |
-          # Setup the melange cache dir on the host so we can use that in subsequent builds
-          mkdir ../.melangecache
-          for package in ${{needs.changes.outputs.packages}}; do
-            make MELANGE_EXTRA_OPTS="--create-build-log --cache-dir=$(pwd)/../.melangecache" REPO="$GITHUB_WORKSPACE/packages" package/$package -j1
-            make REPO="$GITHUB_WORKSPACE/packages" test/$package -j1
-          done
-
-      - name: "Check that packages can be installed with apk add"
-        run: |
-          # Create a fake linux fs under /tmp/emptyroot to pass to `apk --root`.
-          mkdir -p /tmp/emptyroot/etc/apk
-          cp -r /etc/apk/* /tmp/emptyroot/etc/apk/
-          cat /dev/null > /tmp/emptyroot/etc/apk/world
-
-          mkdir -p /tmp/emptyroot/lib/apk/db
-          touch /tmp/emptyroot/lib/apk/db/{installed,lock,scripts.tar,triggers}
-
-          mkdir -p /tmp/emptyroot/var/cache/apk
-          apk update --root /tmp/emptyroot
-
-          # Find .apk files and add them to the string
-          for f in $(find packages -name '*.apk'); do
-              tar -Oxf $f .PKGINFO
-              apk add --root /tmp/emptyroot --repository "$GITHUB_WORKSPACE/packages" --allow-untrusted --simulate $f
-          done
-
-      - name: Check SBOMs
-        run: |
-          apk add py3-ntia-conformance-checker
-          for f in $(find packages -name '*.apk'); do
-              echo ==== Checking SBOM for $f ====
-              tar -Oxf $f var/lib/db/sbom/ > sbom.json
-              echo ::group::sbom.json
-              cat sbom.json
-              echo ::endgroup::
-              ntia-checker -v --file sbom.json
-          done
-
-      - name: Check for file
-        id: file_check
-        run: |
-          if test -f "packages.log"; then
-            cat packages.log
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-          touch packages.log
-
-      - name: Check diff
-        if: steps.file_check.outputs.exists == 'true'
-        # Let's not fail the whole job if this step fails as it is for improved UX rather than an enforced check
-        continue-on-error: true
-        run: |
-          wolfictl check diff
-
-      - name: Check for diff file
-        id: diff_file_check
-        run: |
-          if test -f "diff.log"; then
-            cat diff.log
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      # Use the x86_64 build results for the comment for now so we don't have duplicates.
-      - name: PR comment diff
-        if: steps.diff_file_check.outputs.exists == 'true' && matrix.arch == 'x86_64'
-        uses: thollander/actions-comment-pull-request@632cf9ce90574d125be56b5f3405cda41a84e2fd # v2.3.1
-        # We're seeing jobs using merge queues fail
-        continue-on-error: true
-        with:
-          filePath: diff.log
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 'Upload built packages to GitHub artifacts'
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
-        with:
-          path: |
-            ./packages/${{ matrix.arch }}
-            ./packages.log
-          name: packages-${{ matrix.arch }}
-          retention-days: 1
-          if-no-files-found: warn
+    uses: wolfi-dev/actions/.github/workflows/.ci-build.yml@main
+    with:
+      arch: ${{ matrix.arch }}
+      packages: ${{needs.changes.outputs.packages}}
+      runs_on_group_name: wolfi-builder
+      melange_keyname: "local-melange.rsa"
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
 
   so_check:
     permissions:

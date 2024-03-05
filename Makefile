@@ -15,9 +15,11 @@ MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
 MELANGE_OPTS += --arch ${ARCH}
-MELANGE_OPTS += --env-file build-${ARCH}.env
+# TODO: Add this to wolfictl.
+# MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
-MELANGE_OPTS += --generate-index false
+# TODO: Add this to wolfictl.
+# MELANGE_OPTS += --generate-index false
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 

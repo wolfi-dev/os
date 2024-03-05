@@ -93,6 +93,10 @@ list-yaml:
 	$(info $(addsuffix .yaml,$(shell $(PKGLISTCMD))))
 	@printf ''
 
+.PHONY: wolfictl-build-all
+wolfictl-build-all:
+	wolfictl build $(MELANGE_OPTS)
+
 # This function parses the path from the package file. It's used to figure out
 # what to mount to the container image as supporting files (patches, tests,
 # etc.)

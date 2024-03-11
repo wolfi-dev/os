@@ -39,6 +39,7 @@ addressed, and remove any items that are not relevant to this PR.
 - [ ] The upstream project actually supports multiple concurrent versions.
 - [ ] Any subpackages include the version string in their package name (e.g. `name: ${{package.name}}-compat`)
 - [ ] The package (and subpackages) `provides:` logical unversioned forms of the package (e.g. `nodejs`, `nodejs-lts`)
+- [ ] If non-streamed package names no longer built, open PR to withdraw them (see [WITHDRAWING PACKAGES](https://github.com/wolfi-dev/os/blob/main/WITHDRAWING_PACKAGES.md))
 
 #### For security-related PRs
 <!-- remove if unrelated -->

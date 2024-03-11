@@ -1,6 +1,6 @@
 package:
-  name: cilium
-  version: 1.15.1
+  name: cilium-1.14
+  version: 1.14.7
   epoch: 0
   description: Cilium is a networking, observability, and security solution with an eBPF-based dataplane
   copyright:
@@ -17,31 +17,57 @@ package:
       - kmod
       - llvm15
       - llvm15-tools
+    provides:
+      - cilium=${{package.full-version}}
 
 environment:
   contents:
     packages:
+      - bash
+      - bazel-6
+      - binutils
       - build-base
       - busybox
-      - clang
+      - ca-certificates-bundle
+      - clang~15
+      - cmake
       - coreutils # for GNU install
+      # We need to stick to gcc 12 for now, envoy doesn't build with gcc >= 13
+      - gcc-12-default
       - git
       - go
       - grep
       - iptables # for cilium-iptables
+      - libtool
+      - llvm-lld-15
       - llvm15
+      - llvm15-cmake-default
+      - llvm15-dev
       - llvm15-tools
+      - openjdk-11
+      - patch
+      - python3-dev
+      - samurai
+      - wolfi-baselayout
+
+vars:
+  # https://github.com/cilium/cilium/blob/v1.14.7/images/cilium/Dockerfile
+  CILIUM_PROXY_COMMIT: "39dc41f86c465d2a2d16386339dc0bf4d425babc"
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/cilium/cilium
       tag: v${{package.version}}
-      expected-commit: a368c8f0f34dfe9a47e8a621af31ea94337f6fb5
+      expected-commit: 91b461c78160ff5c96cad23a85e4287093753c22
 
   - uses: patch
     with:
       patches: loopback-location.patch
+
+  - uses: patch
+    with:
+      patches: go.mod.patch
 
   - runs: |
       # Remove groupadd from Makefile: it's not doing anything useful in
@@ -51,11 +77,65 @@ pipeline:
       DESTDIR=${{targets.destdir}} DISABLE_ENVOY_INSTALLATION=1 make build-container
       DESTDIR=${{targets.destdir}} DISABLE_ENVOY_INSTALLATION=1 make install-container
 
+  - runs: |
+      # Check the Dockerfile for a SHA and match against the proxy SHA
+      ENVOY_SHA=$(grep 'FROM.*cilium-envoy' ./images/cilium/Dockerfile \
+        | sed "s/^FROM.*:v[0-9.]\+-//g" | cut -d@ -f1)
+
+      if [ "$ENVOY_SHA" != "${{vars.CILIUM_PROXY_COMMIT}}" ]; then
+        echo "Expected vars.CILIUM_PROXY_COMMIT to be $ENVOY_SHA. Please update" 1>&2
+        exit 1
+      fi
+
+  - runs: |
+      # TODO: Replace with git-checkout when `commit` parameter
+      #       is supported.
+      tmpdir=$(mktemp -d)
+      git config --global --add safe.directory $tmpdir
+      git config --global --add safe.directory /home/build
+      git clone https://github.com/cilium/proxy $tmpdir
+      cd $tmpdir
+      git reset --hard ${{vars.CILIUM_PROXY_COMMIT}}
+
+      mkdir -p /home/build/envoy
+      tar -c . | (cd /home/build/envoy && tar -x)
+      rm -rf $tmpdir
+
+  - uses: patch
+    with:
+      patches: toolchains-paths.patch
+
+  - runs: |
+      cd /home/build/envoy/proxylib
+      make
+      mkdir -p ${{targets.destdir}}/usr/lib
+      cp -v libcilium.so ${{targets.destdir}}/usr/lib/libcilium.so
+
+      cd /home/build/envoy
+
+      export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+      mkdir -p .cache/bazel/_bazel_root
+
+      ./bazel/setup_clang.sh /usr
+
+      mkdir -p ${{targets.destdir}}/usr/bin
+      bazel build --fission=no --config=clang \
+        --discard_analysis_cache \
+        --nokeep_state_after_build \
+        --notrack_incremental_state \
+        --conlyopt="-Wno-strict-prototypes" \
+        --verbose_failures -c opt //:cilium-envoy
+
+      cp -v bazel-bin/cilium-envoy ${{targets.destdir}}/usr/bin/cilium-envoy
+
   - uses: strip
 
 subpackages:
   - name: ${{package.name}}-container-init
     description: init scripts for cilium
+    dependencies:
+      provides:
+        - cilium-container-init=${{package.full-version}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/bin
@@ -69,6 +149,8 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}-container-init
+      provides:
+        - cilium-container-init-compat=${{package.full-version}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}
@@ -81,6 +163,8 @@ subpackages:
     dependencies:
       runtime:
         - iptables
+      provides:
+        - cilium-iptables=${{package.full-version}}
     pipeline:
       - runs: |
           # This script generates a wrapper based on the version
@@ -95,6 +179,8 @@ subpackages:
     dependencies:
       runtime:
         - gops
+      provides:
+        - cilium-operator-generic=${{package.full-version}}
     pipeline:
       - runs: |
           cd /home/build/operator
@@ -102,8 +188,11 @@ subpackages:
           DESTDIR=${{targets.subpkgdir}} make install-generic
       - uses: strip
 
-  - name: hubble-relay
+  - name: ${{package.name}}-hubble-relay
     description: Hubble relay
+    dependencies:
+      provides:
+        - cilium-hubble-relay=${{package.full-version}}
     pipeline:
       - runs: |
           cd /home/build/hubble-relay
@@ -111,8 +200,13 @@ subpackages:
           DESTDIR=${{targets.subpkgdir}} make install
       - uses: strip
 
+test:
+  pipeline:
+    - runs: cilium version
+
 update:
   enabled: true
   github:
     identifier: cilium/cilium
     strip-prefix: v
+    tag-filter-prefix: v1.14.

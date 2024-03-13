@@ -2,10 +2,10 @@ name: Build Wolfi OS
 
 on:
   push:
-    branches: ['main']
+    branches: ["main"]
     paths-ignore:
-      - '**.md'
-      - '**.txt'
+      - "**.md"
+      - "**.txt"
 
   workflow_dispatch:
 
@@ -19,137 +19,139 @@ jobs:
 
     strategy:
       matrix:
-        arch: [ "x86_64", "aarch64" ]
-      fail-fast: false
+        arch: ["x86_64", "aarch64"]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest-64-cores
+            oci: amd64
+          - arch: aarch64
+            runner: ubuntu-arm-64-cores
+            oci: arm64
 
-    runs-on:
-      group: wolfi-os-builder-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
 
     permissions:
       contents: read
 
-    container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:b8778a18b4aa16bc5302aababbe5dfd6fccb659c5478ef46b5b4550d8bc3aa76
-      # TODO: Deprivilege
-      options: |
-        --cap-add NET_ADMIN --cap-add SYS_ADMIN --device /dev/fuse --security-opt seccomp=unconfined --security-opt apparmor:unconfined
-
     steps:
+      - name: Free up runner disk space
+        run: |
+          set -x
+          rm -rf /usr/share/dotnet
+          rm -rf "$AGENT_TOOLSDIRECTORY"
+
       - uses: actions/checkout@v4
 
-      - name: 'Trust the github workspace'
+      - name: Setup Docker
         run: |
-          # This is to avoid fatal errors about "dubious ownership" because we are
-          # running inside of a container action with the workspace mounted in.
-          git config --global --add safe.directory "$(pwd)"
+          # Add Docker's official GPG key:
+          sudo apt-get update -y
+          sudo apt-get install ca-certificates curl -y
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          # Add the repository to Apt sources:
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          sudo usermod -aG docker $USER
+          sudo apt-get install acl
+          sudo setfacl --modify user:$USER:rw /var/run/docker.sock
 
-      # Build with a local key, we'll resign this with the real key later
-      - name: 'Generate local signing key'
-        run: |
-          make local-melange.rsa
+      - name: "Generate local signing key"
+        uses: ./.github/actions/docker-run
+        with:
+          run: |
+            make MELANGE="melange" local-melange.rsa
 
-          # Touch it with the epoch date to convince `make` that we don't need to
-          # rebuild the targets that depend on this (all)
-          touch -d @0 local-melange.rsa
+      - name: "Build Wolfi"
+        uses: ./.github/actions/run-in-docker
+        with:
+          run: |
+            mkdir -p ./packages/${{ matrix.arch }}
 
-      - name: 'Prepare package repository'
-        run: |
-          # yay wolfi!
-          apk add gcsfuse google-cloud-sdk
-
-          # Set up a gcsfuse RO mount to the public bucket. This is a cheap and
-          # cheerful way to recreate the make targets (class A HEADs) locally
-          # without syncing the whole bucket (class A+B).
-          mkdir -p /gcsfuse/wolfi-registry
-          gcsfuse -o ro --implicit-dirs --only-dir os wolfi-production-registry-destination /gcsfuse/wolfi-registry
-
-          mkdir -p ./packages/${{ matrix.arch }}
-          # Symlink the gcsfuse mount to ./packages/ to workaround the Makefile CWD assumptions
-          for f in /gcsfuse/wolfi-registry/${{ matrix.arch }}/*.apk; do
-            ln -s "$f" ./packages/${{ matrix.arch }}/
-          done
-
-          # Make a copy of the APKINDEX.* since we'll need to write to it on package builds
-          cp /gcsfuse/wolfi-registry/${{ matrix.arch }}/APKINDEX.* ./packages/${{ matrix.arch }}/
-
-      # TODO: Remove the previous and next steps by folding the logic into wolfictl.
-      - name: 'Build Wolfi'
-        run: |
-          wolfictl build \
-            --runner bubblewrap \
-            --keyring-append /gcsfuse/wolfi-registry/wolfi-signing.rsa.pub \
-            --repository-append ./packages \
-            --keyring-append local-melange.rsa.pub \
-            --repository-append https://packages.wolfi.dev/os \
-            --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub \
-            --signing-key local-melange.rsa \
-            --arch ${{ matrix.arch }} \
-            --namespace wolfi \
-            --pipeline-dir ./pipelines/ \
-            --destination-repository https://packages.wolfi.dev/os \
-            --trace ./packages/${{ matrix.arch }}/trace.json
+            wolfictl build \
+              --runner bubblewrap \
+              --repository-append ./packages \
+              --keyring-append local-melange.rsa.pub \
+              --repository-append https://packages.wolfi.dev/os \
+              --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub \
+              --signing-key local-melange.rsa \
+              --arch ${{ matrix.arch }} \
+              --namespace wolfi \
+              --pipeline-dir ./pipelines/ \
+              --destination-repository https://packages.wolfi.dev/os \
+              --trace ./packages/${{ matrix.arch }}/trace.json
 
       # Always run this step for https://github.com/wolfi-dev/os/issues/8698
       - if: ${{ always() }}
-        name: 'Create artifacts tarball'
+        name: "Create artifacts tarball"
+        uses: ./.github/actions/run-in-docker
+        with:
+          run: |
+            set -x
+            set -e
+            set -o pipefail
+
+            # Pick up any stragglers that didn't get uploaded in previous builds.
+            cat ./packages/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$1 == "P" {printf "%s-", $2} $1 == "V" {printf "%s.apk\n", $2}' | sort > indexed.txt
+            # TODO: Figure out why ls through gcsfuse is so slow.
+            gcloud storage ls gs://wolfi-production-registry-destination/os/${{ matrix.arch }} | grep ".apk$" | xargs -n1 basename | sort > uploaded.txt
+
+            # Lines that are only in uploaded.txt and not indexed.txt.
+            comm -13 indexed.txt uploaded.txt > missing.txt
+
+            # Merge any missing APKs into our new index.
+            for missed in \$(cat missing.txt); do
+              # We could do this in one command instead of a loop, but it takes things on argv, which is a bit annoying.
+              melange index --merge \
+                --source ./packages/${{ matrix.arch }}/APKINDEX.tar.gz \
+                --output new.tar.gz \
+                /gcsfuse/wolfi-registry/${{ matrix.arch }}/\${missed}
+
+              # Overwrite what we're going to upload (and for the next loop).
+              mv new.tar.gz ./packages/${{ matrix.arch }}/APKINDEX.tar.gz
+            done
+
+            diff \
+              <(cat /gcsfuse/wolfi-registry/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX) \
+              <(cat ./packages/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX) || true
+
+            # Move logs so we can upload them separately.
+            mv ./packages/${{ matrix.arch }}/buildlogs /tmp/buildlogs
+
+            # Move trace so we can upload it separately.
+            mv ./packages/${{ matrix.arch }}/trace.json /tmp/trace.json
+
+            # Create an archive for uploading
+            tar -cvzf /tmp/packages-${{ matrix.arch }}.tar.gz ./packages/${{ matrix.arch }}
+
+      - name: Reset file permissions
         run: |
-          set -x
-          set -e
-          set -o pipefail
-
-          # Pick up any stragglers that didn't get uploaded in previous builds.
-          cat ./packages/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$1 == "P" {printf "%s-", $2} $1 == "V" {printf "%s.apk\n", $2}' | sort > indexed.txt
-          # TODO: Figure out why ls through gcsfuse is so slow.
-          gcloud storage ls gs://wolfi-production-registry-destination/os/${{ matrix.arch }} | grep ".apk$" | xargs -n1 basename | sort > uploaded.txt
-
-          # Lines that are only in uploaded.txt and not indexed.txt.
-          comm -13 indexed.txt uploaded.txt > missing.txt
-
-          # Clean up the symlinks to keep only packages we built.
-          find ./packages/${{ matrix.arch }} -type l -exec rm -f {} \;
-
-          # Merge any missing APKs into our new index.
-          for missed in $(cat missing.txt); do
-            # We could do this in one command instead of a loop, but it takes things on argv, which is a bit annoying.
-            melange index --merge \
-              --source ./packages/${{ matrix.arch }}/APKINDEX.tar.gz \
-              --output new.tar.gz \
-              /gcsfuse/wolfi-registry/${{ matrix.arch }}/${missed}
-
-            # Overwrite what we're going to upload (and for the next loop).
-            mv new.tar.gz ./packages/${{ matrix.arch }}/APKINDEX.tar.gz
-          done
-
-          diff \
-            <(cat /gcsfuse/wolfi-registry/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX) \
-            <(cat ./packages/${{ matrix.arch }}/APKINDEX.tar.gz | tar -Oxz APKINDEX) || true
-
-          # Move logs so we can upload them separately.
-          mv ./packages/${{ matrix.arch }}/buildlogs /tmp/buildlogs
-
-          # Move trace so we can upload it separately.
-          mv ./packages/${{ matrix.arch }}/trace.json /tmp/trace.json
-
-          # Create an archive for uploading
-          tar -cvzf /tmp/packages-${{ matrix.arch }}.tar.gz ./packages/${{ matrix.arch }}
+          sudo chown -R $(id -u):$(id -g) .
 
       # Always run these steps for https://github.com/wolfi-dev/os/issues/8698
       - if: ${{ always() }}
-        name: 'Upload logs archive to GitHub Artifacts'
+        name: "Upload logs archive to GitHub Artifacts"
         uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
         with:
           name: logs-${{ matrix.arch }}
           path: /tmp/buildlogs/
           if-no-files-found: warn
+
       - if: ${{ always() }}
-        name: 'Upload trace to GitHub Artifacts'
+        name: "Upload trace to GitHub Artifacts"
         uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
         with:
           name: trace-${{ matrix.arch }}
           path: /tmp/trace.json
           if-no-files-found: warn
+
       - if: ${{ always() }}
-        name: 'Upload built packages archive to GitHub Artifacts'
+        name: "Upload built packages archive to GitHub Artifacts"
         uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
         with:
           name: packages-${{ matrix.arch }}
@@ -181,19 +183,19 @@ jobs:
           rm -rf /usr/share/dotnet
           rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - name: 'Trust the github workspace'
+      - name: "Trust the github workspace"
         run: |
           # This is to avoid fatal errors about "dubious ownership" because we are
           # running inside of a container action with the workspace mounted in.
           git config --global --add safe.directory "$(pwd)"
 
-      - name: 'Download x86_64 package archives'
+      - name: "Download x86_64 package archives"
         uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
         with:
           path: /tmp/artifacts/
           name: packages-x86_64
 
-      - name: 'Download aarch64 package archives'
+      - name: "Download aarch64 package archives"
         uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
         with:
           path: /tmp/artifacts/
@@ -208,7 +210,7 @@ jobs:
       - uses: google-github-actions/setup-gcloud@5a5f7b85fca43e76e53463acaa9d408a03c98d3a # v2.0.1
         with:
           project_id: "chainguard-github-secrets"
-      - uses: 'google-github-actions/get-secretmanager-secrets@ae0d4054c32840e2ced71207a9df55161ae3debc' # v2.0.0
+      - uses: "google-github-actions/get-secretmanager-secrets@ae0d4054c32840e2ced71207a9df55161ae3debc" # v2.0.0
         id: secrets
         with:
           secrets: |-
@@ -219,7 +221,7 @@ jobs:
           mkdir -p /etc/apk/keys
           cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
 
-      - name: 'Update the APKINDEX'
+      - name: "Update the APKINDEX"
         run: |
           for arch in "x86_64" "aarch64"; do
             mkdir -p ./packages/${arch}
@@ -250,7 +252,7 @@ jobs:
         with:
           project_id: "prod-images-c6e5"
 
-      - name: 'Upload packages to GCS'
+      - name: "Upload packages to GCS"
         run: |
           for arch in "x86_64" "aarch64"; do
             # Only attempt to upload when *.apk's exist
@@ -264,13 +266,13 @@ jobs:
             fi
           done
 
-      - name: 'Create APKINDEX tarball'
+      - name: "Create APKINDEX tarball"
         run: |
           # Tar up any 'APKINDEX.*' files {aarch64,x86_64} x {tar.gz,json}
           find ./packages/ -name 'APKINDEX.*' > to-include
           tar -cvzf /tmp/indexes.tar.gz --files-from to-include
 
-      - name: 'Upload APKINDEX archive to GitHub Artifacts'
+      - name: "Upload APKINDEX archive to GitHub Artifacts"
         uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
         with:
           name: indexes
@@ -293,14 +295,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 'Trust the github workspace'
+      - name: "Trust the github workspace"
         run: |
           # This is to avoid fatal errors about "dubious ownership" because we are
           # running inside of a container action with the workspace mounted in.
           git config --global --add safe.directory "$(pwd)"
 
       - id: auth
-        name: 'Authenticate to Google Cloud'
+        name: "Authenticate to Google Cloud"
         uses: google-github-actions/auth@v1
         with:
           workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
@@ -310,13 +312,13 @@ jobs:
         with:
           project_id: prod-images-c6e5
 
-      - name: 'Download index archive'
+      - name: "Download index archive"
         uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
         with:
           path: /tmp/artifacts/
           name: indexes
 
-      - name: 'Upload indexes to GCS'
+      - name: "Upload indexes to GCS"
         run: |
           tar xvf /tmp/artifacts/indexes.tar.gz
 
@@ -344,8 +346,8 @@ jobs:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_CHANNEL: C047DK5BUNP
           SLACK_MSG_AUTHOR: wolfi-bot
-          SLACK_COLOR: '#8E1600'
-          MSG_MINIMAL: 'true'
-          SLACK_TITLE: '[build-wolfi-os] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          SLACK_COLOR: "#8E1600"
+          MSG_MINIMAL: "true"
+          SLACK_TITLE: "[build-wolfi-os] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           SLACK_MESSAGE: |
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

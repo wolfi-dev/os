@@ -103,12 +103,13 @@ list-yaml:
 #
 # $(call get-package-dir,ret-variable-in-calling-function,package-file)
 # $(call get-package-dir,ret-variable-in-calling-function,package-file)
+# $(call get-package-dir,ret-variable-in-calling-function,package-file)
 define get-package-dir
         $(@info Getting package dir for $(2))
         $(@eval temp_dir := $(shell dirname $(2)))
         $(@eval is_excluded := $(findstring /.melangecache/,$(temp_dir)))
         $(if $(is_excluded),\
-            $(@info Skipping $(2) due to /.melangecache/ in path),\
+            $(@info Skipping directory $(temp_dir) due to /.melangecache/ in path),\
             $(@eval pkgdir := $(temp_dir))\
             $(@info For package $(1) found dir: $(pkgdir))\
             $(1) := $(pkgdir)\

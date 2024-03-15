@@ -102,11 +102,17 @@ list-yaml:
 # argument list and it will be populated and usable.
 #
 # $(call get-package-dir,ret-variable-in-calling-function,package-file)
+# $(call get-package-dir,ret-variable-in-calling-function,package-file)
 define get-package-dir
-	$(info getting package dir for $(2))
-	$(eval pkgdir := $(shell dirname $(2)))
-	$(info For package $(1) found dir: $(pkgdir))
-	$(1) := ${pkgdir}
+        $(@info Getting package dir for $(2))
+        $(@eval temp_dir := $(shell dirname $(2)))
+        $(@eval is_excluded := $(findstring /.melangecache/,$(temp_dir)))
+        $(if $(is_excluded),\
+            $(@info Skipping $(2) due to /.melangecache/ in path),\
+            $(@eval pkgdir := $(temp_dir))\
+            $(@info For package $(1) found dir: $(pkgdir))\
+            $(1) := $(pkgdir)\
+        )
 endef
 
 # This function tries to figure out what the 'source-dir' is for the package.

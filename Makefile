@@ -129,7 +129,7 @@ define get-source-dir
 endef
 
 package/%:
-	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
 	else \

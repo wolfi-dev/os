@@ -168,7 +168,7 @@ debug/%:
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) $(sourcedir) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
 
 test/%:
-	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
 	else \

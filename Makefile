@@ -11,19 +11,15 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
-# Common options for melange
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
+MELANGE_OPTS += --signing-key ${KEY}
 MELANGE_OPTS += --arch ${ARCH}
+MELANGE_OPTS += --env-file build-${ARCH}.env
+MELANGE_OPTS += --namespace wolfi
+MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
+MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
-
-# Options for melange build command
-MELANGE_BUILD_OPTS += ${MELANGE_OPTS}
-MELANGE_BUILD_OPTS += --signing-key ${KEY}
-MELANGE_BUILD_OPTS += --pipeline-dir ./pipelines/
-MELANGE_BUILD_OPTS += --env-file build-${ARCH}.env
-MELANGE_BUILD_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
-MELANGE_BUILD_OPTS += --namespace wolfi
 
 # Enter interactive mode on failure for debug
 MELANGE_DEBUG_OPTS += --interactive
@@ -32,7 +28,9 @@ MELANGE_DEBUG_OPTS += ${MELANGE_OPTS}
 
 # These are separate from MELANGE_OPTS because for building we need additional
 # ones that are not defined for tests.
-MELANGE_TEST_OPTS += ${MELANGE_OPTS}
+MELANGE_TEST_OPTS += --repository-append ${REPO}
+MELANGE_TEST_OPTS += --keyring-append ${KEY}.pub
+MELANGE_TEST_OPTS += --arch ${ARCH}
 MELANGE_TEST_OPTS += --pipeline-dirs ./pipelines/
 MELANGE_TEST_OPTS += --repository-append https://packages.wolfi.dev/os
 MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub

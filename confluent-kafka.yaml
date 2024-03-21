@@ -16,8 +16,12 @@ package:
     - license: Apache-2.0
   dependencies:
     runtime:
-      - zookeeper
-      - bash # Requied by this images - uses shell to launch image wth zookeeper.
+      - bash # Required by kafka - uses shebangs to launch the image.
+      - confluent-common-docker
+      - confluent-common-docker-ub
+      - confluent-common-docker-base
+      - confluent-docker-utils
+      - confluent-kafka-images-kafka
 
 environment:
   contents:
@@ -67,7 +71,17 @@ pipeline:
       # Create a symlink for the kafka libs since upstream images expect it to be in /usr/share/java/kafka:
       # https://github.com/confluentinc/kafka/blob/b66558da5d6b33c2fba9f424131575b948e6f611/bin/kafka-run-class.sh#L197
       mkdir -p ${{targets.destdir}}/usr/share/java/kafka
-      ln -sf ${{targets.destdir}}/usr/lib/kafka/libs ${{targets.destdir}}/usr/share/java/kafka
+      # ln -sf /usr/lib/kafka/libs/* ${{targets.destdir}}/usr/share/java/kafka/
+
+      # symlink every file in /usr/lib/kafka/libs to /usr/share/java/kafka
+      for file in "${{targets.destdir}}"/usr/lib/kafka/libs/*; do
+        ln -sf /usr/lib/kafka/libs/$(basename $file) ${{targets.destdir}}/usr/share/java/kafka/$(basename $file)
+      done
+
+      # /etc/confluent/docker/ensure runs kafka-storage whereas upstream only provides kafka-storage.sh for some reason.
+      echo "#!/usr/bin/env bash" > ${{targets.destdir}}/usr/bin/kafka-storage
+      echo "exec \"\$0.sh\" \"\$@\"" >> ${{targets.destdir}}/usr/bin/kafka-storage
+      chmod +x ${{targets.destdir}}/usr/bin/kafka-storage
 
       # Clean up windows
       rm -rf ${{targets.destdir}}/usr/lib/kafka/bin/*.bat
@@ -82,84 +96,129 @@ update:
 
 # TODO: Comment out the test section until the pipeline defaults to docker runner for tests.
 # The following tests are passing locally but failing on the CI.
-# test:
-#   environment:
-#     contents:
-#       packages:
-#         - zookeeper
-#         - busybox
-#         - netcat-openbsd
-#         - confluent-common-docker
-#         - confluent-common-docker-ub
-#         - confluent-common-docker-base
-#         - confluent-docker-utils
-#         - confluent-kafka-images-kafka
-#   pipeline:
-#     - runs: |
-#         KAFKA_DIR=/usr/lib/kafka
+test:
+  environment:
+    contents:
+      packages:
+        - zookeeper
+        - busybox
+        - netcat-openbsd
+        - confluent-common-docker
+        - confluent-common-docker-ub
+        - confluent-common-docker-base
+        - confluent-docker-utils
+        - confluent-kafka-images-kafka
+  pipeline:
+    - runs: |
+        KAFKA_DIR=/usr/lib/kafka
+        echo "Starting Zookeeper..."
+        nohup "${KAFKA_DIR}/bin/zookeeper-server-start.sh" \
+          "${KAFKA_DIR}/config/zookeeper.properties" > "${KAFKA_DIR}/logs/zookeeper.out" 2> \
+          "${KAFKA_DIR}/logs/zookeeper.err" < /dev/null &
+        ZOO_PID=$!
+        sleep 5
+        # We have more test cases in the image, but this is a simple quick-win to check if the service is running.
+        # That's becasue Zookeeper stops printing logs after it prints the Banner on the CI, but works fine in the image and locally.
+        grep "Starting server" "${KAFKA_DIR}/logs/zookeeper.out" > /dev/null || { cat "${KAFKA_DIR}/logs/zookeeper.out"; echo "Zookeeper log entry not found"; exit 1; }
+        echo "Starting Kafka..."
+        nohup "${KAFKA_DIR}/bin/kafka-server-start.sh" "${KAFKA_DIR}/config/server.properties" > "${KAFKA_DIR}/logs/kafka.out" 2> "${KAFKA_DIR}/logs/kafka.err" < /dev/null &
+        KAFKA_PID=$!
+        sleep 5
+        # Kafka doesn't print logs on the CI, but works fine in the image test and locally.
+        # grep "Controller 0 connected" "${KAFKA_DIR}/logs/controller.log" > /dev/null || { cat "${KAFKA_DIR}/logs/controller.log"; echo "Kafka log entry not found"; exit 1; }
+        if grep -q "Fatal error during KafkaServer startup." "${KAFKA_DIR}/logs/kafka.out"; then
+            cat "${KAFKA_DIR}/logs/kafka.out"
+            echo "Fatal error found in Kafka logs!"
+            exit 1
+        fi
+        # Cleanup
+        kill $KAFKA_PID
+        kill $ZOO_PID
+    - runs: |
+        export COMPONENT="kafka" KAFKA_ZOOKEEPER_CONNECT="127.0.0.1:2888" KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://localhost:9092" CLUSTER_ID="" CUB_CLASSPATH="/usr/share/java/kafka/*:/usr/share/java/cp-base-new/*:/usr/share/java/zookeeper/*:/usr/share/java/confluent-common-docker/*"
 
-#         echo "Starting Zookeeper..."
-#         nohup "${KAFKA_DIR}/bin/zookeeper-server-start.sh" \
-#           "${KAFKA_DIR}/config/zookeeper.properties" > "${KAFKA_DIR}/logs/zookeeper.out" 2> \
-#           "${KAFKA_DIR}/logs/zookeeper.err" < /dev/null &
-#         ZOO_PID=$!
-#         sleep 5
+        set +e
+        echo "Starting entrypoint for Zookeeper..."
+        logs=$(timeout 5 /etc/confluent/docker/run 2>&1)
+        set -e
 
-#         # We have more test cases in the image, but this is a simple quick-win to check if the service is running.
-#         # That's becasue Zookeeper stops printing logs after it prints the Banner on the CI, but works fine in the image and locally.
-#         grep "Starting server" "${KAFKA_DIR}/logs/zookeeper.out" > /dev/null || { cat "${KAFKA_DIR}/logs/zookeeper.out"; echo "Zookeeper log entry not found"; exit 1; }
+        # Use assert_true for conditions that should be true
+        assert_true() {
+            local assert="$1"
+            if ! echo "$logs" | grep -q "$assert"; then
+                echo "Did not find '$assert' in logs"
+                echo "$logs"
+                exit 1
+            fi
+        }
 
-#         echo "Starting Kafka..."
-#         nohup "${KAFKA_DIR}/bin/kafka-server-start.sh" "${KAFKA_DIR}/config/server.properties" > "${KAFKA_DIR}/logs/kafka.out" 2> "${KAFKA_DIR}/logs/kafka.err" < /dev/null &
-#         KAFKA_PID=$!
-#         sleep 5
+        # Use assert_false for conditions that should be false
+        assert_false() {
+            local assert="$1"
+            if echo "$logs" | grep -q "$assert"; then
+                echo "Found '$assert' in logs"
+                echo "$logs"
+                exit 1
+            fi
+        }
 
-#         # Kafka doesn't print logs on the CI, but works fine in the image test and locally.
-#         # grep "Controller 0 connected" "${KAFKA_DIR}/logs/controller.log" > /dev/null || { cat "${KAFKA_DIR}/logs/controller.log"; echo "Kafka log entry not found"; exit 1; }
+        # Ensure all required Java libs are available in the classpath
+        assert_false "Could not find or load main class"
+        assert_false "java.lang.ClassNotFoundException"
 
-#         if grep -q "Fatal error during KafkaServer startup." "${KAFKA_DIR}/logs/kafka.out"; then
-#             cat "${KAFKA_DIR}/logs/kafka.out"
-#             echo "Fatal error found in Kafka logs!"
-#             exit 1
-#         fi
+        assert_true "Configuring"
+        assert_true "Running preflight checks"
+        # We couldn't run zookeeper in the CI for some reason so
+        # package keep trying to connect to it as an expected case.
+        # More detailed tests in the image.
+        assert_true "Check if Zookeeper is healthy"
+    - runs: |
+        export \
+          COMPONENT="kafka" \
+          KAFKA_NODE_ID=1 \
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP='CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT' \
+          KAFKA_ADVERTISED_LISTENERS='PLAINTEXT://kafka-kraft:29092,PLAINTEXT_HOST://localhost:9092' \
+          KAFKA_JMX_PORT=9101 \
+          KAFKA_JMX_HOSTNAME=localhost \
+          KAFKA_PROCESS_ROLES='broker,controller' \
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+          KAFKA_CONTROLLER_QUORUM_VOTERS='1@kafka-kraft:29093' \
+          KAFKA_LISTENERS='PLAINTEXT://kafka-kraft:29092,CONTROLLER://kafka-kraft:29093,PLAINTEXT_HOST://0.0.0.0:9092' \
+          KAFKA_INTER_BROKER_LISTENER_NAME='PLAINTEXT' \
+          KAFKA_CONTROLLER_LISTENER_NAMES='CONTROLLER' \
+          CLUSTER_ID='MkU3OEVBNTcwNTJENDM2Qk'
 
-#         # Cleanup
-#         kill $KAFKA_PID
-#         kill $ZOO_PID
-#     - runs: |
-#         export COMPONENT="kafka" KAFKA_ZOOKEEPER_CONNECT="127.0.0.1:2888" KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://localhost:9092" CLUSTER_ID="" CUB_CLASSPATH="/usr/share/java/kafka/*:/usr/share/java/cp-base-new/*:/usr/share/java/zookeeper/*:/usr/share/java/confluent-common-docker/*"
-#         set +e
-#         echo "Starting entrypoint..."
-#         logs=$(timeout 5 /etc/confluent/docker/run 2>&1)
-#         set -e
+        set +e
+        echo "Starting entrypoint for Kraft..."
+        logs=$(timeout 5 /etc/confluent/docker/run 2>&1)
+        set -e
 
-#         # Use assert_true for conditions that should be true
-#         assert_true() {
-#             local assert="$1"
-#             if ! echo "$logs" | grep -q "$assert"; then
-#                 echo "Did not find '$assert' in logs"
-#                 echo "$logs"
-#                 exit 1
-#             fi
-#         }
+        # Use assert_true for conditions that should be true
+        assert_true() {
+            local assert="$1"
+            if ! echo "$logs" | grep -q "$assert"; then
+                echo "Did not find '$assert' in logs"
+                echo "$logs"
+                exit 1
+            fi
+        }
 
-#         # Use assert_false for conditions that should be false
-#         assert_false() {
-#             local assert="$1"
-#             if echo "$logs" | grep -q "$assert"; then
-#                 echo "Found '$assert' in logs"
-#                 echo "$logs"
-#                 exit 1
-#             fi
-#         }
+        # Use assert_false for conditions that should be false
+        assert_false() {
+            local assert="$1"
+            if echo "$logs" | grep -q "$assert"; then
+                echo "Found '$assert' in logs"
+                echo "$logs"
+                exit 1
+            fi
+        }
 
-#         assert_true "Configuring"
-#         assert_true "Running preflight checks"
-#         # We couldn't run zookeeper in the CI for some reason so
-#         # package keep trying to connect to it as an expected case.
-#         # More detailed tests in the image.
-#         assert_true "Check if Zookeeper is healthy"
+        # Ensure all required Java libs are available in the classpath
+        assert_false "Could not find or load main class"
+        assert_false "java.lang.ClassNotFoundException"
 
-#         # Ensure all required Java libs are available in the classpath
-#         assert_false "Could not find or load main class"
-#         assert_false "java.lang.ClassNotFoundException"
+        assert_true "Configuring"
+        assert_true "Running preflight checks"
+        assert_true "Running in KRaft mode, skipping Zookeeper health check"
+        assert_true "Starting (org.apache.kafka.raft.KafkaRaftClientDriver)"
+        assert_true "Registered the listener"

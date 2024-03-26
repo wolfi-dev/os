@@ -52,3 +52,36 @@ Wolfi also aims to keep its package set as up-to-date with security patches as p
 package/version contributed to Wolfi has an actively maintained upstream. 
 
 To request inclusion of a package into Wolfi please use our [New Package Request Template](https://wolfi.dev/os/issues/new/choose).
+
+## Building a package
+
+To build a package, you will need [melange](https://github.com/chainguard-dev/melange) to be installed and [bubblewrap](https://github.com/containers/bubblewrap) or Docker. You can use also the SDK docker image to build the packages with:
+
+```bash
+docker run --rm -v $PWD:/work -w /work -it ghcr.io/wolfi-dev/sdk:latest
+```
+
+Before building a package, you will need to create a local key for signing, this can be created with the `make local-melange.rsa` command.
+
+After this you can create the package with:
+
+```bash
+make MELANGE_EXTRA_OPTS="--cache-dir=$(pwd)/melange-cache" REPO="$(pwd)/packages" package/<PACKAGE-NAME> -j1
+```
+
+when the package has been successfully created it will be generated at `packages/<arch>/name.apk`.
+
+## Testing the package
+
+To test your generated `apk` package, you can spawn a Wolfi docker and install it with it:
+
+```bash
+docker run --rm -it -v $PWD/packages:/packages cgr.dev/chainguard/wolfi-base
+```
+
+and install the Package with:
+
+```bash
+apk add --no-cache --allow-untrusted /packages/<arch>/<package>.apk
+```
+

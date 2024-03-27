@@ -81,7 +81,7 @@ jobs:
             runner: ubuntu-arm-16-cores
             oci: arm64
       fail-fast: false
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     needs: changes
     outputs:
       packages_were_built: ${{ steps.file_check.outputs.exists }}
@@ -149,40 +149,57 @@ jobs:
 
             mkdir -p .melangecache
             for package in ${{needs.changes.outputs.packages}}; do
-              make MELANGE_EXTRA_OPTS="--out-dir=/tmp/ --create-build-log --cache-dir=.melangecache" REPO="./packages" package/\$package -j1 2>&1 | tee /tmp/${package}.log
+              # use a script so we can log to standard out and a file, plus keep the exit code for the package build
+              ./build_and_log.sh "\${package}"
               make MELANGE_EXTRA_OPTS="--runner docker" REPO="./packages" "test/\$package" -j1
             done
 
-      - name: Print package log with the errors
-        run: |
-          for package in ${{needs.changes.outputs.packages}}; do
-            cat /tmp/${package}.log
-          done
+      - name: Check OPENAISECRET presence
+        id: check_secret
         if: failure()
+        run: |
+          if [ -z "${{ secrets.OPENAISECRET }}" ]; then
+            echo "OPENAISECRET_PRESENT=false" >> $GITHUB_ENV
+          else
+            echo "OPENAISECRET_PRESENT=true" >> $GITHUB_ENV
+          fi
 
       - name: Install gptscript
-        uses: hectorj2f/gptscript-installer@fix_installer
-        if: failure()
+        continue-on-error: true
+        uses: cpanato/gptscript-installer@f72d33f0b8f9d6e5c71704a553d7183705a57f74 # v0.2.2
+        if: failure() && env.OPENAISECRET_PRESENT == 'true'
 
       - name: Run gptscript against the build log
         id: gptscript
+        continue-on-error: true
         run:  |
           for package in ${{needs.changes.outputs.packages}}; do
-            pkgVersion=$(melange package-version ${package}.yaml)
-            # Use only the last 500 lines of the build log.
-            tail -n 500 /tmp/${package}.log >> ${package}.log
-            echo "Calling GTPScript..."
-            echo "GPTScript suggestions to solve the error while building the package ${package}:" >> wolfi-packages.log
-            gptscript $GITHUB_WORKSPACE/gptscripts/wolfi-logs.gpt $(pwd)/${package}.log $package >> wolfi-packages.log
+            # if error log file exists 
+            if [ -f /temp/${package}.error.log ]; then
+              # Use only the last 150 lines of the build log.
+              tail -n 200 /temp/${package}.error.log >> ${package}.log
+              echo "Calling GTPScript..."
+              echo "GPTScript suggestions to solve the error while building the package ${package}:" >> wolfi-packages.log
+              gptscript gptscripts/wolfi-logs.gpt $(pwd)/${package}.log $package >> wolfi-packages.log
+            fi
           done
-        if: failure() && matrix.arch == 'x86_64'
+        if: failure() && matrix.arch == 'x86_64' && env.OPENAISECRET_PRESENT == 'true'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAISECRET }}
 
+      - name: Check for chatgpt response
+        id: file_check_gpt_log
+        if: failure() && matrix.arch == 'x86_64' && env.OPENAISECRET_PRESENT == 'true'
+        run: |
+          if test -f "wolfi-packages.log"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: GPTScript PR comment diff
-        if: failure() && matrix.arch == 'x86_64'
+        if: failure() && matrix.arch == 'x86_64'&& env.OPENAISECRET_PRESENT == 'true' && steps.file_check_gpt_log.outputs.exists == 'true'
         uses: thollander/actions-comment-pull-request@632cf9ce90574d125be56b5f3405cda41a84e2fd # v2.3.1
-        # We're seeing jobs using merge queues fail
         continue-on-error: true
         with:
           filePath: wolfi-packages.log

@@ -2,26 +2,47 @@
 
 set -euo pipefail
 
-makepkgs=$(make list-yaml)
-for f in *.yaml; do
-  echo "---" $f
+for p in $(make list); do
+  echo "--- package" $p
 
-  # Don't specify packages.wolfi.dev/os as a repository, and remove it from the keyring.
-  # Packages from the bootstrap repo should be allowed, but otherwise packages
-  # should be fetched locally and the local repository should be appended at
-  # build time.
-  if grep -q packages.wolfi.dev/os $f; then
-    yq -i 'del(.environment.contents.repositories)' $f
-    yq -i 'del(.environment.contents.keyring)' $f
+  if [ -f ${p}.yaml ]; then
+    if [ -f **/${p}/${p}.melange.yaml ]; then
+      echo "ERROR: ${p}.yaml and **/${p}/${p}.melange.yaml both exist"
+      exit 1
+    fi
+
+    fn=${p}.yaml
+  elif [ -f **/${p}/${p}.melange.yaml ]; then
+    fn=$(ls **/${p}/${p}.melange.yaml | head -n 1)
+  else
+    echo "ERROR: ${p}.yaml or **/${p}/${p}.melange.yaml does not exist, or multiple matches found"
+    exit 1
   fi
 
-  # With the introduction of https://github.com/wolfi-dev/advisories,
-  # package config files should no longer contain any advisory data.
-  if [[ "$(yq 'keys | contains(["advisories"])' "$f")" == "true" ]]; then
-    echo "
-$f has an 'advisories' section, but advisory data should now be stored in https://github.com/wolfi-dev/advisories.
+  # Don't specify repositories or keyring for os packages
+  if grep -q packages.wolfi.dev/os ${fn}; then
+    yq -i 'del(.environment.contents.repositories)' ${fn}
+    yq -i 'del(.environment.contents.keyring)' ${fn}
+  fi
 
-To learn about how to create advisory data in the advisories repo, run 'wolfictl advisory create -h', and check out the '--advisories-repo-dir' flag."
+  # Don't specify wolfi-base or any of its packages, or the main package, for test pipelines.
+  for pkg in wolfi-base busybox apk-tools wolfi-keys ${p}; do
+    yq -i 'del(.test.environment.contents.packages[] | select(. == "'${pkg}'"))' ${fn}
+    yam ${fn}
+  done
+
+  # If .test.environment.contents.packages is empty, remove it all.
+  if [ "$(yq -r '.test.environment.contents.packages | length' ${fn})" == "0" ]; then
+    yq -i 'del(.test.environment)' ${fn}
+    yam ${fn}
+  fi
+done
+
+# New section to check for .sts.yaml files under ./.github/chainguard/
+echo "Checking for .sts.yaml files in ./.github/chainguard/..."
+for file in $(find .github/chainguard -type f); do
+  if [[ ! $file =~ \.sts\.yaml$ ]]; then
+    echo "ERROR: File $file does not have the required '.sts.yaml' suffix"
     exit 1
   fi
 done

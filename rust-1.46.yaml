@@ -1,0 +1,192 @@
+package:
+  name: rust-1.46
+  version: 1.46.0
+  epoch: 0
+  description: "Empowering everyone to build reliable and efficient software. (version 1.46.0)"
+  copyright:
+    - license: Apache-2.0 AND MIT
+  dependencies:
+    provides:
+      - rust=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cmake
+      - coreutils
+      - curl-dev
+      - file
+      - libgit2-dev
+      - patch
+      - perl
+      - py3-setuptools
+      - python3
+      - rust~1.45
+      - wasi-libc
+      - xz-dev
+      - zlib-dev
+
+pipeline:
+  - name: Build vendored OpenSSL 1.1
+    working-directory: /home/build/vendored-deps/openssl
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://www.openssl.org/source/openssl-${{vars.openssl-version}}.tar.gz
+          expected-sha256: cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8
+      - name: Configure and build
+        runs: |
+          export CC=${{host.triplet.gnu}}-gcc
+          export CXX=${{host.triplet.gnu}}-g++
+          export CPP=${{host.triplet.gnu}}-cpp
+
+          perl ./Configure \
+            linux-${{build.arch}} \
+            --prefix=${{vars.sysroot}} \
+            --libdir=lib \
+            --openssldir=/etc/ssl1.1 \
+            no-shared \
+            no-zlib \
+            no-async \
+            no-comp \
+            no-idea \
+            no-mdc2 \
+            no-rc5 \
+            no-ec2m \
+            no-sm2 \
+            no-sm4 \
+            no-ssl3 \
+            no-seed \
+            no-weak-ssl-ciphers \
+            -fPIC -Wa,--noexecstack
+
+          make -j$(nproc)
+          make install_sw install_ssldirs
+
+  - name: Build vendored libssh2 1.11
+    working-directory: /home/build/vendored-deps/libssh2
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://www.libssh2.org/download/libssh2-${{vars.libssh2-version}}.tar.gz
+          expected-sha256: 3736161e41e2693324deb38c26cfdc3efe6209d634ba4258db1cecff6a5ad461
+      - runs: |
+          ./configure \
+            --prefix=${{vars.sysroot}} \
+            --with-libssl-prefix=/home/build/sysroot \
+            --with-crypto=openssl
+          make -j$(nproc)
+          make install
+
+  - uses: fetch
+    working-directory: rustc-${{package.version}}
+    with:
+      uri: https://static.rust-lang.org/dist/rustc-${{package.version}}-src.tar.xz
+      expected-sha256: 865dae1290a205f16ded8818c6a0254cc32862985fc250a602a70285b7d92b82
+
+  - uses: patch
+    working-directory: rustc-${{package.version}}
+    with:
+      patches: /home/build/llvm-add-cstdint.patch
+
+  - name: Configure rustc
+    working-directory: rustc-${{package.version}}
+    runs: |
+      # Fix distutils usage
+      sed 's/distutils/setuptools/g' -i src/bootstrap/bootstrap.py
+
+      export OPENSSL_NO_VENDOR=1
+      export RUST_BACKTRACE=1
+      export ARCH=${{host.triplet.rust}}
+
+      export PKG_CONFIG_LIBDIR="${{vars.PKG_CONFIG_LIBDIR}}"
+      export LIBSSH2_SYS_USE_PKG_CONFIG=1
+      export CFLAGS="${{vars.CFLAGS}}"
+      export CPPFLAGS="${{vars.CPPFLAGS}}"
+      export CXXFLAGS="${{vars.CXXFLAGS}}"
+
+      ./configure \
+        --host="${ARCH}" \
+        --target="${ARCH}" \
+        --prefix="/usr" \
+        --local-rust-root="/usr" \
+        --release-channel="stable" \
+        --enable-local-rust \
+        --disable-docs \
+        --enable-extended \
+        --tools="cargo,src" \
+        --enable-option-checking \
+        --enable-locked-deps \
+        --enable-vendor \
+        --python="python3" \
+        --set="rust.codegen-units=1" \
+        --set="rust.codegen-units-std=1" \
+        --set="rust.parallel-compiler=false" \
+        --set="target.${ARCH}.crt-static=false"
+
+      # Fix up config
+      sed -ri'' "s/(codegen-units =) '1'/\1 1/" config.toml
+      sed -ri'' "s/(codegen-units-std =) '1'/\1 1/" config.toml
+
+  - name: Build rustc
+    working-directory: rustc-${{package.version}}
+    runs: |
+      sed 's/#deny-warnings = .*/deny-warnings = false/' -i config.toml
+      sed 's|deny(warnings,|deny(|' -i src/bootstrap/lib.rs
+      mkdir -p "${{targets.destdir}}/usr"
+
+      unset CARGO_PROFILE_RELEASE_LTO
+      unset CARGO_PROFILE_RELEASE_OPT_LEVEL
+      unset CARGO_PROFILE_RELEASE_PANIC
+      unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+
+      export PKG_CONFIG_LIBDIR="${{vars.PKG_CONFIG_LIBDIR}}"
+      export LIBSSH2_SYS_USE_PKG_CONFIG=1
+      export CFLAGS="${{vars.CFLAGS}}"
+      export CPPFLAGS="${{vars.CPPFLAGS}}"
+      export CXXFLAGS="${{vars.CXXFLAGS}}"
+
+      export OPENSSL_NO_VENDOR=1
+      export RUST_BACKTRACE=1
+      DESTDIR=${{targets.destdir}} python3 ./x.py install --jobs $(nproc)
+
+  - uses: strip
+
+  # delete uneeded files such as uninstallation scripts
+  - runs: |
+      # Remove vendored LLVM stored in /home/build, not needed as rustc is statically linked
+      rm -r ${{targets.destdir}}/home
+
+      rm ${{targets.destdir}}/usr/lib/rustlib/components
+      rm ${{targets.destdir}}/usr/lib/rustlib/install.log
+      rm ${{targets.destdir}}/usr/lib/rustlib/rust-installer-version
+      rm ${{targets.destdir}}/usr/lib/rustlib/uninstall.sh
+      rm ${{targets.destdir}}/usr/lib/rustlib/manifest-*
+
+  # rustbuild always installs copies of the shared libraries to /usr/lib,
+  # overwrite them with symlinks to the per-architecture versions
+  - if: ${{build.arch}} == 'x86_64'
+    runs: |
+      cd ${{targets.destdir}}
+      mkdir -p ${{targets.destdir}}/usr/lib32
+      ln -srft usr/lib32 usr/lib/rustlib/i686-unknown-linux-gnu/lib/*.so
+
+  - runs: |
+      cd ${{targets.destdir}}
+      ln -srft usr/lib usr/lib/rustlib/${{build.arch}}-unknown-linux-gnu/lib/*.so
+
+vars:
+  openssl-version: 1.1.1w
+  libssh2-version: 1.11.0
+  sysroot: /home/build/sysroot
+  PKG_CONFIG_LIBDIR: "/home/build/sysroot/lib/pkgconfig:/home/build/sysroot/share/pkgconfig:/usr/lib/pkgconfig"
+  CFLAGS: "$CFLAGS -I/home/build/sysroot/include"
+  CPPFLAGS: "$CPPFLAGS -I/home/build/sysroot/include"
+  CXXFLAGS: "$CXXFLAGS -I/home/build/sysroot/include"
+
+update:
+  enabled: false

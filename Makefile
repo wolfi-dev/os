@@ -17,9 +17,26 @@ MELANGE_OPTS += --signing-key ${KEY}
 MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
-MELANGE_OPTS += --generate-index false
+MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
+
+# Enter interactive mode on failure for debug
+MELANGE_DEBUG_OPTS += --interactive
+MELANGE_DEBUG_OPTS += --package-append apk-tools
+MELANGE_DEBUG_OPTS += ${MELANGE_OPTS}
+
+# These are separate from MELANGE_OPTS because for building we need additional
+# ones that are not defined for tests.
+MELANGE_TEST_OPTS += --repository-append ${REPO}
+MELANGE_TEST_OPTS += --keyring-append ${KEY}.pub
+MELANGE_TEST_OPTS += --arch ${ARCH}
+MELANGE_TEST_OPTS += --pipeline-dirs ./pipelines/
+MELANGE_TEST_OPTS += --repository-append https://packages.wolfi.dev/os
+MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+MELANGE_TEST_OPTS += --test-package-append wolfi-base
+MELANGE_TEST_OPTS += --debug
+MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
 	MELANGE_OPTS += --cache-source ${CACHE_DIR}
@@ -76,22 +93,102 @@ list-yaml:
 	$(info $(addsuffix .yaml,$(shell $(PKGLISTCMD))))
 	@printf ''
 
+# This function parses the path from the package file. It's used to figure out
+# what to mount to the container image as supporting files (patches, tests,
+# etc.)
+# Returns the directory of the package in the first variable passed in. In
+# example below this would be ret-variable-in-calling-function. You do not need
+# to explicitly declare this variable in the calling function, just add to
+# argument list and it will be populated and usable.
+#
+# $(call get-package-dir,ret-variable-in-calling-function,package-file)
+define get-package-dir
+	$(info getting package dir for $(2))
+	$(eval pkgdir := $(shell dirname $(2)))
+	$(info For package $(1) found dir: $(pkgdir))
+	$(1) := ${pkgdir}
+endef
+
+# This function tries to figure out what the 'source-dir' is for the package.
+# It's complicated by the fact that it can either be './<package-name>' for
+# packages before the refactoring, or it can be a relative path
+# './<module>/package/', and in some cases it may not exist.
+# To make it easier on the caller, it returns the entire:
+# `--source-dir ./<package-name>`, or `--source-dir ./<module>/package/`, or ""
+# as the first variable passed in, and this is meant to be directly passed
+# to the melange build/test command.
+#
+#$(call get-source-dir,ret-variable-for-source-dir,package-dir,package-name)
+define get-source-dir
+	$(info getting source dir for package $(3) with dir $(2))
+	$(1) := $(shell if [ "." = "$(2)" ]; then \
+		echo "--source-dir ./$(3)"; \
+	else \
+		echo "--source-dir $(2)"; \
+	fi)
+endef
+
 package/%:
-	$(eval yamlfile := $*.yaml)
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
+	@if [ -z "$(yamlfile)" ]; then \
+		echo "Error: could not find yaml file for $*"; exit 1; \
+	else \
+		echo "yamlfile is $(yamlfile)"; \
+	fi
+	$(eval $(call get-package-dir,pkgdir,$(yamlfile)))
+	$(info found package dir as $(pkgdir))
+	$(eval $(call get-source-dir,sourcedir,$(pkgdir),$*))
+	$(info found source dir as $(sourcedir))
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
+	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
+	$(MAKE) yamlfile=$(yamlfile) srcdirflag="$(sourcedir)" pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: $(KEY)
 	@mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/ --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
+	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log)
+	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
+
+debug/%:
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	@if [ -z "$(yamlfile)" ]; then \
+		echo "Error: could not find yaml file for $*"; exit 1; \
+	else \
+		echo "yamlfile is $(yamlfile)"; \
+	fi
+	$(eval $(call get-package-dir,pkgdir,$(yamlfile)))
+	$(info found package dir as $(pkgdir))
+	$(eval $(call get-source-dir,sourcedir,$(pkgdir),$*))
+	$(info found source dir as $(sourcedir))
+	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
+	@mkdir -p ./"$*"/
+	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
+	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(sourcedir) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log)
+	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) $(sourcedir) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
+
+test/%:
+	@mkdir -p ./$(*)/
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
+	@if [ -z "$(yamlfile)" ]; then \
+		echo "Error: could not find yaml file for $*"; exit 1; \
+	else \
+		echo "yamlfile is $(yamlfile)"; \
+	fi
+	$(eval $(call get-package-dir,pkgdir,$(yamlfile)))
+	$(info found package dir as $(pkgdir))
+	$(eval $(call get-source-dir,sourcedir,$(pkgdir),$*))
+	$(info found source dir as $(sourcedir))
+	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
+	$(MELANGE) test $(yamlfile) $(sourcedir) $(MELANGE_TEST_OPTS) --log-policy builtin:stderr
 
 dev-container:
 	docker run --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:9441b0d6dc418ab41fdd7ee9bffd80d3a6332818fef35f9b8d2d9e0fa5f62add
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:dbc3af4f81a0d282698894040662e21e3a6d01b3439fca3937da78142e3cdb5f
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -156,6 +253,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:9441b0d6dc418ab41fdd7ee9bffd80d3a6332818fef35f9b8d2d9e0fa5f62add
+		ghcr.io/wolfi-dev/sdk:latest@sha256:dbc3af4f81a0d282698894040662e21e3a6d01b3439fca3937da78142e3cdb5f
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

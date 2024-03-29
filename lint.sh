@@ -37,3 +37,12 @@ for p in $(make list); do
     yam ${fn}
   fi
 done
+
+# New section to check for .sts.yaml files under ./.github/chainguard/
+echo "Checking for .sts.yaml files in ./.github/chainguard/..."
+for file in $(find .github/chainguard -type f); do
+  if [[ ! $file =~ \.sts\.yaml$ ]]; then
+    echo "ERROR: File $file does not have the required '.sts.yaml' suffix"
+    exit 1
+  fi
+done

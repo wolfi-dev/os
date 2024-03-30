@@ -88,7 +88,6 @@ jobs:
 
     permissions:
       contents: read
-      pull-requests: write # so we have permission to comment on pull requests
 
     steps:
       - name: Harden Runner
@@ -149,10 +148,85 @@ jobs:
 
             mkdir -p .melangecache
             for package in ${{needs.changes.outputs.packages}}; do
-              make MELANGE_EXTRA_OPTS="--create-build-log --cache-dir=.melangecache" REPO="./packages" package/\$package -j1
+              # use a script so we can log to standard out and a file, plus keep the exit code for the package build
+              ./build_and_log.sh "\${package}"
               make MELANGE_EXTRA_OPTS="--runner docker" REPO="./packages" "test/\$package" -j1
             done
 
+  gpt:
+    name: Check for ChatGPT suggestions
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event.pull_request.head.repo.full_name == github.repository # Only run on PRs from the same repo
+
+    permissions:
+      contents: read
+      pull-requests: write # so we have permission to comment on pull requests
+      id-token: write # so we can securly fetch the openai secret from the secrets store
+
+    steps:
+      # This is managed here: https://github.com/chainguard-dev/secrets/blob/main/wolfi-dev.tf
+      - uses: google-github-actions/auth@a6e2e39c0a0331da29f7fd2c2a20a427e8d3ad1f # v2.1.1
+        id: auth
+        with:
+          workload_identity_provider: "projects/12758742386/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "wolfi-dev@chainguard-github-secrets.iam.gserviceaccount.com"
+      - uses: google-github-actions/setup-gcloud@5a5f7b85fca43e76e53463acaa9d408a03c98d3a # v2.0.1
+        with:
+          project_id: "chainguard-github-secrets"
+      - uses: 'google-github-actions/get-secretmanager-secrets@ae0d4054c32840e2ced71207a9df55161ae3debc' # v2.0.0
+        id: secrets
+        with:
+          secrets: |-
+            token:chainguard-github-secrets/openai-secret
+
+      - name: Install gptscript
+        continue-on-error: true
+        uses: cpanato/gptscript-installer@f72d33f0b8f9d6e5c71704a553d7183705a57f74 # v0.2.2
+        if: failure() && steps.secrets.outputs.token != ''
+
+      - name: Run gptscript against the build log
+        id: gptscript
+        continue-on-error: true
+        run:  |
+          for package in ${{needs.changes.outputs.packages}}; do
+            # if error log file exists 
+            if [ -f /temp/${package}.error.log ]; then
+              # Use only the last 150 lines of the build log.
+              tail -n 200 /temp/${package}.error.log >> ${package}.log
+              echo "Calling GTPScript..."
+              echo "GPTScript suggestions to solve the error while building the package ${package}:" >> wolfi-packages.log
+              gptscript gptscripts/wolfi-logs.gpt $(pwd)/${package}.log $package >> wolfi-packages.log
+            fi
+          done
+        if: failure() && matrix.arch == 'x86_64' steps.secrets.outputs.token != ''
+        env:
+          OPENAI_API_KEY: steps.secrets.outputs.token
+
+      - name: Check for chatgpt response
+        id: file_check_gpt_log
+        if: failure() && matrix.arch == 'x86_64' steps.secrets.outputs.token != '' 
+        run: |
+          if test -f "wolfi-packages.log"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: GPTScript PR comment diff
+        if: failure() && matrix.arch == 'x86_64'&& steps.secrets.outputs.token != '' && steps.file_check_gpt_log.outputs.exists == 'true'
+        uses: thollander/actions-comment-pull-request@632cf9ce90574d125be56b5f3405cda41a84e2fd # v2.3.1
+        continue-on-error: true
+        with:
+          filePath: wolfi-packages.log
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  check:
+    name: Test packages
+    runs-on: ubuntu-latest
+    needs: build
+  
+    steps:
       - name: "Check that packages can be installed with apk add"
         uses: ./.github/actions/docker-run
         with:
@@ -250,7 +324,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/wolfi-dev/sdk:latest@sha256:dbc3af4f81a0d282698894040662e21e3a6d01b3439fca3937da78142e3cdb5f
-    needs: build
+    needs: check
     if: needs.build.outputs.packages_were_built == 'true'
 
     steps:

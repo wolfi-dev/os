@@ -16,11 +16,6 @@
 # [1] The default configuration is changed in the Dockerfile to allow local
 # network connections. See the Dockerfile for further information.
 
-# re-create snakeoil self-signed certificate removed in the build process
-if [ ! -f /etc/ssl/private/ssl-cert-snakeoil.key ]; then
-    /usr/sbin/make-ssl-cert generate-default-snakeoil --force-overwrite > /dev/null 2>&1
-fi
-
 tail -F /var/log/squid/access.log 2>/dev/null &
 tail -F /var/log/squid/error.log 2>/dev/null &
 tail -F /var/log/squid/store.log 2>/dev/null &

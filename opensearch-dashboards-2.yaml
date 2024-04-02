@@ -1,6 +1,6 @@
 package:
   name: opensearch-dashboards-2
-  version: 2.11.1
+  version: 2.12.0
   epoch: 1
   description: Open source visualization dashboards for OpenSearch
   copyright:
@@ -22,6 +22,7 @@ environment:
       - git
       - node-gyp
       - nodejs-18
+      - npm
       - posix-libc-utils
       - py3-setuptools
       - python3
@@ -53,12 +54,23 @@ pipeline:
     with:
       repository: https://github.com/opensearch-project/OpenSearch-Dashboards.git
       tag: ${{package.version}}
-      expected-commit: 989d8f41f37cca3275bf3fedc5c2057a717d1d64
+      expected-commit: 9ec9a677af5f28e5450926ce07e9d6c3273717a7
+
+  - uses: patch
+    with:
+      patches: 0001-Backport-Bump-typescript-and-axios.patch
 
   - runs: |
       # Workaround for "OpenSearch Dashboards should not be run as root.  Use --allow-root to continue."
       # This change will add the --allow-root when running the build_ts_refs and register_git_hook scripts
       sed -i 's/\("osd:bootstrap": "scripts\/use_node scripts\/build_ts_refs\)\( && scripts\/use_node scripts\/register_git_hook\)/\1 --allow-root\2 --allow-root/' package.json
+
+  - runs: |
+      # Create "resolutions" section of package.json
+      jq '.resolutions |= (if . then . else {} end)' package.json > temp.json && mv temp.json package.json
+      for override in '"**/hoek"="npm:@hapi/hoek@>=8.5.1"'; do
+        jq ".resolutions.${override}" package.json > temp.json && mv temp.json package.json
+      done
 
   - runs: |
       set -x
@@ -75,14 +87,26 @@ pipeline:
       mkdir -p "${{targets.destdir}}/usr/share"
       cp -r build/opensearch-dashboards-${{package.version}}-linux-* "${{targets.destdir}}/usr/share/opensearch-dashboards"
 
+      # Remove the default config file, as it will be provided by the config package which comes from a different repository.
+      rm -r ${{targets.destdir}}/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml
+
   - uses: strip
 
 subpackages:
-  - name: ${{package.name}}-compat
+  - name: ${{package.name}}-config
     description: Compatibility package to place Docker startup scripts.
     pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/opensearch-project/opensearch-build
+          tag: ${{package.version}}
+          destination: opensearch-build
+          expected-commit: 7e150e42bd47e989af58d508e9d7668e45bc31e8 # will need to be manually updated when opensearch dashboard auto update happens
       - runs: |
-          install -Dm755 src/dev/build/tasks/os_packages/docker_generator/resources/bin/opensearch-dashboards-docker "${{targets.contextdir}}/usr/local/bin/opensearch-dashboards-docker"
+          install -Dm755 opensearch-build/docker/release/config/opensearch-dashboards/opensearch-dashboards-docker-entrypoint-2.x.sh ${{targets.contextdir}}/usr/share/opensearch-dashboards/opensearch-dashboards-docker-entrypoint.sh
+          install -Dm666 opensearch-build/config/opensearch_dashboards-2.x.yml ${{targets.contextdir}}/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml
+          install -Dm666 opensearch-build/docker/release/config/opensearch-dashboards/opensearch.example.org.key ${{targets.contextdir}}/usr/share/opensearch-dashboards/config/opensearch.example.org.key
+          install -Dm666 opensearch-build/docker/release/config/opensearch-dashboards/opensearch.example.org.cert ${{targets.contextdir}}/usr/share/opensearch-dashboards/config/opensearch.example.org.cert
 
   - range: plugins
     name: ${{package.name}}-${{range.key}}
@@ -96,17 +120,17 @@ subpackages:
           tag: ${{package.version}}.0
           destination: ./plugins/${{range.value}}
       - runs: |
-          if [ ${{range.value}} = "ganttChartDashboards" ]
-          then
-            mv ./plugins/ganttChartDashboards/gantt-chart ./plugins/gantt-chart
-            rm -r ./plugins/ganttChartDashboards
-            mv ./plugins/gantt-chart ./plugins/ganttChartDashboards
-          fi
-
           yarn osd bootstrap --allow-root
           cd ./plugins/${{range.value}}
 
           node /home/build/scripts/plugin_helpers build --allow-root --skip-archive
+
+          if [ ${{range.value}} = "reportsDashboards" ]
+          then
+            # Remove a test directory of the `resolver` package to prevent surfacing a false-positive.
+            # See https://github.com/browserify/resolve/issues/288
+            rm -r build/opensearch-dashboards/${{range.value}}/node_modules/resolve/test
+          fi
 
           mkdir -p "${{targets.contextdir}}/usr/share/opensearch-dashboards/plugins"
           cp -r build/opensearch-dashboards/${{range.value}} "${{targets.contextdir}}/usr/share/opensearch-dashboards/plugins/"
@@ -122,6 +146,7 @@ test:
     contents:
       packages:
         - busybox
+        - ${{package.name}}-config
     environment:
       OSD_NODE_HOME: /usr
   pipeline:

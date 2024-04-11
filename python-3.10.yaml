@@ -1,10 +1,16 @@
 package:
   name: python-3.10
-  version: 3.10.13
-  epoch: 1
+  version: 3.10.14
+  epoch: 0
   description: "the Python programming language"
   copyright:
     - license: PSF-2.0
+  dependencies:
+    provides:
+      - python3=3.10.999
+      - python-3=3.10.999
+    runtime:
+      - ${{package.name}}-base=${{package.full-version}}
 
 environment:
   contents:
@@ -25,17 +31,36 @@ environment:
       - xz-dev
       - zlib-dev
 
+# creates helpfull python3.M and 3.M variables
+var-transforms:
+  - from: ${{package.name}}
+    match: '-'
+    replace: ''
+    to: python
+  - from: ${{package.version}}
+    match: (\d).(\d+).(\d+)
+    replace: '$1.$2'
+    to: pyversion
+
 pipeline:
   - uses: fetch
     with:
       uri: https://www.python.org/ftp/python/${{package.version}}/Python-${{package.version}}.tar.xz
-      expected-sha256: 5c88848668640d3e152b35b4536ef1c23b2ca4bd2c957ef1ecbb053f571dd3f6
+      expected-sha256: 9c50481faa8c2832329ba0fc8868d0a606a680fc4f60ec48d26ce8e076751fda
 
   - name: Force use of system libraries
     runs: |
       rm -rf Modules/expat \
         Modules/_ctypes/darwin* \
         Modules/_ctypes/libffi*
+
+  - uses: patch
+    with:
+      patches: CVE-2023-27043.patch
+
+  - uses: patch
+    with:
+      patches: CVE-2023-27043-enable-disable.patch
 
   - name: Configure
     runs: |
@@ -59,41 +84,114 @@ pipeline:
 
   - uses: autoconf/make
 
-  - uses: autoconf/make
-    with:
-      opts: altinstall DESTDIR="${{targets.destdir}}"
+  - uses: autoconf/make-install
 
   - runs: |
-      find ${{targets.destdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
-      find ${{targets.destdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
       find ${{targets.destdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
       find ${{targets.destdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
       find ${{targets.destdir}}/usr/lib -type d -name 'tests' -exec rm -rf '{}' +
       find ${{targets.destdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
 
-  - name: Install python symlink
-    runs: |
-      ln -s python3.10 "${{targets.destdir}}"/usr/bin/python
+      cd ${{targets.destdir}}/usr/bin
+      rm -f idle3* 2to3*
+      rm ${{targets.destdir}}/usr/lib/libpython3.so
+
+      # add dubious python -> python3 link
+      ln -s python3 ${{targets.destdir}}/usr/bin/python
+
+      # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+      cd ${{targets.destdir}}/usr/lib/${{vars.python}}
+      rm site-packages/README.txt
+      rmdir site-packages
+
+  - runs: |
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+      export LD_LIBRARY_PATH="${{targets.destdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      ${{targets.destdir}}/usr/bin/${{vars.python}} -m compileall --invalidation-mode=unchecked-hash \
+          -r100 ${{targets.destdir}}/usr/lib/
 
   - uses: strip
 
 subpackages:
-  - name: "python-3.10-doc"
-    description: "python3.10 documentation"
+  - name: "${{package.name}}-base"
+    description: "${{package.name}} as /usr/bin/python3"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/bin/${{vars.python}} \
+              ${{targets.destdir}}/usr/bin/pydoc${{vars.pyversion}} \
+              ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/lib/${{vars.python}} \
+             ${{targets.subpkgdir}}/usr/lib
+          mv -v ${{targets.destdir}}/usr/lib/libpython${{vars.pyversion}}.so.* \
+             ${{targets.subpkgdir}}/usr/lib
+
+          # pyconfig.h is needed at runtime... ugh.
+          d=usr/include/${{vars.python}}
+          mkdir -p "${{targets.subpkgdir}}"/$d
+          mv "${{targets.destdir}}"/$d/pyconfig.h "${{targets.subpkgdir}}"/$d/
+
+          # move usr/lib/python3.X/config-3.X-x86_64-linux-gnu
+          # back into main package so the -base-dev can take it below.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.destdir}}/$d"
+          mv -v "${{targets.subpkgdir}}/$d"/config-${{vars.pyversion}}* \
+              "${{targets.destdir}}/$d"
+    test:
+      pipeline:
+        - runs: |
+            ${{vars.python}} CVE-2023-27043-unittest.py
+            ${{vars.python}} version-check.py ${{package.version}}
+
+  - name: "${{package.name}}-doc"
+    description: "python3 documentation"
     pipeline:
       - uses: split/manpages
 
-  - name: "python-3.10-dev"
-    description: "python3.10 development headers"
-    pipeline:
-      - uses: split/dev
-      - runs: |
-          mkdir -p "${{targets.destdir}}"/usr/include/python3.10
-          mv "${{targets.subpkgdir}}"/usr/include/python3.10/pyconfig.h "${{targets.destdir}}"/usr/include/python3.10
+  - name: "${{package.name}}-dev"
+    description: "python3 development headers"
     dependencies:
       provides:
-        - python3-dev=3.10.999
-        - python-3-dev=3.10.999
+        - python3-dev=${{package.full-version}}
+        - python-3-dev=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - ${{package.name}}-base-dev=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/bin/python3-config ${{targets.subpkgdir}}/usr/bin
+
+          d="usr/lib/pkgconfig"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v \
+             "${{targets.destdir}}"/$d/python3-embed.pc \
+             "${{targets.destdir}}"/$d/python3.pc \
+             "${{targets.subpkgdir}}/$d/"
+
+  - name: "${{package.name}}-base-dev"
+    description: "python3 development headers"
+    dependencies:
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # usr/lib/pytyon3.X/config-3.X-x86_64-linux-gnu
+          # split/dev will only move 2 files from it, but we want all of it.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v "${{targets.destdir}}"/$d/config-${{vars.pyversion}}* \
+             "${{targets.subpkgdir}}"/$d
+      - uses: split/dev
+
+test:
+  pipeline:
+    - runs: |
+        # main package should provide 'python' and 'python3'.
+        python version-check.py ${{package.version}}
+        python3 version-check.py ${{package.version}}
 
 update:
   enabled: true

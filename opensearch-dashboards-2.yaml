@@ -1,0 +1,150 @@
+package:
+  name: opensearch-dashboards-2
+  version: 2.13.0
+  epoch: 0
+  description: Open source visualization dashboards for OpenSearch
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - nodejs-18
+
+environment:
+  contents:
+    packages:
+      - apk-tools
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - gcc-12
+      - gcc-12-default
+      - git
+      - node-gyp
+      - nodejs-18
+      - npm
+      - posix-libc-utils
+      - py3-setuptools
+      - python3
+      - xorg-server
+      - yarn
+  environment:
+    CC: gcc
+    CXX: g++
+
+data:
+  - name: plugins
+    items:
+      dashboards-observability: observabilityDashboards
+      dashboards-reporting: reportsDashboards
+      dashboards-visualizations: ganttChartDashboards
+      dashboards-query-workbench: queryWorkbenchDashboards
+      dashboards-maps: customImportMapDashboards
+      anomaly-detection-dashboards-plugin: anomalyDetectionDashboards
+      ml-commons-dashboards: mlCommonsDashboards
+      index-management-dashboards-plugin: indexManagementDashboards
+      dashboards-notifications: notificationsDashboards
+      alerting-dashboards-plugin: alertingDashboards
+      security-analytics-dashboards-plugin: securityAnalyticsDashboards
+      security-dashboards-plugin: securityDashboards
+      dashboards-search-relevance: searchRelevanceDashboards
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/opensearch-project/OpenSearch-Dashboards.git
+      tag: ${{package.version}}
+      expected-commit: 2a9d6dd852c2931f94d292c09ed7a7ba82a43c82
+
+  - runs: |
+      # Workaround for "OpenSearch Dashboards should not be run as root.  Use --allow-root to continue."
+      # This change will add the --allow-root when running the build_ts_refs and register_git_hook scripts
+      sed -i 's/\("osd:bootstrap": "scripts\/use_node scripts\/build_ts_refs\)\( && scripts\/use_node scripts\/register_git_hook\)/\1 --allow-root\2 --allow-root/' package.json
+
+  - runs: |
+      # Create "resolutions" section of package.json
+      jq '.resolutions |= (if . then . else {} end)' package.json > temp.json && mv temp.json package.json
+      for override in '"**/hoek"="npm:@hapi/hoek@>=8.5.1"'; do
+        jq ".resolutions.${override}" package.json > temp.json && mv temp.json package.json
+      done
+
+  - runs: |
+      set -x
+
+      # Our commond LDFLAGS cause some issues when building for aarch64. We
+      # unset our global flags to allow the build to succeed.
+      unset LDFLAGS
+      yarn osd bootstrap --allow-root
+      yarn build-platform --skip-os-packages --skip-archives --release --allow-root
+
+      # Delete the node directory to ensure we use the system node.
+      rm -r build/opensearch-dashboards-${{package.version}}-linux-*/node
+
+      mkdir -p "${{targets.destdir}}/usr/share"
+      cp -r build/opensearch-dashboards-${{package.version}}-linux-* "${{targets.destdir}}/usr/share/opensearch-dashboards"
+
+      # Remove the default config file, as it will be provided by the config package which comes from a different repository.
+      rm -r ${{targets.destdir}}/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-config
+    description: Compatibility package to place Docker startup scripts.
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/opensearch-project/opensearch-build
+          tag: ${{package.version}}
+          destination: opensearch-build
+          expected-commit: a40d0547457f945e09447ce7c91b285d5362b0d3 # will need to be manually updated when opensearch dashboard auto update happens
+      - runs: |
+          install -Dm755 opensearch-build/docker/release/config/opensearch-dashboards/opensearch-dashboards-docker-entrypoint-2.x.sh ${{targets.contextdir}}/usr/share/opensearch-dashboards/opensearch-dashboards-docker-entrypoint.sh
+          install -Dm666 opensearch-build/config/opensearch_dashboards-2.x.yml ${{targets.contextdir}}/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml
+          install -Dm666 opensearch-build/docker/release/config/opensearch-dashboards/opensearch.example.org.key ${{targets.contextdir}}/usr/share/opensearch-dashboards/config/opensearch.example.org.key
+          install -Dm666 opensearch-build/docker/release/config/opensearch-dashboards/opensearch.example.org.cert ${{targets.contextdir}}/usr/share/opensearch-dashboards/config/opensearch.example.org.cert
+
+  - range: plugins
+    name: ${{package.name}}-${{range.key}}
+    pipeline:
+      # Delete other plugins. Opensearch can only build one at a time, otherwise we run into conflicting dependencies version issues with yarn.
+      - runs: |
+          rm -r plugins/* || true
+      - uses: git-checkout
+        with:
+          repository: https://github.com/opensearch-project/${{range.key}}.git
+          tag: ${{package.version}}.0
+          destination: ./plugins/${{range.value}}
+      - runs: |
+          yarn osd bootstrap --allow-root
+          cd ./plugins/${{range.value}}
+
+          node /home/build/scripts/plugin_helpers build --allow-root --skip-archive
+
+          if [ ${{range.value}} = "reportsDashboards" ]
+          then
+            # Remove a test directory of the `resolver` package to prevent surfacing a false-positive.
+            # See https://github.com/browserify/resolve/issues/288
+            rm -r build/opensearch-dashboards/${{range.value}}/node_modules/resolve/test
+          fi
+
+          mkdir -p "${{targets.contextdir}}/usr/share/opensearch-dashboards/plugins"
+          cp -r build/opensearch-dashboards/${{range.value}} "${{targets.contextdir}}/usr/share/opensearch-dashboards/plugins/"
+
+update:
+  enabled: true
+  github:
+    identifier: opensearch-project/OpenSearch-Dashboards
+    tag-filter: 2.
+
+test:
+  environment:
+    contents:
+      packages:
+        - busybox
+        - ${{package.name}}-config
+    environment:
+      OSD_NODE_HOME: /usr
+  pipeline:
+    - runs: |
+        /usr/share/opensearch-dashboards/bin/opensearch-dashboards --version --allow-root

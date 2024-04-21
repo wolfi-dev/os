@@ -1,45 +1,102 @@
+# This melange yaml is complex.  The context is opensearch releases the main package and many plugins, some in the same repo
+# and some in different repos.  They all share the same version number so rather than having a separate melange yaml for each
+# package, we package them all in one build so they can be released together.  For plugins to run they need to be built with the
+# same version they are installed into.
 package:
   name: opensearch-2
-  version: 2.11.1
-  epoch: 2 # Remove CVE-2022-45146 patch when bumping to 2.12 or later
-  description:
+  version: 2.13.0
+  epoch: 0
+  description: Open source distributed and RESTful search engine.
   copyright:
-    - paths:
-        - "*"
-      attestation:
-      license: Apache-2.0
+    - license: Apache-2.0
   dependencies:
     runtime:
       - bash # some helper scripts use bash
-      - openjdk-11-jre
+      - busybox # some helper scripts use busybox
+      - openjdk-17-jre
+
+vars:
+  plugin_version_qualifier: "0" # external plugins use the same version as the main package with a qualifier
 
 environment:
   contents:
     packages:
+      - bash
       - busybox
       - ca-certificates-bundle
       - curl
       - gradle
-      - openjdk-11
+      - openjdk-17
+      - openjdk-17-default-jvm
+      - patch
+      - unzip
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+    LANG: "en_US.UTF-8"
+
+data:
+  - name: internal-plugins
+    items:
+      # plugin_name: cve patch list
+      analysis-icu: ""
+      analysis-kuromoji: ""
+      analysis-nori: ""
+      analysis-phonetic: ""
+      analysis-smartcn: ""
+      analysis-stempel: ""
+      analysis-ukrainian: ""
+      crypto-kms: ""
+      discovery-azure-classic: ""
+      discovery-ec2: ""
+      discovery-gce: ""
+      identity-shiro: ""
+      ingest-attachment: ""
+      mapper-annotated-text: ""
+      mapper-murmur3: ""
+      mapper-size: ""
+      repository-azure: ""
+      repository-gcs: ""
+      repository-s3: ""
+      store-smb: ""
+      telemetry-otel: ""
+      transport-nio: ""
+
+  - name: external-plugins
+    items:
+      # plugin_name: cve patch list
+      alerting: ""
+      anomaly-detection: ""
+      asynchronous-search: ""
+      cross-cluster-replication: ""
+      custom-codecs: ""
+      geospatial: ""
+      index-management: ""
+      job-scheduler: ""
+      k-nn: ""
+      ml-commons: ""
+      neural-search: ""
+      notifications: ""
+      observability: ""
+      performance-analyzer: ""
+      reporting: ""
+      security: "security-bump-cxf.patch"
+      security-analytics: ""
+      sql: ""
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/opensearch-project/OpenSearch
       tag: ${{package.version}}
-      expected-commit: 6b1986e964d440be9137eba1413015c31c5a7752
+      expected-commit: 7ec678d1b7c87d6e779fdef94e33623e1f1e2647
 
   - uses: patch
     with:
-      # Patch from: https://patch-diff.githubusercontent.com/raw/opensearch-project/OpenSearch/pull/10297.patch
-      patches: CVE-2022-45146.patch
+      patches: bump-netty.patch bump-commons-compress.patch
 
   - runs: |
-      export LANG=en_US.UTF-8
-      export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
-
+      echo "org.gradle.daemon=false" >> gradle.properties
       gradle localDistro --parallel -Dbuild.snapshot="false" -Dbuild.version_qualifier=""
-
       mkdir -p ${{targets.destdir}}/usr/share/opensearch/logs
 
       install -dm777 ${{targets.destdir}}/usr/share/opensearch/
@@ -49,11 +106,14 @@ pipeline:
       mv build/distribution/local/opensearch-${{package.version}}/modules/ ${{targets.destdir}}/usr/share/opensearch
       mv build/distribution/local/opensearch-${{package.version}}/plugins/ ${{targets.destdir}}/usr/share/opensearch
 
-      # Grab the docker entrypoint from the source tree
-      mv ./distribution/docker/src/docker/bin/docker-entrypoint.sh  ${{targets.destdir}}/usr/share/opensearch/bin
-
       mv ./distribution/docker/src/docker/config/opensearch.yml ./distribution/docker/src/docker/config/log4j2.properties ${{targets.destdir}}/usr/share/opensearch/config
 
+  - runs: |
+      # Use a modified entrypoint script as the official one duplicates env vars and system properties used by the JVM on startup
+      # This means we avoid errors like: ERROR: setting [discovery.seed_hosts] already set, saw [opensearch-cluster-master-headless] and [opensearch-cluster-master-headless]
+      mv opensearch-docker-entrypoint.sh  ${{targets.destdir}}/usr/share/opensearch/bin/
+
+  - runs: |
       # Set permissions to read/write the config dir
       chmod -R 755 ${{targets.destdir}}/usr/share/opensearch/
 
@@ -63,10 +123,148 @@ pipeline:
         ln -sf /usr/share/opensearch/bin/$name ${{targets.destdir}}/usr/bin/$name
       done
 
+      chmod -R 666 ${{targets.destdir}}/usr/share/opensearch/config/opensearch.yml
+
       # Manually set this to docker: https://github.com/opensearch-project/OpenSearch/blob/5f8193021215cd6979fde66474ec8d74d32ac91a/distribution/docker/src/docker/Dockerfile#LL49C90-L49C129
       sed -i -e 's/OPENSEARCH_DISTRIBUTION_TYPE=tar/OPENSEARCH_DISTRIBUTION_TYPE=docker/'  ${{targets.destdir}}/usr/share/opensearch/bin/opensearch-env
+
+  - runs: |
+      cd plugins
+      gradle assemble -Dbuild.snapshot="false" -Dbuild.version_qualifier="" --stacktrace
+
+      # useful for finding generated zip file we use to extract into the final apk
+      find . -name "*.zip"
+
+  - runs: |
+      # Remove files so they don't conflict with subpackages
+      echo "Removing files that conflict with subpackages"
+      rm -rf /home/build/settings.gradle
+
+  - uses: strip
+
+subpackages:
+  - range: internal-plugins
+    name: ${{package.name}}-${{range.key}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/opensearch/plugins/opensearch-${{range.key}}
+          unzip "./plugins/${{range.key}}/build/distributions/${{range.key}}-${{package.version}}.zip" -d "${{targets.contextdir}}/usr/share/opensearch/plugins/opensearch-${{range.key}}"
+
+  - range: external-plugins
+    name: ${{package.name}}-${{range.key}}
+    pipeline:
+      # Delete other plugins. Opensearch can only build one at a time, otherwise we run into conflicting dependencies version issues with yarn.
+      - runs: |
+          rm -r plugins/* || true
+      - uses: git-checkout
+        with:
+          repository: https://github.com/opensearch-project/${{range.key}}.git
+          tag: ${{package.version}}.${{vars.plugin_version_qualifier}}
+          destination: ./plugins/${{range.key}}
+      - runs: |
+          cd ./plugins/${{range.key}}
+
+          # apply any CVE patches
+          if [ -n "${{range.value}}" ]; then
+              patch -p1 < "../../${{range.value}}"
+          fi
+
+          # notifications source live in a subfolder
+          if [ "${{range.key}}" = "notifications" ]; then
+            cd ./notifications
+          fi
+
+          # skip check task, using -x doesn't append to an existing list
+          # job scheduler requires a test cluster to connect to so skip verification checks
+          if [ "${{range.key}}" = "job-scheduler" ]; then
+            sed -i '/startParameter.excludedTaskNames=\[/ s/]/, "check"]/g' settings.gradle
+          fi
+
+          echo "org.gradle.daemon=false" >> gradle.properties
+          ./gradlew clean assemble -Dbuild.snapshot="false" -Dbuild.version_qualifier="" -Dopensearch.version="${{package.version}}" -x check -x integTest -x javadoc -PfailOnJavadocWarning=false --stacktrace
+
+          # useful for finding generated zip file we use to extract into the final apk
+          find . -name "*.zip"
+
+          # Extract the value of rootProject.name, this is because the key is not always the same as the plugin name
+          # note: not all plugins have a settings.gradle file
+          plugin_name=$(grep "^rootProject.name" settings.gradle 2>/dev/null | awk -F" = " '{print $2}' | tr -d "'" | tr -d '"')
+
+          # Check if plugin_name is empty and assign default if it is
+          if [ -z "$plugin_name" ]; then
+              plugin_name=${{range.key}}
+          fi
+
+          echo "Plugin name: $plugin_name"
+
+          # Remove any existing "opensearch-" prefix before adding it to ensure it's not duplicated
+          plugin_name=$(echo $plugin_name | sed 's/^opensearch-//')
+
+          # Ensure the plugin_name has the "opensearch-" prefix
+          plugin_name="opensearch-$plugin_name"
+
+          echo "Final plugin name: $plugin_name"
+
+          mkdir -p "${{targets.contextdir}}/usr/share/opensearch/plugins"
+
+          # Define the base path for the unzip destination
+          destination_base="${{targets.contextdir}}/usr/share/opensearch"
+
+          # Determine the source directory based on the plugin key
+          case "${{range.key}}" in
+              "alerting")
+                  zip_dir="./alerting"
+                  ;;
+              "ml-commons"|"sql")
+                  zip_dir="./plugin"
+                  ;;
+              "notifications")
+                  zip_dir="./notifications"
+                  install -Dm644 notifications/src/main/config/notifications.yml "${destination_base}/config/${plugin_name}/notifications.yml"
+
+                  # Special handling for notifications core
+                  unzip "./core/build/distributions/${plugin_name}-core-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/plugins/${plugin_name}-core"
+                  install -Dm644 core/src/main/config/notifications-core.yml "${destination_base}/config/${plugin_name}-core/notifications-core.yml"
+                  ;;
+              "observability")
+                  zip_dir="."
+                  install -Dm644 src/main/config/observability.yml "${destination_base}/config/${plugin_name}/observability.yml"
+                  ;;
+              "performance-analyzer")
+                  zip_dir="."
+                  mkdir -p "${destination_base}/config/${plugin_name}/"
+                  install -Dm644 config/* "${destination_base}/config/${plugin_name}/"
+                  ;;
+              "reporting")
+                  zip_dir="."
+                  install -Dm644 src/main/config/reports-scheduler.yml "${destination_base}/config/${plugin_name}/reports-scheduler.yml"
+                  ;;
+              "security")
+                  zip_dir="."
+                  mkdir -p "${destination_base}/config/${plugin_name}/"
+                  install -Dm644 config/* "${destination_base}/config/${plugin_name}/"
+                  ;;
+              *)
+                  zip_dir="."
+                  ;;
+          esac
+
+          # Unzip the main plugin distribution
+          unzip "${zip_dir}/build/distributions/${plugin_name}-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/plugins/${plugin_name}"
+      - uses: strip
 
 update:
   enabled: true
   github:
     identifier: opensearch-project/OpenSearch
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-17-default-jvm
+        - bash
+  pipeline:
+    - runs: |
+        export JAVA_HOME=/usr/lib/jvm/default-jvm
+        opensearch --version

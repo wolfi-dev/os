@@ -1,0 +1,188 @@
+package:
+  name: docker-selenium
+  # Officially they distribute the version with the following format: 4.16.1-20231219
+  # But the '-' is not a valid character according to APK versioning spec; and resulting
+  # 'package format error' when trying to install the package. The workaround is
+  # to replace '-' with '.', then mangling the version to replace back.
+  version: 4.19.1.20240402
+  epoch: 0
+  description: Provides a simple way to run Selenium Grid with Chrome, Firefox, and Edge using Docker, making it easier to perform browser automation
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    # TODO: Enable aarch64
+    # Requires aarch64 variant of Chromedriver
+    - x86_64
+  dependencies:
+    runtime:
+      - Xvfb
+      - bash
+      - busybox
+      - chromium
+      - chromium-docker-selenium-compat
+      - coreutils
+      - fluxbox
+      - font-ipa
+      - font-liberation
+      - font-misc-cyrillic
+      - font-noto-emoji
+      - font-ubuntu
+      - font-wqy-zenhei
+      - fontconfig
+      - freetype
+      - glib
+      - glibc-locale-en
+      - libfontconfig1
+      - libgcc
+      - libnss
+      - libnss-tools
+      - libxcb
+      - mcookie
+      - novnc
+      - openjdk-11
+      - pulseaudio
+      - selenium-server-compat
+      - sudo-rs
+      - supervisor
+      - ttf-dejavu
+      - tzdata
+      - websockify
+      - x11vnc
+      - xauth
+      - xkbcomp
+      - xkeyboard-config
+      - xmessage
+      - xvfb-run
+
+environment:
+  contents:
+    packages:
+      - acl
+      - bash
+      - build-base
+      - busybox
+      - bzip2
+      - ca-certificates-bundle
+      - curl
+      - git
+      - gnupg
+      - jq
+      - openjdk-11
+      - openjdk-11-default-jvm
+      - openjdk-11-jre
+      - openssl
+      - x11vnc
+      - yq
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-11-openjdk
+    TC: UTC
+    SEL_USER: seluser
+    SEL_PASSWD: secret
+
+# Transform melange version to replace last dot "." with "-".
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(.+)\.(\d+)$
+    replace: $1-$2
+    to: mangled-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/SeleniumHQ/docker-selenium
+      tag: ${{vars.mangled-package-version}}
+      expected-commit: 55bcd41eac43d039f3a85ce0296273eac6f7ef08
+
+  - uses: patch
+    with:
+      patches: 0001-fix-paths.patch
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/usr/bin
+      mkdir -p ${{targets.destdir}}/etc/supervisor/conf.d
+      mkdir -p ${{targets.destdir}}/var/tmp
+
+  # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Base/Dockerfile
+  - working-directory: Base
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.destdir}}/opt/bin
+          install -Dm755 check-grid.sh ${{targets.destdir}}/opt/bin/
+          install -Dm755 entry_point.sh ${{targets.destdir}}/opt/bin/
+          install -Dm755f supervisord.conf ${{targets.destdir}}/etc
+          mkdir -p ${{targets.destdir}}/var/run/supervisor
+      - runs: |
+          mkdir -p ${{targets.destdir}}/opt/selenium
+          echo "${SEL_PASSWD}" > ${{targets.destdir}}/opt/selenium/initialPasswd
+      # TODO: Implement malware scan for jars retrieved by coursier
+      - runs: |
+          # Retrieve OpenTelemetry/GRPC Java versions
+          export OPENTELEMETRY_VERSION=$(curl "https://api.github.com/repos/open-telemetry/opentelemetry-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
+          export GRPC_VERSION=$(curl "https://api.github.com/repos/grpc/grpc-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
+
+          mkdir -p ${{targets.destdir}}/external_jars
+          curl -sSLfO https://github.com/coursier/launchers/raw/master/coursier
+          chmod +x coursier
+          # The netty-codec-http bump is for CVE-2024-29025
+          ./coursier fetch --classpath --cache ${{targets.destdir}}/external_jars \
+            io.opentelemetry:opentelemetry-exporter-otlp:${OPENTELEMETRY_VERSION} \
+            io.netty:netty-codec-http:4.1.108.Final \
+            io.grpc:grpc-netty:${GRPC_VERSION} > ${{targets.destdir}}/external_jars/.classpath.txt
+
+  # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/NodeBase/Dockerfile
+  - working-directory: NodeBase
+    pipeline:
+      - runs: |
+          install -Dm755 start-selenium-node.sh ${{targets.destdir}}/opt/bin/
+          install -Dm755 start-xvfb.sh ${{targets.destdir}}/opt/bin/
+          install -Dm755 selenium.conf ${{targets.destdir}}/etc/supervisor/conf.d/
+          install -Dm755 start-vnc.sh ${{targets.destdir}}/opt/bin/
+          install -Dm755 start-novnc.sh ${{targets.destdir}}/opt/bin/
+          install -Dm755 selenium_grid_logo.png ${{targets.destdir}}/usr/share/images/fluxbox/ubuntu-light.png
+          install -Dm755 generate_config ${{targets.destdir}}/opt/bin/generate_config
+
+          mkdir -p ${{targets.destdir}}/home/$SEL_USER/.fluxbox
+          mkdir -p ${{targets.destdir}}/tmp/.X11-unix
+          mkdir -p ${{targets.destdir}}/home/$SEL_USER/.vnc
+          mkdir -p ${{targets.destdir}}/opt/selenium
+          x11vnc -storepasswd $(cat ${{targets.destdir}}/opt/selenium/initialPasswd) ${{targets.destdir}}/home/$SEL_USER/.vnc/passwd
+
+  # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/NodeChrome/Dockerfile
+  - working-directory: NodeChrome
+    pipeline:
+      - runs: |
+          install -Dm755 wrap_chrome_binary ${{targets.destdir}}/opt/bin/wrap_chrome_binary
+
+  # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Standalone/Dockerfile
+  - working-directory: Standalone
+    pipeline:
+      - runs: |
+          install -Dm755 start-selenium-standalone.sh ${{targets.destdir}}/opt/bin/start-selenium-standalone.sh
+          install -Dm755 selenium.conf ${{targets.destdir}}/etc/supervisor/conf.d/
+          install -Dm755 generate_config ${{targets.destdir}}/opt/bin/generate_config
+
+  - uses: strip
+
+subpackages:
+  - name: docker-selenium-supervisor-config
+    description: Docker Selenium supervisor configuration
+    dependencies:
+      replaces:
+        - supervisor-config
+      provides:
+        - supervisor-config
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc
+          mv ${{targets.destdir}}/etc/supervisord.conf ${{targets.subpkgdir}}/etc
+          mv ${{targets.destdir}}/etc/supervisor ${{targets.subpkgdir}}/etc
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - '.*grid.*'
+  version-transform:
+    - match: ^(.+)\-(\d+)$
+      replace: $1.$2
+  github:
+    identifier: SeleniumHQ/docker-selenium

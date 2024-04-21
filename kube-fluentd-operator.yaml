@@ -1,7 +1,7 @@
 package:
   name: kube-fluentd-operator
-  version: 1.18.1
-  epoch: 2
+  version: 1.18.2
+  epoch: 7
   description: Auto-configuration of Fluentd daemon-set based on Kubernetes metadata
   copyright:
     - license: MIT
@@ -11,6 +11,7 @@ package:
       - jemalloc
       - libsystemd
       - ruby-3.2
+      - ruby3.2-bundler
 
 environment:
   contents:
@@ -45,7 +46,17 @@ pipeline:
     with:
       repository: https://github.com/vmware/kube-fluentd-operator
       tag: v${{package.version}}
-      expected-commit: e568a6b2508153ee721bd22fc560338f6bad283d
+      expected-commit: 20e6130591ab07d1c73fcc892a4f9146c5a26b25
+
+  - uses: go/bump
+    with:
+      deps: google.golang.org/protobuf@v1.33.0
+      modroot: image
+
+  - uses: go/bump
+    with:
+      deps: google.golang.org/protobuf@v1.33.0
+      modroot: config-reloader
 
   - runs: |
       echo 'gem: --no-rdoc --no-ri' >> ~/.gemrc
@@ -58,6 +69,10 @@ pipeline:
 
       # Bump activemodel to mitigate CVE-2023-38037
       echo "gem 'activemodel', '7.0.7.2'" >> Gemfile
+      # Bump json-jwt to mitigate GHSA-c8v6-786g-vjx6
+      echo "gem 'json-jwt', '1.15.3.1'" >> Gemfile
+      # Bump rack to mitigate GHSA-xj5v-6v4g-jfw6
+      bundle update rack
       bundle install
 
       mkdir -p ${{targets.destdir}}/etc/fluent/plugin
@@ -71,7 +86,7 @@ pipeline:
       git checkout ${{vars.FLUENT_PLUGIN_GOOGLE_CLOUD_COMMIT}}
 
       # to fix some CVEs in the grpc
-      sed -e "s/'grpc', '1.52.0'/'grpc', '1.53.0'/g" -i fluent-plugin-google-cloud.gemspec
+      sed -e "s/'grpc', '1.52.0'/'grpc', '1.53.2'/g" -i fluent-plugin-google-cloud.gemspec
 
       bundle config set --local path ${GEM_DIR}
       bundle config set --local without 'development test'
@@ -81,16 +96,6 @@ pipeline:
       rm -rf ${{targets.destdir}}/$(ruby -e "puts File.join(Gem.default_dir, 'ruby', RbConfig::CONFIG['ruby_version'])")/cache
 
   - uses: strip
-
-  - uses: go/bump
-    with:
-      deps: golang.org/x/net@v0.17.0
-      modroot: image
-
-  - uses: go/bump
-    with:
-      deps: golang.org/x/crypto@v0.17.0
-      modroot: config-reloader
 
   - runs: |
       # makefile has moved to the root of the repo without any changes
@@ -144,6 +149,53 @@ subpackages:
           # this should probably live in the ruby-3.2 package but not sure if we need to do it in a way that multiple ruby versions can coexist
           # TODO JR to followup
           ln -sf $(ruby -e "puts File.join(Gem.default_dir, 'ruby', RbConfig::CONFIG['ruby_version'])") ${{targets.subpkgdir}}/usr/lib/gem/home
+
+test:
+  environment:
+    contents:
+      packages:
+        - kube-fluentd-operator-compat
+        - kube-fluentd-operator-default-config
+        - kube-fluentd-operator-oci-entrypoint
+  pipeline:
+    - runs: |
+        export PATH="$PATH:/usr/lib/gem/home/bin/"
+        export GEM_PATH="/usr/lib/gem/home"
+
+        # Check if Fluentd is installed
+        fluentd -help
+
+        # Configure Fluentd to capture logs in a file
+        mkdir -p /var/log/fluentd
+        fluentd -s conf
+        cat << EOF > conf/fluent.conf
+        <source>
+          @type forward
+          @id forward_input
+        </source>
+        <match debug.**>
+          @type file
+          path /var/log/fluentd/debug
+          append true
+          format json
+          buffer_path /var/log/fluentd/debug.*
+        </match>
+        EOF
+
+        # Start Fluentd in daemon mode
+        fluentd -c conf/fluent.conf &
+        sleep 2
+
+        # Send a test message to Fluentd
+        echo '{"json":"Test message"}' | fluent-cat debug.test
+
+        # Check if the test message is successfully logged
+        if grep -q "Test message" /var/log/fluentd/debug*.log; then
+          echo "Test message found in the log file."
+        else
+          echo "Test message not found in the log file."
+          exit 1
+        fi
 
 update:
   enabled: true

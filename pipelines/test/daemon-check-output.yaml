@@ -1,0 +1,218 @@
+name: Check Daemon Output
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  start:
+    description: |
+      The command to run to start the daemon.
+      WARNING: executed with a shell.
+    required: true
+  setup:
+    description: |
+      Command to run before starting daemon.
+      Content is placed into a file and executed. If no '#!' is present,
+      then '#!/bin/sh -ex' will be prepended.
+      WARNING: The content of this field goes through shell. Avoid single quotes.
+    required: false
+  timeout:
+    description: "Time in seconds to wait before giving up."
+    default: 30
+  expected_output:
+    description: "newline separated list of strings expected to be found in output."
+    required: true
+  error_strings:
+    description: |
+      newline separated list of strings that are considered error if found.
+      set to empty for none.
+    required: true
+    default: |
+      ERROR
+      FAIL
+      Traceback.*most.recent.call
+      Exception in thread
+
+pipeline:
+  - name: "start daemon on localhost"
+    runs: |
+      info() { echo "$@"; }
+      # term_wait_kill(pid, ttime, ktime)
+      # wait ttime seconds, send SIGTERM to pid
+      # then wait up to stime seconds for pid to die.
+      # if it is still alive after ktime more seconds, SIGKILL it.
+      term_wait_kill() {
+        local pid="$1" ttime="$2" ktime="$3" n=""
+        n=0
+        [ -d "/proc/$pid" ] || {
+          info "twk: pid $pid did not exist"
+          return 0
+        }
+        while [ $n -lt $ttime ] && n=$((n+1)); do
+            if [ ! -d "/proc/$pid" ]; then
+                info "twk: pid $pid did not exist after $n seconds"
+                return 0
+            fi
+            sleep 1
+        done
+        if [ ! -d "/proc/$pid" ]; then
+            info "twk: pid $pid died on its own within $n seconds"
+            return 0
+        fi
+        kill -TERM "$pid"
+        info "twk: SIGTERM sent to pid $pid. kill returned $?."
+        n=0
+        while [ $n -lt $ktime ] && n=$((n+1)); do
+            if [ ! -d "/proc/$pid" ]; then
+                info "twk: pid $pid exited within $n seconds after SIGTERM"
+                return 0
+            fi
+            sleep 1
+        done
+        if [ ! -d "/proc/$pid" ]; then
+            info "twk: pid $pid exited within $n seconds after SIGTERM"
+            return 0
+        fi
+        kill -KILL "$pid"
+        info "twk: SIGKILL sent to pid $pid [kill returned $?]"
+        return 0
+      }
+
+      cleanup() {
+        # stop subshells from cleaning up.
+        if [ "$$" != "$MAINPID" ]; then
+            return 0
+        fi
+        rm -Rf "$TMPD"
+      }
+
+      set +x
+      MAINPID=$$
+      TMPD=$(mktemp -d)
+      trap cleanup EXIT
+      KID=""
+      OUT_F="${TMPD}/out"
+      EXPECTED_F="${TMPD}/expected"
+      MISSING_F="${TMPD}/missing"
+      ERRORS_F="${TMPD}/errorstrings"
+      ERRORS_FOUND_F="${TMPD}/errorstrings-found"
+      SETUP_F="${TMPD}/setup"
+
+      timeout=${{inputs.timeout}}
+      setup='${{inputs.setup}}'
+      expected_strings='${{inputs.expected_output}}'
+      printf "%s\n" "${expected_strings}" > "${EXPECTED_F}"
+      error_strings='${{inputs.error_strings}}'
+      printf "%s\n" "${error_strings}" > "${ERRORS_F}"
+
+      set --
+      while read line ; do
+          [ "$line" = "" ] && continue
+          set -- "$@" "$line"
+      done < "$EXPECTED_F"
+      num_lines=$#
+
+      if [ -n "$setup" ]; then
+          shbang="#!"
+          if [ "${setup#${shbang}}" = "$shbang" ]; then
+              printf "%s\n" '#!/bin/sh -ex' > "${SETUP_F}"
+          fi
+          printf "%s\n" "$setup" >> "${SETUP_F}"
+          chmod 755 "${SETUP_F}"
+          info "running setup from ${SETUP_F}"
+          "${SETUP_F}" || {
+            rc=$?
+            info "ERROR: setup failed with $rc"
+            exit $rc
+          }
+      fi
+
+      set -- ${{inputs.start}}
+      n=$#
+      "$@" >"$OUT_F" 2>&1 </dev/null &
+      KID=$!
+      info "daemon started as pid $KID with: $*"
+      info "looking for ${num_lines} lines in output within $timeout seconds"
+
+      set --
+      while read line ; do
+          [ "$line" = "" ] && continue
+          set -- "$@" "$line"
+      done < "$EXPECTED_F"
+      found=0
+
+      n=0
+      while n=$((n+1)); do
+          while [ $# -gt 0 ] && grep -q "$1" "$OUT_F"; do
+              info "found within $n seconds: $1"
+              found=$((found+1))
+              shift
+          done
+          [ $# -eq 0 ] && break
+          [ -d "/proc/$KID" ] || { info "process $KID no longer exists"; break; }
+          if [ $n -gt $timeout ]; then
+              info "timeout $timeout seconds reached."
+              break
+          fi
+          sleep 1
+      done
+
+      term_wait_kill "$KID" 0 30 &
+
+      while [ $# -ne 0 ]; do
+          if grep -q "$1" "$OUT_F"; then
+              info "found within $n seconds: $line"
+              found=$((found+1))
+          else
+              info "missing expected output: $1"
+              echo "$1" >> "$MISSING_F"
+          fi
+          shift
+      done
+
+      # now look for errors.
+      errors_found=0
+      num_error_strings=0
+      if [ -z "${error_strings}" ]; then
+          info "error string checking is disabled."
+      else
+          set --
+          while read line ; do
+              [ "$line" = "" ] && continue
+              set -- "$@" "$line"
+          done < "$ERRORS_F"
+          num_error_strings=$#
+          for errmsg in "$@"; do
+              if out=$(grep "$errmsg" "$OUT_F"); then
+                  info "ERROR: found error message '$errmsg' in output: $out"
+                  errors_found=$((errors_found+1))
+                  echo "$errmsg" >> "$ERRORS_FOUND_F"
+              fi
+          done
+      fi
+
+      info "-- begin output --"
+      sed 's,^,> ,' "$OUT_F"
+      info "-- end   output --"
+
+      rc=0
+      if [ $found -ne $num_lines ]; then
+          rc=1
+          info "ERROR: found $found of expected ${num_lines} lines in output."
+          info "missing:"
+          sed 's,^,> ,' "$MISSING_F"
+      else
+          info "found $found of expected ${num_lines} lines in output."
+      fi
+
+      if [ $errors_found -ne 0 ]; then
+          rc=1
+          info "ERROR: matched ${errors_found} error strings below in output above:"
+          sed 's,^,> ,' "$ERRORS_FOUND_F"
+      elif [ $num_error_strings -ne 0 ]; then
+          info "found 0 / ${num_error_strings} error strings in output."
+      fi
+
+      wait || info "wait returned $?"
+      exit $rc

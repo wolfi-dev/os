@@ -1,7 +1,11 @@
+# This melange yaml is complex.  The context is opensearch releases the main package and many plugins, some in the same repo
+# and some in different repos.  They all share the same version number so rather than having a separate melange yaml for each
+# package, we package them all in one build so they can be released together.  For plugins to run they need to be built with the
+# same version they are installed into.
 package:
   name: opensearch-2
-  version: 2.11.1
-  epoch: 4 # Remove CVE-2022-45146 patch when bumping to 2.12 or later
+  version: 2.13.0
+  epoch: 0
   description: Open source distributed and RESTful search engine.
   copyright:
     - license: Apache-2.0
@@ -9,10 +13,10 @@ package:
     runtime:
       - bash # some helper scripts use bash
       - busybox # some helper scripts use busybox
-      - openjdk-11-jre
+      - openjdk-17-jre
 
 vars:
-  plugin_version_qualifier: "0"
+  plugin_version_qualifier: "0" # external plugins use the same version as the main package with a qualifier
 
 environment:
   contents:
@@ -22,12 +26,12 @@ environment:
       - ca-certificates-bundle
       - curl
       - gradle
-      - openjdk-11
-      - openjdk-11-default-jvm
+      - openjdk-17
+      - openjdk-17-default-jvm
       - patch
       - unzip
   environment:
-    JAVA_HOME: /usr/lib/jvm/java-11-openjdk
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
     LANG: "en_US.UTF-8"
 
 data:
@@ -69,35 +73,26 @@ data:
       index-management: ""
       job-scheduler: ""
       k-nn: ""
-      ml-commons: "CVE-2023-51074.patch"
-      neural-search: "CVE-2023-5072.patch"
+      ml-commons: ""
+      neural-search: ""
       notifications: ""
       observability: ""
       performance-analyzer: ""
       reporting: ""
-      security: "CVE-2023-44483.patch"
+      security: "security-bump-cxf.patch"
       security-analytics: ""
-      sql: "CVE-2023-5072-sql.patch"
+      sql: ""
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/opensearch-project/OpenSearch
       tag: ${{package.version}}
-      expected-commit: 6b1986e964d440be9137eba1413015c31c5a7752
+      expected-commit: 7ec678d1b7c87d6e779fdef94e33623e1f1e2647
 
   - uses: patch
     with:
-      # Patch from: https://patch-diff.githubusercontent.com/raw/opensearch-project/OpenSearch/pull/10297.patch
-      patches: CVE-2022-45146.patch
-
-  - uses: patch
-    with:
-      patches: CVE-2023-46749.patch
-
-  - uses: patch
-    with:
-      patches: CVE-2023-34054.patch
+      patches: bump-netty.patch bump-commons-compress.patch
 
   - runs: |
       echo "org.gradle.daemon=false" >> gradle.properties
@@ -111,11 +106,14 @@ pipeline:
       mv build/distribution/local/opensearch-${{package.version}}/modules/ ${{targets.destdir}}/usr/share/opensearch
       mv build/distribution/local/opensearch-${{package.version}}/plugins/ ${{targets.destdir}}/usr/share/opensearch
 
-      # Grab the docker entrypoint from the source tree
-      mv ./distribution/docker/src/docker/bin/docker-entrypoint.sh  ${{targets.destdir}}/usr/share/opensearch/bin
-
       mv ./distribution/docker/src/docker/config/opensearch.yml ./distribution/docker/src/docker/config/log4j2.properties ${{targets.destdir}}/usr/share/opensearch/config
 
+  - runs: |
+      # Use a modified entrypoint script as the official one duplicates env vars and system properties used by the JVM on startup
+      # This means we avoid errors like: ERROR: setting [discovery.seed_hosts] already set, saw [opensearch-cluster-master-headless] and [opensearch-cluster-master-headless]
+      mv opensearch-docker-entrypoint.sh  ${{targets.destdir}}/usr/share/opensearch/bin/
+
+  - runs: |
       # Set permissions to read/write the config dir
       chmod -R 755 ${{targets.destdir}}/usr/share/opensearch/
 
@@ -124,6 +122,8 @@ pipeline:
         name=$(basename $i)
         ln -sf /usr/share/opensearch/bin/$name ${{targets.destdir}}/usr/bin/$name
       done
+
+      chmod -R 666 ${{targets.destdir}}/usr/share/opensearch/config/opensearch.yml
 
       # Manually set this to docker: https://github.com/opensearch-project/OpenSearch/blob/5f8193021215cd6979fde66474ec8d74d32ac91a/distribution/docker/src/docker/Dockerfile#LL49C90-L49C129
       sed -i -e 's/OPENSEARCH_DISTRIBUTION_TYPE=tar/OPENSEARCH_DISTRIBUTION_TYPE=docker/'  ${{targets.destdir}}/usr/share/opensearch/bin/opensearch-env
@@ -181,15 +181,10 @@ subpackages:
           fi
 
           echo "org.gradle.daemon=false" >> gradle.properties
-          ./gradlew clean assemble -Dbuild.snapshot="false" -Dbuild.version_qualifier="" -x check -x integTest -x javadoc -PfailOnJavadocWarning=false --stacktrace
+          ./gradlew clean assemble -Dbuild.snapshot="false" -Dbuild.version_qualifier="" -Dopensearch.version="${{package.version}}" -x check -x integTest -x javadoc -PfailOnJavadocWarning=false --stacktrace
 
           # useful for finding generated zip file we use to extract into the final apk
           find . -name "*.zip"
-
-          mkdir -p "${{targets.contextdir}}/usr/share/opensearch/plugins"
-
-          # Define the base path for the unzip destination
-          destination_base="${{targets.contextdir}}/usr/share/opensearch/plugins"
 
           # Extract the value of rootProject.name, this is because the key is not always the same as the plugin name
           # note: not all plugins have a settings.gradle file
@@ -210,6 +205,11 @@ subpackages:
 
           echo "Final plugin name: $plugin_name"
 
+          mkdir -p "${{targets.contextdir}}/usr/share/opensearch/plugins"
+
+          # Define the base path for the unzip destination
+          destination_base="${{targets.contextdir}}/usr/share/opensearch"
+
           # Determine the source directory based on the plugin key
           case "${{range.key}}" in
               "alerting")
@@ -220,8 +220,29 @@ subpackages:
                   ;;
               "notifications")
                   zip_dir="./notifications"
+                  install -Dm644 notifications/src/main/config/notifications.yml "${destination_base}/config/${plugin_name}/notifications.yml"
+
                   # Special handling for notifications core
-                  unzip "./core/build/distributions/${plugin_name}-core-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/${plugin_name}-core"
+                  unzip "./core/build/distributions/${plugin_name}-core-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/plugins/${plugin_name}-core"
+                  install -Dm644 core/src/main/config/notifications-core.yml "${destination_base}/config/${plugin_name}-core/notifications-core.yml"
+                  ;;
+              "observability")
+                  zip_dir="."
+                  install -Dm644 src/main/config/observability.yml "${destination_base}/config/${plugin_name}/observability.yml"
+                  ;;
+              "performance-analyzer")
+                  zip_dir="."
+                  mkdir -p "${destination_base}/config/${plugin_name}/"
+                  install -Dm644 config/* "${destination_base}/config/${plugin_name}/"
+                  ;;
+              "reporting")
+                  zip_dir="."
+                  install -Dm644 src/main/config/reports-scheduler.yml "${destination_base}/config/${plugin_name}/reports-scheduler.yml"
+                  ;;
+              "security")
+                  zip_dir="."
+                  mkdir -p "${destination_base}/config/${plugin_name}/"
+                  install -Dm644 config/* "${destination_base}/config/${plugin_name}/"
                   ;;
               *)
                   zip_dir="."
@@ -229,7 +250,7 @@ subpackages:
           esac
 
           # Unzip the main plugin distribution
-          unzip "${zip_dir}/build/distributions/${plugin_name}-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/${plugin_name}"
+          unzip "${zip_dir}/build/distributions/${plugin_name}-${{package.version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/plugins/${plugin_name}"
       - uses: strip
 
 update:
@@ -241,8 +262,7 @@ test:
   environment:
     contents:
       packages:
-        - wolfi-base
-        - openjdk-11-default-jvm
+        - openjdk-17-default-jvm
         - bash
   pipeline:
     - runs: |

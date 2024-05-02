@@ -1,0 +1,215 @@
+name: Build Wolfi OS (beta)
+
+on:
+  push:
+    branches: ['main']
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build packages
+    if: github.repository == 'wolfi-dev/os'
+
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-intel-64-cores
+          - arch: aarch64
+            runner: ubuntu-arm-64-cores
+      fail-fast: false
+
+    runs-on: ${{matrix.runner}}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Docker
+        run: |
+          # Add Docker's official GPG key:
+          sudo apt-get update -y
+          sudo apt-get install ca-certificates curl -y
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          # Add the repository to Apt sources:
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          sudo usermod -aG docker $USER
+          sudo apt-get install acl
+          sudo setfacl --modify user:$USER:rw /var/run/docker.sock
+
+      - uses: google-github-actions/auth@55bd3a7c6e2ae7cf1877fd1ccb9d54c0503c457c # v2.1.2
+        with:
+          workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
+          service_account: ${{ env.FQ_SERVICE_ACCOUNT }}
+
+      # Build with a local key, we'll resign this with the real key later
+      - name: 'Set up environment and build'
+        uses: ./.github/actions/docker-run
+        with:
+          run: |
+            set -x
+            set -e
+            set -o pipefail
+
+            # This is to avoid fatal errors about "dubious ownership" because we are
+            # running inside of a container action with the workspace mounted in.
+            git config --global --add safe.directory "\$(pwd)"
+
+            make local-melange.rsa
+
+            # Touch it with the epoch date to convince `make` that we don't need to
+            # rebuild the targets that depend on this (all)
+            touch -d @0 local-melange.rsa
+
+            # yay wolfi!
+            apk add google-cloud-sdk
+
+            mkdir -p ./packages/${{ matrix.arch }}
+
+            wolfictl build \
+              --runner bubblewrap \
+              --repository-append ./packages \
+              --keyring-append local-melange.rsa.pub \
+              --repository-append https://packages.wolfi.dev/os \
+              --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub \
+              --signing-key local-melange.rsa \
+              --arch ${{ matrix.arch }} \
+              --namespace wolfi \
+              --pipeline-dir ./pipelines/ \
+              --destination-repository https://packages.wolfi.dev/os \
+              --trace ./packages/${{ matrix.arch }}/trace.json
+
+      - name: Reset file permissions
+        run: sudo chown -R $(id -u):$(id -g) .
+
+      - name: Create an archive for uploading
+        if: ${{ always() }}
+        run: |
+            # Move logs so we can upload them separately.
+            mv ./packages/${{ matrix.arch }}/buildlogs /tmp/buildlogs
+
+            # Move trace so we can upload it separately.
+            mv ./packages/${{ matrix.arch }}/trace.json /tmp/trace.json
+
+            tar -cvzf /tmp/packages-${{ matrix.arch }}.tar.gz ./packages/${{ matrix.arch }}
+
+      # Always run these steps for https://github.com/wolfi-dev/os/issues/8698
+      - if: ${{ always() }}
+        name: 'Upload logs archive to GitHub Artifacts'
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        with:
+          name: logs-${{ matrix.arch }}
+          path: /tmp/buildlogs/
+          if-no-files-found: warn
+      - if: ${{ always() }}
+        name: 'Upload trace to GitHub Artifacts'
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        with:
+          name: trace-${{ matrix.arch }}
+          path: /tmp/trace.json
+          if-no-files-found: warn
+      - if: ${{ always() }}
+        name: 'Upload built packages archive to GitHub Artifacts'
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        with:
+          name: packages-${{ matrix.arch }}
+          path: /tmp/packages-${{ matrix.arch }}.tar.gz
+          retention-days: 1 # Low ttl since this is just an intermediary used once
+          if-no-files-found: warn
+
+  upload-packages:
+    runs-on: ubuntu-latest-16-cores
+    needs: build
+
+    # Always run this job for https://github.com/wolfi-dev/os/issues/8698
+    if: ${{ always() }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    container:
+      # NOTE: This step only signs and uploads, so it doesn't need any privileges
+      image: ghcr.io/wolfi-dev/sdk:latest@sha256:0c12b7d91359034743f788b49f5b6d7ab86cc9d35fd0e8715377e8ef4926b177
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Free up runner disk space
+        run: |
+          set -x
+          printf "==> Available space before cleanup\n"
+          df -h
+          rm -rf /usr/share/dotnet
+          rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          printf "==> Available space after cleanup\n"
+          df -h
+
+      - name: 'Trust the github workspace'
+        run: |
+          # This is to avoid fatal errors about "dubious ownership" because we are
+          # running inside of a container action with the workspace mounted in.
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: 'Download x86_64 package archives'
+        uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
+        with:
+          path: /tmp/artifacts/
+          name: packages-x86_64
+
+      - name: 'Download aarch64 package archives'
+        uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
+        with:
+          path: /tmp/artifacts/
+          name: packages-aarch64
+
+      - name: 'Update the APKINDEX'
+        run: |
+          for arch in "aarch64" "x86_64"; do
+            mkdir -p ./packages/${arch}
+
+            # Consolidate with the built artifacts
+            tar xvf /tmp/artifacts/packages-${arch}.tar.gz
+          done
+
+      - name: 'Create APKINDEX tarball'
+        run: |
+          # Tar up any 'APKINDEX.*' files {aarch64,x86_64} x {tar.gz,json}
+          find ./packages/ -name 'APKINDEX.*' > to-include
+          tar -cvzf /tmp/indexes.tar.gz --files-from to-include
+
+      - name: 'Upload APKINDEX archive to GitHub Artifacts'
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        with:
+          name: indexes
+          path: /tmp/indexes.tar.gz
+          retention-days: 1 # Low ttl since this is just an intermediary used once
+          if-no-files-found: warn

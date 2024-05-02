@@ -6,6 +6,9 @@ on:
 # Don't withdraw during builds, to prevent out of sync signatures.
 concurrency: build
 
+permissions:
+  contents: read
+
 jobs:
   withdraw:
     name: Withdraw packages
@@ -16,33 +19,36 @@ jobs:
       contents: read
 
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
         with:
           fetch-depth: 0 # We want the full history for uploading withdrawn-packages.txt to GCS. If this takes too long, we look at merging both files.
 
+      # this need to point to main to always get the latest action
       - name: "Install wolfictl onto PATH"
-        run: |
-          # Copy wolfictl out of the wolfictl image and onto PATH
-          TMP=$(mktemp -d)
-          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:4d3e7b655060d781d5bd3e8876359f530dd3c678b463cc16fecbcd1b7102d1a7 -c "cp /usr/bin/wolfictl /out"
-          echo "$TMP" >> $GITHUB_PATH
+        uses: wolfi-dev/actions/install-wolfictl@main # main
 
-      - name: 'Authenticate to Google Cloud'
+      # This is managed here: https://github.com/chainguard-dev/secrets/blob/main/wolfi-dev.tf
+      - uses: google-github-actions/auth@a6e2e39c0a0331da29f7fd2c2a20a427e8d3ad1f # v2.1.1
         id: auth
-        uses: google-github-actions/auth@f6de81663f7788d05bd15bcce18f0e57f23f0846 # v2.0.1
         with:
-          workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
-          service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
+          workload_identity_provider: "projects/12758742386/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "wolfi-dev@chainguard-github-secrets.iam.gserviceaccount.com"
 
       - uses: google-github-actions/setup-gcloud@5a5f7b85fca43e76e53463acaa9d408a03c98d3a # v2.0.1
         with:
-          project_id: "prod-images-c6e5"
+          project_id: "chainguard-github-secrets"
 
       - uses: 'google-github-actions/get-secretmanager-secrets@ae0d4054c32840e2ced71207a9df55161ae3debc' # v2.0.0
         id: secrets
         with:
           secrets: |-
-            token:prod-images-c6e5/melange-signing-key
+            token:chainguard-github-secrets/wolfi-dev-signing-key
+
       - run: echo "${{ steps.secrets.outputs.token }}" > ./wolfi-signing.rsa
       - run: |
           sudo mkdir -p /etc/apk/keys
@@ -55,6 +61,16 @@ jobs:
             mkdir -p $arch
             curl https://packages.wolfi.dev/os/$arch/APKINDEX.tar.gz | wolfictl withdraw $(grep -v '\#' withdrawn-packages.txt) --signing-key="${{ github.workspace }}/wolfi-signing.rsa" > $arch/APKINDEX.tar.gz
           done
+
+      # We use a different GSA for our interaction with GCS.
+      - uses: google-github-actions/auth@f6de81663f7788d05bd15bcce18f0e57f23f0846 # v2.0.1
+        with:
+          workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
+          service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
+
+      - uses: google-github-actions/setup-gcloud@5a5f7b85fca43e76e53463acaa9d408a03c98d3a # v2.0.1
+        with:
+          project_id: "prod-images-c6e5"
 
       - name: Delete withdrawn packages
         run: |
@@ -81,7 +97,17 @@ jobs:
             all-withdrawn-packages.txt \
             gs://wolfi-production-registry-destination/os/withdrawn-packages.txt
 
-      - uses: rtCamp/action-slack-notify@v2.2.1
+      - name: Delete sbom packages from the lifecycle automation
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            for pkg in $(grep -v '\#' withdrawn-packages.txt); do
+              echo "=> $pkg"
+              gsutil -m rm -f gs://insights-apk-sbom-prod/wolfi-production-registry-destination/os/$arch/$pkg.sbom.json || true
+            done
+          done
+
+      - uses: rtCamp/action-slack-notify@f05987dc91a66984f1666f486497def2cf85183d # v2.2.1
         if: failure()
         env:
           SLACK_ICON: http://github.com/chainguard-dev.png?size=48

@@ -2,10 +2,13 @@ name: CI build action
 
 on:
   pull_request:
-    branches: ['main']
+    branches: ["main"]
   push:
     branches:
       - gh-readonly-queue/main/**
+
+permissions:
+  contents: read
 
 jobs:
   changes:
@@ -18,23 +21,24 @@ jobs:
       packages: ${{steps.package-list.outputs.packages}}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Look for changed files
         id: changes
-        uses: tj-actions/changed-files@716b1e13042866565e00e85fd4ec490e186c4a2f #tj-actions/changed-files@v41.0.1
+        uses: tj-actions/changed-files@2d756ea4c53f7f6b397767d8723b3a10a9f35bf2 # v44.0.0
         with:
           files_yaml: |
             melange:
               - ./*.yaml # Only top level files without structure
               - ./*/*/*.melange.yaml # Support recursive melange files with the new naming convention.
 
-      - name: "Install wolfictl onto PATH"
-        run: |
-          # Copy wolfictl out of the wolfictl image and onto PATH
-          TMP=$(mktemp -d)
-          docker run --rm -i -v $TMP:/out --entrypoint /bin/sh ghcr.io/wolfi-dev/sdk:latest@sha256:4d3e7b655060d781d5bd3e8876359f530dd3c678b463cc16fecbcd1b7102d1a7 -c "cp /usr/bin/wolfictl /out"
-          echo "$TMP" >> $GITHUB_PATH
+      # this need to point to main to always get the latest action
+      - uses: wolfi-dev/actions/install-wolfictl@main # main
 
       # Assuming that we have a list of changed files such as `foo.yaml` and `bar.yaml`, this
       # strips the list down into `foo` and `bar`.
@@ -64,15 +68,17 @@ jobs:
     name: Test building of packages
     strategy:
       matrix:
-        arch: [ "x86_64", "aarch64" ]
+        arch: ["x86_64", "aarch64"]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest-16-cores
+            oci: amd64
+          - arch: aarch64
+            runner: ubuntu-arm-16-cores
+            oci: arm64
       fail-fast: false
-    runs-on:
-      group: wolfi-builder-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     needs: changes
-    container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:4d3e7b655060d781d5bd3e8876359f530dd3c678b463cc16fecbcd1b7102d1a7
-      options: |
-        --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor:unconfined
     outputs:
       packages_were_built: ${{ steps.file_check.outputs.exists }}
 
@@ -81,57 +87,107 @@ jobs:
       pull-requests: write # so we have permission to comment on pull requests
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        with:
+          egress-policy: audit
 
-      - name: 'Trust the github workspace'
+      - name: Free up runner disk space
         run: |
-          # This is to avoid fatal errors about "dubious ownership" because we are
-          # running inside of a container action with the workspace mounted in.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          set -x
+          printf "==> Available space before cleanup\n"
+          df -h
+          rm -rf /usr/share/dotnet
+          rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - name: 'Generate local signing key'
-        run: |
-          make MELANGE="melange" local-melange.rsa
+          printf "==> Available space after cleanup\n"
+          df -h
 
-      - name: 'Build Wolfi'
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Setup Docker
         run: |
-          # Setup the melange cache dir on the host so we can use that in subsequent builds
-          mkdir ../.melangecache
-          for package in ${{needs.changes.outputs.packages}}; do
-            make MELANGE_EXTRA_OPTS="--create-build-log --cache-dir=$(pwd)/../.melangecache" REPO="$GITHUB_WORKSPACE/packages" package/$package -j1
-            make REPO="$GITHUB_WORKSPACE/packages" test/$package -j1
-          done
+          # Add Docker's official GPG key:
+          sudo apt-get update -y
+          sudo apt-get install ca-certificates curl -y
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          # Add the repository to Apt sources:
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          sudo usermod -aG docker $USER
+          sudo apt-get install acl
+          sudo setfacl --modify user:$USER:rw /var/run/docker.sock
+
+      - name: "Generate local signing key"
+        uses: ./.github/actions/docker-run
+        with:
+          run: |
+            make MELANGE="melange" local-melange.rsa
+
+      - name: "Build Wolfi"
+        uses: ./.github/actions/docker-run
+        with:
+          opts: "-v /temp:/temp -v /var/run/docker.sock:/var/run/docker.sock"
+          run: |
+            # Use a different shared $TMPDIR accessible and non-conflicting to
+            # both the host and container since we're running docker out of
+            # docker
+            export TMPDIR="/temp"
+
+            # This is to avoid fatal errors about "dubious ownership" because we are
+            # running inside of a container action with the workspace mounted in.
+            git config --global --add safe.directory .
+
+            mkdir -p .melangecache
+            for package in ${{needs.changes.outputs.packages}}; do
+              make MELANGE_EXTRA_OPTS="--create-build-log --cache-dir=.melangecache" REPO="./packages" package/\$package -j1
+              make MELANGE_EXTRA_OPTS="--runner docker" REPO="./packages" "test/\$package" -j1
+            done
 
       - name: "Check that packages can be installed with apk add"
+        uses: ./.github/actions/docker-run
+        with:
+          run: |
+            # Create a fake linux fs under /tmp/emptyroot to pass to `apk --root`.
+            mkdir -p /tmp/emptyroot/etc/apk
+            cp -r /etc/apk/* /tmp/emptyroot/etc/apk/
+            cat /dev/null > /tmp/emptyroot/etc/apk/world
+
+            mkdir -p /tmp/emptyroot/lib/apk/db
+            touch /tmp/emptyroot/lib/apk/db/{installed,lock,scripts.tar,triggers}
+
+            mkdir -p /tmp/emptyroot/var/cache/apk
+            apk update --root /tmp/emptyroot
+
+            # Find .apk files and add them to the string
+            for f in \$(find packages -name '*.apk'); do
+                tar -Oxf \$f .PKGINFO
+                apk add --root /tmp/emptyroot --repository "./packages" --allow-untrusted --simulate \$f
+            done
+
+      - name: Reset file permissions
         run: |
-          # Create a fake linux fs under /tmp/emptyroot to pass to `apk --root`.
-          mkdir -p /tmp/emptyroot/etc/apk
-          cp -r /etc/apk/* /tmp/emptyroot/etc/apk/
-          cat /dev/null > /tmp/emptyroot/etc/apk/world
-
-          mkdir -p /tmp/emptyroot/lib/apk/db
-          touch /tmp/emptyroot/lib/apk/db/{installed,lock,scripts.tar,triggers}
-
-          mkdir -p /tmp/emptyroot/var/cache/apk
-          apk update --root /tmp/emptyroot
-
-          # Find .apk files and add them to the string
-          for f in $(find packages -name '*.apk'); do
-              tar -Oxf $f .PKGINFO
-              apk add --root /tmp/emptyroot --repository "$GITHUB_WORKSPACE/packages" --allow-untrusted --simulate $f
-          done
+          sudo chown -R $(id -u):$(id -g) .
 
       - name: Check SBOMs
-        run: |
-          apk add py3-ntia-conformance-checker
-          for f in $(find packages -name '*.apk'); do
-              echo ==== Checking SBOM for $f ====
-              tar -Oxf $f var/lib/db/sbom/ > sbom.json
-              echo ::group::sbom.json
-              cat sbom.json
-              echo ::endgroup::
-              ntia-checker -v --file sbom.json
-          done
+        uses: ./.github/actions/docker-run
+        with:
+          run: |
+            apk add py3-ntia-conformance-checker spdx-tools-java
+            for f in \$(find packages -name '*.apk'); do
+                echo ==== Checking SBOM for \$f ====
+                tar -Oxf \$f var/lib/db/sbom/ > sbom.json
+                echo ::group::sbom.json
+                cat sbom.json
+                echo ::endgroup::
+                ntia-checker -v --file sbom.json
+                tools-java Verify sbom.json
+            done
 
       - name: Check for file
         id: file_check
@@ -142,13 +198,16 @@ jobs:
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
+          touch packages.log
 
       - name: Check diff
         if: steps.file_check.outputs.exists == 'true'
         # Let's not fail the whole job if this step fails as it is for improved UX rather than an enforced check
         continue-on-error: true
-        run: |
-          wolfictl check diff
+        uses: ./.github/actions/docker-run
+        with:
+          run: |
+            wolfictl check diff
 
       - name: Check for diff file
         id: diff_file_check
@@ -163,15 +222,15 @@ jobs:
       # Use the x86_64 build results for the comment for now so we don't have duplicates.
       - name: PR comment diff
         if: steps.diff_file_check.outputs.exists == 'true' && matrix.arch == 'x86_64'
-        uses: thollander/actions-comment-pull-request@632cf9ce90574d125be56b5f3405cda41a84e2fd # v2.3.1
+        uses: thollander/actions-comment-pull-request@fabd468d3a1a0b97feee5f6b9e499eab0dd903f6 # v2.5.0
         # We're seeing jobs using merge queues fail
         continue-on-error: true
         with:
           filePath: diff.log
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 'Upload built packages to GitHub artifacts'
-        uses: actions/upload-artifact@v3
+      - name: "Upload built packages to GitHub artifacts"
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
         with:
           path: |
             ./packages/${{ matrix.arch }}
@@ -186,25 +245,28 @@ jobs:
 
     name: "ABI Compatibility check"
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:4d3e7b655060d781d5bd3e8876359f530dd3c678b463cc16fecbcd1b7102d1a7
     needs: build
     if: needs.build.outputs.packages_were_built == 'true'
 
     steps:
-      - name: 'Retrieve x86_64 packages'
-        uses: actions/download-artifact@v3
+      - name: Harden Runner
+        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        with:
+          egress-policy: audit
+
+      - name: "Retrieve x86_64 packages"
+        uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
         with:
           name: packages-x86_64
           path: /tmp/artifacts-1/
 
-      - name: 'Retrieve aarch64 packages'
-        uses: actions/download-artifact@v3
+      - name: "Retrieve aarch64 packages"
+        uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
         with:
           name: packages-aarch64
           path: /tmp/artifacts-2/
 
-      - name: 'Collect packages from all architectures into one place'
+      - name: "Collect packages from all architectures into one place"
         run: |
           cd /tmp/artifacts-1
 
@@ -214,6 +276,9 @@ jobs:
             # Merge the build log ("packages.log") files
             cat /tmp/artifacts-2/packages.log >> ./packages.log
           fi
+
+      # this need to point to main to always get the latest action
+      - uses: wolfi-dev/actions/install-wolfictl@main # main
 
       - name: Soname check
         run: |
@@ -225,25 +290,30 @@ jobs:
 
     name: "Scan packages for CVEs"
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/wolfi-dev/sdk:latest@sha256:4d3e7b655060d781d5bd3e8876359f530dd3c678b463cc16fecbcd1b7102d1a7
     needs: build
     if: needs.build.outputs.packages_were_built == 'true'
 
+    timeout-minutes: 30
+
     steps:
-      - name: 'Retrieve x86_64 packages'
-        uses: actions/download-artifact@v3
+      - name: Harden Runner
+        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        with:
+          egress-policy: audit
+
+      - name: "Retrieve x86_64 packages"
+        uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
         with:
           name: packages-x86_64
           path: /tmp/artifacts-1/
 
-      - name: 'Retrieve aarch64 packages'
-        uses: actions/download-artifact@v3
+      - name: "Retrieve aarch64 packages"
+        uses: actions/download-artifact@21e5c25de9cf2ee24742cd3e822327f3be6dd2a3 # v4.1.1
         with:
           name: packages-aarch64
           path: /tmp/artifacts-2/
 
-      - name: 'Collect packages from all architectures into one place'
+      - name: "Collect packages from all architectures into one place"
         run: |
           cd /tmp/artifacts-1
 
@@ -254,11 +324,14 @@ jobs:
             cat /tmp/artifacts-2/packages.log >> ./packages.log
           fi
 
-      - name: 'Retrieve Wolfi advisory data'
-        uses: actions/checkout@v4
+      - name: "Retrieve Wolfi advisory data"
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
         with:
-          repository: 'wolfi-dev/advisories'
-          path: 'data/wolfi-advisories'
+          repository: "wolfi-dev/advisories"
+          path: "data/wolfi-advisories"
+
+      # this need to point to main to always get the latest action
+      - uses: wolfi-dev/actions/install-wolfictl@main # main
 
       - name: Scan for CVEs
         run: |

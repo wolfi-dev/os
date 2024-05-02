@@ -17,9 +17,14 @@ MELANGE_OPTS += --signing-key ${KEY}
 MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
-MELANGE_OPTS += --generate-index false
+MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
+
+# Enter interactive mode on failure for debug
+MELANGE_DEBUG_OPTS += --interactive
+MELANGE_DEBUG_OPTS += --package-append apk-tools
+MELANGE_DEBUG_OPTS += ${MELANGE_OPTS}
 
 # These are separate from MELANGE_OPTS because for building we need additional
 # ones that are not defined for tests.
@@ -29,6 +34,8 @@ MELANGE_TEST_OPTS += --arch ${ARCH}
 MELANGE_TEST_OPTS += --pipeline-dirs ./pipelines/
 MELANGE_TEST_OPTS += --repository-append https://packages.wolfi.dev/os
 MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+MELANGE_TEST_OPTS += --test-package-append wolfi-base
+MELANGE_TEST_OPTS += --debug
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
@@ -122,7 +129,7 @@ define get-source-dir
 endef
 
 package/%:
-	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
 	else \
@@ -139,10 +146,30 @@ package/%:
 packages/$(ARCH)/%.apk: $(KEY)
 	@mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
+	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
 
-test/%:
+debug/%:
 	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	@if [ -z "$(yamlfile)" ]; then \
+		echo "Error: could not find yaml file for $*"; exit 1; \
+	else \
+		echo "yamlfile is $(yamlfile)"; \
+	fi
+	$(eval $(call get-package-dir,pkgdir,$(yamlfile)))
+	$(info found package dir as $(pkgdir))
+	$(eval $(call get-source-dir,sourcedir,$(pkgdir),$*))
+	$(info found source dir as $(sourcedir))
+	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
+	@mkdir -p ./"$*"/
+	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
+	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(sourcedir) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log)
+	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) $(sourcedir) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
+
+test/%:
+	@mkdir -p ./$(*)/
+	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
 	else \
@@ -161,7 +188,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:4d3e7b655060d781d5bd3e8876359f530dd3c678b463cc16fecbcd1b7102d1a7
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:0c12b7d91359034743f788b49f5b6d7ab86cc9d35fd0e8715377e8ef4926b177
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -226,6 +253,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:4d3e7b655060d781d5bd3e8876359f530dd3c678b463cc16fecbcd1b7102d1a7
+		ghcr.io/wolfi-dev/sdk:latest@sha256:0c12b7d91359034743f788b49f5b6d7ab86cc9d35fd0e8715377e8ef4926b177
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

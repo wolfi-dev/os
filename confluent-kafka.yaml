@@ -1,0 +1,99 @@
+#nolint:git-checkout-must-use-github-updates
+package:
+  name: confluent-kafka
+  # Upstream versioning is too weird that we need to work-around it.
+  # Release Monitor returns the latest version as `7.7.0-314-ccs` format:
+  # https://release-monitoring.org/api/v2/versions/?project_id=371656
+  # In order to make the `update:` section happy:
+  # 1. We need to transform it by replacing the last `-` with `.` to match
+  # with the `version:` field.
+  # 2. Created a new variable `mangled-package-version` to append `-ccs` to the
+  # version.
+  version: 7.8.0.103
+  epoch: 2
+  description: Community edition of Confluent Kafka.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bash # Required by kafka - uses shebangs to launch the image.
+      - busybox
+      - confluent-common-docker
+      - confluent-common-docker-ub
+      - confluent-common-docker-base
+      - confluent-docker-utils
+      - confluent-kafka-images-kafka
+      - openjdk-17-jre
+      - openjdk-17-default-jvm
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - gradle
+      - openjdk-11
+      - sbt
+
+var-transforms:
+  - from: ${{package.version}}
+    match: '\.(\d+)$'
+    replace: '-$1-ccs'
+    to: mangled-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: acfe21eba9add7c8548225e1f4272eb30fa85e79
+      repository: https://github.com/confluentinc/kafka
+      tag: v${{vars.mangled-package-version}}
+
+  - runs: |
+      export JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF8
+
+      gradle clean releaseTarGz
+
+      nohup /usr/lib/kafka/bin/zookeeper-server-start.sh /usr/lib/kafka/config/zookeeper.properties > ${{targets.destdir}}/usr/lib/kafka/logs/zookeeper.out 2> zookeeper.err < /dev/null &
+      tar -xzvf core/build/distributions/kafka_*-${{vars.mangled-package-version}}.tgz
+
+      mkdir -p ${{targets.destdir}}/usr/lib/kafka/logs
+      mkdir -p ${{targets.destdir}}/etc/kafka
+      mkdir -p ${{targets.destdir}}/var/lib/kafka/data
+
+      mv kafka_*-${{vars.mangled-package-version}}/bin ${{targets.destdir}}/usr/lib/kafka
+      mv kafka_*-${{vars.mangled-package-version}}/libs ${{targets.destdir}}/usr/lib/kafka
+      mv kafka_*-${{vars.mangled-package-version}}/config ${{targets.destdir}}/usr/lib/kafka
+
+      # Install required runtime scripts
+      mkdir -p ${{targets.destdir}}/usr/bin
+      for file in $(find ./bin -type f -exec grep -lE '^#!(/usr/bin/env |/bin/)' {} \;); do
+        filename=$(basename "$f")
+        install -D -m755 "$file" ${{targets.destdir}}/usr/bin/"$filename"
+      done
+
+      # Create a symlink for the kafka libs since upstream images expect it to be in /usr/share/java/kafka:
+      # https://github.com/confluentinc/kafka/blob/b66558da5d6b33c2fba9f424131575b948e6f611/bin/kafka-run-class.sh#L197
+      mkdir -p ${{targets.destdir}}/usr/share/java/kafka
+      # ln -sf /usr/lib/kafka/libs/* ${{targets.destdir}}/usr/share/java/kafka/
+
+      # symlink every file in /usr/lib/kafka/libs to /usr/share/java/kafka
+      for file in "${{targets.destdir}}"/usr/lib/kafka/libs/*; do
+        ln -sf /usr/lib/kafka/libs/$(basename $file) ${{targets.destdir}}/usr/share/java/kafka/$(basename $file)
+      done
+
+      # /etc/confluent/docker/ensure runs kafka-storage whereas upstream only provides kafka-storage.sh for some reason.
+      echo "#!/usr/bin/env bash" > ${{targets.destdir}}/usr/bin/kafka-storage
+      echo "exec \"\$0.sh\" \"\$@\"" >> ${{targets.destdir}}/usr/bin/kafka-storage
+      chmod +x ${{targets.destdir}}/usr/bin/kafka-storage
+
+      # Clean up windows
+      rm -rf ${{targets.destdir}}/usr/lib/kafka/bin/*.bat
+
+update:
+  enabled: true
+  release-monitor:
+    identifier: 371645
+  version-transform:
+    - match: ^(.+)\-(\d+)-css$
+      replace: $1.$2

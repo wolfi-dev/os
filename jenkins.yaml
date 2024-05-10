@@ -1,7 +1,7 @@
 package:
   name: jenkins
   version: "2.456"
-  epoch: 0
+  epoch: 1
   description: Open-source CI/CD application.
   copyright:
     - license: MIT
@@ -29,6 +29,7 @@ environment:
       - coreutils
       - git
       - glibc-locale-en
+      - libxml2-utils
       - maven
       - openjdk-17
       - openjdk-17-default-jvm
@@ -55,8 +56,19 @@ pipeline:
 
       export MAVEN_OPTS="-DforkCount=2"
 
+      # now do something strange to get around invalid git tag versions..
+      # clone the remoting package, build the jar, and make it available
+      # for the subpackages pipeline that will actually package it
+      remoting_version=$(xmllint --xpath "//*[local-name()='remoting.version']/text()" pom.xml)
+      echo "Remoting version: ${remoting_version}"
+      git clone https://github.com/jenkinsci/remoting
+      cd remoting
+      git checkout "${remoting_version}"
+      mvn -B -V -e --ntp -Dchangelist="${remoting_version}" -Pquick-build clean package
+
+      cd ..
       # tests take ~1.5 hours to run and have passed 100% since the initial addition of Jenkins, let's skip them and save time + resources
-      mvn install -DskipTests=true
+      mvn install -DskipTests=true -Dyarn.lint.skip=true
 
       mkdir -p ${{targets.destdir}}/usr/share/java/jenkins
       mv war/target/jenkins.war ${{targets.destdir}}/usr/share/java/jenkins/
@@ -71,6 +83,18 @@ subpackages:
           mkdir -p "${{targets.subpkgdir}}"/usr/share/jenkins
           mkdir -p "${{targets.subpkgdir}}"/usr/share/jenkins/ref
           ln -s /usr/share/java/jenkins/jenkins.war "${{targets.subpkgdir}}"/usr/share/jenkins/jenkins.war
+
+  # The remoting repo uses difficult to parse tags, so extract the jar here
+  # in a subpackage. The apk version won't be quite right, but the jar itself
+  # will match the version jenkins specifies in its pom.xml
+  - name: "jenkins-remoting"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/share/jenkins
+          remoting_version=$(xmllint --xpath "//*[local-name()='remoting.version']/text()" pom.xml)
+          cp "remoting/target/remoting-${remoting_version}.jar" "${{targets.subpkgdir}}"/usr/share/jenkins/
+          ln -sf "/usr/share/jenkins/remoting-${remoting_version}.jar" "${{targets.subpkgdir}}"/usr/share/jenkins/agent.jar
+          ln -sf "/usr/share/jenkins/remoting-${remoting_version}.jar" "${{targets.subpkgdir}}"/usr/share/jenkins/slave.jar
 
 update:
   enabled: true
@@ -89,28 +113,10 @@ test:
         - jenkins-compat
         - jenkins-entrypoint
   pipeline:
-    - runs: |
-        cleanup() {
-          kill $JENKINS_PID
-        }
-        trap cleanup EXIT
-
-        echo "Launching Jenkins and performing log validation..."
-        jenkins.sh > jenkins.log 2>&1 &
-        JENKINS_PID=$!
-        TIMEOUT=60
-
-        while ! grep -q "Jenkins is fully up and running" jenkins.log && [ $TIMEOUT -gt 0 ]; do
-          sleep 5
-          TIMEOUT=$((TIMEOUT-1))
-        done
-
-        if [ $TIMEOUT -eq 0 ]; then
-          echo "Attempted to launch Jenkins in melange test, but log validation failed."
-          exit 1
-        fi
-
-        if grep -Eq "FAIL|FAILURE|ERROR" jenkins.log; then
-          echo "Successfully launched Jenkins, but errors where found in the logs."
-          exit 1
-        fi
+    - name: "start daemon on localhost"
+      uses: test/daemon-check-output
+      with:
+        start: jenkins.sh
+        timeout: 120
+        expected_output: |
+          Jenkins is fully up and running

@@ -7,13 +7,26 @@ package:
     - license: MIT
   dependencies:
     runtime:
+      - bash
       - glibc-locale-en
+      - gnupg
+      - gnupg-dirmngr
+      - iproute2
+      - logrotate
+      - procps
+      - py3-pyyaml
+      - python3
+      - runit
 
 environment:
   contents:
     packages:
       - busybox
       - ca-certificates-bundle
+
+vars:
+  # A common package name for this and osixia-docker-openldap packages.
+  APP_NAME: osixia-openldap
 
 pipeline:
   - uses: git-checkout
@@ -23,16 +36,45 @@ pipeline:
       expected-commit: 8200d17647fac9390d9f3b5550a03be113a40f8c
 
   - runs: |
-      mkdir -p "${{targets.contextdir}}"/etc/${{package.name}}/container
-      for dir in service-available tool; do
-        mv ./${dir}/ "${{targets.contextdir}}"/etc/${{package.name}}/container/${dir}
+      # Replace /container dir in some files since we create it in the upper package (which is osixia-docker-openldap)
+      for file in install-service add-service-available; do
+        sed -i "s|/container/|/etc/${{vars.APP_NAME}}/container/|g" image/tool/$file
+      done
+
+      # Alpine does not have apt-get, lets unwrap it
+      sed -i "/apt-get update/d" image/tool/install-service
+      # Remove apt-get from all download.sh scripts
+      for file in image/service-available/:*/download.sh; do
+        sed -i "/apt-get/d" "$file"
       done
 
   - runs: |
-      mkdir -p "${{targets.contextdir}}"/etc/${{package.name}}/container/environment
-      printf en_US.UTF-8 > "${{targets.contextdir}}"/etc/${{package.name}}/container/environment/LANG
-      printf en_US.UTF-8 > "${{targets.contextdir}}"/etc/${{package.name}}/container/environment/LANGUAGE
-      printf en_US.UTF-8 > "${{targets.contextdir}}"/etc/${{package.name}}/container/environment/LC_CTYPE
+      mkdir -p "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container
+      mkdir -p "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/service
+      for dir in service-available tool; do
+        mv ./image/${dir}/ "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/${dir}
+      done
+
+  - runs: |
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      mkdir -p "${{targets.contextdir}}"/sbin
+      for f in "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/tool/*; do
+        # Skip 'run' binary, since it got conflict with the 'run' binary during melange build
+        if [ "$(basename "$f")" = "run" ]; then
+          continue
+        fi
+        filename=$(basename "$f")
+        ln -sf /etc/${{vars.APP_NAME}}/container/tool/"$filename" "${{targets.contextdir}}"/usr/bin/"$filename"
+      done
+      ln -sf /etc/${{vars.APP_NAME}}/container/tool/run "${{targets.contextdir}}"/sbin/run
+
+  - runs: |
+      mkdir -p "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/environment
+      mkdir -p "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/environment/startup
+      printf en_US.UTF-8 > "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/environment/LANG
+      printf en_US.UTF-8 > "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/environment/LANGUAGE
+      printf en_US.UTF-8 > "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/environment/LC_CTYPE
+      printf no > "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/environment/INITRD
 
   - uses: strip
 
@@ -45,11 +87,38 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p "${{targets.contextdir}}/container"
-          ln -sf /etc/${{package.name}}/container/service "${{targets.contextdir}}/container/service"
-          ln -sf /etc/${{package.name}}/container/environment "${{targets.contextdir}}/container/environment"
+          ln -sf /etc/${{vars.APP_NAME}}/container/service-available "${{targets.contextdir}}"/container/service-available
+          ln -sf /etc/${{vars.APP_NAME}}/container/tool "${{targets.contextdir}}"/container/tool
+
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          mkdir -p "${{targets.contextdir}}"/sbin
+
+          # https://github.com/osixia/container-baseimage/blob/761451de259b7e16c9a4664c8ea3cb476b6425c6/image/build.sh#L29-L32
+          ln -sf /usr/bin/true "${{targets.contextdir}}"/sbin/initctl
+          ln -sf /usr/bin/true "${{targets.contextdir}}"/usr/bin/initctl
+
+          # https://github.com/osixia/container-baseimage/blob/761451de259b7e16c9a4664c8ea3cb476b6425c6/image/build.sh#L34-L39
+          ln -sf /usr/bin/true "${{targets.contextdir}}"/sbin/ischroot
+          ln -sf /usr/bin/true "${{targets.contextdir}}"/usr/bin/ischroot
 
 update:
   enabled: true
+  ignore-regex-patterns:
+    - alpine-
+    - jessie-
+    - ubuntu-
   github:
     identifier: osixia/container-baseimage
     strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+  pipeline:
+    - runs: /container/tool/run --loglevel=trace --no-kill-all-on-exit
+    - runs: log-helper info hello | grep -i hello
+    - runs: setuser root true
+    - runs: complex-bash-env true
+    - runs: add-service-available :runit :syslog-ng-core :logrotate :cron

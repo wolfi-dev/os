@@ -188,7 +188,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:cef3580e9f9e2fb69fe6eec01799b2b015f97a01fe89b372c084a726b2b1a32a
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:fe7a0133f713688d8845f7e209fecde1b6c9f0d5de65818fa6c60ba380714142
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -253,6 +253,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:cef3580e9f9e2fb69fe6eec01799b2b015f97a01fe89b372c084a726b2b1a32a
+		ghcr.io/wolfi-dev/sdk:latest@sha256:fe7a0133f713688d8845f7e209fecde1b6c9f0d5de65818fa6c60ba380714142
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

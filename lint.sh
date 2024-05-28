@@ -36,6 +36,13 @@ for p in $(make list); do
     yq -i 'del(.test.environment)' ${fn}
     yam ${fn}
   fi
+
+  if ! yq -e 'has("test") or (.subpackages | map(has("test")) | any)' ${fn}; then
+    echo "ERROR: No tests defined for package ${p}"
+    exit 1
+  fi
+  # Package must have at least one primary pipeline test
+  echo "Checking for at least one primary pipeline test or subpackage..."
 done
 
 # New section to check for .sts.yaml files under ./.github/chainguard/

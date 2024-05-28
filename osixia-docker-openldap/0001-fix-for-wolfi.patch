@@ -1,14 +1,102 @@
-From c86f7249d562a554b18f297f93854c4152b4b3af Mon Sep 17 00:00:00 2001
+From a6bec4de3b25e3f60e31d316866f0854f026fa10 Mon Sep 17 00:00:00 2001
 From: Dentrax <furkan.turkal@chainguard.dev>
-Date: Fri, 24 May 2024 11:57:25 +0300
+Date: Tue, 28 May 2024 17:00:27 +0300
 Subject: [PATCH] fix for wolfi
 
 Signed-off-by: Dentrax <furkan.turkal@chainguard.dev>
 ---
- image/service/slapd/process.sh |  2 +-
- image/service/slapd/startup.sh | 50 +++++++++++++++++++---------------
- 2 files changed, 29 insertions(+), 23 deletions(-)
+ .../config/bootstrap/schema/rfc2307bis.conf   |   8 +-
+ image/service/slapd/assets/schema-to-ldif.sh  |  36 ++++--
+ image/service/slapd/process.sh                |   2 +-
+ image/service/slapd/startup.sh                | 110 ++++++++++--------
+ 4 files changed, 93 insertions(+), 63 deletions(-)
 
+diff --git a/image/service/slapd/assets/config/bootstrap/schema/rfc2307bis.conf b/image/service/slapd/assets/config/bootstrap/schema/rfc2307bis.conf
+index 68582c4..2fe7a3d 100644
+--- a/image/service/slapd/assets/config/bootstrap/schema/rfc2307bis.conf
++++ b/image/service/slapd/assets/config/bootstrap/schema/rfc2307bis.conf
+@@ -1,4 +1,4 @@
+-include         /etc/ldap/schema/core.schema
+-include         /etc/ldap/schema/cosine.schema
+-include         /etc/ldap/schema/inetorgperson.schema
+-include         /etc/ldap/schema/rfc2307bis.schema
++include         /etc/openldap/schema/core.schema
++include         /etc/openldap/schema/cosine.schema
++include         /etc/openldap/schema/inetorgperson.schema
++include         /etc/openldap/schema/rfc2307bis.schema
+diff --git a/image/service/slapd/assets/schema-to-ldif.sh b/image/service/slapd/assets/schema-to-ldif.sh
+index 34b826f..b9c65ac 100755
+--- a/image/service/slapd/assets/schema-to-ldif.sh
++++ b/image/service/slapd/assets/schema-to-ldif.sh
+@@ -9,28 +9,43 @@ SCHEMAS=$1
+ tmpd=`mktemp -d`
+ pushd ${tmpd} >>/dev/null
+ 
+-echo "include /etc/ldap/schema/core.schema" >> convert.dat
+-echo "include /etc/ldap/schema/cosine.schema" >> convert.dat
+-echo "include /etc/ldap/schema/inetorgperson.schema" >> convert.dat
+-
+-if [ -e "/etc/ldap/schema/rfc2307bis.schema" ]; then
+-  echo "include /etc/ldap/schema/rfc2307bis.schema" >> convert.dat
++echo "include /etc/openldap/schema/core.schema" >> convert.dat
++echo "include /etc/openldap/schema/cosine.schema" >> convert.dat
++echo "include /etc/openldap/schema/inetorgperson.schema" >> convert.dat
++
++isRFC2307BisAdded=false
++if [ -e "/etc/openldap/schema/rfc2307bis.schema" ]; then
++  echo "include /etc/openldap/schema/rfc2307bis.schema" >> convert.dat
++  isRFC2307BisAdded=true
+ else
+-  echo "include /etc/ldap/schema/nis.schema" >> convert.dat
++  echo "include /etc/openldap/schema/nis.schema" >> convert.dat
+ fi
+ 
+-
+ for schema in ${SCHEMAS} ; do
++    # Patched by Chainguard
++    # This is a workaround for the slaptest conversion issue with rfc2307bis.schema:
++    # Duplicate attributeType: "1.3.6.1.1.1.1.2"
++    # This is probably a bug in since "SCHEMAS" also includes rfc2307bis.schema
++    if [ "$isRFC2307BisAdded" = true ] && [ $(echo "$schema" | grep -c "rfc2307bis.schema") -gt 0 ]; then
++      continue
++    fi
+     echo "include ${schema}" >> convert.dat
+ done
+ 
+-slaptest -f convert.dat -F .
++# -F flag causes an error:
++# config_setup_ldif: expected directory . to be empty!
++# slaptest: bad configuration directory!
++# Use a new output directory.
++mkdir -p output
++slaptest -f convert.dat -F output
+ 
+ if [ $? -ne 0 ] ; then
+     log-helper error "slaptest conversion failed"
+     exit
+ fi
+ 
++cd output
++
+ for schema in ${SCHEMAS} ; do
+     fullpath=${schema}
+     schema_name=`basename ${fullpath} .schema`
+@@ -42,6 +57,7 @@ for schema in ${SCHEMAS} ; do
+       continue
+     fi
+ 
++
+     find . -name *\}${schema_name}.ldif -exec mv '{}' ./${ldif_file} \;
+ 
+     # TODO: these sed invocations could all be combined
+@@ -61,5 +77,7 @@ for schema in ${SCHEMAS} ; do
+     mv ${ldif_file} ${schema_dir}
+ done
+ 
++cd ..
++
+ popd >>/dev/null
+ rm -rf $tmpd
 diff --git a/image/service/slapd/process.sh b/image/service/slapd/process.sh
 index a669300..7df7839 100755
 --- a/image/service/slapd/process.sh
@@ -22,9 +110,20 @@ index a669300..7df7839 100755
  HOST_PARAM="ldap://$FQDN:$LDAP_PORT ldaps://$FQDN:$LDAPS_PORT"
  exec /usr/sbin/slapd -h "$HOST_PARAM ldapi:///" -u openldap -g openldap -d "$LDAP_LOG_LEVEL"
 diff --git a/image/service/slapd/startup.sh b/image/service/slapd/startup.sh
-index dae1bd2..04ef566 100755
+index dae1bd2..dec26ba 100755
 --- a/image/service/slapd/startup.sh
 +++ b/image/service/slapd/startup.sh
+@@ -39,8 +39,8 @@ file_env 'LDAP_CONFIG_PASSWORD'
+ file_env 'LDAP_READONLY_USER_PASSWORD'
+ 
+ # create dir if they not already exists
+-[ -d /var/lib/ldap ] || mkdir -p /var/lib/ldap
+-[ -d /etc/ldap/slapd.d ] || mkdir -p /etc/ldap/slapd.d
++[ -d /var/lib/openldap ] || mkdir -p /var/lib/openldap
++[ -d /etc/openldap/slapd.d ] || mkdir -p /etc/openldap/slapd.d
+ 
+ log-helper info "openldap user and group adjustments"
+ LDAP_OPENLDAP_UID=${LDAP_OPENLDAP_UID:-911}
 @@ -53,12 +53,14 @@ CUR_USER_UID=`id -u openldap || true`
  LDAP_UIDGID_CHANGED=false
  if [ "$LDAP_OPENLDAP_UID" != "$CUR_USER_UID" ]; then
@@ -42,7 +141,41 @@ index dae1bd2..04ef566 100755
      LDAP_UIDGID_CHANGED=true
  fi
  
-@@ -187,26 +189,29 @@ if [ ! -e "$FIRST_START_DONE" ]; then
+@@ -74,16 +76,16 @@ log-helper info "-------------------------------------"
+ if [ "${DISABLE_CHOWN,,}" == "false" ]; then
+   log-helper info "updating file uid/gid ownership"
+   chown -R openldap:openldap /var/run/slapd
+-  chown -R openldap:openldap /var/lib/ldap
++  chown -R openldap:openldap /var/lib/openldap
+   chown -R openldap:openldap /etc/ldap
+   chown -R openldap:openldap ${CONTAINER_SERVICE_DIR}/slapd
+ fi
+ 
+ FIRST_START_DONE="${CONTAINER_STATE_DIR}/slapd-first-start-done"
+-WAS_STARTED_WITH_TLS="/etc/ldap/slapd.d/docker-openldap-was-started-with-tls"
+-WAS_STARTED_WITH_TLS_ENFORCE="/etc/ldap/slapd.d/docker-openldap-was-started-with-tls-enforce"
+-WAS_STARTED_WITH_REPLICATION="/etc/ldap/slapd.d/docker-openldap-was-started-with-replication"
+-WAS_ADMIN_PASSWORD_SET="/etc/ldap/slapd.d/docker-openldap-was-admin-password-set"
++WAS_STARTED_WITH_TLS="/etc/openldap/slapd.d/docker-openldap-was-started-with-tls"
++WAS_STARTED_WITH_TLS_ENFORCE="/etc/openldap/slapd.d/docker-openldap-was-started-with-tls-enforce"
++WAS_STARTED_WITH_REPLICATION="/etc/openldap/slapd.d/docker-openldap-was-started-with-replication"
++WAS_ADMIN_PASSWORD_SET="/etc/openldap/slapd.d/docker-openldap-was-admin-password-set"
+ 
+ LDAP_TLS_CA_CRT_PATH="${CONTAINER_SERVICE_DIR}/slapd/assets/certs/$LDAP_TLS_CA_CRT_FILENAME"
+ LDAP_TLS_CRT_PATH="${CONTAINER_SERVICE_DIR}/slapd/assets/certs/$LDAP_TLS_CRT_FILENAME"
+@@ -179,64 +181,69 @@ if [ ! -e "$FIRST_START_DONE" ]; then
+   # database and config directory are empty
+   # setup bootstrap config - Part 1
+   #
+-  if [ -z "$(ls -A -I lost+found --ignore=.* /var/lib/ldap)" ] && \
+-    [ -z "$(ls -A -I lost+found --ignore=.* /etc/ldap/slapd.d)" ]; then
++  # Patched by Chainguard
++  # Even though we have a database and config directory, we still want to bootstrap the configuration
++  # to ensure that the `/etc/openldap/slapd.d` configuration is up to date.
++  if true; then
+ 
+     BOOTSTRAP=true
+     log-helper info "Database and config directory are empty..."
      log-helper info "Init new ldap server..."
  
      get_ldap_base_dn
@@ -84,12 +217,25 @@ index dae1bd2..04ef566 100755
  
      # RFC2307bis schema
      if [ "${LDAP_RFC2307BIS_SCHEMA,,}" == "true" ]; then
-+      log-helper error "(Chainguard) Error: LDAP_RFC2307BIS_SCHEMA=true is not supported in this image. Please reach us for support."
-+      exit 1
- 
+-
        log-helper info "Switching schema to RFC2307bis..."
-       cp ${CONTAINER_SERVICE_DIR}/slapd/assets/config/bootstrap/schema/rfc2307bis.* /etc/ldap/schema/
-@@ -223,7 +228,8 @@ EOF
+-      cp ${CONTAINER_SERVICE_DIR}/slapd/assets/config/bootstrap/schema/rfc2307bis.* /etc/ldap/schema/
++      cp ${CONTAINER_SERVICE_DIR}/slapd/assets/config/bootstrap/schema/rfc2307bis.* /etc/openldap/schema/
+ 
+-      rm -f /etc/ldap/slapd.d/cn=config/cn=schema/*
++      rm -f /etc/openldap/slapd.d/cn=config/cn=schema/*
+ 
+       mkdir -p /tmp/schema
++      rm -rf /tmp/schema/*
+       slaptest -f ${CONTAINER_SERVICE_DIR}/slapd/assets/config/bootstrap/schema/rfc2307bis.conf -F /tmp/schema
+-      mv /tmp/schema/cn=config/cn=schema/* /etc/ldap/slapd.d/cn=config/cn=schema
++      mkdir -p /etc/openldap/slapd.d/cn=config/cn=schema
++      mv /tmp/schema/cn=config/cn=schema/* /etc/openldap/slapd.d/cn=config/cn=schema
+       rm -r /tmp/schema
+ 
+       if [ "${DISABLE_CHOWN,,}" == "false" ]; then
+-        chown -R openldap:openldap /etc/ldap/slapd.d/cn=config/cn=schema
++        chown -R openldap:openldap /etc/openldap/slapd.d/cn=config/cn=schema
        fi
      fi
  
@@ -98,8 +244,71 @@ index dae1bd2..04ef566 100755
 +    # rm ${CONTAINER_SERVICE_DIR}/slapd/assets/config/bootstrap/schema/rfc2307bis.*
  
    #
-   # Error: the database directory (/var/lib/ldap) is empty but not the config directory (/etc/ldap/slapd.d)
-@@ -567,8 +573,8 @@ ln -sf ${CONTAINER_SERVICE_DIR}/slapd/assets/ldap.conf /etc/ldap/ldap.conf
+-  # Error: the database directory (/var/lib/ldap) is empty but not the config directory (/etc/ldap/slapd.d)
++  # Error: the database directory (/var/lib/openldap) is empty but not the config directory (/etc/openldap/slapd.d)
+   #
+-  elif [ -z "$(ls -A -I lost+found --ignore=.* /var/lib/ldap)" ] && [ ! -z "$(ls -A -I lost+found --ignore=.* /etc/ldap/slapd.d)" ]; then
+-    log-helper error "Error: the database directory (/var/lib/ldap) is empty but not the config directory (/etc/ldap/slapd.d)"
++  elif [ -z "$(ls -A -I lost+found --ignore=.* /var/lib/openldap)" ] && [ ! -z "$(ls -A -I lost+found --ignore=.* /etc/openldap/slapd.d)" ]; then
++    log-helper error "Error: the database directory (/var/lib/openldap) is empty but not the config directory (/etc/openldap/slapd.d)"
+     exit 1
+ 
+   #
+-  # Error: the config directory (/etc/ldap/slapd.d) is empty but not the database directory (/var/lib/ldap)
++  # Error: the config directory (/etc/openldap/slapd.d) is empty but not the database directory (/var/lib/openldap)
+   #
+-  elif [ ! -z "$(ls -A -I lost+found --ignore=.* /var/lib/ldap)" ] && [ -z "$(ls -A -I lost+found --ignore=.* /etc/ldap/slapd.d)" ]; then
+-    log-helper error "Error: the config directory (/etc/ldap/slapd.d) is empty but not the database directory (/var/lib/ldap)"
++  elif [ ! -z "$(ls -A -I lost+found --ignore=.* /var/lib/openldap)" ] && [ -z "$(ls -A -I lost+found --ignore=.* /etc/openldap/slapd.d)" ]; then
++    log-helper error "Error: the config directory (/etc/openldap/slapd.d) is empty but not the database directory (/var/lib/openldap)"
+     exit 1
+ 
+   #
+@@ -247,7 +254,7 @@ EOF
+     # try to detect if ldap backend is hdb but LDAP_BACKEND environment variable is mdb
+     # due to default switch from hdb to mdb in 1.2.x
+     if [ "${LDAP_BACKEND}" = "mdb" ]; then
+-      if [ -e "/etc/ldap/slapd.d/cn=config/olcDatabase={1}hdb.ldif" ]; then
++      if [ -e "/etc/openldap/slapd.d/cn=config/olcDatabase={1}hdb.ldif" ]; then
+         log-helper warning -e "\n\n\nWarning: LDAP_BACKEND environment variable is set to mdb but hdb backend is detected."
+         log-helper warning "Going to use hdb as LDAP_BACKEND. Set LDAP_BACKEND=hdb to discard this message."
+         log-helper warning -e "https://github.com/osixia/docker-openldap#set-your-own-environment-variables\n\n\n"
+@@ -323,8 +330,13 @@ EOF
+ 
+       log-helper info "Add bootstrap schemas..."
+ 
+-      # add ppolicy schema
+-      ldapadd -c -Y EXTERNAL -Q -H ldapi:/// -f /etc/ldap/schema/ppolicy.ldif 2>&1 | log-helper debug
++      # Patched by Chainguard
++      # ppolicy schema removed in OpenLDAP 2.4: https://www.openldap.org/doc/admin25/appendix-upgrading.html
++      # In OpenLDAP 2.4 the slapo-ppolicy(5) overlay relied on a separate schema file to be included for it to function.
++      # This schema is now implemented internally in the slapo-ppolicy module. When upgrading slapd.conf(5) deployments
++      # the include statement for the schema must be removed.
++      # ldapadd -c -Y EXTERNAL -Q -H ldapi:/// -f /etc/openldap/schema/ppolicy.ldif 2>&1 | log-helper debug
++      # ldapadd -c -Y EXTERNAL -Q -H ldapi:/// -f /etc/openldap/schema/ppolicy.ldif 2>&1 | log-helper debug
+ 
+       # convert schemas to ldif
+       SCHEMAS=""
+@@ -536,9 +548,9 @@ EOF
+   #
+   if [ "${LDAP_TLS,,}" == "true" ]; then
+     log-helper info "Configure ldap client TLS configuration..."
+-    sed -i --follow-symlinks "s,TLS_CACERT.*,TLS_CACERT ${LDAP_TLS_CA_CRT_PATH},g" /etc/ldap/ldap.conf
+-    echo "TLS_REQCERT ${LDAP_TLS_VERIFY_CLIENT}" >> /etc/ldap/ldap.conf
+-    cp -f /etc/ldap/ldap.conf ${CONTAINER_SERVICE_DIR}/slapd/assets/ldap.conf
++    sed -i --follow-symlinks "s,TLS_CACERT.*,TLS_CACERT ${LDAP_TLS_CA_CRT_PATH},g" /etc/openldap/ldap.conf
++    echo "TLS_REQCERT ${LDAP_TLS_VERIFY_CLIENT}" >> /etc/openldap/ldap.conf
++    cp -f /etc/openldap/ldap.conf ${CONTAINER_SERVICE_DIR}/slapd/assets/ldap.conf
+ 
+     [[ -f "$HOME/.ldaprc" ]] && rm -f $HOME/.ldaprc
+     echo "TLS_CERT ${LDAP_TLS_CRT_PATH}" > $HOME/.ldaprc
+@@ -562,13 +574,13 @@ EOF
+ fi
+ 
+ ln -sf ${CONTAINER_SERVICE_DIR}/slapd/assets/.ldaprc $HOME/.ldaprc
+-ln -sf ${CONTAINER_SERVICE_DIR}/slapd/assets/ldap.conf /etc/ldap/ldap.conf
++ln -sf ${CONTAINER_SERVICE_DIR}/slapd/assets/ldap.conf /etc/openldap/ldap.conf
+ 
  # force OpenLDAP to listen on all interfaces
  # We need to make sure that /etc/hosts continues to include the
  # fully-qualified domain name and not just the specified hostname.

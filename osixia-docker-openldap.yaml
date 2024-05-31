@@ -1,0 +1,118 @@
+package:
+  name: osixia-docker-openldap
+  version: 1.5.0
+  epoch: 0
+  description: Required packages and scripts for osixia/docker-openldap image
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - bash
+      - coreutils
+      - openldap
+      - openldap-backend-all
+      - openldap-clients
+      - openldap-overlay-ppolicy
+      - osixia-container-baseimage-compat
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - osixia-container-baseimage
+      - python3
+
+vars:
+  # A common package name for this and osixia-container-baseimage packages.
+  APP_NAME: osixia-openldap
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/osixia/docker-openldap
+      tag: v${{package.version}}
+      expected-commit: 32eb22ce1e9b34e893d97acf6c6cd7c6fea787ab
+
+  - uses: patch
+    with:
+      patches: 0001-fix-for-wolfi.patch
+
+  - runs: |
+      mkdir -p "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/service
+      mkdir -p "${{targets.contextdir}}"/etc/${{vars.APP_NAME}}/container/environment
+
+  - working-directory: image
+    pipeline:
+      - runs: |
+          mv ./service/ ${{targets.contextdir}}/etc/${{vars.APP_NAME}}/container
+          mv ./environment/ ${{targets.contextdir}}/etc/${{vars.APP_NAME}}/container/environment/99-default
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream image"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/container
+          mkdir -p "${{targets.contextdir}}"/var/lib/openldap/run
+          ln -sf /etc/${{vars.APP_NAME}}/container/service "${{targets.contextdir}}/container/service"
+          ln -sf /etc/${{vars.APP_NAME}}/container/environment "${{targets.contextdir}}/container/environment"
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/etc/openldap2
+          cp -r ./openldap/* "${{targets.contextdir}}"/etc/openldap2
+
+update:
+  enabled: true
+  github:
+    identifier: osixia/docker-openldap
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+    # We will set the required accounts and permissions in the Apko manifest.
+    # This is a workaround to avoid permission errors when running slapd.
+    # The chown and chmod commands below will be defined in the image.
+    accounts:
+      groups:
+        - groupname: openldap
+          gid: 911
+        - groupname: docker_env
+          gid: 911
+      users:
+        - username: openldap
+          gid: 911
+          uid: 911
+    environment:
+      LDAP_ORGANISATION: "foo"
+      LDAP_DOMAIN: "bar"
+      LDAP_ADMIN_PASSWORD: "baz"
+      LDAP_CONFIG_PASSWORD: "baz"
+      CONTAINER_SERVICE_DIR: "/container/service"
+      CONTAINER_STATE_DIR: "/container/run/state"
+      LDAP_RFC2307BIS_SCHEMA: "true"
+      LDAP_SSL_HELPER_PREFIX: "ldap"
+  pipeline:
+    # We will set the required accounts and permissions in the Apko manifest.
+    - runs: chown -R openldap:openldap /etc/openldap /var/lib/openldap
+    # Ensure core functionality (slapd) is working with openldap user.
+    - runs: |
+        slapd -d 1 -h 'ldap:/// ldapi:///' -u openldap -g openldap > /tmp/slapd.log 2>&1 &
+        PID=$!
+        sleep 5 # ensure that enough time is given for the logs to get written
+        if ! cat /tmp/slapd.log | grep -i 'slapd starting'; then
+          cat /tmp/slapd.log
+          exit 1
+        fi
+        kill $PID
+    # Ensure that the container image entrypoint is working.
+    - runs: |
+        python -m trace --count -C . /container/tool/run --loglevel=trace

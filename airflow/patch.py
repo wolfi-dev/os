@@ -5,25 +5,25 @@ file_path = 'hatch_build.py'
 
 # Lines to be added
 lines_to_add = [
-    '    "amazon",',
-    '    "celery",',
-    '    "cncf.kubernetes",',
-    '    "docker",',
-    '    "elasticsearch",',
-    '    "google",',
-    '    "grpc",',
-    '    "hashicorp",',
-    '    "microsoft.azure",',
-    '    "mysql",',
-    '    "odbc",',
-    '    "openlineage",',
-    '    "postgres",',
-    '    "redis",',
-    '    "sendgrid",',
-    '    "sftp",',
-    '    "slack",',
-    '    "snowflake",',
-    '    "ssh",',
+    '    "amazon",\n',
+    '    "celery",\n',
+    '    "cncf.kubernetes",\n',
+    '    "docker",\n',
+    '    "elasticsearch",\n',
+    '    "google",\n',
+    '    "grpc",\n',
+    '    "hashicorp",\n',
+    '    "microsoft.azure",\n',
+    '    "mysql",\n',
+    '    "odbc",\n',
+    '    "openlineage",\n',
+    '    "postgres",\n',
+    '    "redis",\n',
+    '    "sendgrid",\n',
+    '    "sftp",\n',
+    '    "slack",\n',
+    '    "snowflake",\n',
+    '    "ssh",\n',
 ]
 
 # Read the contents of the file
@@ -40,7 +40,6 @@ for i, line in enumerate(file_contents):
 # If the target line is found, insert the new lines
 if insert_index is not None:
     for line in lines_to_add:
-        line = f'    "{line.strip()}",\n'
         file_contents.insert(insert_index, line)
         insert_index += 1
 

@@ -83,7 +83,6 @@ ${KEY}:
 
 clean:
 	rm -rf packages/${ARCH}
-	rm -rf /tmp/melange-guest* /tmp/tmp.*
 
 .PHONY: list list-yaml
 list:

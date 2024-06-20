@@ -129,7 +129,7 @@ define get-source-dir
 endef
 
 package/%:
-	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
+	$(eval yamlfile=$(firstword $(wildcard $*.yaml */$*/$*.melange.yaml)))
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
 	else \
@@ -149,8 +149,9 @@ packages/$(ARCH)/%.apk: $(KEY)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag))
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag)
 
+
 debug/%:
-	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
+	$(eval yamlfile=$(firstword $(wildcard $*.yaml */$*/$*.melange.yaml)))
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
 	else \
@@ -169,7 +170,7 @@ debug/%:
 
 test/%:
 	@mkdir -p ./$(*)/
-	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) -not -path "*.melangecache/*" | head -n 1))
+	$(eval yamlfile=$(firstword $(wildcard $*.yaml */$*/$*.melange.yaml)))
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
 	else \

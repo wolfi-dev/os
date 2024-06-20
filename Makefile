@@ -146,8 +146,8 @@ package/%:
 packages/$(ARCH)/%.apk: $(KEY)
 	@mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log)
-	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
+	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag))
+	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(srcdirflag)
 
 debug/%:
 	$(eval yamlfile := $(shell find . -type f \( -name "$*.yaml" -o -path "*/$*/$*.melange.yaml" \) | head -n 1))
@@ -164,8 +164,8 @@ debug/%:
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	@mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(sourcedir) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log)
-	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) $(sourcedir) --log-policy builtin:stderr,$(TARGETDIR)/buildlogs/$*.log
+	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) $(sourcedir))
+	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) $(sourcedir)
 
 test/%:
 	@mkdir -p ./$(*)/
@@ -181,14 +181,14 @@ test/%:
 	$(info found source dir as $(sourcedir))
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(MELANGE) test $(yamlfile) $(sourcedir) $(MELANGE_TEST_OPTS) --log-policy builtin:stderr
+	$(MELANGE) test $(yamlfile) $(sourcedir) $(MELANGE_TEST_OPTS)
 
 dev-container:
 	docker run --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:634eedd4e6cd139f4dcbebf46458db4e2558d0e01096cbabd6402e0a017d5ff3
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:54dc12e79ca59ca81fede78c9036265f85faab8c098ebbab71f167aca76bf90d
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)
@@ -253,6 +253,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:634eedd4e6cd139f4dcbebf46458db4e2558d0e01096cbabd6402e0a017d5ff3
+		ghcr.io/wolfi-dev/sdk:latest@sha256:54dc12e79ca59ca81fede78c9036265f85faab8c098ebbab71f167aca76bf90d
 	@rm "$(TMP_REPOSITORIES_FILE)"
 	@rmdir "$(TMP_REPOSITORIES_DIR)"

@@ -48,10 +48,6 @@ if [[ "$1" == apache2* ]] || [ "$1" = 'php-fpm' ]; then
 			--extract
 			--file -
 		)
-		if [ "$uid" != '0' ]; then
-			# avoid "tar: .: Cannot utime: Operation not permitted" and "tar: .: Cannot change mode to rwxr-xr-x: Operation not permitted"
-			targetTarArgs+=( --no-overwrite-dir )
-		fi
 		# loop over "pluggable" content in the source, and if it already exists in the destination, skip it
 		# https://github.com/docker-library/wordpress/issues/506 ("wp-content" persisted, "akismet" updated, WordPress container restarted/recreated, "akismet" downgraded)
 		for contentPath in \

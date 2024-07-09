@@ -1,0 +1,426 @@
+From 26f294c49378020b143385f32253d10027501a70 Mon Sep 17 00:00:00 2001
+From: Alex Lopez <alex.lopez@datadoghq.com>
+Date: Fri, 3 May 2024 19:55:08 +0200
+Subject: [PATCH 1/5] Move whole collection to invoke task to avoid calling
+ invoke in a loop
+
+---
+ .../datadog-agent-integrations-py2.rb         | 46 ++-----------
+ .../datadog-agent-integrations-py3.rb         | 46 ++-----------
+ tasks/agent.py                                | 65 +++++++++++++++----
+ 3 files changed, 68 insertions(+), 89 deletions(-)
+
+diff --git a/omnibus/config/software/datadog-agent-integrations-py2.rb b/omnibus/config/software/datadog-agent-integrations-py2.rb
+index 5b0c15f776f54..e4d8c9cc2a349 100644
+--- a/omnibus/config/software/datadog-agent-integrations-py2.rb
++++ b/omnibus/config/software/datadog-agent-integrations-py2.rb
+@@ -120,47 +120,15 @@
+     cached_wheels_dir = "#{wheel_build_dir}/.cached"
+   end
+ 
++  # Create the array outside the block so that it can be referenced both inside and outside the block
+   checks_to_install = Array.new
+-
+   block "Collect integrations to install" do
+-    # Go through every integration package in `integrations-core`, build and install
+-    Dir.glob("#{project_dir}/*").each do |check_dir|
+-      check = check_dir.split('/').last
+-
+-      # do not install excluded integrations
+-      next if !File.directory?("#{check_dir}") || excluded_folders.include?(check)
+-
+-      # If there is no manifest file, then we should assume the folder does not
+-      # contain a working check and move onto the next
+-      manifest_file_path = "#{check_dir}/manifest.json"
+-
+-      # If there is no manifest file, then we should assume the folder does not
+-      # contain a working check and move onto the next
+-      File.exist?(manifest_file_path) || next
+-
+-      manifest = JSON.parse(File.read(manifest_file_path))
+-      if manifest.key?("supported_os")
+-        manifest["supported_os"].include?(os) || next
+-      else
+-        if os == "mac_os"
+-          tag = "Supported OS::macOS"
+-        else
+-          tag = "Supported OS::#{os.capitalize}"
+-        end
+-
+-        manifest["tile"]["classifier_tags"].include?(tag) || next
+-      end
+-
+-      File.file?("#{check_dir}/setup.py") || File.file?("#{check_dir}/pyproject.toml") || next
+-      # Check if it supports Python 2.
+-      support = `inv agent.check-supports-python-version #{check_dir} 2`
+-      if support == "False"
+-        log.info(log_key) { "Skipping '#{check}' since it does not support Python 2." }
+-        next
+-      end
+-
+-      checks_to_install.push(check)
+-    end
++    tasks_dir_in = windows_safe_path(Dir.pwd)
++    to_install = (
++      shellout! "inv agent.collect-integrations #{project_dir} 2 #{os} #{excluded_folders.join(',')}",
++                :cwd => tasks_dir_in
++    ).stdout.split()
++    checks_to_install.concat(to_install)
+   end
+ 
+   installed_list = Array.new
+diff --git a/omnibus/config/software/datadog-agent-integrations-py3.rb b/omnibus/config/software/datadog-agent-integrations-py3.rb
+index e3e6a7607aa42..17a887c4df862 100644
+--- a/omnibus/config/software/datadog-agent-integrations-py3.rb
++++ b/omnibus/config/software/datadog-agent-integrations-py3.rb
+@@ -121,47 +121,15 @@
+     cached_wheels_dir = "#{wheel_build_dir}/.cached"
+   end
+ 
++  # Create the array outside the block so that it can be referenced both inside and outside the block
+   checks_to_install = Array.new
+-
+   block "Collect integrations to install" do
+-    # Go through every integration package in `integrations-core`, build and install
+-    Dir.glob("#{project_dir}/*").each do |check_dir|
+-      check = check_dir.split('/').last
+-
+-      # do not install excluded integrations
+-      next if !File.directory?("#{check_dir}") || excluded_folders.include?(check)
+-
+-      # If there is no manifest file, then we should assume the folder does not
+-      # contain a working check and move onto the next
+-      manifest_file_path = "#{check_dir}/manifest.json"
+-
+-      # If there is no manifest file, then we should assume the folder does not
+-      # contain a working check and move onto the next
+-      File.exist?(manifest_file_path) || next
+-
+-      manifest = JSON.parse(File.read(manifest_file_path))
+-      if manifest.key?("supported_os")
+-        manifest["supported_os"].include?(os) || next
+-      else
+-        if os == "mac_os"
+-          tag = "Supported OS::macOS"
+-        else
+-          tag = "Supported OS::#{os.capitalize}"
+-        end
+-
+-        manifest["tile"]["classifier_tags"].include?(tag) || next
+-      end
+-
+-      File.file?("#{check_dir}/setup.py") || File.file?("#{check_dir}/pyproject.toml") || next
+-      # Check if it supports Python 3.
+-      support = `inv agent.check-supports-python-version #{check_dir} 3`
+-      if support == "False"
+-        log.info(log_key) { "Skipping '#{check}' since it does not support Python 3." }
+-        next
+-      end
+-
+-      checks_to_install.push(check)
+-    end
++    tasks_dir_in = windows_safe_path(Dir.pwd)
++    to_install = (
++      shellout! "inv agent.collect-integrations #{project_dir} 3 #{os} #{excluded_folders.join(',')}",
++                :cwd => tasks_dir_in
++    ).stdout.split()
++    checks_to_install.concat(to_install)
+   end
+ 
+   installed_list = Array.new
+diff --git a/tasks/agent.py b/tasks/agent.py
+index 91ef837fd8de1..1d93112457924 100644
+--- a/tasks/agent.py
++++ b/tasks/agent.py
+@@ -623,8 +623,7 @@ def _linux_integration_tests(ctx, race=False, remote_docker=False, go_mod="mod",
+         ctx.run(f"{go_cmd} {prefix}")
+ 
+ 
+-@task
+-def check_supports_python_version(_, check_dir, python):
++def check_supports_python_version(check_dir, python):
+     """
+     Check if a Python project states support for a given major Python version.
+     """
+@@ -642,17 +641,15 @@ def check_supports_python_version(_, check_dir, python):
+ 
+         project_metadata = data['project']
+         if 'requires-python' not in project_metadata:
+-            print('True', end='')
+-            return
++            return True
+ 
+         specifier = SpecifierSet(project_metadata['requires-python'])
+         # It might be e.g. `>=3.8` which would not immediatelly contain `3`
+         for minor_version in range(100):
+             if specifier.contains(f'{python}.{minor_version}'):
+-                print('True', end='')
+-                return
++                return True
+         else:
+-            print('False', end='')
++            return False
+     elif os.path.isfile(setup_file):
+         with open(setup_file) as f:
+             tree = ast.parse(f.read(), filename=setup_file)
+@@ -661,13 +658,59 @@ def check_supports_python_version(_, check_dir, python):
+         for node in ast.walk(tree):
+             if isinstance(node, ast.keyword) and node.arg == 'classifiers':
+                 classifiers = ast.literal_eval(node.value)
+-                print(any(cls.startswith(prefix) for cls in classifiers), end='')
+-                return
++                return any(cls.startswith(prefix) for cls in classifiers)
+         else:
+-            print('False', end='')
++            return False
+     else:
+-        raise Exit('not a Python project', code=1)
++        return False
++
++
++@task
++def collect_integrations(_, integrations_dir, python_version, target_os, excluded):
++    """
++    Collect and print the list of integrations to install.
++
++    `excluded` is a comma-separated list of directories that don't contain an actual integration
++    """
++    import json
++
++    excluded = excluded.split(',')
++    integrations = []
++
++    for entry in os.listdir(integrations_dir):
++        int_path = os.path.join(integrations_dir, entry)
++        if not os.path.isdir(int_path) or entry in excluded:
++            continue
++
++        manifest_file_path = os.path.join(int_path, "manifest.json")
++
++        # If there is no manifest file, then we should assume the folder does not
++        # contain a working check and move onto the next
++        if not os.path.exists(manifest_file_path):
++            continue
++
++        with open(manifest_file_path) as f:
++            manifest = json.load(f)
++
++        # Figure out whether the integration is supported on the target oS
++        if 'supported_os' in manifest:
++            if target_os not in manifest['supported_os']:
++                continue
++        else:
++            if target_os == 'mac_os':
++                tag = 'Supported OS::macOS'
++            else:
++                tag = f'Supported OS::{target_os.capitalize()}'
++
++        if tag not in manifest['tile']['classifier_tags']:
++            continue
++
++        if not check_supports_python_version(int_path, python_version):
++            continue
++
++        integrations.append(entry)
+ 
++    print(' '.join(sorted(integrations)))
+ 
+ @task
+ def clean(ctx):
+
+From 7b2902f4bd98772baef2a4e9203c4f7a91428b90 Mon Sep 17 00:00:00 2001
+From: Alex Lopez <alex.lopez@datadoghq.com>
+Date: Sun, 5 May 2024 20:29:24 +0200
+Subject: [PATCH 2/5] Simplify by merging blocks
+
+---
+ .../datadog-agent-integrations-py2.rb         | 20 ++++++++-----------
+ .../datadog-agent-integrations-py3.rb         | 16 ++++++---------
+ 2 files changed, 14 insertions(+), 22 deletions(-)
+
+diff --git a/omnibus/config/software/datadog-agent-integrations-py2.rb b/omnibus/config/software/datadog-agent-integrations-py2.rb
+index e4d8c9cc2a349..414b675a11609 100644
+--- a/omnibus/config/software/datadog-agent-integrations-py2.rb
++++ b/omnibus/config/software/datadog-agent-integrations-py2.rb
+@@ -120,21 +120,16 @@
+     cached_wheels_dir = "#{wheel_build_dir}/.cached"
+   end
+ 
+-  # Create the array outside the block so that it can be referenced both inside and outside the block
+-  checks_to_install = Array.new
+-  block "Collect integrations to install" do
++  block "Install integrations" do
+     tasks_dir_in = windows_safe_path(Dir.pwd)
+-    to_install = (
++    # Collect integrations to install
++    checks_to_install = (
+       shellout! "inv agent.collect-integrations #{project_dir} 2 #{os} #{excluded_folders.join(',')}",
+                 :cwd => tasks_dir_in
+     ).stdout.split()
+-    checks_to_install.concat(to_install)
+-  end
+ 
+-  installed_list = Array.new
+-  cache_bucket = ENV.fetch('INTEGRATION_WHEELS_CACHE_BUCKET', '')
+-  block "Install integrations" do
+-    tasks_dir_in = windows_safe_path(Dir.pwd)
++    # Retrieving integrations from cache
++    cache_bucket = ENV.fetch('INTEGRATION_WHEELS_CACHE_BUCKET', '')
+     cache_branch = (shellout! "inv release.get-release-json-value base_branch", cwd: File.expand_path('..', tasks_dir_in)).stdout.strip
+     # On windows, `aws` actually executes Ruby's AWS SDK, but we want the Python one
+     awscli = if windows_target? then '"c:\Program files\python311\scripts\aws"' else 'aws' end
+@@ -154,12 +149,13 @@
+         shellout! "#{python} -m pip install --no-deps --no-index " \
+                   "--find-links #{windows_safe_path(cached_wheels_dir)} -r #{windows_safe_path(cached_wheels_dir)}\\found.txt"
+       else
+-        shellout! "#{pip} install --no-deps --no-index " \
+-                  " --find-links #{cached_wheels_dir} -r #{cached_wheels_dir}/found.txt"
++        shellout! "#{python} -m pip install --no-deps --no-index " \
++                  "--find-links #{cached_wheels_dir} -r #{cached_wheels_dir}/found.txt"
+       end
+     end
+ 
+     # get list of integration wheels already installed from cache
++    installed_list = Array.new
+     if cache_bucket != ''
+       if windows_target?
+         installed_out = (shellout! "#{python} -m pip list --format json").stdout
+diff --git a/omnibus/config/software/datadog-agent-integrations-py3.rb b/omnibus/config/software/datadog-agent-integrations-py3.rb
+index 17a887c4df862..79b8300019006 100644
+--- a/omnibus/config/software/datadog-agent-integrations-py3.rb
++++ b/omnibus/config/software/datadog-agent-integrations-py3.rb
+@@ -121,21 +121,16 @@
+     cached_wheels_dir = "#{wheel_build_dir}/.cached"
+   end
+ 
+-  # Create the array outside the block so that it can be referenced both inside and outside the block
+-  checks_to_install = Array.new
+-  block "Collect integrations to install" do
++  block "Install integrations" do
+     tasks_dir_in = windows_safe_path(Dir.pwd)
+-    to_install = (
++    # Collect integrations to install
++    checks_to_install = (
+       shellout! "inv agent.collect-integrations #{project_dir} 3 #{os} #{excluded_folders.join(',')}",
+                 :cwd => tasks_dir_in
+     ).stdout.split()
+-    checks_to_install.concat(to_install)
+-  end
+ 
+-  installed_list = Array.new
+-  cache_bucket = ENV.fetch('INTEGRATION_WHEELS_CACHE_BUCKET', '')
+-  block "Install integrations" do
+-    tasks_dir_in = windows_safe_path(Dir.pwd)
++    # Retrieving integrations from cache
++    cache_bucket = ENV.fetch('INTEGRATION_WHEELS_CACHE_BUCKET', '')
+     cache_branch = (shellout! "inv release.get-release-json-value base_branch", cwd: File.expand_path('..', tasks_dir_in)).stdout.strip
+     # On windows, `aws` actually executes Ruby's AWS SDK, but we want the Python one
+     awscli = if windows_target? then '"c:\Program files\python311\scripts\aws"' else 'aws' end
+@@ -161,6 +156,7 @@
+     end
+ 
+     # get list of integration wheels already installed from cache
++    installed_list = Array.new
+     if cache_bucket != ''
+       installed_out = (shellout! "#{python} -m pip list --format json").stdout
+       if $?.exitstatus == 0
+
+From 09a42a692c09b62e628eeff48a86323c2be4ecc7 Mon Sep 17 00:00:00 2001
+From: Alex Lopez <alex.lopez@datadoghq.com>
+Date: Sun, 5 May 2024 22:21:40 +0200
+Subject: [PATCH 3/5] Fixup an error that surface after reordering
+
+Usage of the special $? variable requires a previous shell invocation
+via ``; this was working because there was a `` call above (not the
+actual one we intended to check). This commit corrects that.
+---
+ omnibus/config/software/datadog-agent-integrations-py2.rb | 6 +-----
+ omnibus/config/software/datadog-agent-integrations-py3.rb | 2 +-
+ 2 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/omnibus/config/software/datadog-agent-integrations-py2.rb b/omnibus/config/software/datadog-agent-integrations-py2.rb
+index 414b675a11609..d654bf752b6e0 100644
+--- a/omnibus/config/software/datadog-agent-integrations-py2.rb
++++ b/omnibus/config/software/datadog-agent-integrations-py2.rb
+@@ -157,11 +157,7 @@
+     # get list of integration wheels already installed from cache
+     installed_list = Array.new
+     if cache_bucket != ''
+-      if windows_target?
+-        installed_out = (shellout! "#{python} -m pip list --format json").stdout
+-      else
+-        installed_out = (shellout! "#{pip} list --format json").stdout
+-      end
++      installed_out = `#{python} -m pip list --format json`
+       if $?.exitstatus == 0
+         installed = JSON.parse(installed_out)
+         installed.each do |package|
+diff --git a/omnibus/config/software/datadog-agent-integrations-py3.rb b/omnibus/config/software/datadog-agent-integrations-py3.rb
+index 79b8300019006..1ceb159dfc1fa 100644
+--- a/omnibus/config/software/datadog-agent-integrations-py3.rb
++++ b/omnibus/config/software/datadog-agent-integrations-py3.rb
+@@ -158,7 +158,7 @@
+     # get list of integration wheels already installed from cache
+     installed_list = Array.new
+     if cache_bucket != ''
+-      installed_out = (shellout! "#{python} -m pip list --format json").stdout
++      installed_out = `#{python} -m pip list --format json`
+       if $?.exitstatus == 0
+         installed = JSON.parse(installed_out)
+         installed.each do |package|
+
+From 50931a25d19867a339f7488c92c0bcc1b0dadde0 Mon Sep 17 00:00:00 2001
+From: Alex Lopez <alex.lopez.zorzano@gmail.com>
+Date: Mon, 6 May 2024 17:38:07 +0200
+Subject: [PATCH 4/5] Fix capitalization
+
+Co-authored-by: Dustin Long <me@dustmop.io>
+---
+ tasks/agent.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tasks/agent.py b/tasks/agent.py
+index 1d93112457924..9d869a5d9b76c 100644
+--- a/tasks/agent.py
++++ b/tasks/agent.py
+@@ -692,7 +692,7 @@ def collect_integrations(_, integrations_dir, python_version, target_os, exclude
+         with open(manifest_file_path) as f:
+             manifest = json.load(f)
+ 
+-        # Figure out whether the integration is supported on the target oS
++        # Figure out whether the integration is supported on the target OS
+         if 'supported_os' in manifest:
+             if target_os not in manifest['supported_os']:
+                 continue
+
+From 2be302e1ebcca6d1a8d80b7afa6476c63c54e9f6 Mon Sep 17 00:00:00 2001
+From: Alex Lopez <alex.lopez@datadoghq.com>
+Date: Mon, 6 May 2024 04:28:27 +0200
+Subject: [PATCH 5/5] Remove logic for old manifest
+
+---
+ tasks/agent.py | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/tasks/agent.py b/tasks/agent.py
+index 9d869a5d9b76c..cd904210dd6eb 100644
+--- a/tasks/agent.py
++++ b/tasks/agent.py
+@@ -693,14 +693,10 @@ def collect_integrations(_, integrations_dir, python_version, target_os, exclude
+             manifest = json.load(f)
+ 
+         # Figure out whether the integration is supported on the target OS
+-        if 'supported_os' in manifest:
+-            if target_os not in manifest['supported_os']:
+-                continue
++        if target_os == 'mac_os':
++            tag = 'Supported OS::macOS'
+         else:
+-            if target_os == 'mac_os':
+-                tag = 'Supported OS::macOS'
+-            else:
+-                tag = f'Supported OS::{target_os.capitalize()}'
++            tag = f'Supported OS::{target_os.capitalize()}'
+ 
+         if tag not in manifest['tile']['classifier_tags']:
+             continue

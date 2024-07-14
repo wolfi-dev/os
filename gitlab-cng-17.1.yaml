@@ -1,7 +1,33 @@
+# These variables track the tag and expected commit for GitLab components that
+# require manual intervention for updates. Please refer to the variables
+# manifest that aligns with the CNG release tag set in the CNG package version
+# below. The manifest can be found here:
+#
+# https://gitlab.com/gitlab-org/build/CNG/-/blob/v<PACKAGE VERSION HERE>/ci_files/variables.yml
+vars:
+  # Container registry tags: https://gitlab.com/gitlab-org/container-registry/-/tags
+  registry-commit: 96e8efda4e5837182a93e62aab2de89991d762bf
+  registry-tag: 4.5.0
+  # ElasticSearch indexer tags: https://gitlab.com/gitlab-org/gitlab-elasticsearch-indexer/-/tags
+  indexer-commit: 4cb1c8c5f129c19c8e5cbc5e7b95ba72f4a3ded2
+  indexer-tag: 5.0.0
+  # Exporter tags: https://gitlab.com/gitlab-org/ruby/gems/gitlab-exporter/-/tags
+  exporter-commit: f16670c44a4a26393f780512d3ff669aa74d2cf6
+  exporter-tag: 15.0.0
+  # Logger tags: https://gitlab.com/gitlab-org/cloud-native/gitlab-logger/-/tags
+  logger-commit: 61e76054e898803f7c2408e7e54dfba96a5085fc
+  logger-tag: 3.0.0
+  # Mailroom tags: https://gitlab.com/gitlab-org/ruby/gems/gitlab-mail_room/-/tags
+  mailroom-commit: 1e300f1d571f89713f5448009d70dc8cd467997e
+  mailroom-tag: 0.0.25
+  # Shell tags: https://gitlab.com/gitlab-org/gitlab-shell/-/tags
+  shell-commit: 29bb5c68e7bdbfc2f7690e28f2a693da437bb323
+  shell-tag: 14.36.0
+
 package:
   name: gitlab-cng-17.1
   version: 17.1.2
-  epoch: 0
+  epoch: 1
   description: Cloud Native container images per component of GitLab
   copyright:
     - license: MIT
@@ -12,7 +38,19 @@ package:
 environment:
   contents:
     packages:
+      - bash
+      - build-base
       - busybox
+      - ca-certificates
+      - ca-certificates-bundle
+      - heimdal-dev
+      - icu-dev
+      - libpq-16
+      - postgresql-dev
+      - ruby-3.2
+      - ruby-3.2-dev
+      - ruby3.2-bundler
+      - zlib-dev
 
 pipeline:
   - uses: git-checkout
@@ -113,7 +151,340 @@ subpackages:
               fi
             done
 
+  - name: ${{package.name}}-gitlab-container-registry
+    description: The GitLab Container Registry originated as a fork of the Docker Distribution Registry, now CNCF Distribution, both distributed under Apache License Version 2.0.
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-container-registry=${{package.full-version}}
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://gitlab.com/gitlab-org/container-registry
+          tag: v${{vars.registry-tag}}-gitlab
+          expected-commit: ${{vars.registry-commit}}
+          destination: ./container-registry
+      - working-directory: ./container-registry
+        runs: |
+          mkdir -p "${{targets.contextdir}}"/etc/docker/registry
+      - uses: go/build
+        with:
+          packages: ./cmd/registry
+          output: registry
+          tags: include_oss,include_gcs,continuous_profiler_stackdriver
+          ldflags: -X github.com/docker/distribution/version.Version=${{vars.registry-tag}} -X github.com/docker/distribution/version.Revision=$(git rev-parse HEAD || echo '<unknown>') -X github.com/docker/distribution/version.Package="github.com/docker/distribution" -X github.com/docker/distribution/version.BuildTime=$(date +%F-%T)
+          modroot: ./container-registry
+    test:
+      environment:
+        contents:
+          packages:
+            - crane
+            - gitlab-cng-gitlab-container-registry-compat
+      pipeline:
+        - runs: |
+            #!/bin/bash
+
+            # Create the configuration file
+            tee /etc/docker/registry/config.yml <<EOL
+            # This config file is a basic configuration using filesystem metadata and blob
+            # storage.
+            version: 0.1
+            log:
+              accesslog:
+                disabled: false
+                formatter: text
+              level: info
+              formatter: text
+              fields:
+                service: registry
+            storage:
+              delete:
+                enabled: true
+              filesystem:
+                # Temp dir, rename if you need persistence.
+                # registry/storage/paths.go describes the structure of the data
+                # written to this directory
+                rootdirectory: "/tmp/registry"
+            http:
+              # Registry API will be accessible at localhost:5000
+              addr: :5000
+              debug:
+                addr: :5001
+                prometheus:
+                  enabled: true
+                  path: /metrics
+                pprof:
+                  enabled: true
+            EOL
+
+            # Run the Docker registry with the configuration file
+            /bin/registry serve /etc/docker/registry/config.yml &
+            PID=$!
+
+            # Wait for the registry to start
+            sleep 5
+
+            # Test the registry
+            crane catalog localhost:5000
+
+            # copy the image to the registry
+            crane copy alpine:latest localhost:5000/alpine:latest
+
+            # check for the image in the registry
+            crane manifest localhost:5000/alpine:latest
+
+            # Stop the registry
+            kill $PID
+
+  - name: ${{package.name}}-gitlab-container-registry-compat
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-container-registry-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # https://gitlab.com/gitlab-org/build/CNG/-/blob/master/gitlab-container-registry/scripts/process-wrapper?ref_type=heads#L3
+          mkdir -p "${{targets.contextdir}}"/bin
+          ln -sf /usr/bin/registry "${{targets.contextdir}}"/bin/registry
+
+  - name: ${{package.name}}-gitlab-elasticsearch-indexer
+    description: Elasticsearch indexer for GitLab EE, written in Go
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-elasticsearch-indexer=${{package.full-version}}
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://gitlab.com/gitlab-org/gitlab-elasticsearch-indexer
+          tag: v${{vars.indexer-tag}}
+          expected-commit: ${{vars.indexer-commit}}
+          destination: ./elasticsearch-indexer
+      - uses: go/bump
+        with:
+          deps: google.golang.org/grpc@v1.64.1
+          modroot: ./elasticsearch-indexer
+      - uses: go/build
+        with:
+          packages: .
+          output: gitlab-elasticsearch-indexer
+          modroot: ./elasticsearch-indexer
+    test:
+      pipeline:
+        - runs: |
+            gitlab-elasticsearch-indexer --version
+            gitlab-elasticsearch-indexer --help
+
+  - name: ${{package.name}}-gitlab-elasticsearch-indexer-compat
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-elasticsearch-indexer-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/local/bin"
+          ln -sf /usr/bin/gitlab-elasticsearch-indexer ${{targets.subpkgdir}}/usr/local/bin/gitlab-elasticsearch-indexer
+
+  - name: ${{package.name}}-gitlab-exporter
+    description: GitLab Exporter is a Prometheus Web exporter.
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-exporter=${{package.full-version}}
+      runtime:
+        - jemalloc
+        - ruby-3.2
+        - libpq-16
+        - busybox
+        - ${{package.name}}-base
+        - ${{package.name}}-exporter-scripts
+        - ruby3.2-webrick
+        - ruby3.2-faraday
+        - ruby3.2-faraday-excon
+        - ruby3.2-mustermann
+        - ruby3.2-bundler
+        - ruby3.2-deep_merge
+        - ruby3.2-redis
+        - ruby3.2-redis-namespace
+        - ruby3.2-sinatra
+        - ruby3.2-puma
+        - ruby3.2-pg
+        - ruby3.2-sidekiq
+        - ruby3.2-quantile
+        - ruby3.2-connection_pool
+        - ruby3.2-tilt
+        - ruby3.2-nio4r
+        - ruby3.2-rack-2.2
+        - ruby3.2-rack-protection
+    pipeline:
+      # GitLab-Exporter
+      - uses: git-checkout
+        with:
+          repository: https://gitlab.com/gitlab-org/gitlab-exporter
+          tag: ${{vars.exporter-tag}}
+          expected-commit: ${{vars.exporter-commit}}
+          destination: ./exporter
+      # GitLab-Exporter Runtime Dependencies
+      - working-directory: ./exporter
+        runs: |
+          cat gitlab-exporter.gemspec
+
+          # CVE-2023-40175 puma
+          sed -e 's/5.6.7/>= 5.6.7/' -i gitlab-exporter.gemspec
+
+          # CVE-2023-26141 sidekiq conflicting with the redis version as well
+          sed -e 's/6.4.0/>= 6.5.10/' -i gitlab-exporter.gemspec
+          sed -e 's/4.4.0/>= 4.5.0/' -i gitlab-exporter.gemspec
+
+          # Unlock strict version requirements of connection_pool, pg, redis-namespace and quantile
+          sed -e 's/2.2.5/>= 2.4.1/' -i gitlab-exporter.gemspec
+          sed -e 's/1.5.3/>= 1.5.3/' -i gitlab-exporter.gemspec
+          sed -e 's/1.9.0/>= 1.9.0/' -i gitlab-exporter.gemspec
+          sed -e 's/0.2.1/>= 0.2.1/' -i gitlab-exporter.gemspec
+
+          # Unlock Faraday
+          sed -e 's/faraday", \[">= 1.8.0", "<= 2.8.1"\]/faraday", ">= 1.8.0"/' -i gitlab-exporter.gemspec
+          sed -e "s:(=:(>=:g" -i Gemfile.lock
+      - uses: ruby/build
+        with:
+          gem: gitlab-exporter
+          dir: ./exporter
+      - uses: ruby/install
+        with:
+          gem: gitlab-exporter
+          version: ${{vars.exporter-tag}}
+          dir: ./exporter
+      - uses: ruby/clean
+    test:
+      environment:
+        contents:
+          packages:
+            - wolfi-base
+        environment:
+      pipeline:
+        - name: "Test gitlab-exporter"
+          runs: |
+            if ! command -v gitlab-exporter &> /dev/null; then
+              echo "GitLab Exporter is not installed."
+              exit 1
+            fi
+
+  - name: ${{package.name}}-gitlab-logger
+    description: GitLab Logger provides a means of wrapping non-structured log files within structure JSON.
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-logger=${{package.full-version}}
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://gitlab.com/gitlab-org/cloud-native/gitlab-logger
+          tag: v${{vars.logger-tag}}
+          destination: ./logger
+      - uses: go/build
+        with:
+          packages: ./cmd/gitlab-logger
+          output: gitlab-logger
+          ldflags: -X main.version=${component_version} -X main.buildtime=$(date +%F-%T)
+          modroot: ./logger
+    test:
+      environment:
+        contents:
+          packages:
+            - gitlab-cng-gitlab-logger-compat
+      pipeline:
+        - runs: |
+            gitlab-logger -h
+
+  - name: ${{package.name}}-gitlab-logger-compat
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-logger-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # GitLab helm chart mostly hardcodes multiple executables path to /usr/local/bin/*
+          mkdir -p "${{targets.subpkgdir}}"/usr/local/bin
+          ln -s /usr/bin/gitlab-logger "${{targets.subpkgdir}}"/usr/local/bin/gitlab-logger
+
+  - name: ${{package.name}}-gitlab-mailroom
+    description: GitLab mail_room contains some merged functionality that GitLab requires, so this mirror fork is to help us release custom functionality.
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-mailroom=${{package.full-version}}
+      runtime:
+        - jemalloc
+        - ruby-3.2
+        - busybox
+        - ${{package.name}}-base
+        - ${{package.name}}-mailroom-scripts
+        - ruby3.2-webrick
+        - ruby3.2-bundler
+        - ruby3.2-oauth2
+        - ruby3.2-rack
+        - ruby3.2-redis
+        - ruby3.2-redis-namespace
+        - ruby3.2-redis-client
+        - ruby3.2-charlock_holmes
+        - ruby3.2-snaky_hash
+    pipeline:
+      # GitLab-Mail_Room
+      - uses: git-checkout
+        with:
+          repository: https://gitlab.com/gitlab-org/ruby/gems/gitlab-mail_room
+          tag: v${{vars.mailroom-tag}}
+          expected-commit: ${{vars.mailroom-commit}}
+          destination: ./mailroom
+      - uses: ruby/unlock-spec
+      - uses: ruby/build
+        with:
+          gem: mail_room
+          output: mail_room-${{vars.mailroom-tag}}.gem
+          dir: ./mailroom
+      - uses: ruby/install
+        with:
+          gem: mail_room
+          version: ${{vars.mailroom-tag}}
+          dir: ./mailroom
+      - uses: ruby/clean
+
+  - name: ${{package.name}}-gitlab-shell
+    description: SSH access for GitLab
+    dependencies:
+      provides:
+        - gitlab-cng-gitlab-shell=${{package.full-version}}
+      runtime:
+        - ${{package.name}}-base
+        - ${{package.name}}-shell-scripts
+        - ${{package.name}}-gitlab-logger-compat
+        - openssh
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://gitlab.com/gitlab-org/gitlab-shell
+          tag: v${{vars.shell-tag}}
+          expected-commit: ${{vars.shell-commit}}
+          destination: ./shell
+      - uses: go/bump
+        with:
+          deps: google.golang.org/grpc@v1.64.1
+          modroot: ./shell
+      - working-directory: ./shell
+        runs: |
+          make build
+
+          BINDIR=${{targets.contextdir}}/srv/gitlab-shell/bin
+          mkdir -p "${BINDIR}"
+
+          install -m755 bin/check "${BINDIR}/check"
+          install -m755 bin/gitlab-shell "${BINDIR}/gitlab-shell"
+          install -m755 bin/gitlab-shell-authorized-keys-check "${BINDIR}/gitlab-shell-authorized-keys-check"
+          install -m755 bin/gitlab-shell-authorized-principals-check "${BINDIR}/gitlab-shell-authorized-principals-check"
+          install -m755 bin/gitlab-sshd "${BINDIR}/gitlab-sshd"
+
+          mkdir -p ${{targets.contextdir}}/srv/gitlab-shell/
+          cp LICENSE VERSION ${{targets.contextdir}}/srv/gitlab-shell/
+
+          install -d ${{targets.contextdir}}/srv/sshd
+          install -d ${{targets.contextdir}}/etc/ssh
+          install -d ${{targets.contextdir}}/var/log/gitlab-shell
+          touch ${{targets.contextdir}}/var/log/gitlab-shell/gitlab-shell.log
+
 update:
   enabled: true
+  manual: true
   release-monitor:
     identifier: 373190

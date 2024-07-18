@@ -73,20 +73,49 @@ subpackages:
         - zlib
         - wait-for-port
         - net-tools
+        - posix-libc-utils
+        - su-exec
     pipeline:
       - uses: bitnami/compat
         with:
           image: keycloak
           version-path: 24/debian-12
       - runs: |
+          mkdir -p ${{targets.contextdir}}/bitnami/keycloak
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/keycloak
           mkdir -p ${{targets.contextdir}}/opt/bitnami/keycloak/bin
-          mkdir -p ${{targets.contextdir}}/opt/bitnami/keycloak/conf
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/keycloak/conf.default
+          mkdir -p ${{targets.contextdir}}/docker-entrypoint-initdb.d
+
+          # An hacky workaround to symlink the directories, since some directories are already present
+          # so we can not symlink the whole directory. Some of them already copied using the `bitnami/compat`
+          # pipeline. So we need to symlink the *missing* files in the directories.
+          for dir in bin conf lib providers themes; do
+            mkdir -p ${{targets.contextdir}}/opt/bitnami/keycloak/$dir
+            for file in /usr/share/java/keycloak/$dir/*; do
+              echo "Processing file: $file"
+              if [ -e "$file" ]; then
+                target="${{targets.contextdir}}/opt/bitnami/keycloak/$dir/$(basename "$file")"
+                ln -sf "$file" "$target" || true
+              fi
+            done
+          done
 
           chmod g+rwX ${{targets.contextdir}}/opt/bitnami
 
           # Replace the incorrect Java paths in the Bitnami scripts
           sed -i 's/JAVA_HOME="\/opt\/bitnami\/java"/JAVA_HOME="\/usr\/lib\/jvm\/java-17-openjdk"/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak-env.sh
           sed -i 's/\/opt\/bitnami\/java\/lib\/security/\/usr\/lib\/jvm\/java-17-openjdk\/conf\/security/g' ${{targets.contextdir}}/opt/bitnami/scripts/java/postunpack.sh
+
+          # Disable some commands used in Bitnami scripts. These commands more likely fail in this since this image take non root approach
+          sed -i 's/chown -R "$KEYCLOAK_DAEMON_USER" "$dir"/# chown -R "$KEYCLOAK_DAEMON_USER" "$dir"/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak/postunpack.sh
+          sed -i 's/ensure_user_exists/# ensure_user_exists/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak/postunpack.sh
+          sed -i 's/am_i_root/# am_i_root/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak/setup.sh
+          sed -i 's/hostname --fqdn/hostname -f/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak-env.sh
+
+          # The `--userspec`` flag belongs to GNU's chroot, whereas we are use BusyBox's. As a workaround, use `su-exec` instead.
+          sed -i 's|exec chroot --userspec="$userspec" /|exec chroot / su-exec "$userspec"|' ${{targets.contextdir}}/opt/bitnami/scripts/libos.sh
+          sed -i 's|chroot --userspec="$userspec" /|chroot / su-exec "$userspec"|' /path/to/your/script.sh
 
           # Use package path while unpacking
           find . -iname "*.sh" -exec sed 's#/opt/bitnami#${{targets.contextdir}}/opt/bitnami#g' -i {} \;
@@ -98,6 +127,55 @@ subpackages:
           ln -sf /usr/bin/keycloak ${{targets.contextdir}}/opt/bitnami/keycloak/bin/keycloak
           ln -sf /opt/bitnami/scripts/keycloak/entrypoint.sh ${{targets.contextdir}}/entrypoint.sh
           ln -sf /opt/bitnami/scripts/keycloak/run.sh ${{targets.contextdir}}/run.sh
+    test:
+      environment:
+        contents:
+          packages:
+            - postgresql
+            - postgresql-client
+            - shadow
+            - sudo-rs
+            - ${{package.name}}-bitnami-compat
+        environment:
+          PGDATA: /tmp/test_db
+          PGUSER: bn_keycloak
+          PGDB: bitnami_keycloak
+          ALLOW_EMPTY_PASSWORD: yes
+      pipeline:
+        - name: "Test database creation"
+          with:
+            setup: echo "127.0.0.1 postgresql" >> /etc/hosts
+          runs: |
+            useradd $PGUSER
+            sudo -u $PGUSER initdb -D $PGDATA
+            sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/logfile start
+            sudo -u $PGUSER createdb $PGDB
+            sudo -u $PGUSER psql -lqt | cut -d \| -f 1 | grep -qw $PGDB
+        - name: "start daemon on localhost"
+          uses: test/daemon-check-output
+          with:
+            setup: echo echo "127.0.0.1 postgresql" >> /etc/hosts
+            start: "KEYCLOAK_ENABLE_HEALTH_ENDPOINTS=true /opt/bitnami/scripts/keycloak/entrypoint.sh /opt/bitnami/scripts/keycloak/run.sh"
+            timeout: 60
+            expected_output: |
+              Welcome to the Bitnami keycloak container
+              ** keycloak setup finished! **
+              server listening on
+              Keycloak ${{package.version}}
+              Running the server in development mode
+            post: |
+              #!/bin/sh -e
+              url=http://localhost:9000/health/ready
+              response=$(curl -fsS --retry-all-errors --retry 3 --retry-max-time 60 "$url") || {
+                echo "curl ${url} failed $?"
+                exit 1
+              }
+              echo "$response" | jq .status | grep -q UP || {
+                echo "response from $url did not contain \"UP\""
+                echo "response: $response"
+                exit 1
+              }
+              echo "$url had expected output: $response"
 
 test:
   pipeline:

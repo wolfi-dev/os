@@ -1,0 +1,70 @@
+#!/bin/busybox sh
+set -e
+set -x
+
+# creating base directories
+/bin/mkdir -p -m 0755 /dev /home /home/build/ /mnt /proc /root /run /sys /var /var/empty
+# creating base world writable/readable directories
+/bin/mkdir -p -m 0777 /opt /tmp /var/cache /var/run
+
+/bin/mount -t proc proc -o nodev,nosuid,hidepid=2 /proc
+/bin/mount -t devtmpfs -o nosuid,noexec devtmpfs /dev
+/bin/mount -t sysfs sys -o nodev,nosuid,noexec /sys
+/bin/mount -t tmpfs -o nodev,nosuid,noexec tmpfs /tmp
+
+/bin/mkdir /dev/pts
+/bin/mount -t devpts devpts -o noexec,nosuid,newinstance,ptmxmode=0666,mode=0620,gid=tty /dev/pts/
+/bin/mount --bind /dev/pts/ptmx /dev/ptmx
+
+# ldconfig is run to prime ld.so.cache for glibc packages which require it.
+if [ -x /sbin/ldconfig ]; then
+	/sbin/ldconfig /lib /usr/lib /usr/lib64 || :
+fi
+
+# We can ignore this fail, if we use a kernel with kvm_guest.config, we won't need this
+# and network will work anyway
+# If this fails and we won't have network, the ifconfig command will fail anyway.
+# Also we load cpu accelleration drivers in case those are needed.
+/usr/sbin/depmod -a || :
+/usr/bin/sort -u \
+	/sys/devices/system/cpu/modalias  \
+	/sys/devices/pci*/*/virtio*/modalias | /usr/bin/xargs -n1 /usr/sbin/modprobe 2>/dev/null || :
+# modprobe 9p if absent
+/bin/grep -q 9p /proc/filesystems || /usr/sbin/modprobe 9p
+
+/bin/ifconfig lo up
+/bin/ifconfig eth0 10.0.2.15 netmask 255.255.255.0
+/bin/route add default gw 10.0.2.2 eth0
+
+# Setup hostname
+/bin/hostname wolfi-qemu
+/bin/sed  -i 's| localhost | localhost wolfi-qemu |g' /etc/hosts
+
+# Setup DNS
+/bin/echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+
+# Setup UTC timezone
+/bin/ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+
+# Setup default mountpoint for 9p shared dir
+/bin/mount -t 9p -o trans=virtio defaultshare /mnt/ -oversion=9p2000.L
+
+if [ ! -e /mnt/ssh/authorized_keys ]; then
+	/bin/echo "Missing default mount for ssh keys"
+	exit 1
+fi
+
+# Setup SSH keys for external access
+/bin/mkdir -p -m 0700 /root/.ssh/ /home/build/.ssh/
+/bin/cp /mnt/ssh/authorized_keys /root/.ssh/
+/bin/cp /mnt/ssh/authorized_keys /home/build/.ssh/
+/bin/chmod 0400 /root/.ssh/authorized_keys /home/build/.ssh/authorized_keys
+
+# Fix home permissions from cpio command
+/bin/chown -R build:build /home/build
+
+# Setting up AcceptEnv
+/bin/echo "AcceptEnv *" >> /etc/ssh/sshd_config
+
+/usr/bin/ssh-keygen -A
+exec /usr/sbin/sshd -D

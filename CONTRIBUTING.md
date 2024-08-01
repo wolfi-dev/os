@@ -62,6 +62,8 @@ Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CV
 
 - `melange` CLI has a command `bump` to make it easier. More details are [available here](https://github.com/chainguard-dev/melange/blob/f52b622351657fd9ccdb7e3bfb124caef61ad651/NEWS.md).
 
+- We will consider contributions for latest package versions. However, we do not build pre-release versions until they are officially released.
+
 ## Some tips
 
 - melange has a few built-in pipelines. You can see their source code [in the melange repository](https://github.com/chainguard-dev/melange/tree/main/pkg/build/pipelines).

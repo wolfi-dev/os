@@ -1,0 +1,129 @@
+name: hardening-check
+
+needs:
+  packages:
+    - bash
+    - busybox
+    - hardening-check
+
+inputs:
+  package-match:
+    description: |
+      regex matching packages to check.
+    required: true
+    default: 'DEFAULT'
+  args:
+    description: |
+      arguments to pass to hardening-check
+    required: true
+    # Current toolchains do not have cf-protection turned on
+    default: '--nocfprotection'
+
+pipeline:
+  - name: "check files for hardening flags"
+    runs: |
+      cat <<"END_CHECK" >/tmp/hardening-check-files
+      #!/bin/bash
+      set -o errexit -o nounset -o errtrace -o pipefail
+      r=0
+
+      checkfile() {
+          arch_skip=
+          # full cfprotection is x86 only for now
+          if [ "${{build.arch}}" = "aarch64" ]; then
+              arch_skip=--nocfprotection
+          fi
+
+          hardening-check $arch_skip ${{inputs.args}} --color $1
+      }
+
+      debug() {
+          [ "$DEBUG" = "true" ] || return 0
+          echo "$@"
+      }
+      packages=false
+      if [ "$1" = "--package" ]; then
+          packages=true
+          shift
+      fi
+
+      TEMP_D=$(mktemp -d)
+      trap "rm -Rf '${TEMP_D}'" EXIT
+
+      errors=0
+      files=0
+      DEBUG=false
+      command -v readelf >/dev/null 2>&1 ||
+          { echo "ERROR: You need 'readelf' executable"; exit 1; }
+
+      if [ "$packages" = "true" ]; then
+          flist="${TEMP_D}/files"
+          cd /
+          for pkg in "$@"; do
+              apk info --quiet -L "$pkg" > "$flist" || {
+                  echo "failed to list contents of $pkg"
+                  exit 1
+              }
+              debug ":: $pkg"
+              while read f; do
+                  # apk info -L adds a blank line at the end.
+                  [ -z "$f" ] && continue
+                  [ -d "$f" ] && continue
+                  outf="${TEMP_D}/version.out"
+                  errf="${TEMP_D}/version.err"
+                  set +e
+                  LANG=C readelf -hW "$f" > "$outf" 2> "$errf"
+                  rc=$?
+                  set -e
+                  if grep -qi "readelf: Error: Not an ELF file" "$errf"; then
+                      debug "$f: not an ELF file"
+                      continue
+                  fi
+                  checkfile "$f" || errors=$((errors+1))
+                  files=$((files+1))
+              done < "$flist"
+          done
+      else
+          for path in "$@"; do
+              if [ -f "$path" ]; then
+                  checkfile "$path" || errors=$((errors+1))
+                  files=$((files+1))
+              else
+                  echo "ERROR: $path is not a file!"
+                  exit 2
+              fi
+          done
+      fi
+
+      result=FAIL
+      rc=1
+      [ $errors -eq 0 ] && { result="PASS"; rc=0; }
+
+      echo "$result: $files checked. $errors hardening failures found."
+      exit $rc
+      END_CHECK
+      chmod 755 /tmp/hardening-check-files
+
+      pkgmatch='${{inputs.package-match}}'
+      pkgname='${{package.name}}'
+      if [ "${pkgmatch}" = "DEFAULT" ]; then
+        pkgmatch="^${pkgname}"
+      fi
+
+      pfile=/tmp/packages.list
+      if ! apk info -L >"$pfile" 2>"$pfile.err" ; then
+        echo "ERROR: apk info -L failed"
+        cat "$pfile" "$pfile.err"
+        exit 1
+      fi
+      packages=$(grep "$pkgmatch" "$pfile") || :
+      set -- ${packages}
+      if [ $# -eq 0 ]; then
+        echo "packages:"
+        sed 's,^,>  ,' "$pfile"
+        echo "ERROR: package-match '$pkgmatch'" \
+            "did not match any installed packages (see list above)"
+        exit 1
+      fi
+      echo "checking $# packages: $*"
+      /tmp/hardening-check-files --package "$@"

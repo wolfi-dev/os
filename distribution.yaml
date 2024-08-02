@@ -1,0 +1,153 @@
+package:
+  name: distribution
+  version: 3.0.0
+  epoch: 1
+  description: The toolkit to pack, ship, store, and deliver container content
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go
+  environment:
+    CGO_ENABLED: "0"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: c709432b917488208fa78a7932843d91eca59801
+      repository: https://github.com/distribution/distribution
+      tag: v${{package.version}}-beta.1
+
+  - uses: go/build
+    with:
+      ldflags: -X github.com/distribution/distribution/v3/version.Version=${{package.version}} -X github.com/distribution/distribution/v3/version.Revision=$(git rev-parse --short HEAD) -X github.com/distribution/distribution/v3/version.mainpkg=github.com/distribution/distribution/v3
+      output: registry
+      packages: ./cmd/registry
+      vendor: true
+
+  - uses: go/build
+    with:
+      ldflags: -X github.com/distribution/distribution/v3/version.Version=${{package.version}} -X github.com/distribution/distribution/v3/version.Revision=$(git rev-parse --short HEAD) -X github.com/distribution/distribution/v3/version.mainpkg=github.com/distribution/distribution/v3
+      output: digest
+      packages: ./cmd/digest
+      vendor: true
+
+  - uses: go/build
+    with:
+      ldflags: -X github.com/distribution/distribution/v3/version.Version=${{package.version}} -X github.com/distribution/distribution/v3/version.Revision=$(git rev-parse --short HEAD) -X github.com/distribution/distribution/v3/version.mainpkg=github.com/distribution/distribution/v3
+      output: registry-api-descriptor-template
+      packages: ./cmd/registry-api-descriptor-template
+      vendor: true
+
+  - runs: |
+      mkdir -p ${{targets.contextdir}}/
+      mkdir -p ${{targets.contextdir}}/etc/docker/registry
+      mkdir -p ${{targets.contextdir}}/var/lib/registry
+      cp ./config-example.yml ${{targets.contextdir}}/etc/docker/registry/config.yml
+      cp ./entrypoint.sh ${{targets.contextdir}}/entrypoint.sh
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    # https://github.com/twuni/docker-registry.helm/blob/541f368966fd1d1ecbd17183acaa76e6105d8677/templates/deployment.yaml#L61-L63
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/bin
+          ln -sf /usr/bin/registry ${{targets.contextdir}}/bin/registry
+
+# https://github.com/distribution/distribution/discussions/4404
+update:
+  enabled: true
+  manual: true
+  github:
+    identifier: distribution/distribution
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - crane
+  pipeline:
+    - runs: |
+        #!/bin/bash
+
+        # Define image names and registry
+        SOURCE_IMAGE="cgr.dev/chainguard/busybox:latest"
+        LOCAL_REGISTRY="localhost:5000"
+        TARGET_IMAGE="${LOCAL_REGISTRY}/busybox:latest"
+
+        # Function to check if the previous command was successful
+        check_success() {
+            if [ $? -ne 0 ]; then
+                echo "Error: $1"
+                exit 1
+            fi
+        }
+
+        # Start the local Docker registry using the binary
+        echo "Starting local Docker registry..."
+        mkdir -p /etc/docker/registry
+        mkdir -p /var/lib/registry
+        cat <<'EOF' > /etc/docker/registry/config.yml
+        version: 0.1
+        log:
+          level: debug
+          fields:
+            service: registry
+            environment: development
+        storage:
+            delete:
+              enabled: true
+            cache:
+                blobdescriptor: inmemory
+            filesystem:
+                rootdirectory: /var/lib/registry
+            tag:
+              concurrencylimit: 5
+        http:
+            addr: :5000
+            debug:
+                addr: :5001
+                prometheus:
+                    enabled: true
+                    path: /metrics
+        health:
+          storagedriver:
+            enabled: true
+            interval: 10s
+            threshold: 3
+        EOF
+        registry serve /etc/docker/registry/config.yml &
+        REGISTRY_PID=$!
+        check_success "Failed to start local Docker registry"
+
+        # Wait for the registry to be ready
+        echo "Waiting for the registry to become ready..."
+        sleep 5
+
+        # Pull the source image
+        echo "Pulling image ${SOURCE_IMAGE}..."
+        crane pull ${SOURCE_IMAGE} ./busybox.tar
+        check_success "Failed to pull image ${SOURCE_IMAGE}"
+
+        # Push the image to the local registry
+        echo "Pushing image to ${TARGET_IMAGE}..."
+        crane push ./busybox.tar ${TARGET_IMAGE}
+        check_success "Failed to push image to ${TARGET_IMAGE}"
+
+        # Clean up the tar file
+        rm ./busybox.tar
+
+        # Stop the local Docker registry
+        echo "Stopping the local Docker registry..."
+        kill $REGISTRY_PID
+        check_success "Failed to stop local Docker registry"
+
+        echo "Test completed successfully!"

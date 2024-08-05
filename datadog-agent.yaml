@@ -1,58 +1,134 @@
 package:
   name: datadog-agent
-  version: 7.51.0
-  epoch: 1
+  version: 7.55.3
+  epoch: 0
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
-      - ca-certificates-bundle
-      - openjdk-11
+      - datadog-agent-core-integrations
+      - findutils
+      - grep
+      - libseccomp
+      - shadow
 
 environment:
   contents:
     packages:
+      - bison
       - build-base
       - busybox
       - ca-certificates-bundle
+      # NOTE: Package requires clang-12, which it downloads from a known source
+      # during the build process. Currently its not simple to replace this with
+      # a modern clang, but leaving this commented out in case this changes in
+      # the future.
+      # - clang-16
+      # - clang-16-dev
       - cmake
       - coreutils
+      - dpkg
+      - elfutils-dev
+      - findutils
+      - flex
+      # https://github.com/DataDog/datadog-agent/blob/95f4d66f5fb0c10940e0f9b8fc2ab33f0c6099f0/omnibus/config/software/datadog-agent-integrations-py3-dependencies.rb
+      - freetds-dev
+      # - gstatus # TODO: Required by gluster
       - gcc-12
-      - go-1.21
-      - py3-boto3
-      - py3-codeowners
-      - py3-docker
-      - py3-docker-squash
-      - py3-dulwich
-      - py3-invoke
-      - py3-packaging
-      - py3-pip
-      - py3-reno
-      - py3-requests
-      - py3-toml
-      - py3-urllib3
-      - py3-wheel
-      - python-3
-      - python-3-dev
+      - gnutar
+      - go~1.21 # strictly requires go 1.21
+      - krb5-dev
+      - libbpf-dev
+      - libedit-dev
+      - libzip
+      - linux-headers
+      - ninja
+      - procps-dev
+      - py3.11-pip
+      - python3-dev~3.11 # strictly requires python3.11
+      - systemd-dev
+      - wget # Required for downloading clang-12 and kernel headers from debian
   environment:
     # CGo allows Go programs to call C code
     CGO_ENABLED: "1"
-    # -Os optimizes the code for size
-    # -I/build/datadog-agent/dev/include adds the directory to search
-    CGO_CFLAGS: "-Os -I${{targets.destdir}}/home/build/dev/include/"
-    # Pass options to the linker. -L/build/datadog-agent/dev/lib adds directory to search for libraries
-    CGO_LDFLAGS: "-L${{targets.destdir}}/home/build/dev/lib/"
+    # -Os optimizes the code for size and add the directory to rtlinkers includes
+    CGO_CFLAGS: "-Os -I${{targets.destdir}}/usr/include/"
+    # Pass options to the linker.
+    CGO_LDFLAGS: "-L${{targets.destdir}}/usr/lib/"
     # disables generation of debugging information
     # omits the symbol table and debug information, further reducing the size of the binary.
     GOFLAGS: "-ldflags=-w -ldflags=-s"
+    # The version of linux-headers to fetch kernel headers for
+    LINUX_HEADERS_VERSION: "5.10.0-0.deb10.29"
+    # The version of linux to fetch kernel headers for
+    LINUX_KERNEL_VERSION: "5.10.216-1~deb10u1"
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: 5b3c5ccb394e61a7946f35ad0eeb4197dfcd5d68
+      expected-commit: 89afbb0fed170c70009f651639d2ab95ee0f5842
+
+  # Install `invoke` (build) dependencies. We ultimately package with venv so
+  # these won't leak into the package.
+  - runs: |
+      # install `invoke` and its dependencies
+      python3.11 -m pip install invoke requests toml pyyaml packaging
+
+      # install `gitlab`
+      python3.11 -m pip install python-gitlab
+
+  - uses: go/bump
+    with:
+      deps: github.com/moby/buildkit@v0.13.1 google.golang.org/grpc@v1.64.1 github.com/docker/docker@v26.1.4
+      replaces: go.opentelemetry.io/collector=go.opentelemetry.io/collector@v0.102.1 github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
+      show-diff: true
+
+  - if: ${{build.arch}} == 'aarch64'
+    runs: |
+      mkdir -p /usr/src
+      wget -O arch.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-arm64_${LINUX_KERNEL_VERSION}_arm64.deb
+      echo "a9f5b8614dc1dc123b13de540bb98283cd927a29438e0fe010c9e477b5448124 arch.deb" | sha256sum -c
+
+      dpkg -x arch.deb /tmp/arch
+      ln -s /tmp/arch/usr/src/linux-headers-${LINUX_HEADERS_VERSION}-arm64 /usr/src/linux-headers-${LINUX_HEADERS_VERSION}-arm64
+
+      wget "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.1/clang+llvm-12.0.1-aarch64-linux-gnu.tar.xz" -O /tmp/clang.tar.xz  -o /dev/null
+      echo "3d4ad804b7c85007686548cbc917ab067bf17eaedeab43d9eb83d3a683d8e9d4  /tmp/clang.tar.xz" | sha256sum --check
+
+  - if: ${{build.arch}} == 'x86_64'
+    runs: |
+      mkdir -p /usr/src
+      wget -O arch.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-amd64_${LINUX_KERNEL_VERSION}_amd64.deb
+      echo "6090e3d5c874ae8ac99d777bbbcb692051af93d8d8d0cbefa6b7376b9e112317 arch.deb" | sha256sum -c
+
+      dpkg -x arch.deb /tmp/arch
+      ln -s /tmp/arch/usr/src/linux-headers-${LINUX_HEADERS_VERSION}-amd64 /usr/src/linux-headers-${LINUX_HEADERS_VERSION}-amd64
+
+      # https://github.com/DataDog/datadog-agent-buildimages/blob/main/system-probe_x64/Dockerfile#L80
+      wget "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.1/clang+llvm-12.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz" -O /tmp/clang.tar.xz  -o /dev/null
+      echo "6b3cc55d3ef413be79785c4dc02828ab3bd6b887872b143e3091692fc6acefe7  /tmp/clang.tar.xz" | sha256sum --check
+
+  - runs: |
+      wget -O common.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-common_${LINUX_KERNEL_VERSION}_all.deb
+      dpkg -x common.deb /tmp/common
+      ln -s /tmp/common/usr/src/linux-headers-${LINUX_HEADERS_VERSION}-common /usr/src/linux-headers-${LINUX_HEADERS_VERSION}-common
+
+      mkdir -p /opt/clang
+      tar xf /tmp/clang.tar.xz --no-same-owner -C /opt/clang --strip-components=1
+      PATH="/opt/clang/bin:${PATH}"
+
+      # HOW DOES THIS WORK: https://stackoverflow.com/a/60357720
+      ln -s /usr/lib/libncursesw.so.6 /usr/lib/libtinfo.so.5
+
+      # Build once to correctly setup links/generates. The system-probe we end
+      # up using will be part of the multicall below.
+      invoke -e system-probe.build \
+        --strip-object-files \
+        --no-bundle \
+        --bundle-ebpf
 
   - runs: |
       export PATH=$PATH:$GOPATH/bin
@@ -60,76 +136,303 @@ pipeline:
       ln -sf /home/build/ "$GOPATH"/src/github.com/DataDog/datadog-agent
       go mod tidy
 
-      invoke deps
-      invoke install-tools
+      invoke -e deps
 
-      invoke rtloader.make \
+  - runs: |
+      invoke -e rtloader.make \
         --python-runtimes=3 \
+        --install-prefix="${{targets.destdir}}/usr" \
         --cmake-options="\
           -DCMAKE_INSTALL_LIBDIR=lib \
           -DCMAKE_CXX_FLAGS=-Os \
-          -DCMAKE_C_FLAGS=-Os" \
-      && invoke rtloader.install
+          -DCMAKE_C_FLAGS=-Os"
+      invoke -e rtloader.install
 
-      invoke agent.build --build-exclude=systemd --python-runtimes 3
+      # Default includes [process-agent, security-agent, trace-agent]. Add in
+      # the `system-probe` as well, which saves us ~140Mb.
+      invoke -e agent.build \
+        --bundle process-agent \
+        --bundle trace-agent \
+        --bundle system-probe \
+        --bundle security-agent \
+        --exclude-rtloader \
+        --python-runtimes 3 \
+        --no-development \
+        --bundle-ebpf \
+        --embedded-path /usr/lib
 
-      mkdir -p \
-        ${{targets.destdir}}/usr/lib/include \
-        && cp /home/build/dev/lib/* ${{targets.destdir}}/usr/lib/ \
-        && cp /home/build/dev/include/* ${{targets.destdir}}/usr/lib/include/ \
+  - runs: |
+      install -Dm755 bin/agent/agent ${{targets.destdir}}/usr/bin/agent
+      # *-agent is just a symlink to the "agent" multicall
+      ln -s agent ${{targets.destdir}}/usr/bin/process-agent
+      ln -s agent ${{targets.destdir}}/usr/bin/security-agent
+      ln -s agent ${{targets.destdir}}/usr/bin/trace-agent
+      ln -s agent ${{targets.destdir}}/usr/bin/system-probe
 
-      export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib
+      mkdir -p ${{targets.destdir}}/etc/datadog-agent/
 
-      mkdir -p \
-        ${{targets.destdir}}/opt/datadog-agent/bin/agent/dist \
-        ${{targets.destdir}}/opt/datadog-agent/run \
-        ${{targets.destdir}}/etc/datadog-agent \
-      && touch ${{targets.destdir}}/opt/datadog-agent/requirements-agent-release.txt \
-      && touch ${{targets.destdir}}/opt/datadog-agent/final_constraints-py3.txt
+      cp -r Dockerfiles/agent/s6-services ${{targets.destdir}}/etc/services.d
+      cp -r Dockerfiles/agent/cont-init.d ${{targets.destdir}}/etc/cont-init.d
 
-      cp bin/agent/agent ${{targets.destdir}}/opt/datadog-agent/bin/agent/agent
+      install -Dm644 Dockerfiles/agent/datadog-docker.yaml ${{targets.destdir}}/etc/datadog-agent/datadog-docker.yaml
+      install -Dm644 Dockerfiles/agent/datadog-ecs.yaml ${{targets.destdir}}/etc/datadog-agent/datadog-ecs.yaml
+      install -Dm644 bin/agent/dist/datadog.yaml ${{targets.destdir}}/etc/datadog-agent/datadog.yaml.example
+      install -Dm644 bin/agent/dist/system-probe.yaml ${{targets.destdir}}/etc/datadog-agent/system-probe.yaml.example
+      install -Dm644 bin/agent/dist/security-agent.yaml ${{targets.destdir}}/etc/datadog-agent/security-agent.yaml.example
 
-      cp -r \
-        bin/agent/dist/checks \
-        bin/agent/dist/config.py \
-        bin/agent/dist/utils \
-        bin/agent/dist/views \
-        ${{targets.destdir}}/opt/datadog-agent/bin/agent/dist/
+      install -Dm755 Dockerfiles/agent/entrypoint.sh ${{targets.destdir}}/bin/entrypoint.sh
+      install -Dm755 Dockerfiles/agent/probe.sh ${{targets.destdir}}/probe.sh
+      install -Dm755 Dockerfiles/agent/initlog.sh ${{targets.destdir}}/initlog.sh
+      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.py ${{targets.destdir}}/readsecret.py
+      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.sh ${{targets.destdir}}/readsecret.sh
+      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret_multiple_providers.sh ${{targets.destdir}}/readsecret_multiple_providers.sh
 
-      cp -r bin/agent/dist/conf.d ${{targets.destdir}}/etc/datadog-agent/conf.d/
+      cp -r bin/agent/dist/conf.d ${{targets.destdir}}/etc/datadog-agent/conf.d
 
-      mkdir -p ${{targets.destdir}}/etc/datadog-agent/ && cp \
-        Dockerfiles/agent/datadog-docker.yaml \
-        Dockerfiles/agent/datadog-ecs.yaml \
-        bin/agent/dist/system-probe.yaml \
-        ${{targets.destdir}}/etc/datadog-agent/
+      # Setup s3-overlay overrides
+      mkdir -p ${{targets.destdir}}/etc/s6/init
+      cp -r Dockerfiles/agent/init-stage3 ${{targets.destdir}}/etc/s6/init/init-stage3
+      cp Dockerfiles/agent/init-stage3-host-pid ${{targets.destdir}}/etc/s6/init/init-stage3-host-pid
 
-      cp \
-        bin/agent/dist/datadog.yaml \
-        ${{targets.destdir}}/etc/datadog-agent/datadog.yaml.example
+  - uses: strip
+
+subpackages:
+  - name: datadog-agent-jmx
+    description: "Datadog agent with JMX integration"
+    dependencies:
+      runtime:
+        - openjdk-11-default-jvm
+        - datadog-agent
+
+  - name: datadog-agent-oci-compat
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+        - datadog-agent-s6-overlay
+        - datadog-security-agent-policies
+    pipeline:
+      - runs: |
+          mkdir -p \
+            ${{targets.subpkgdir}}/conf.d \
+            ${{targets.subpkgdir}}/checks.d \
+            ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist \
+            ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin
+
+          # several startup scripts assume binaries are located in /opt/datadog-agent/...
+          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/agent
+          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/system-probe
+          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/security-agent
+          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/process-agent
+          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/trace-agent
+
+          cp -r /opt/datadog-agent/embedded/share ${{targets.subpkgdir}}/opt/datadog-agent/embedded/share
+
+          cp -r bin/agent/dist/checks ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/
+          install -Dm644 bin/agent/dist/config.py ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/config.py
+          cp -r bin/agent/dist/utils ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/
+          cp -r bin/agent/dist/views ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/
+
+          cp -r Dockerfiles/agent/entrypoint.d ${{targets.subpkgdir}}/opt/entrypoints
+
+  - name: datadog-agent-core-integrations
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+        - python-3.11
+    pipeline:
+      - working-directory: /home/integrations
+        pipeline:
+          - uses: git-checkout
+            with:
+              repository: https://github.com/DataDog/integrations-core
+              tag: ${{package.version}}
+              expected-commit: 5240f2a7cdcabc6ae7787b9191b9189438671f3e # needs to be updated with each new release
+          - uses: patch
+            with:
+              patches: /home/build/cve-fixes.patch
+          - runs: |
+              # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
+              SOURCE_DATE_EPOCH=315532800
+
+              # Create virtual environment
+              python3.11 -m venv .venv
+
+              # Install locked dependencies
+              .venv/bin/pip install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_py3.txt
+
+              excludes="datadog_checks_base datadog_checks_dev datadog_checks_tests_helper docker_daemon esxi teleport"
+              checks=$(invoke -r /home/build agent.collect-integrations /home/integrations/ 3 linux --excluded "$excludes")
+
+              # Install core and dependencies
+              .venv/bin/pip install \
+                "./datadog_checks_base[deps, http]" \
+                $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
+
+              find .venv -name "*.pyc" -delete
+              find .venv -name "__pycache__" -exec rm -rf {} +
+
+              mkdir -p ${{targets.contextdir}}/opt/datadog-agent
+              .venv/bin/pip freeze > ${{targets.contextdir}}/opt/datadog-agent/final_constraints-py3.txt
+
+              # Use Python in virtual environment
+              sed -i "s|$(pwd)/.venv|/usr/share/datadog-agent|g" .venv/pyvenv.cfg
+              sed -i "s|$(pwd)/.venv|/usr/share/datadog-agent|g" .venv/bin/*
+
+              # Install virtual environment
+              mkdir -p ${{targets.contextdir}}/usr/share/datadog-agent
+              cp -r .venv/* ${{targets.contextdir}}/usr/share/datadog-agent/
+
+              # this is intentionally referencing the main package, since we only "install" if a config doesn't already exist
+              conf_dir="${{targets.destdir}}/etc/datadog-agent/conf.d"
+              mkdir -p $conf_dir
+
+              for c in $checks; do
+                check_conf_dir="${conf_dir}/${c}.d"
+
+                # copy the configuration file if they don't already exist
+                for f in conf.yaml.example conf.yaml.default metrics.yaml auto_conf.yaml; do
+
+                  src="$c/datadog_checks/$c/data/$f"
+                  dst="$check_conf_dir"
+
+                  if [ -f "$src" ] && [ ! -f "$dst/$f" ]; then
+                    mkdir -p $dst
+                    cp $src $dst
+                  fi
+                done
+
+                # copy SNMP profiles
+                for p in profiles default_profiles; do
+                  folder_path="$c/datadog_checks/$c/data/$p"
+                  if [ -d "$folder_path" ]; then
+                    cp -r "${folder_path}" "${check_conf_dir}"
+                  fi
+                done
+              done
+
+  - name: datadog-cluster-agent
+    dependencies:
+      runtime:
+        - tzdata
+        - libseccomp
+    pipeline:
+      - runs: |
+          invoke -e cluster-agent.build
+          go generate cmd/cluster-agent/main.go
+
+          install -Dm755 bin/datadog-cluster-agent/datadog-cluster-agent ${{targets.subpkgdir}}/usr/bin/datadog-cluster-agent
+      - working-directory: Dockerfiles/cluster-agent
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp -r conf.d ${{targets.subpkgdir}}/etc/datadog-agent/
+
+          cp ./install_info ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp ./datadog-cluster.yaml ${{targets.subpkgdir}}/etc/datadog-agent/
+
+  - name: datadog-cluster-agent-oci-compat
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/datadog-agent/bin/
+          ln -s /usr/bin/datadog-cluster-agent ${{targets.subpkgdir}}/opt/datadog-agent/bin/datadog-cluster-agent
+          ln -s /usr/bin/datadog-cluster-agent ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent
+      - working-directory: Dockerfiles/cluster-agent
+        runs: |
+          install -Dm755 entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
+          install -Dm755 readsecret.sh ${{targets.subpkgdir}}/readsecret.sh
+          install -Dm755 readsecret_multiple_providers.sh ${{targets.subpkgdir}}/readsecret_multiple_providers.sh
+
+  - name: datadog-agent-fakeintake
+    description: A fake intake server useful for testing purposes
+    pipeline:
+      - working-directory: test/fakeintake
+        # This needs CGO_ENABLED=1, which we just so happen to inherit from the
+        # main package
+        pipeline:
+          - uses: go/bump
+            with:
+              deps: google.golang.org/protobuf@v1.33.0 github.com/golang/protobuf@v1.5.4
+          - uses: go/build
+            with:
+              packages: ./cmd/server
+              output: fakeintake
+
+  # The datadog-agent image uses a deprecated version of s6-overlay from 2020
+  # we don't want to maintain a package for. Instead, include the
+  # raw release of that version of s6-overlay as a datadog-agent
+  # subpackage, only to be used by image builders.
+  - name: datadog-agent-s6-overlay
+    description: "Deprecated s6-overlay for datadog-agent"
+    options:
+      # Hide this from our SCA and dag, this package should _only_ ever be used by datadog-agent
+      no-provides: true
+      no-depends: true
+    pipeline:
+      - runs: |
+          S6_OVERLAY_VERSION=v2.2.0.3
+
+          case $(uname -m) in
+          aarch64)
+            _arch="aarch64"
+            expected_sha256="84f585a100b610124bb80e441ef2dc2d68ac2c345fd393d75a6293e0951ccfc5"
+            ;;
+          x86_64)
+            _arch="amd64"
+            expected_sha256="a7076cf205b331e9f8479bbb09d9df77dbb5cd8f7d12e9b74920902e0c16dd98"
+            ;;
+          *)
+            echo "Unsupported architecture $(uname -m)"
+            exit 1
+            ;;
+          esac
+
+          wget -O s6-overlay.tgz https://github.com/just-containers/s6-overlay/releases/download/${S6_OVERLAY_VERSION}/s6-overlay-${_arch}.tar.gz
+
+          echo "${expected_sha256}  s6-overlay.tgz" | sha256sum -c
+
+          mkdir -p ${{targets.subpkgdir}}/
+          tar -xvzf s6-overlay.tgz -C ${{targets.subpkgdir}}/
+
+          # Since this is essentially a hard fork only for datadog, we can do this without issue
+          # https://github.com/DataDog/datadog-agent/blob/f20521b4b0b05ad83314e3fc353ecbbe7e3e69a0/Dockerfiles/agent/Dockerfile#L200
+          mv ${{targets.subpkgdir}}/etc/s6/init/init-stage3 ${{targets.subpkgdir}}/etc/s6/init/init-stage3-original
 
 update:
   enabled: true
   github:
     identifier: DataDog/datadog-agent
   ignore-regex-patterns:
-    - 'lambda-extension.*'
+    - "lambda-extension.*"
 
 test:
   environment:
     contents:
       packages:
-        - busybox
+        - datadog-agent-fakeintake
+        - datadog-agent-core-integrations
+    environment:
+      PYTHONPATH: "/usr/share/datadog-agent/lib/python3.11/site-packages"
   pipeline:
-    - runs: |
-        # Execute the help command and capture the output
-        OUTPUT=$(/opt/datadog-agent/bin/agent/agent --help)
+    - name: Ensure checks can be loaded
+      runs: |
+        python -c "import datadog_checks.base"
+    - name: Ensure agent can be started
+      runs: |
+        cat > /etc/datadog-agent/datadog.yaml <<EOF
+        api_key: "test"
+        dd_url: "http://localhost:80"
+        EOF
 
-        # Check for "Usage:" in the output
-        if echo "$OUTPUT" | grep -q "Usage:"; then
-          echo "Help command works as expected."
-          exit 0
-        else
-          echo "Help command output does not contain expected text."
-          exit 1
-        fi
+        export DD_HOSTNAME_FILE=/etc/hostname
+        agent check uptime
+    - name: Validate multicall components are correctly linked
+      runs: |
+        trace-agent version | grep trace-agent
+        security-agent version | grep "Security agent"
+        process-agent version | grep Agent
+        system-probe version | grep "System Probe"

@@ -1,0 +1,190 @@
+package:
+  name: spark-3.5
+  version: 3.5.1
+  epoch: 7
+  description: Unified engine for large-scale data analytics
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - spark=${{package.full-version}}
+    runtime:
+      - bash
+      - busybox
+      - openjdk-17
+      - openjdk-17-default-jvm
+      - procps
+
+environment:
+  contents:
+    packages:
+      - R
+      - R-dev
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - glibc-iconv
+      - glibc-locale-en
+      - grep
+      - maven
+      - openjdk-8
+      - openjdk-8-default-jvm
+      - perl-utils
+      - procps
+      - py3.11-pip
+      - python-3.11
+      - wolfi-base
+      - wolfi-baselayout
+      - yaml-dev
+  environment:
+    LANG: en_US.UTF-8
+    JAVA_HOME: /usr/lib/jvm/java-1.8-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/spark
+      tag: v${{package.version}}
+      expected-commit: fd86f85e181fc2dc0f50a096855acf83a6cc5d9c
+
+  - uses: patch
+    with:
+      patches: make-distribution.patch bump-packages.patch
+
+  - uses: maven/pombump
+
+  - name: build
+    runs: |
+      ./dev/make-distribution.sh --name custom-spark --pip -Psparkr -Phive -Phive-thriftserver -Pmesos -Pyarn -Pkubernetes
+
+      patch dist/bin/load-spark-env.sh load-spark-env.sh.diff
+      patch dist/sbin/spark-daemon.sh spark-daemon.sh.diff
+
+      mkdir -p ${{targets.destdir}}/usr/lib/spark
+      mv dist/* ${{targets.destdir}}/usr/lib/spark/
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to place binaries in the location expected by upstream image"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mkdir -p "${{targets.subpkgdir}}"/opt/
+          ln -s /usr/lib/spark/ ${{targets.subpkgdir}}/opt/spark
+          ln -sf /usr/lib/spark/bin/spark-submit ${{targets.subpkgdir}}/usr/bin/spark-submit
+          ln -sf /usr/lib/spark/bin/spark-shell ${{targets.subpkgdir}}/usr/bin/spark-shell
+          ln -sf /usr/lib/spark/bin/pyspark ${{targets.subpkgdir}}/usr/bin/pyspark
+          ln -sf /usr/lib/spark/bin/spark-class ${{targets.subpkgdir}}/usr/bin/spark-class
+          ln -sf /usr/lib/spark/bin/spark-sql ${{targets.subpkgdir}}/usr/bin/spark-sql
+          ln -sf /usr/lib/spark/bin/sparkR ${{targets.subpkgdir}}/usr/bin/spark
+      - uses: strip
+
+  - name: ${{package.name}}-minimal
+    description: Minimal version of Spark
+    pipeline:
+      - runs: |
+          ./dev/make-distribution.sh --name minimal-spark --pip -Psparkr -Phive
+
+          mkdir -p ${{targets.contextdir}}/usr/lib/spark
+          mv dist/* ${{targets.contextdir}}/usr/lib/spark/
+
+  - name: ${{package.name}}-bitnami-compat
+    description: Bitnami compat for spark 3.5
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: spark
+          version-path: 3.5/debian-12
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/spark/
+          mkdir -p "${{targets.subpkgdir}}"/opt/bitnami/spark/logs
+          mkdir -p "${{targets.subpkgdir}}"/opt/bitnami/spark/tmp
+
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/spark/conf.default/
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/spark/conf/
+          cp -r ${{targets.destdir}}/usr/lib/spark/conf/* ${{targets.subpkgdir}}/opt/bitnami/spark/conf.default/
+          # We copy conf instead of symlinking to avoid issues with the bitnami volume mount.
+          cp -r ${{targets.destdir}}/usr/lib/spark/conf/* ${{targets.subpkgdir}}/opt/bitnami/spark/conf/
+
+          ln -s /usr/lib/spark/jars ${{targets.subpkgdir}}/opt/bitnami/spark/jars
+          ln -s /usr/lib/spark/bin ${{targets.subpkgdir}}/opt/bitnami/spark/bin
+          ln -s /usr/lib/spark/data ${{targets.subpkgdir}}/opt/bitnami/spark/data
+          ln -s /usr/lib/spark/python ${{targets.subpkgdir}}/opt/bitnami/spark/python
+          ln -s /usr/lib/spark/licenses ${{targets.subpkgdir}}/opt/bitnami/spark/licenses
+          ln -s /usr/lib/spark/kubernetes ${{targets.subpkgdir}}/opt/bitnami/spark/kubernetes
+          ln -s /usr/lib/spark/sbin ${{targets.subpkgdir}}/opt/bitnami/spark/sbin
+          ln -s /usr/lib/spark/yarn ${{targets.subpkgdir}}/opt/bitnami/spark/yarn
+
+update:
+  enabled: true
+  github:
+    identifier: apache/spark
+    use-tag: true
+    strip-prefix: v
+    tag-filter: v3.5
+
+test:
+  environment:
+    contents:
+      packages:
+        - R
+        - python3
+    environment:
+      LANG: en_US.UTF-8
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+  pipeline:
+    - runs: /usr/lib/spark/bin/spark-shell --version
+    - runs: /usr/lib/spark/bin/spark-submit --version
+    - runs: /usr/lib/spark/bin/pyspark --version
+    - runs: /usr/lib/spark/bin/spark-sql --version
+    - name: Run a simple Scala test script
+      runs: cat ./scala-test | /usr/lib/spark/bin/spark-shell
+    - name: Run a simple Spark job in Scala
+      runs: |
+        cat <<EOF > SimpleJob.scala
+        val data = Seq(1, 2, 3, 4, 5)
+        val rdd = spark.sparkContext.parallelize(data)
+        val sum = rdd.reduce(_ + _)
+        assert(sum == 15)
+        EOF
+        cat SimpleJob.scala | /usr/lib/spark/bin/spark-shell
+    - name: Run a simple Spark job in Python
+      runs: |
+        cat <<EOF > simple_job.py
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.appName("SimpleJob").getOrCreate()
+        data = [1, 2, 3, 4, 5]
+        rdd = spark.sparkContext.parallelize(data)
+        sum = rdd.reduce(lambda x, y: x + y)
+        assert sum == 15
+        EOF
+        /usr/lib/spark/bin/spark-submit simple_job.py
+    - name: Perform SQL query on DataFrame in Scala
+      runs: |
+        cat <<EOF > SQLTest.scala
+        import org.apache.spark.sql.SparkSession
+        val spark = SparkSession.builder.appName("SQLTest").getOrCreate()
+        import spark.implicits._
+        val df = Seq((1, "Alice"), (2, "Bob")).toDF("id", "name")
+        df.createOrReplaceTempView("people")
+        val result = spark.sql("SELECT name FROM people WHERE id = 2")
+        assert(result.count() == 1 && result.first().getString(0) == "Bob")
+        EOF
+        cat SQLTest.scala | /usr/lib/spark/bin/spark-shell
+    - name: Run basic SQL query with spark-sql
+      runs: |
+        echo 'CREATE OR REPLACE TEMP VIEW test AS SELECT 1 AS id;' > test.sql
+        echo 'SELECT * FROM test;' >> test.sql
+        /usr/lib/spark/bin/spark-sql -f test.sql
+    - name: Run SparkR script
+      runs: |
+        cat <<EOF > sparkr_test.R
+        library(SparkR)
+        sparkR.session()
+        df <- as.DataFrame(data.frame(id = c(1, 2), name = c("Alice", "Bob")))
+        createOrReplaceTempView(df, "people")
+        df2 <- sql("SELECT * FROM people WHERE id > 1")
+        stopifnot(count(df2) == 1)
+        EOF
+        /usr/lib/spark/bin/spark-submit sparkr_test.R

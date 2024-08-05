@@ -1,7 +1,7 @@
 package:
   name: php-8.1
-  version: 8.1.27
-  epoch: 1
+  version: 8.1.29
+  epoch: 4
   description: "the PHP programming language"
   copyright:
     - license: PHP-3.01
@@ -15,6 +15,7 @@ package:
 environment:
   contents:
     packages:
+      - autoconf
       - bison
       - build-base
       - busybox
@@ -23,6 +24,7 @@ environment:
       - curl-dev
       - file
       - freetds
+      - freetds-dev
       - freetype-dev
       - gmp-dev
       - icu-dev
@@ -41,26 +43,28 @@ environment:
       - openldap-dev
       - openssl-dev
       - patch
-      - postgresql-15-dev
+      - postgresql-dev
+      - re2c
       - readline-dev
       - sqlite-dev
       - unixodbc-dev
+      - wget
 
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      uri: https://www.php.net/distributions/php-${{package.version}}.tar.gz
-      expected-sha256: 9aa5d7a29389d799885d90740932697006d5d0f55d1def67678e0c14f6ab7b2d
-      extract: false
+      repository: https://github.com/php/php-src
+      tag: php-${{package.version}}
+      expected-commit: fc4973fb0dfae6085742868b8f0f05163e150a0c
 
-  - name: Prepare Build Folder
+  - name: Patch to use C++17 (default)
     runs: |
-      mv php-${{package.version}}.tar.gz $HOME
-      tar zxf $HOME/php-${{package.version}}.tar.gz
+      # patching PHP_CXX_COMPILE_STDCXX to 17
+      sed -i 's|PHP_CXX_COMPILE_STDCXX(11|PHP_CXX_COMPILE_STDCXX(17|' ext/intl/config.m4
 
   - name: Configure
     runs: |
-      cd $HOME/php-${{package.version}}
+      ./buildconf --force
       EXTENSION_DIR=/usr/lib/php/modules ./configure \
         --prefix=/usr \
         --libdir=/usr/lib/php \
@@ -102,6 +106,7 @@ pipeline:
             --with-pdo-sqlite=shared \
             --with-pdo-dblib=shared \
             --with-pdo-pgsql=shared \
+            --with-pdo-odbc=shared,unixODBC,/usr \
         --with-unixODBC=shared,/usr \
         --enable-pcntl=shared \
         --enable-sockets=shared \
@@ -126,12 +131,9 @@ pipeline:
         --with-zip=shared
 
   - uses: autoconf/make
-    with:
-      dir: $HOME/php-${{package.version}}
 
   - name: Make Install
     runs: |
-      cd $HOME/php-${{package.version}}
       INSTALL_ROOT=${{targets.destdir}} DESTDIR=${{targets.destdir}} make install
       mkdir -p "${{targets.destdir}}/bin" && ln -s /usr/bin/php "${{targets.destdir}}/bin/php"
 
@@ -151,6 +153,7 @@ data:
       pdo_sqlite: SQLite 3.x driver for PDO
       pdo_dblib: PDO driver for Sybase / MS SQL databases
       pdo_pgsql: PDO driver for pgsql
+      pdo_odbc: PDO driver for ODBC
       soap: SOAP
       sodium: Sodium
       calendar: Calendar
@@ -188,7 +191,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
-          mv $HOME/php-${{package.version}}/php.ini-production ${{targets.subpkgdir}}/etc/php/php.ini
+          mv $HOME/php.ini-production ${{targets.subpkgdir}}/etc/php/php.ini
 
   - range: extensions
     name: "${{package.name}}-${{range.key}}"
@@ -215,9 +218,18 @@ subpackages:
       - runs: |
           export CONF_DIR="${{targets.subpkgdir}}/etc/php/conf.d"
           mkdir -p $CONF_DIR
+          order=10
           prefix=
           [ "${{range.key}}" != "opcache" ] || prefix="zend_"
-          echo "${prefix}extension=${{range.key}}.so" > $CONF_DIR/"${{range.key}}.ini"
+          # Determine load order based on number of dependencies found in config.w32
+          [ -f "ext/${{range.key}}/config.w32" ] && \
+            deps=`sed -En "s/.*ADD_EXTENSION_DEP\('${{range.key}}', ([^)]+)\).*/\1/p" "ext/${{range.key}}/config.w32" \
+                | tr -d "'," | tr ' ' '\n' \
+                | sort -u \
+                | while read -r dep; do
+                  [ "$dep" = "true" ] || echo $dep
+                done | wc -w`
+          echo "${prefix}extension=${{range.key}}.so" > $CONF_DIR/"$((order+order*deps))-${{range.key}}.ini"
 
   - name: ${{package.name}}-dev
     description: PHP 8.1 development headers
@@ -304,3 +316,58 @@ update:
     strip-prefix: php-
     tag-filter: php-8.1
     use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql
+        - postgresql-client
+        - wolfi-base
+        - shadow
+        - sudo-rs
+        - glibc-locales
+        - php-8.1-pgsql
+    environment:
+      PGDATA: /tmp/test_db
+      PGUSER: wolfi
+  pipeline:
+    - name: "Test database creation"
+      runs: |
+        useradd $PGUSER
+        sudo -u $PGUSER initdb -D /tmp/test_db
+        sudo -u $PGUSER pg_ctl -D /tmp/test_db -l /tmp/logfile start
+        sudo -u $PGUSER createdb testdb
+        psql -lqt | cut -d \| -f 1 | grep -qw testdb
+    - name: "Test basic read/write operations"
+      runs: |
+        sudo -u $PGUSER psql -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, test_value VARCHAR(50));"
+        sudo -u $PGUSER psql -d testdb -c "INSERT INTO test_table (test_value) VALUES ('Hello, Wolfi!');"
+        sudo -u $PGUSER psql -d testdb -t -A -c "SELECT test_value FROM test_table WHERE id=1;"
+    - name: "Test php"
+    - runs: |
+        php --version
+        php -m
+    - runs: |
+        cat <<'EOF' >> /tmp/read_db.php
+        <?php
+        $conn = pg_connect("host=localhost dbname=testdb user=wolfi");
+        if (!$conn) {
+            echo "Connection error.\n";
+            exit;
+        }
+        $result = pg_query($conn, "SELECT test_value FROM test_table WHERE id=1");
+        if (!$result) {
+            echo "Error in the query.\n";
+            exit;
+        }
+        $row = pg_fetch_row($result);
+        if (!$row) {
+            echo "Empty.\n";
+            exit;
+        }
+        echo "Value from test_table: $row[0]\n";
+        pg_close($conn);
+        ?>
+        EOF
+        php /tmp/read_db.php

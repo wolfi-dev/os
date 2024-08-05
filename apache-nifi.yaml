@@ -1,0 +1,160 @@
+package:
+  name: apache-nifi
+  version: 1.27.0
+  epoch: 0
+  description: Apache NiFi is an easy to use, powerful, and reliable system to process and distribute data.
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: 33
+    memory: 32Gi
+  dependencies:
+    runtime:
+      - bash
+      - busybox
+      - coreutils
+      - glibc-locale-en
+      - openjdk-11-default-jvm
+      - openjdk-11-jre
+      - xmlstarlet
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - coreutils
+      - maven
+      - nodejs-20
+      - npm
+      - openjdk-11
+      - openjdk-11-default-jvm
+      - openssl-dev
+      - rsync
+      - wolfi-base
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-11-openjdk
+    MAVEN_OPTS: |
+      -Xmx4g
+      -XX:ReservedCodeCacheSize=1g
+      -XX:+UseG1GC
+      -Dorg.slf4j.simpleLogger.defaultLogLevel=WARN
+      -Daether.connector.http.retryHandler.count=5
+      -Daether.connector.http.connectionMaxTtl=30
+    NIFI_BASE: "/usr/share/nifi"
+    NIFI_HOME: "/usr/share/nifi/nifi-current"
+    TOOLKIT_HOME: "/usr/share/nifi/nifi-toolkit-current"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/nifi
+      tag: rel/nifi-${{package.version}}
+      expected-commit: e0c4461d90bd4f6e5f2b81765bcff5cd97ed3e18
+
+  - runs: |
+      # Use single thread on x86_64
+      if [[ "${{build.arch}}" == "x86_64" ]]; then
+        MAVEN_THREADS=1
+      else
+        MAVEN_THREADS=$(nproc)
+      fi
+
+      # Build NiFi
+      ./mvnw -T${MAVEN_THREADS}C -q package \
+        --no-snapshot-updates \
+        --no-transfer-progress \
+        --fail-fast \
+        -DskipTests \
+        -Dfrontend.skipTests=true \
+        -Drat.skip=true
+
+      # Install NiFi
+      mkdir -p "${{targets.contextdir}}/${NIFI_BASE}"
+      cp -ar "nifi-assembly/target/nifi-${{package.version}}-bin/nifi-${{package.version}}" "${{targets.contextdir}}/${NIFI_HOME}"
+
+      # Create expected directories
+      for dir in conf logs database_repository flowfile_repository content_repository provenance_repository state; do
+        mkdir -p "${{targets.contextdir}}/${NIFI_HOME}/${dir}"
+      done
+
+      # Set shell in environment script
+      echo "#!/bin/sh\n" > "${{targets.contextdir}}/${NIFI_HOME}/bin/nifi-env.sh"
+
+      # Install scripts
+      mkdir -p "${{targets.contextdir}}/${NIFI_BASE}/scripts"
+      install -m755 nifi-docker/dockerhub/sh/*.sh "${{targets.contextdir}}/${NIFI_BASE}/scripts/"
+
+      # Ensure scripts are executable
+      chmod -R +x "${{targets.contextdir}}/${NIFI_BASE}/scripts"
+
+      # Fix paths in scripts
+      sed -i "s|/opt|/usr/share|g" "${{targets.contextdir}}/${NIFI_BASE}"/scripts/*.sh
+
+      # Remove batch scripts
+      rm "${{targets.contextdir}}/${NIFI_HOME}"/bin/*.bat
+
+      # Symlink current release to versioned path
+      ln -sf "${NIFI_HOME}" "${{targets.contextdir}}/${NIFI_BASE}/nifi-${{package.version}}"
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-toolkit"
+    description: "Toolkit for Apache NiFi"
+    dependencies:
+      runtime:
+        - apache-nifi
+    pipeline:
+      - runs: |
+          TARGET_DIR="nifi-toolkit/nifi-toolkit-assembly/target"
+
+          # Unzip toolkit
+          unzip "${TARGET_DIR}/nifi-toolkit-1.27.0-bin.zip" -d "${TARGET_DIR}"
+
+          # Install toolkit
+          mkdir -p "${{targets.contextdir}}/${NIFI_BASE}"
+          cp -ar "${TARGET_DIR}/nifi-toolkit-${{package.version}}" "${{targets.contextdir}}/${TOOLKIT_HOME}"
+
+          # Remove batch scripts
+          rm "${{targets.contextdir}}/${TOOLKIT_HOME}"/bin/*.bat
+
+          # Symlink current release to versioned path
+          ln -sf "${TOOLKIT_HOME}" "${{targets.contextdir}}/${NIFI_BASE}/nifi-toolkit-${{package.version}}"
+      - uses: strip
+    test:
+      pipeline:
+        - runs: |
+            echo "help" | /usr/share/nifi/nifi-toolkit-current/bin/cli.sh
+
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream image"
+    dependencies:
+      runtime:
+        - apache-nifi
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/opt"
+          ln -sf "${NIFI_BASE}" "${{targets.contextdir}}/opt/nifi"
+    test:
+      pipeline:
+        - runs: |
+            test -d /opt/nifi/nifi-current
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - -RC
+    - -M
+  github:
+    identifier: apache/nifi
+    use-tag: true
+    strip-prefix: rel/nifi-
+    tag-filter: rel/nifi-
+
+test:
+  pipeline:
+    - runs: |
+        export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+        /usr/share/nifi/nifi-current/bin/nifi.sh start

@@ -1,6 +1,6 @@
 package:
   name: php-8.2
-  version: 8.2.17
+  version: 8.2.22
   epoch: 0
   description: "the PHP programming language"
   copyright:
@@ -15,12 +15,15 @@ package:
 environment:
   contents:
     packages:
+      - aom-dev
+      - autoconf
       - bison
       - build-base
       - busybox
       - bzip2-dev
       - ca-certificates-bundle
       - curl-dev
+      - dav1d-dev
       - file
       - freetds
       - freetds-dev
@@ -30,6 +33,7 @@ environment:
       - libavif-dev
       - libjpeg-turbo-dev
       - libpng-dev
+      - libpsl-dev
       - libsodium-dev
       - libtool
       - libwebp-dev
@@ -38,30 +42,28 @@ environment:
       - libxpm-dev
       - libxslt-dev
       - libzip
+      - nghttp2-dev
       - oniguruma-dev
       - openldap-dev
       - openssl-dev
       - patch
-      - postgresql-15-dev
+      - postgresql-dev
+      - re2c
       - readline-dev
       - sqlite-dev
       - unixodbc-dev
+      - wget
 
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      uri: https://www.php.net/distributions/php-${{package.version}}.tar.gz
-      expected-sha256: 1d8ab98e1c09518c672c5afcbef0e61f9003173c7638fc686461ae670d12742e
-      extract: false
-
-  - name: Prepare Build Folder
-    runs: |
-      mv php-${{package.version}}.tar.gz $HOME
-      tar zxf $HOME/php-${{package.version}}.tar.gz
+      repository: https://github.com/php/php-src
+      tag: php-${{package.version}}
+      expected-commit: fed03397c78f8de5a161040ea36a5b71a7c0ae41
 
   - name: Configure
     runs: |
-      cd $HOME/php-${{package.version}}
+      ./buildconf --force
       EXTENSION_DIR=/usr/lib/php/modules ./configure \
         --prefix=/usr \
         --libdir=/usr/lib/php \
@@ -128,12 +130,9 @@ pipeline:
         --with-zip=shared
 
   - uses: autoconf/make
-    with:
-      dir: $HOME/php-${{package.version}}
 
   - name: Make Install
     runs: |
-      cd $HOME/php-${{package.version}}
       INSTALL_ROOT=${{targets.destdir}} DESTDIR=${{targets.destdir}} make install
       mkdir -p "${{targets.destdir}}/bin" && ln -s /usr/bin/php "${{targets.destdir}}/bin/php"
 
@@ -191,7 +190,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
-          mv $HOME/php-${{package.version}}/php.ini-production ${{targets.subpkgdir}}/etc/php/php.ini
+          mv $HOME/php.ini-production ${{targets.subpkgdir}}/etc/php/php.ini
 
   - range: extensions
     name: "${{package.name}}-${{range.key}}"
@@ -218,9 +217,18 @@ subpackages:
       - runs: |
           export CONF_DIR="${{targets.subpkgdir}}/etc/php/conf.d"
           mkdir -p $CONF_DIR
+          order=10
           prefix=
           [ "${{range.key}}" != "opcache" ] || prefix="zend_"
-          echo "${prefix}extension=${{range.key}}.so" > $CONF_DIR/"${{range.key}}.ini"
+          # Determine load order based on number of dependencies found in config.w32
+          [ -f "ext/${{range.key}}/config.w32" ] && \
+            deps=`sed -En "s/.*ADD_EXTENSION_DEP\('${{range.key}}', ([^)]+)\).*/\1/p" "ext/${{range.key}}/config.w32" \
+                | tr -d "'," | tr ' ' '\n' \
+                | sort -u \
+                | while read -r dep; do
+                  [ "$dep" = "true" ] || echo $dep
+                done | wc -w`
+          echo "${prefix}extension=${{range.key}}.so" > $CONF_DIR/"$((order+order*deps))-${{range.key}}.ini"
 
   - name: ${{package.name}}-dev
     description: PHP 8.2 development headers
@@ -309,13 +317,56 @@ update:
     use-tag: true
 
 test:
+  environment:
+    contents:
+      packages:
+        - postgresql
+        - postgresql-client
+        - wolfi-base
+        - shadow
+        - sudo-rs
+        - glibc-locales
+        - php-8.2-pgsql
+    environment:
+      PGDATA: /tmp/test_db
+      PGUSER: wolfi
   pipeline:
+    - name: "Test database creation"
+      runs: |
+        useradd $PGUSER
+        sudo -u $PGUSER initdb -D /tmp/test_db
+        sudo -u $PGUSER pg_ctl -D /tmp/test_db -l /tmp/logfile start
+        sudo -u $PGUSER createdb testdb
+        psql -lqt | cut -d \| -f 1 | grep -qw testdb
+    - name: "Test basic read/write operations"
+      runs: |
+        sudo -u $PGUSER psql -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, test_value VARCHAR(50));"
+        sudo -u $PGUSER psql -d testdb -c "INSERT INTO test_table (test_value) VALUES ('Hello, Wolfi!');"
+        sudo -u $PGUSER psql -d testdb -t -A -c "SELECT test_value FROM test_table WHERE id=1;"
+    - name: "Test php"
     - runs: |
         php --version
+        php -m
     - runs: |
-        cat <<'EOF' >> /tmp/hello.php
+        cat <<'EOF' >> /tmp/read_db.php
         <?php
-        echo 'Hello, Wolfi!';
+        $conn = pg_connect("host=localhost dbname=testdb user=wolfi");
+        if (!$conn) {
+            echo "Connection error.\n";
+            exit;
+        }
+        $result = pg_query($conn, "SELECT test_value FROM test_table WHERE id=1");
+        if (!$result) {
+            echo "Error in the query.\n";
+            exit;
+        }
+        $row = pg_fetch_row($result);
+        if (!$row) {
+            echo "Empty.\n";
+            exit;
+        }
+        echo "Value from test_table: $row[0]\n";
+        pg_close($conn);
+        ?>
         EOF
-
-        php /tmp/hello.php
+        php /tmp/read_db.php

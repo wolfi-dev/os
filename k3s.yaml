@@ -1,7 +1,7 @@
 package:
   name: k3s
   version: 1.30.3.1
-  epoch: 2
+  epoch: 3
   description:
   copyright:
     - license: Apache-2.0
@@ -11,8 +11,11 @@ package:
       - conntrack-tools
       - containerd-shim-runc-v2
       - ip6tables # this pulls in iptables as well
+      - kmod
       - libseccomp
+      - mount
       - runc
+      - umount
       # Do not include runtime dependencies already included in the multicall k3s
       # - ctr
       # - crictl
@@ -29,8 +32,11 @@ environment:
       - curl
       - go
       - libseccomp-dev
+      - libseccomp-static
       - sqlite-dev
       - yq
+      - zlib-dev
+      - zlib-static
       - zstd
 
 var-transforms:
@@ -87,7 +93,7 @@ pipeline:
       go mod tidy
   - uses: go/bump
     with:
-      deps: github.com/docker/docker@v25.0.6+incompatible
+      deps: github.com/docker/docker@v25.0.6+incompatible github.com/go-jose/go-jose/v3@v3.0.3
       replaces: golang.org/x/net=golang.org/x/net@v0.25.0
   - runs: |
       # Override the go version check at runtime to always match the go version at build time
@@ -110,42 +116,97 @@ pipeline:
       rm -rf bin/runc
       rm -rf bin/containerd-shim-runc-v2
 
-      # Move the "inner" k3s binary out of the bundle dir to avoid packaging it
-      # twice. Give it a weird but semi-descriptive name to discourage users from
-      # calling it directly
-      mkdir -p "${{targets.destdir}}"/bin/
-      mv bin/k3s "${{targets.destdir}}"/bin/_k3s-inner
+      for cni in bandwidth bridge firewall flannel host-local loopback portmap; do
+        ln -s cni bin/$cni
+      done
 
-      # Modify the packaging script to exclusively use symlinks to our moved "inner" binary
-      sed -i 's|ln -s k3s${BINARY_POSTFIX} bin/$i${BINARY_POSTFIX}|ln -s /bin/_k3s-inner${BINARY_POSTFIX} bin/$i${BINARY_POSTFIX}|g' ./scripts/package-cli
-
-      # Remove the upload portion from the upstream package-cli script
-      sed -e '/scripts\/build-upload/d' -i scripts/package-cli
-
-      # Upstream handles a few links at install time, since we don't have an "install" phase, we do it here
-      rm -rf bin/ctr && ln -s /bin/_k3s-inner bin/ctr
-
-      ./scripts/package-cli
-
-      # Check that the multicall symlinks were created
-      [ "$(readlink ./bin/k3s-server)" = "/bin/_k3s-inner" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
-      [ "$(readlink ./bin/loopback)" = "cni" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
-
-      # Include any additional symlinks valid before k3s runs
-      ln -s /bin/_k3s-inner ${{targets.destdir}}/bin/kubectl
-      ln -s /bin/_k3s-inner ${{targets.destdir}}/bin/ctr
-      ln -s /bin/_k3s-inner ${{targets.destdir}}/bin/crictl
-
-      # Finally, install the "outer" k3s multicall binary. This should only
-      # contain the go runtime plus the self extracting multicall logic, and
-      # should be a relatively small binary (~<15Mb).
-      install -Dm755 dist/artifacts/k3s* "${{targets.destdir}}"/bin/k3s
-
-      # Assert a max multicall size since it's a good sign that packaging happened correctly.
-      [ $(stat -c%s "${{targets.destdir}}"/bin/k3s) -le $((15 * 1024 * 1024)) ] || { echo "Error: multicall k3s exceeds 15MB" >&2; exit 1; }
+      mkdir -p "${{targets.destdir}}/bin"
+      cp -r bin/* "${{targets.destdir}}/bin/"
   - uses: strip
 
 subpackages:
+  - name: k3s-multicall
+    description: "The k3s multicall binary with embedded components"
+    dependencies:
+      runtime:
+        - busybox
+        - conntrack-tools
+        - containerd-shim-runc-v2
+        - ip6tables
+        - libseccomp
+        - runc
+        - mount
+        - umount
+        - kmod
+    pipeline:
+      - runs: |
+          # Remove the upload portion from the upstream package-cli script
+          sed -e '/scripts\/build-upload/d' -i scripts/package-cli
+
+          ./scripts/package-cli
+
+          # Install the "outer" k3s multicall binary. This should only
+          # contain the go runtime plus the self extracting multicall logic, and
+          # should be a relatively small binary (~<15Mb).
+          install -Dm755 dist/artifacts/k3s* "${{targets.contextdir}}/bin/k3s"
+
+          # Create our own links to the multicall binary, which won't be present until k3s is unpacked
+          for bin in kubectl ctr crictl containerd; do
+            ln -s k3s "${{targets.contextdir}}/bin/$bin"
+          done
+      - uses: strip
+    test:
+      pipeline:
+        - runs: |
+            # Verify that the multicall symlinks were created
+            [ "$(readlink $(which kubectl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+            [ "$(readlink $(which ctr))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+            [ "$(readlink $(which crictl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+            [ "$(readlink $(which containerd))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+
+  - name: k3s-static
+    description: "k3s built with statically linked components"
+    dependencies:
+      runtime:
+        - busybox
+        - conntrack-tools
+        - ip6tables
+        - mount
+        - umount
+        - kmod
+    pipeline:
+      - uses: go/bump
+        with:
+          modroot: build/src/github.com/opencontainers/runc
+          deps: google.golang.org/protobuf@v1.33.0 golang.org/x/net@v0.23.0
+      - runs: |
+          # Clean up the build directory
+          rm -rf bin etc
+
+          STATIC_BUILD=true ./scripts/build
+
+          for cni in bandwidth bridge firewall flannel host-local loopback portmap; do ln -s cni bin/$cni; done
+
+          mkdir -p "${{targets.subpkgdir}}/bin"
+          cp -r bin/* "${{targets.subpkgdir}}/bin/"
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils
+      pipeline:
+        - runs: |
+            # Verify libseccomp is statically linked against k3s
+            objdump -x $(which k3s) | grep -v "DYNAMIC"
+            strings $(which k3s) | grep -q "libseccomp"
+
+            # Verify runc is statically linked
+            objdump -x $(which runc) | grep -v "DYNAMIC"
+
+            # Verify containerd is statically linked
+            objdump -x $(which containerd) | grep -v "DYNAMIC"
+
   - name: k3s-images
     description: "pre-packaged k3s core runtime images"
     pipeline:
@@ -205,10 +266,6 @@ update:
     strip-prefix: v
 
 test:
-  environment:
-    contents:
-      packages:
-        - busybox
   pipeline:
     - name: Basic version smoketest
       runs: |
@@ -216,6 +273,7 @@ test:
     - name: Ensure the various tools are appropriately symlinked
       runs: |
         # Ensure the various tools are appropriately symlinked
-        [ "$(readlink /bin/kubectl)" = "/bin/_k3s-inner" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
-        [ "$(readlink /bin/ctr)" = "/bin/_k3s-inner" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
-        [ "$(readlink /bin/crictl)" = "/bin/_k3s-inner" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+        [ "$(readlink $(which kubectl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+        [ "$(readlink $(which ctr))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+        [ "$(readlink $(which crictl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+        [ "$(readlink $(which containerd))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }

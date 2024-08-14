@@ -1,0 +1,204 @@
+package:
+  name: neuvector
+  version: 5.3.4
+  epoch: 2
+  description: "NeuVector Full Lifecycle Container Security Platform"
+  copyright:
+    - license: Apache-2.0
+  # CIS benchmarks hardcoded to /tmp
+  # In 5.4, these will be moved to a scripts folder in /usr/local/bin/...
+  checks:
+    disabled:
+      - tempdir
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - glibc-dev
+      - go
+      - jansson-dev
+      - jemalloc-dev
+      - libnetfilter_queue-dev
+      - libnfnetlink-dev
+      - libpcap-dev
+      - pcre-dev
+      - pcre2-dev
+      - pkgconf
+      - userspace-rcu-dev
+      - vectorscan-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 256aeb1f097abb66c058ea80ff82e76f496747bf
+      repository: https://github.com/neuvector/neuvector.git
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: github.com/opencontainers/runc@v1.1.12 github.com/opencontainers/image-spec@v1.1.0 github.com/docker/distribution@v2.8.2-beta.1+incompatible golang.org/x/sys@v0.19.0 golang.org/x/net@v0.23.0 golang.org/x/text@v0.14.0 gopkg.in/yaml.v3@v3.0.1 github.com/containerd/containerd@v1.6.26 google.golang.org/grpc@v1.56.3 github.com/golang/protobuf@v1.5.4 golang.org/x/crypto@v0.22.0 github.com/docker/docker@v26.1.5
+      replaces: github.com/samalba/dockerclient=github.com/Dentrax/dockerclient@v0.1.0 github.com/vishvananda/netlink=github.com/vishvananda/netlink@v1.1.0 github.com/dgrijalva/jwt-go=github.com/golang-jwt/jwt/v4@v4.4.2 github.com/docker/docker=github.com/docker/docker@v26.1.4+incompatible
+      show-diff: true
+
+subpackages:
+  - name: neuvector-monitor
+    description: "NeuVector Monitor"
+    pipeline:
+      - runs: |
+          # Build and install monitor
+          make -C monitor
+          install -Dm755 monitor/monitor ${{targets.contextdir}}/usr/local/bin/monitor
+
+          # Install sysctl config
+          mkdir -p ${{targets.contextdir}}/etc
+          install -Dm755 scripts/sysctl.conf ${{targets.contextdir}}/etc/
+
+          # Install scripts used by monitor
+          install -Dm755 scripts/configure.sh ${{targets.contextdir}}/usr/local/bin/
+          install -Dm755 scripts/teardown.sh ${{targets.contextdir}}/usr/local/bin/
+          install -Dm755 scripts/runtime-gdb.py ${{targets.contextdir}}/usr/local/bin/
+
+  - name: neuvector-nstools
+    description: "NeuVector NSTools"
+    pipeline:
+      - runs: |
+          # Build and install nstools
+          make -C tools/nstools
+          install -Dm755 tools/nstools/nstools ${{targets.contextdir}}/usr/local/bin/nstools
+
+  - name: neuvector-cis-benchmarks
+    description: "CIS benchmarks for NeuVector"
+    pipeline:
+      - runs: |
+          # Copy CIS benchmarks to /tmp - yes, /tmp
+          mkdir -p ${{targets.contextdir}}/tmp
+          cp -r agent/nvbench/kubernetes-cis-benchmark/utils/ ${{targets.contextdir}}/tmp/
+          cp -r agent/nvbench/kubernetes-cis-benchmark/cis-1.6.0/ ${{targets.contextdir}}/tmp/
+          cp -r agent/nvbench/kubernetes-cis-benchmark/cis-1.23/ ${{targets.contextdir}}/tmp/
+          cp -r agent/nvbench/kubernetes-cis-benchmark/cis-1.24/ ${{targets.contextdir}}/tmp/
+          cp -r agent/nvbench/kubernetes-cis-benchmark/cis-1.8.0/ ${{targets.contextdir}}/tmp/
+          cp -r agent/nvbench/ocp/rh-1.4.0/ ${{targets.contextdir}}/tmp/
+
+  - name: neuvector-enforcer
+    description: "NeuVector Enforcer"
+    dependencies:
+      runtime:
+        - busybox
+        - ca-certificates
+        - consul
+        - curl
+        - ethtool
+        - iproute2
+        - iptables
+        - jq
+        - neuvector-cis-benchmarks
+        - neuvector-monitor
+        - neuvector-nstools
+        - yq
+    pipeline:
+      - runs: |
+          sed -i 's|interim/master.xxxx|v${{package.version}}|g' agent/version.go
+      - uses: go/build
+        with:
+          modroot: agent
+          ldflags: "-X main.version=${{package.version}} -s -w"
+          packages: .
+          output: agent
+          prefix: usr/local
+      - uses: go/build
+        with:
+          modroot: agent/workerlet/pathWalker
+          ldflags: "-X main.version=${{package.version}} -s -w"
+          packages: .
+          output: pathWalker
+          prefix: usr/local
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+
+          # Install scripts and templates used by agent
+          chmod +x agent/nvbench/*.sh
+          install -Dm755 agent/nvbench/*.sh ${{targets.contextdir}}/usr/local/bin/
+          install -Dm755 agent/nvbench/*.rem ${{targets.contextdir}}/usr/local/bin/
+          install -Dm755 agent/nvbench/*.tmpl ${{targets.contextdir}}/usr/local/bin/
+
+          # Build and install dp
+          export CFLAGS="$CFLAGS -DRCU_MEMBARRIER=true -I${PWD}/dp"
+          export LDFLAGS="$LDFLAGS -lurcu-memb -no-pie"
+          if [[ "${{build.arch}}" == "aarch64" ]]; then
+            make -C dp -f Makefile_arm64 CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
+          else
+            make -C dp CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
+          fi
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+          install -Dm755 dp/dp ${{targets.contextdir}}/usr/local/bin/dp
+
+          # NV checks for this empty file to validate enforcer is running in container
+          touch ${{targets.contextdir}}/usr/local/bin/.nvcontainer
+
+          # Binaries expected by agent in /usr/local/bin
+          ln -sf /bin/consul ${{targets.contextdir}}/usr/local/bin/consul
+          ln -sf /usr/bin/iptables-xml ${{targets.contextdir}}/usr/local/bin/iptables-xml
+          ln -sf /usr/bin/tcpdump ${{targets.contextdir}}/usr/local/bin/tcpdump
+          ln -sf /usr/bin/yq ${{targets.contextdir}}/usr/local/bin/yq
+    test:
+      pipeline:
+        - runs: |
+            agent -v | grep "${{package.version}}"
+
+  - name: neuvector-controller
+    description: "NeuVector Controller"
+    dependencies:
+      runtime:
+        - busybox
+        - ca-certificates
+        - consul
+        - ethtool
+        - iproute2
+        - neuvector-cis-benchmarks
+        - neuvector-monitor
+        - neuvector-nstools
+        - opa
+        - pcre
+        - procps
+    pipeline:
+      - runs: |
+          sed -i 's|interim/master.xxxx|v${{package.version}}|g' controller/version.go
+      - uses: go/build
+        with:
+          modroot: controller
+          ldflags: "-X main.Version=${{package.version}} -X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn"
+          packages: .
+          output: controller
+          prefix: usr/local
+      - runs: |
+          # Create Folders
+          mkdir -p ${{targets.contextdir}}/etc/neuvector/templates
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+
+          # Install pod template
+          cp templates/podTemplate.json ${{targets.contextdir}}/etc/neuvector/templates/podTemplate.json
+
+          # NV checks for this empty file to validate controller is running in container
+          touch ${{targets.contextdir}}/usr/local/bin/.nvcontainer
+
+          # Binaries expected by agent in /usr/local/bin
+          ln -sf /usr/bin/opa ${{targets.contextdir}}/usr/local/bin/opa
+          ln -sf /bin/consul ${{targets.contextdir}}/usr/local/bin/consul
+    test:
+      pipeline:
+        - runs: |
+            controller --help 2>&1 |pcregrep -M 'START.*\nUsage'
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - '.*\-.*'
+    - '.*fnb.*'
+    - '.*oc.*'
+  github:
+    identifier: neuvector/neuvector
+    tag-filter: v
+    strip-prefix: v

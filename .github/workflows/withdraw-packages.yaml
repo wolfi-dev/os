@@ -20,11 +20,11 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@63c24ba6bd7ba022e95695ff85de572c04a18142 # v2.7.0
+        uses: step-security/harden-runner@5c7944e73c4c2a096b17a9cb74d65b6c2bbafbde # v2.9.1
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
         with:
           fetch-depth: 0 # We want the full history for uploading withdrawn-packages.txt to GCS. If this takes too long, we look at merging both files.
 
@@ -33,15 +33,17 @@ jobs:
         uses: wolfi-dev/actions/install-wolfictl@main # main
 
       # This is managed here: https://github.com/chainguard-dev/secrets/blob/main/wolfi-dev.tf
-      - uses: google-github-actions/auth@a6e2e39c0a0331da29f7fd2c2a20a427e8d3ad1f # v2.1.1
+      - uses: google-github-actions/auth@f112390a2df9932162083945e46d439060d66ec2 # v2.1.4
         id: auth
         with:
           workload_identity_provider: "projects/12758742386/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
           service_account: "wolfi-dev@chainguard-github-secrets.iam.gserviceaccount.com"
-      - uses: google-github-actions/setup-gcloud@5a5f7b85fca43e76e53463acaa9d408a03c98d3a # v2.0.1
+
+      - uses: google-github-actions/setup-gcloud@f0990588f1e5b5af6827153b93673613abdc6ec7 # v2.1.1
         with:
           project_id: "chainguard-github-secrets"
-      - uses: 'google-github-actions/get-secretmanager-secrets@ae0d4054c32840e2ced71207a9df55161ae3debc' # v2.0.0
+
+      - uses: 'google-github-actions/get-secretmanager-secrets@95a0b09b8348ef3d02c68c6ba5662a037e78d713' # v2.1.4
         id: secrets
         with:
           secrets: |-
@@ -61,11 +63,12 @@ jobs:
           done
 
       # We use a different GSA for our interaction with GCS.
-      - uses: google-github-actions/auth@f6de81663f7788d05bd15bcce18f0e57f23f0846 # v2.0.1
+      - uses: google-github-actions/auth@f112390a2df9932162083945e46d439060d66ec2 # v2.1.4
         with:
           workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
           service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
-      - uses: google-github-actions/setup-gcloud@5a5f7b85fca43e76e53463acaa9d408a03c98d3a # v2.0.1
+
+      - uses: google-github-actions/setup-gcloud@f0990588f1e5b5af6827153b93673613abdc6ec7 # v2.1.1
         with:
           project_id: "prod-images-c6e5"
 
@@ -94,7 +97,41 @@ jobs:
             all-withdrawn-packages.txt \
             gs://wolfi-production-registry-destination/os/withdrawn-packages.txt
 
-      - uses: rtCamp/action-slack-notify@f05987dc91a66984f1666f486497def2cf85183d # v2.2.1
+      - name: Delete sbom packages from the lifecycle automation
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            for pkg in $(grep -v '\#' withdrawn-packages.txt); do
+              echo "=> $pkg"
+              gsutil -m rm -f gs://insights-apk-sbom-prod/wolfi-production-registry-destination/os/$arch/$pkg.sbom.json || true
+            done
+          done
+
+      # use public chainguard provider.
+      - uses: chainguard-dev/setup-chainctl@f52718d822dc73d21a04ef2082822c4a203163b3 # v0.2.2
+        with:
+          # Managed here:
+          # https://github.com/chainguard-dev/mono/blob/main/env/chainguard-images/iac/wolfi-os-pusher.tf
+          identity: "720909c9f5279097d847ad02a2f24ba8f59de36a/6a26f2970f880c31"
+
+      - name: 'Withdraw packages from apk.cgr.dev'
+        run: |
+          set -e
+          # Populate the token here, since chainctl auth token
+          # doesn't support all of the options we need.
+          chainctl auth login --audience apk.cgr.dev \
+            --identity "720909c9f5279097d847ad02a2f24ba8f59de36a/6a26f2970f880c31"
+          echo "::add-mask::$(chainctl auth token --audience apk.cgr.dev)"
+
+          for arch in "aarch64" "x86_64"; do
+            while IFS= read -r pkg; do
+              curl -X DELETE \
+                  --user "user:$(chainctl auth token --audience apk.cgr.dev)" \
+                  "https://apk.cgr.dev/chainguard/${arch}/${pkg}" || true
+            done < <(grep -v -e '^$' -v '\#' withdrawn-packages.txt | cut -d':' -f2) # Ignore empty lines and comments
+          done
+
+      - uses: rtCamp/action-slack-notify@4e5fb42d249be6a45a298f3c9543b111b02f7907 # v2.2.1
         if: failure()
         env:
           SLACK_ICON: http://github.com/chainguard-dev.png?size=48

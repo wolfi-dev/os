@@ -1,0 +1,92 @@
+name: Backfill packages to apk.cgr.dev
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backfill:
+    name: Backfill packages
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - uses: google-github-actions/auth@f112390a2df9932162083945e46d439060d66ec2 # v2.1.4
+        with:
+          workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
+          service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
+
+      - uses: google-github-actions/setup-gcloud@f0990588f1e5b5af6827153b93673613abdc6ec7 # v2.1.1
+        with:
+          project_id: "prod-images-c6e5"
+
+      - uses: chainguard-dev/setup-chainctl@f52718d822dc73d21a04ef2082822c4a203163b3 # v0.2.2
+        with:
+            # Managed here:
+            # https://github.com/chainguard-dev/mono/blob/main/env/chainguard-images/iac/wolfi-os-pusher.tf
+            identity: "720909c9f5279097d847ad02a2f24ba8f59de36a/6a26f2970f880c31"
+
+      - name: 'Backfill packages to apk.cgr.dev'
+        run: |
+          set -e
+          # Populate the token here, since chainctl auth token
+          # doesn't support all of the options we need.
+          chainctl auth login --audience apk.cgr.dev \
+            --identity "720909c9f5279097d847ad02a2f24ba8f59de36a/6a26f2970f880c31"
+          echo "::add-mask::$(chainctl auth token --audience apk.cgr.dev)"
+
+          for arch in "aarch64" "x86_64"; do
+            echo "Processing ${arch}"
+            while IFS= read -r pkg; do
+              # Ignore empty lines and comments
+              if [[ -z "${pkg}" ]]; then
+                continue
+              fi
+              if [[ "${pkg}" == \#* ]]; then
+                continue
+              fi
+
+              tok=$(chainctl auth token --audience apk.cgr.dev)
+              tmp=$(mktemp -d)
+
+              # Check if package already exists in apk.cgr.dev
+              code=$(curl -s -o /dev/null --head -w "%{http_code}" --user "user:${tok}" "https://apk.cgr.dev/chainguard/${arch}/${pkg}")
+              if [ $code == "303" ]; then
+                echo "Package already exists: ${pkg}"
+                continue
+              elif [ $code != "404" ]; then
+                echo "Unexpected response code: $code"
+                exit 1
+              fi
+
+              # Get package from GCS, continue if it doesn't exist (e.g., not in the repo)
+              echo "Downloading ${pkg} from GCS"
+              gsutil cp gs://wolfi-production-registry-destination/os/${arch}/${pkg} ${tmp}/ > /dev/null 2>&1 || continue
+              echo "Downloaded ${pkg} from GCS"
+
+              echo "Uploading ${pkg} to apk.cgr.dev"
+              curl --fail -X POST \
+                --user "user:${tok}" \
+                --data-binary "@${tmp}/${pkg}" \
+                "https://apk.cgr.dev/chainguard/${arch}/${pkg}"
+              echo "Uploaded ${pkg} to apk.cgr.dev"
+              rm ${tmp}/${pkg}
+            done < backfill-packages.txt
+          done
+
+      - uses: rtCamp/action-slack-notify@4e5fb42d249be6a45a298f3c9543b111b02f7907 # v2.3.0
+        if: failure()
+        env:
+          SLACK_ICON: http://github.com/chainguard-dev.png?size=48
+          SLACK_USERNAME: guardian
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: chainguard-images-alerts
+          SLACK_COLOR: '#8E1600'
+          MSG_MINIMAL: 'true'
+          SLACK_TITLE: '[backfill-packages-wolfi] failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          SLACK_MESSAGE: |
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

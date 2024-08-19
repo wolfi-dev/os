@@ -1,46 +1,156 @@
 package:
   name: chartmuseum
-  version: 0.16.1
-  epoch: 3
+  version: 0.16.2
+  epoch: 5
   description: helm chart repository server
   copyright:
     - license: Apache-2.0
-  dependencies:
-    runtime:
-      - ca-certificates-bundle
 
 environment:
-  contents:
-    packages:
-      - bash
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go
+  environment:
+    # Lots of deps have cgo accelerations, which chartmuseum builds typically opt out of.
+    # https://github.com/helm/chartmuseum/blob/8795e9930ad1f88f8c20426368327b0e500adcda/Makefile#L48
+    CGO_ENABLED: 0
 
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: f00683f2e100dceec0af7f1629e98713a9c0a1e4
+      expected-commit: 8795e9930ad1f88f8c20426368327b0e500adcda
       repository: https://github.com/helm/chartmuseum
       tag: v${{package.version}}
 
   - uses: go/bump
     with:
-      deps: golang.org/x/net@v0.17.0 google.golang.org/grpc@v1.58.3 golang.org/x/crypto@v0.17.0 github.com/containerd/containerd@v1.7.11 github.com/docker/docker@v24.0.7 helm.sh/helm/v3@v3.14.2
-      replaces: oras.land/oras-go=oras.land/oras-go@v1.2.4
-      go-version: 1.21
+      deps: oras.land/oras-go@v1.2.6 github.com/docker/docker@v27.1.1
+      modroot: .
 
-  - runs: |
-      CGO_ENABLED=0 go build --ldflags="-s -w -X main.Version=${{package.version}} \
-        -X main.Revision=$(git rev-parse --short HEAD)" \
-        -o "${{targets.destdir}}/usr/bin/chartmuseum" \
-        cmd/chartmuseum/main.go
-
-  - uses: strip
+  - uses: go/build
+    with:
+      modroot: .
+      ldflags: -X main.Version=${{package.version}} -X main.Revision=$(git rev-parse --short HEAD)
+      packages: cmd/chartmuseum/main.go
+      output: chartmuseum
 
 update:
   enabled: true
   github:
     identifier: helm/chartmuseum
     strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - helm
+        - jq
+  pipeline:
+    - runs: |
+        #!/bin/bash
+
+        # Define variables
+        CHARTMUSEUM_BINARY="chartmuseum"
+        CHARTMUSEUM_URL="http://localhost:8080"
+        CHARTMUSEUM_STORAGE="local"
+        CHARTMUSEUM_STORAGE_ROOTDIR="./chartstorage"
+        CHART_NAME="nginx"
+        CHART_VERSION="0.1.0"
+        CHART_DIR="./$CHART_NAME"
+        CHART_PACKAGE="$CHART_NAME-$CHART_VERSION.tgz"
+        CHARTMUSEUM_PID_FILE="./chartmuseum.pid"
+
+        # Function to start ChartMuseum
+        function start_chartmuseum {
+            if [ -f "$CHARTMUSEUM_PID_FILE" ]; then
+                echo "ChartMuseum is already running."
+                return
+            fi
+
+            nohup "$CHARTMUSEUM_BINARY" --port=8080 --storage="$CHARTMUSEUM_STORAGE" --storage-local-rootdir="$CHARTMUSEUM_STORAGE_ROOTDIR" &> chartmuseum.log &
+            echo $! > "$CHARTMUSEUM_PID_FILE"
+            echo "ChartMuseum started."
+        }
+
+        # Function to stop ChartMuseum
+        function stop_chartmuseum {
+            if [ -f "$CHARTMUSEUM_PID_FILE" ]; then
+                PID=$(cat "$CHARTMUSEUM_PID_FILE")
+                if kill -0 $PID > /dev/null 2>&1; then
+                    kill $PID
+                    rm "$CHARTMUSEUM_PID_FILE"
+                    echo "ChartMuseum stopped."
+                else
+                    echo "ChartMuseum process not found. Cleaning up PID file."
+                    rm "$CHARTMUSEUM_PID_FILE"
+                fi
+            else
+                echo "ChartMuseum is not running."
+            fi
+        }
+
+        # Function to check if ChartMuseum is running
+        function check_chartmuseum {
+            curl -s "$CHARTMUSEUM_URL/health"
+            if [ $? -ne 0 ]; then
+                echo "ChartMuseum is not running. Please start ChartMuseum and try again."
+                exit 1
+            fi
+        }
+
+        # Create and package the Nginx Helm chart
+        function create_and_package_chart {
+            helm create "$CHART_NAME"
+            if [ $? -ne 0 ]; then
+                echo "Failed to create the Helm chart."
+                exit 1
+            fi
+            helm package "$CHART_DIR" --destination ./
+            if [ $? -ne 0 ]; then
+                echo "Failed to package the Helm chart."
+                exit 1
+            fi
+            echo "Helm chart created and packaged successfully: $CHART_PACKAGE"
+        }
+
+        # Upload the Helm chart to ChartMuseum
+        function upload_chart {
+            curl --data-binary "@$CHART_PACKAGE" "$CHARTMUSEUM_URL/api/charts"
+            if [ $? -ne 0 ]; then
+                echo "Failed to upload the Helm chart to ChartMuseum."
+                exit 1
+            fi
+            echo "Helm chart uploaded successfully to ChartMuseum."
+        }
+
+        # List charts in ChartMuseum
+        function list_charts {
+            curl -s "$CHARTMUSEUM_URL/api/charts" | jq
+            if [ $? -ne 0 ]; then
+                echo "Failed to list charts from ChartMuseum."
+                exit 1
+            fi
+        }
+
+        # Download the chart from ChartMuseum
+        function download_chart {
+            helm repo add chartmuseum "$CHARTMUSEUM_URL"
+            helm repo update
+            helm fetch chartmuseum/$CHART_NAME --version $CHART_VERSION
+            if [ $? -ne 0 ]; then
+                echo "Failed to download the Helm chart from ChartMuseum."
+                exit 1
+            fi
+            echo "Helm chart downloaded successfully from ChartMuseum."
+        }
+
+        # Main script execution
+        start_chartmuseum
+        sleep 10  # Give ChartMuseum some time to start
+        check_chartmuseum
+        create_and_package_chart
+        upload_chart
+        list_charts
+        download_chart
+        stop_chartmuseum
+
+        echo "ChartMuseum testing completed successfully."

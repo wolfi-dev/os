@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# This script came from https://github.com/MariaDB/mariadb-docker/blob/f07f84ce55de7d7f1d85ccf2c642c4247b425ea4/docker-entrypoint.sh
+# This script came from https://github.com/MariaDB/mariadb-docker/blob/master/11.5/docker-entrypoint.sh 
 # The only change is to tweak the logging function and remove the --rfc flag since it's not supported in our date impl
 set -eo pipefail
 shopt -s nullglob
@@ -98,7 +98,7 @@ docker_process_init_files() {
 	done
 }
 
-# arguments necessary to run "mysqld --verbose --help" successfully (used for testing configuration validity and for extracting default/configured values)
+# arguments necessary to run "mariadbd --verbose --help" successfully (used for testing configuration validity and for extracting default/configured values)
 _verboseHelpArgs=(
 	--verbose --help
 )
@@ -106,12 +106,12 @@ _verboseHelpArgs=(
 mysql_check_config() {
 	local toRun=( "$@" "${_verboseHelpArgs[@]}" ) errors
 	if ! errors="$("${toRun[@]}" 2>&1 >/dev/null)"; then
-		mysql_error $'mysqld failed while attempting to check config\n\tcommand was: '"${toRun[*]}"$'\n\t'"$errors"
+		mysql_error $'mariadbd failed while attempting to check config\n\tcommand was: '"${toRun[*]}"$'\n\t'"$errors"
 	fi
 }
 
 # Fetch value from server config
-# We use mysqld --verbose --help instead of my_print_defaults because the
+# We use mariadbd --verbose --help instead of my_print_defaults because the
 # latter only show values present in config files, and not server defaults
 mysql_get_config() {
 	local conf="$1"; shift
@@ -124,7 +124,9 @@ mysql_get_config() {
 docker_temp_server_start() {
 	"$@" --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}" --wsrep_on=OFF \
 		--expire-logs-days=0 \
-		--loose-innodb_buffer_pool_load_at_startup=0 &
+		--loose-innodb_buffer_pool_load_at_startup=0 \
+		--skip-ssl --ssl-cert='' --ssl-key='' --ssl-ca='' \
+		&
 	declare -g MARIADB_PID
 	MARIADB_PID=$!
 	mysql_note "Waiting for server startup"
@@ -136,7 +138,9 @@ docker_temp_server_start() {
 	fi
 	local i
 	for i in {30..0}; do
-		if docker_process_sql "${extraArgs[@]}" --database=mysql <<<'SELECT 1' &> /dev/null; then
+		if docker_process_sql "${extraArgs[@]}" --database=mysql \
+			--skip-ssl --skip-ssl-verify-server-cert \
+			<<<'SELECT 1' &> /dev/null; then
 			break
 		fi
 		sleep 1
@@ -146,7 +150,7 @@ docker_temp_server_start() {
 	fi
 }
 
-# Stop the server. When using a local socket file mysqladmin will block until
+# Stop the server. When using a local socket file mariadb-admin will block until
 # the shutdown is complete.
 docker_temp_server_stop() {
 	kill "$MARIADB_PID"
@@ -155,6 +159,14 @@ docker_temp_server_stop() {
 
 # Verify that the minimally required password settings are set for new databases.
 docker_verify_minimum_env() {
+	# Restoring from backup requires no environment variables
+	declare -g DATABASE_INIT_FROM_BACKUP
+	for file in /docker-entrypoint-initdb.d/*.tar{.gz,.xz,.zst}; do
+		if [ -f "${file}" ]; then
+			DATABASE_INIT_FROM_BACKUP='true'
+			return
+		fi
+	done
 	if [ -z "$MARIADB_ROOT_PASSWORD" ] && [ -z "$MARIADB_ROOT_PASSWORD_HASH" ] && [ -z "$MARIADB_ALLOW_EMPTY_ROOT_PASSWORD" ] && [ -z "$MARIADB_RANDOM_ROOT_PASSWORD" ]; then
 		mysql_error $'Database is uninitialized and password option is not specified\n\tYou need to specify one of MARIADB_ROOT_PASSWORD, MARIADB_ROOT_PASSWORD_HASH, MARIADB_ALLOW_EMPTY_ROOT_PASSWORD and MARIADB_RANDOM_ROOT_PASSWORD'
 	fi
@@ -164,6 +176,25 @@ docker_verify_minimum_env() {
 	fi
 	if [ -n "$MARIADB_PASSWORD" ] && [ -n "$MARIADB_PASSWORD_HASH" ]; then
 		mysql_error "Cannot specify MARIADB_PASSWORD_HASH and MARIADB_PASSWORD option."
+	fi
+	if [ -n "$MARIADB_REPLICATION_USER" ]; then
+		if [ -z "$MARIADB_MASTER_HOST" ]; then
+			# its a master, we're creating a user
+			if [ -z "$MARIADB_REPLICATION_PASSWORD" ] && [ -z "$MARIADB_REPLICATION_PASSWORD_HASH" ]; then
+				mysql_error "MARIADB_REPLICATION_PASSWORD or MARIADB_REPLICATION_PASSWORD_HASH not found to create replication user for master"
+			fi
+		else
+			# its a replica
+			if [ -z "$MARIADB_REPLICATION_PASSWORD" ] ; then
+				mysql_error "MARIADB_REPLICATION_PASSWORD is mandatory to specify the replication on the replica image."
+			fi
+			if [ -n "$MARIADB_REPLICATION_PASSWORD_HASH" ] ; then
+				mysql_warn "MARIADB_REPLICATION_PASSWORD_HASH cannot be specified on a replica"
+			fi
+		fi
+	fi
+	if [ -n "$MARIADB_MASTER_HOST" ] && { [ -z "$MARIADB_REPLICATION_USER" ] || [ -z "$MARIADB_REPLICATION_PASSWORD" ] ; }; then
+		mysql_error "For a replica, MARIADB_REPLICATION_USER and MARIADB_REPLICATION is mandatory."
 	fi
 }
 
@@ -178,24 +209,43 @@ docker_create_db_directories() {
 
 	if [ "$user" = "0" ]; then
 		# this will cause less disk access than `chown -R`
-		find "$DATADIR" \! -user mysql -exec chown mysql: '{}' +
+		find "$DATADIR" \! -user mysql \( -exec chown mysql: '{}' + -o -true \)
 		# See https://github.com/MariaDB/mariadb-docker/issues/363
-		find "${SOCKET%/*}" -maxdepth 0 \! -user mysql -exec chown mysql: '{}' \;
+		if [ "${SOCKET:0:1}" != '@' ]; then # not abstract sockets
+			find "${SOCKET%/*}" -maxdepth 0 \! -user mysql \( -exec chown mysql: '{}' \; -o -true \)
+		fi
+
+		# memory.pressure
+		local cgroup; cgroup=$(</proc/self/cgroup)
+		local mempressure="/sys/fs/cgroup/${cgroup:3}/memory.pressure"
+		if [ -w "$mempressure" ]; then
+			chown mysql: "$mempressure" || mysql_warn "unable to change ownership of $mempressure, functionality unavailable to MariaDB"
+		else
+			mysql_warn "$mempressure not writable, functionality unavailable to MariaDB"
+		fi
 	fi
 }
 
 _mariadb_version() {
-        local mariaVersion="${MARIADB_VERSION##*:}"
-        mariaVersion="${mariaVersion%%[-+~]*}"
-	echo -n "${mariaVersion}-MariaDB"
+	echo -n "11.5.2-MariaDB"
 }
 
 # initializes the database directory
 docker_init_database_dir() {
 	mysql_note "Initializing database files"
 	installArgs=( --datadir="$DATADIR" --rpm --auth-root-authentication-method=normal )
-	# "Other options are passed to mysqld." (so we pass all "mysqld" arguments directly here)
-	mysql_install_db "${installArgs[@]}" "${@:2}" \
+	# "Other options are passed to mariadbd." (so we pass all "mariadbd" arguments directly here)
+
+	local mariadbdArgs=()
+	for arg in "${@:2}"; do
+		# Check if the argument contains whitespace
+		if [[ "$arg" =~ [[:space:]] ]]; then
+			mysql_warn "Not passing argument \'$arg\' to mariadb-install-db because mariadb-install-db does not support arguments with whitespace."
+		else
+			mariadbdArgs+=("$arg")
+		fi
+	done
+	mariadb-install-db "${installArgs[@]}" "${mariadbdArgs[@]}" \
 		--skip-test-db \
 		--old-mode='UTF8_IS_UTF8MB3' \
 		--default-time-zone=SYSTEM --enforce-storage-engine= \
@@ -210,9 +260,10 @@ docker_init_database_dir() {
 # This should be called after mysql_check_config, but before any other functions
 docker_setup_env() {
 	# Get config
-	declare -g DATADIR SOCKET
+	declare -g DATADIR SOCKET PORT
 	DATADIR="$(mysql_get_config 'datadir' "$@")"
 	SOCKET="$(mysql_get_config 'socket' "$@")"
+	PORT="$(mysql_get_config 'port' "$@")"
 
 
 	# Initialize values that might be stored in a file
@@ -224,6 +275,13 @@ docker_setup_env() {
 	# No MYSQL_ compatibility needed for new variables
 	file_env 'MARIADB_PASSWORD_HASH'
 	file_env 'MARIADB_ROOT_PASSWORD_HASH'
+	# env variables related to replication
+	file_env 'MARIADB_REPLICATION_USER'
+	file_env 'MARIADB_REPLICATION_PASSWORD'
+	file_env 'MARIADB_REPLICATION_PASSWORD_HASH'
+	# env variables related to master
+	file_env 'MARIADB_MASTER_HOST'
+	file_env 'MARIADB_MASTER_PORT' 3306
 
 	# set MARIADB_ from MYSQL_ when it is unset and then make them the same value
 	: "${MARIADB_ALLOW_EMPTY_ROOT_PASSWORD:=${MYSQL_ALLOW_EMPTY_PASSWORD:-}}"
@@ -245,7 +303,7 @@ docker_exec_client() {
 	if [ -n "$MYSQL_DATABASE" ]; then
 		set -- --database="$MYSQL_DATABASE" "$@"
 	fi
-	mysql --protocol=socket -uroot -hlocalhost --socket="${SOCKET}" "$@"
+	mariadb --protocol=socket -uroot -hlocalhost --socket="${SOCKET}" "$@"
 }
 
 # Execute sql script, passed via stdin
@@ -270,6 +328,42 @@ docker_sql_escape_string_literal() {
 	echo "${escaped//\'/\\\'}"
 }
 
+# Creates replication user
+create_replica_user() {
+	if [ -n  "$MARIADB_REPLICATION_PASSWORD_HASH" ]; then
+		echo "CREATE USER '$MARIADB_REPLICATION_USER'@'%' IDENTIFIED BY PASSWORD '$MARIADB_REPLICATION_PASSWORD_HASH';"
+	else
+		# SQL escape the user password, \ followed by '
+		local userPasswordEscaped
+		userPasswordEscaped=$(docker_sql_escape_string_literal "${MARIADB_REPLICATION_PASSWORD}")
+		echo "CREATE USER '$MARIADB_REPLICATION_USER'@'%' IDENTIFIED BY '$userPasswordEscaped';"
+	fi
+	echo "GRANT REPLICATION REPLICA ON *.* TO '$MARIADB_REPLICATION_USER'@'%';"
+}
+
+# Create healthcheck users
+create_healthcheck_users() {
+	local healthCheckGrant=USAGE
+	local healthCheckConnectPass
+	local healthCheckConnectPassEscaped
+	healthCheckConnectPass="$(pwgen --numerals --capitalize --symbols --remove-chars="=#'\\" -1 32)"
+	healthCheckConnectPassEscaped=$(docker_sql_escape_string_literal "${healthCheckConnectPass}")
+	if [ -n "$MARIADB_HEALTHCHECK_GRANTS" ]; then
+		healthCheckGrant="$MARIADB_HEALTHCHECK_GRANTS"
+	fi
+	for host in 127.0.0.1 ::1 localhost; do
+		echo "CREATE USER IF NOT EXISTS healthcheck@'$host' IDENTIFIED BY '$healthCheckConnectPassEscaped';"
+		# doing this so if the users exists, we're just setting the password, and not replacing the existing grants
+		echo "SET PASSWORD FOR healthcheck@'$host' = PASSWORD('$healthCheckConnectPassEscaped');"
+		echo "GRANT $healthCheckGrant ON *.* TO healthcheck@'$host';"
+	done
+	local maskPreserve
+	maskPreserve=$(umask -p)
+	umask 0077
+	echo -e "[mariadb-client]\\nport=$PORT\\nsocket=$SOCKET\\nuser=healthcheck\\npassword=$healthCheckConnectPass\\n" > "$DATADIR"/.my-healthcheck.cnf
+	$maskPreserve
+}
+
 # Initializes database with timezone info and root password, plus optional extra db/user
 docker_setup_db() {
 	# Load timezone info into database
@@ -277,7 +371,7 @@ docker_setup_db() {
 		# --skip-write-binlog usefully disables binary logging
 		# but also outputs LOCK TABLES to improve the IO of
 		# Aria (MDEV-23326) for 10.4+.
-		mysql_tzinfo_to_sql --skip-write-binlog /usr/share/zoneinfo \
+		mariadb-tzinfo-to-sql --skip-write-binlog /usr/share/zoneinfo \
 			| docker_process_sql --dont-use-mysql-root-password --database=mysql
 		# tell docker_process_sql to not use MYSQL_ROOT_PASSWORD since it is not set yet
 	fi
@@ -293,7 +387,7 @@ docker_setup_db() {
 	local rootPasswordEscaped=
 	if [ -n "$MARIADB_ROOT_PASSWORD" ]; then
 		# Sets root password and creates root users for non-localhost hosts
-		rootPasswordEscaped=$( docker_sql_escape_string_literal "${MARIADB_ROOT_PASSWORD}" )
+		rootPasswordEscaped=$(docker_sql_escape_string_literal "${MARIADB_ROOT_PASSWORD}")
 	fi
 
 	# default root to listen for connections from anywhere
@@ -304,11 +398,13 @@ docker_setup_db() {
 			read -r -d '' rootCreate <<-EOSQL || true
 				CREATE USER 'root'@'${MARIADB_ROOT_HOST}' IDENTIFIED BY PASSWORD '${MARIADB_ROOT_PASSWORD_HASH}' ;
 				GRANT ALL ON *.* TO 'root'@'${MARIADB_ROOT_HOST}' WITH GRANT OPTION ;
+				GRANT PROXY ON ''@'%' TO 'root'@'${MARIADB_ROOT_HOST}' WITH GRANT OPTION;
 			EOSQL
 		else
 			read -r -d '' rootCreate <<-EOSQL || true
 				CREATE USER 'root'@'${MARIADB_ROOT_HOST}' IDENTIFIED BY '${rootPasswordEscaped}' ;
 				GRANT ALL ON *.* TO 'root'@'${MARIADB_ROOT_HOST}' WITH GRANT OPTION ;
+				GRANT PROXY ON ''@'%' TO 'root'@'${MARIADB_ROOT_HOST}' WITH GRANT OPTION;
 			EOSQL
 		fi
 	fi
@@ -317,16 +413,8 @@ docker_setup_db() {
 	local mysqlAtLocalhostGrants=
 	# Install mysql@localhost user
 	if [ -n "$MARIADB_MYSQL_LOCALHOST_USER" ]; then
-		local pw=
-		pw="$(pwgen --numerals --capitalize --symbols --remove-chars="'\\" -1 32)"
-		# MDEV-24111 before MariaDB-10.4 cannot create unix_socket user directly auth with simple_password_check
-		# It wasn't until 10.4 that the unix_socket auth was built in to the server.
 		read -r -d '' mysqlAtLocalhost <<-EOSQL || true
-		EXECUTE IMMEDIATE IF(VERSION() RLIKE '^10\.3\.',
-			"INSTALL PLUGIN /*M10401 IF NOT EXISTS */ unix_socket SONAME 'auth_socket'",
-			"SELECT 'already there'");
-		CREATE USER mysql@localhost IDENTIFIED BY '$pw';
-		ALTER USER mysql@localhost IDENTIFIED VIA unix_socket;
+		CREATE USER mysql@localhost IDENTIFIED VIA unix_socket;
 		EOSQL
 		if [ -n "$MARIADB_MYSQL_LOCALHOST_GRANTS" ]; then
 			if [ "$MARIADB_MYSQL_LOCALHOST_GRANTS" != USAGE ]; then
@@ -335,6 +423,9 @@ docker_setup_db() {
 			mysqlAtLocalhostGrants="GRANT ${MARIADB_MYSQL_LOCALHOST_GRANTS} ON *.* TO mysql@localhost;";
 		fi
 	fi
+
+	local createHealthCheckUsers
+	createHealthCheckUsers=$(create_healthcheck_users)
 
 	local rootLocalhostPass=
 	if [ -z "$MARIADB_ROOT_PASSWORD_HASH" ]; then
@@ -358,13 +449,33 @@ docker_setup_db() {
 		else
 			# SQL escape the user password, \ followed by '
 			local userPasswordEscaped
-			userPasswordEscaped=$( docker_sql_escape_string_literal "${MARIADB_PASSWORD}" )
+			userPasswordEscaped=$(docker_sql_escape_string_literal "${MARIADB_PASSWORD}")
 			createUser="CREATE USER '$MARIADB_USER'@'%' IDENTIFIED BY '$userPasswordEscaped';"
 		fi
 
 		if [ -n "$MARIADB_DATABASE" ]; then
 			mysql_note "Giving user ${MARIADB_USER} access to schema ${MARIADB_DATABASE}"
 			userGrants="GRANT ALL ON \`${MARIADB_DATABASE//_/\\_}\`.* TO '$MARIADB_USER'@'%';"
+		fi
+	fi
+
+	# To create replica user
+	local createReplicaUser=
+	local changeMasterTo=
+	local startReplica=
+	if  [ -n "$MARIADB_REPLICATION_USER" ] ; then
+		if [ -z "$MARIADB_MASTER_HOST" ]; then
+			# on master
+			mysql_note "Creating user ${MARIADB_REPLICATION_USER}"
+			createReplicaUser=$(create_replica_user)
+		else
+			# on replica
+			local rplPasswordEscaped
+			rplPasswordEscaped=$(docker_sql_escape_string_literal "${MARIADB_REPLICATION_PASSWORD}")
+			# SC cannot follow how MARIADB_MASTER_PORT is assigned a default value.
+			# shellcheck disable=SC2153
+			changeMasterTo="CHANGE MASTER TO MASTER_HOST='$MARIADB_MASTER_HOST', MASTER_USER='$MARIADB_REPLICATION_USER', MASTER_PASSWORD='$rplPasswordEscaped', MASTER_PORT=$MARIADB_MASTER_PORT, MASTER_CONNECT_RETRY=10;"
+			startReplica="START REPLICA;"
 		fi
 	fi
 
@@ -385,15 +496,76 @@ docker_setup_db() {
 		${rootCreate}
 		${mysqlAtLocalhost}
 		${mysqlAtLocalhostGrants}
-		-- pre-10.3 only
-		DROP DATABASE IF EXISTS test ;
+		${createHealthCheckUsers}
 		-- end of securing system users, rest of init now...
 		SET @@SESSION.SQL_LOG_BIN=@orig_sql_log_bin;
 		-- create users/databases
 		${createDatabase}
 		${createUser}
+		${createReplicaUser}
 		${userGrants}
+
+		${changeMasterTo}
+		${startReplica}
 	EOSQL
+}
+
+# create a new installation
+docker_mariadb_init()
+{
+
+	# check dir permissions to reduce likelihood of half-initialized database
+	ls /docker-entrypoint-initdb.d/ > /dev/null
+
+	if [ -n "$DATABASE_INIT_FROM_BACKUP" ]; then
+		shopt -s dotglob
+		for file in /docker-entrypoint-initdb.d/*.tar{.gz,.xz,.zst}; do
+			mkdir -p "$DATADIR"/.init
+			tar --auto-compress --extract --file "$file" --directory="$DATADIR"/.init
+			mariadb-backup --target-dir="$DATADIR"/.init --datadir="$DATADIR"/.restore --move-back
+
+			mv "$DATADIR"/.restore/** "$DATADIR"/
+			if [ -f "$DATADIR/.init/backup-my.cnf" ]; then
+				mv "$DATADIR/.init/backup-my.cnf" "$DATADIR/.my.cnf"
+				mysql_note "Adding startup configuration:"
+				my_print_defaults --defaults-file="$DATADIR/.my.cnf" --mariadbd
+			fi
+			rm -rf "$DATADIR"/.init "$DATADIR"/.restore
+			if [ "$(id -u)" = "0" ]; then
+				# this will cause less disk access than `chown -R`
+				find "$DATADIR" \! -user mysql \( -exec chown mysql: '{}' + -o -true \)
+			fi
+		done
+		if _check_if_upgrade_is_needed; then
+			docker_mariadb_upgrade "$@"
+		fi
+		return
+	fi
+	docker_init_database_dir "$@"
+
+	mysql_note "Starting temporary server"
+	docker_temp_server_start "$@"
+	mysql_note "Temporary server started."
+
+	docker_setup_db
+	docker_process_init_files /docker-entrypoint-initdb.d/*
+	# Wait until after /docker-entrypoint-initdb.d is performed before setting
+	# root@localhost password to a hash we don't know the password for.
+	if [ -n "${MARIADB_ROOT_PASSWORD_HASH}" ]; then
+		mysql_note "Setting root@localhost password hash"
+		docker_process_sql --dont-use-mysql-root-password --binary-mode <<-EOSQL
+			SET @@SESSION.SQL_LOG_BIN=0;
+			SET PASSWORD FOR 'root'@'localhost'= '${MARIADB_ROOT_PASSWORD_HASH}';
+		EOSQL
+	fi
+
+	mysql_note "Stopping temporary server"
+	docker_temp_server_stop
+	mysql_note "Temporary server stopped"
+
+	echo
+	mysql_note "MariaDB init process done. Ready for start up."
+	echo
 }
 
 # backup the mysql database
@@ -406,15 +578,15 @@ docker_mariadb_backup_system()
 	fi
 	local backup_db="system_mysql_backup_unknown_version.sql.zst"
 	local oldfullversion="unknown_version"
-	if [ -r "$DATADIR"/mysql_upgrade_info ]; then
-		read -r -d '' oldfullversion < "$DATADIR"/mysql_upgrade_info || true
+	if [ -r "$DATADIR"/mariadb_upgrade_info ]; then
+		read -r -d '' oldfullversion < "$DATADIR"/mariadb_upgrade_info || true
 		if [ -n "$oldfullversion" ]; then
 			backup_db="system_mysql_backup_${oldfullversion}.sql.zst"
 		fi
 	fi
 
 	mysql_note "Backing up system database to $backup_db"
-	if ! mysqldump --skip-lock-tables --replace --databases mysql --socket="${SOCKET}" | zstd > "${DATADIR}/${backup_db}"; then
+	if ! mariadb-dump --skip-lock-tables --replace --databases mysql --socket="${SOCKET}" | zstd > "${DATADIR}/${backup_db}"; then
 		mysql_error "Unable backup system database for upgrade from $oldfullversion."
 	fi
 	mysql_note "Backing up complete"
@@ -425,7 +597,7 @@ docker_mariadb_backup_system()
 docker_mariadb_upgrade() {
 	if [ -z "$MARIADB_AUTO_UPGRADE" ] \
 		|| [ "$MARIADB_AUTO_UPGRADE" = 0 ]; then
-		mysql_note "MariaDB upgrade (mysql_upgrade) required, but skipped due to \$MARIADB_AUTO_UPGRADE setting"
+		mysql_note "MariaDB upgrade (mariadb-upgrade or creating healthcheck users) required, but skipped due to \$MARIADB_AUTO_UPGRADE setting"
 		return
 	fi
 	mysql_note "Starting temporary server"
@@ -436,8 +608,35 @@ docker_mariadb_upgrade() {
 
 	docker_mariadb_backup_system
 
+	if [ ! -f "$DATADIR"/.my-healthcheck.cnf ]; then
+		mysql_note "Creating healthcheck users"
+		local createHealthCheckUsers
+		createHealthCheckUsers=$(create_healthcheck_users)
+		docker_process_sql --dont-use-mysql-root-password --binary-mode <<-EOSQL
+		-- Healthcheck users shouldn't be replicated
+		SET @@SESSION.SQL_LOG_BIN=0;
+                -- we need the SQL_MODE NO_BACKSLASH_ESCAPES mode to be clear for the password to be set
+		SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
+		FLUSH PRIVILEGES;
+		$createHealthCheckUsers
+EOSQL
+		mysql_note "Stopping temporary server"
+		docker_temp_server_stop
+		mysql_note "Temporary server stopped"
+
+		if _check_if_upgrade_is_needed; then
+			# need a restart as FLUSH PRIVILEGES isn't reversable
+			mysql_note "Restarting temporary server for upgrade"
+			docker_temp_server_start "$@" --skip-grant-tables \
+				--loose-innodb_buffer_pool_dump_at_shutdown=0 \
+				--skip-slave-start
+		else
+			return 0
+		fi
+	fi
+
 	mysql_note "Starting mariadb-upgrade"
-	mysql_upgrade --upgrade-system-tables
+	mariadb-upgrade --upgrade-system-tables
 	mysql_note "Finished mariadb-upgrade"
 
 	mysql_note "Stopping temporary server"
@@ -447,25 +646,29 @@ docker_mariadb_upgrade() {
 
 
 _check_if_upgrade_is_needed() {
-	if [ ! -f "$DATADIR"/mysql_upgrade_info ]; then
+	if [ ! -f "$DATADIR"/mariadb_upgrade_info ]; then
 		mysql_note "MariaDB upgrade information missing, assuming required"
 		return 0
 	fi
 	local mariadbVersion
 	mariadbVersion="$(_mariadb_version)"
 	IFS='.-' read -ra newversion <<<"$mariadbVersion"
-	IFS='.-' read -ra oldversion < "$DATADIR"/mysql_upgrade_info || true
+	IFS='.-' read -ra oldversion < "$DATADIR"/mariadb_upgrade_info || true
 
 	if [[ ${#newversion[@]} -lt 2 ]] || [[ ${#oldversion[@]} -lt 2 ]] \
 		|| [[ ${oldversion[0]} -lt ${newversion[0]} ]] \
 		|| [[ ${oldversion[0]} -eq ${newversion[0]} && ${oldversion[1]} -lt ${newversion[1]} ]]; then
 		return 0
 	fi
+	if [ ! -f "$DATADIR"/.my-healthcheck.cnf ]; then
+		mysql_note "MariaDB heathcheck configation file missing, assuming desirable"
+		return 0
+	fi
 	mysql_note "MariaDB upgrade not required"
 	return 1
 }
 
-# check arguments for an option that would cause mysqld to stop
+# check arguments for an option that would cause mariadbd to stop
 # return true if there is one
 _mysql_want_help() {
 	local arg
@@ -480,9 +683,9 @@ _mysql_want_help() {
 }
 
 _main() {
-	# if command starts with an option, prepend mysqld
+	# if command starts with an option, prepend mariadbd
 	if [ "${1:0:1}" = '-' ]; then
-		set -- mysqld "$@"
+		set -- mariadbd "$@"
 	fi
 
 	#ENDOFSUBSTITUTIONS
@@ -505,36 +708,9 @@ _main() {
 		if [ -z "$DATABASE_ALREADY_EXISTS" ]; then
 			docker_verify_minimum_env
 
-			# check dir permissions to reduce likelihood of half-initialized database
-			ls /docker-entrypoint-initdb.d/ > /dev/null
-
-			docker_init_database_dir "$@"
-
-			mysql_note "Starting temporary server"
-			docker_temp_server_start "$@"
-			mysql_note "Temporary server started."
-
-			docker_setup_db
-			docker_process_init_files /docker-entrypoint-initdb.d/*
-			# Wait until after /docker-entrypoint-initdb.d is performed before setting
-			# root@localhost password to a hash we don't know the password for.
-			if [ -n "${MARIADB_ROOT_PASSWORD_HASH}" ]; then
-				mysql_note "Setting root@localhost password hash"
-				docker_process_sql --dont-use-mysql-root-password --binary-mode <<-EOSQL
-					SET @@SESSION.SQL_LOG_BIN=0;
-					SET PASSWORD FOR 'root'@'localhost'= '${MARIADB_ROOT_PASSWORD_HASH}';
-				EOSQL
-			fi
-
-			mysql_note "Stopping temporary server"
-			docker_temp_server_stop
-			mysql_note "Temporary server stopped"
-
-			echo
-			mysql_note "MariaDB init process done. Ready for start up."
-			echo
+			docker_mariadb_init "$@"
 		# MDEV-27636 mariadb_upgrade --check-if-upgrade-is-needed cannot be run offline
-		#elif mysql_upgrade --check-if-upgrade-is-needed; then
+		#elif mariadb-upgrade --check-if-upgrade-is-needed; then
 		elif _check_if_upgrade_is_needed; then
 			docker_mariadb_upgrade "$@"
 		fi

@@ -2,7 +2,7 @@
 package:
   name: squid
   version: "6.10"
-  epoch: 0
+  epoch: 2
   description: Full-featured Web proxy cache server
   copyright:
     - license: GPL-2.0-or-later
@@ -15,19 +15,38 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
+      - ed # busybox ed is not sufficient for use by boostrap.sh
       - heimdal-dev
       - libcap-dev
+      - libtool
       - linux-headers
       - logrotate
       - openssl
       - openssl-dev
       - perl-dev
 
+var-transforms:
+  - from: ${{package.version}}
+    match: \.
+    replace: "_"
+    to: mangled-package-version
+
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      expected-sha256: 0b07b187e723f04770dd25beb89aec12030a158696aa8892d87c8b26853408a7
-      uri: https://www.squid-cache.org/Versions/v6/squid-${{package.version}}.tar.xz
+      expected-commit: e071b58dfccdf8805fd32b7e4cce239ee12182d9
+      repository: https://github.com/squid-cache/squid.git
+      tag: SQUID_${{vars.mangled-package-version}}
+
+  - runs: |
+      set -x
+      # see https://github.com/chainguard-dev/melange/issues/1422
+      git fetch --no-tags origin master:master
+      # Fix bootstrap build with automake 1.17
+      git show 82e18891262580e1d6ea23e97283ab0dccaa8c1e -- bootstrap.sh > partial-cherry-pick.patch
+      git apply partial-cherry-pick.patch
+
+  - runs: ./bootstrap.sh
 
   - uses: autoconf/configure
     with:
@@ -62,10 +81,60 @@ subpackages:
 
 update:
   enabled: true
-  release-monitor:
-    identifier: 4880
+  version-transform:
+    - match: "_"
+      replace: "."
+  github:
+    identifier: squid-cache/squid
+    strip-prefix: SQUID_
+    use-tag: true
 
 test:
+  environment:
+    accounts:
+      groups:
+        - groupname: squid
+          gid: 65532
+      users:
+        - username: squid
+          gid: 65532
+          uid: 65532
+    contents:
+      packages:
+        - curl
   pipeline:
     - runs: |
         squid -v
+    - name: Squid Server sniff
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          cfg=/etc/squid.conf
+          [ -f "$cfg" ] || { echo "no $cfg file found"; exit 1; }
+          # default is 30 seconds idle before exit on SIGTERM
+          echo "shutdown_lifetime 1 seconds" >> "$cfg"
+          # not sure why, but chown 65532:65532 /var/log/squid fails with Invalid argument
+          # so just chmod
+          chmod ugo+w /var/log/squid/
+        start: squid -N -d1
+        expected_output: |
+          Accepting HTTP Socket connections
+          listening port: 3128
+        post: |
+          host="cgr.dev"
+          url="https://$host/"
+          expected="chainguard"
+          proxy=127.0.0.1:3128
+
+          echo "checking $url for \"$expected\" via proxy $proxy"
+          out=$(HTTPS_PROXY=$proxy curl --silent --location --fail-with-body "$url")
+          echo "$out" | grep -qi "$expected" || {
+            echo "FAIL: output of url $url did not contain \"$expected\""
+            echo "$out"
+            exit 1
+          }
+          echo "PASS: $url contained \"$expected\""
+          log=/var/log/squid/access.log
+          grep -q "$host" "$log" &&
+             echo "PASS: $log contained $host" ||
+             { echo "FAIL: $log did not contain \"$host\""; exit 1; }

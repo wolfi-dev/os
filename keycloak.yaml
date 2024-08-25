@@ -1,7 +1,7 @@
 package:
   name: keycloak
-  version: 25.0.1
-  epoch: 0
+  version: 25.0.4
+  epoch: 1
   description: Open Source Identity and Access Management For Modern Applications and Services
   copyright:
     - license: Apache-2.0
@@ -9,6 +9,15 @@ package:
     runtime:
       - bash # Keycloak helper scripts require bash, aren't compatible with busybox.
       - openjdk-17-default-jvm
+
+# Create a new major-version variable that contains only the major version
+# to use in the bitnami/compat pipeline to find out the correct folder for the image.
+# e.g. 25.0.2 will create a new var major-version=25
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
 
 environment:
   contents:
@@ -30,7 +39,7 @@ pipeline:
     with:
       repository: https://github.com/keycloak/keycloak
       tag: ${{package.version}}
-      expected-commit: 6a22f31b812ce68735373b1a0b047b75958f0b64
+      expected-commit: 8ce8a4ba089eef25a0e01f58e09890399477b9ef
 
   - uses: maven/pombump
 
@@ -47,7 +56,10 @@ pipeline:
 
       mkdir -p ${{targets.destdir}}/usr/share/java
       unzip -d ${{targets.destdir}}/usr/share/java quarkus/dist/target/keycloak-*.zip
-      mv ${{targets.destdir}}/usr/share/java/keycloak-* ${{targets.destdir}}/usr/share/java/keycloak
+      cp -avR ${{targets.destdir}}/usr/share/java/keycloak-* ${{targets.destdir}}/usr/share/java/keycloak
+
+      # Create an empty data directory for keycloak. Required by the UI to store some data.
+      mkdir -p ${{targets.destdir}}/usr/share/java/keycloak/data
 
       mkdir -p ${{targets.destdir}}/usr/bin
       for i in kc.sh kcadm.sh kcreg.sh; do
@@ -62,6 +74,142 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/opt
           ln -s /usr/share/java/keycloak "${{targets.subpkgdir}}"/opt/
+  # https://github.com/bitnami/containers/tree/main/bitnami/keycloak/24/debian-12
+  - name: ${{package.name}}-bitnami-compat
+    description: "compat package with bitnami/keycloak image"
+    dependencies:
+      runtime:
+        - coreutils # Keycloak Helm Chart scripts require coreutils, aren't compatible with busybox. (i.e., `cp` with `--preserve` option)
+        - krb5
+        - libaio
+        - procps
+        - zlib
+        - wait-for-port
+        - net-tools
+        - posix-libc-utils
+        - su-exec
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: keycloak
+          version-path: ${{vars.major-version}}/debian-12
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/bitnami/keycloak
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/keycloak
+          mkdir -p ${{targets.contextdir}}/docker-entrypoint-initdb.d
+
+          for dir in bin conf conf.default lib providers themes; do
+            mkdir -p ${{targets.contextdir}}/opt/bitnami/keycloak/$dir
+          done
+
+          chmod g+rwX ${{targets.contextdir}}/opt/bitnami
+
+          # Copy keycloak files to /opt/bitnami/keycloak for compatibility with
+          # their Helm Chart, which copies the directories into an emptyDir in
+          # an initContainer
+          cp -r ${{targets.destdir}}/usr/share/java/keycloak/* ${{targets.contextdir}}/opt/bitnami/keycloak
+
+          # Replace the incorrect Java paths in the Bitnami scripts
+          sed -i 's/JAVA_HOME="\/opt\/bitnami\/java"/JAVA_HOME="\/usr\/lib\/jvm\/java-17-openjdk"/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak-env.sh
+          sed -i 's/\/opt\/bitnami\/java\/lib\/security/\/usr\/lib\/jvm\/java-17-openjdk\/conf\/security/g' ${{targets.contextdir}}/opt/bitnami/scripts/java/postunpack.sh
+
+          # Disable some commands used in Bitnami scripts. These commands more likely fail in this since this image take non root approach
+          sed -i 's/chown -R "$KEYCLOAK_DAEMON_USER" "$dir"/# chown -R "$KEYCLOAK_DAEMON_USER" "$dir"/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak/postunpack.sh
+          sed -i 's/ensure_user_exists/# ensure_user_exists/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak/postunpack.sh
+          sed -i 's/am_i_root/# am_i_root/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak/setup.sh
+          sed -i 's/hostname --fqdn/hostname -f/g' ${{targets.contextdir}}/opt/bitnami/scripts/keycloak-env.sh
+
+          # The `--userspec`` flag belongs to GNU's chroot, whereas we are use BusyBox's. As a workaround, use `su-exec` instead.
+          sed -i 's|exec chroot --userspec="$userspec" /|exec chroot / su-exec "$userspec"|' ${{targets.contextdir}}/opt/bitnami/scripts/libos.sh
+          sed -i 's|chroot --userspec="$userspec" /|chroot / su-exec "$userspec"|' ${{targets.contextdir}}/opt/bitnami/scripts/libos.sh
+
+          # Use package path while unpacking
+          find . -iname "*.sh" -exec sed 's#/opt/bitnami#${{targets.contextdir}}/opt/bitnami#g' -i {} \;
+            ${{targets.contextdir}}/opt/bitnami/scripts/keycloak/postunpack.sh || true
+          # Restore path
+          find ${{targets.contextdir}}/opt/bitnami -type f -exec sed 's#${{targets.contextdir}}##g' -i {} \;
+
+          # Link binaries used by Bitnami config
+          ln -sf /opt/bitnami/scripts/keycloak/entrypoint.sh ${{targets.contextdir}}/entrypoint.sh
+          ln -sf /opt/bitnami/scripts/keycloak/run.sh ${{targets.contextdir}}/run.sh
+    scriptlets:
+      post-install: |
+        #!/bin/sh
+        # Copy required provider files.
+        cp -avR /usr/share/java/keycloak/providers/* ${{targets.contextdir}}/opt/bitnami/keycloak/providers/
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+            - postgresql
+            - postgresql-client
+            - shadow
+            - sudo-rs
+            - jq
+            - keycloak
+            - keycloak-compat
+            - keycloak-bitnami-compat
+        accounts:
+          groups:
+            - groupname: nonroot
+              gid: 65532
+          users:
+            - username: nonroot
+              gid: 65532
+              uid: 65532
+          run-as: 0
+        environment:
+          PGDATA: /tmp/test_db
+          PGUSER: bn_keycloak
+          PGDB: bitnami_keycloak
+          ALLOW_EMPTY_PASSWORD: yes
+      pipeline:
+        - working-directory: /tmp
+          pipeline:
+            - name: "Test database creation"
+              with:
+                setup: echo "127.0.0.1 postgresql" >> /etc/hosts
+              runs: |
+                useradd $PGUSER
+                sudo -u $PGUSER initdb -D $PGDATA
+                sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/logfile start
+                sudo -u $PGUSER createdb $PGDB
+                sudo -u $PGUSER psql -lqt | cut -d \| -f 1 | grep -qw $PGDB
+            - name: "start daemon on localhost"
+              uses: test/daemon-check-output
+              with:
+                setup: |
+                  #!/bin/sh -e
+                  echo "127.0.0.1 postgresql" >> /etc/hosts
+                  echo "$(hostname) postgresql" >> /etc/hosts
+                start: |
+                  env "BITNAMI_APP_NAME=keycloak" \
+                    "APP_VERSION=${{package.version}}" \
+                    "PATH=/opt/bitnami/keycloak/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+                    "KEYCLOAK_ENABLE_HEALTH_ENDPOINTS=true" \
+                    /opt/bitnami/scripts/keycloak/entrypoint.sh \
+                    /opt/bitnami/scripts/keycloak/run.sh
+                timeout: 60
+                expected_output: |
+                  Welcome to the Bitnami keycloak container
+                  keycloak setup finished!
+                  server listening on
+                  Keycloak ${{package.version}}
+                  Profile dev activated.
+                post: |
+                  #!/bin/sh -e
+                  url=http://localhost:9000/health/ready
+                  response=$(curl -fsS --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40 "$url") || {
+                    echo "curl ${url} failed $?"
+                    exit 1
+                  }
+                  echo "$response" | jq .status | grep -q UP || {
+                    echo "response from $url did not contain \"UP\""
+                    echo "response: $response"
+                    exit 1
+                  }
+                  echo "$url had expected output: $response"
 
 test:
   pipeline:
@@ -91,7 +239,7 @@ update:
   # The upstream repos releases contains a 'nightly' release. Which we want to
   # exclude from discovery.
   ignore-regex-patterns:
-    - '.*nightly.*'
+    - ".*nightly.*"
   enabled: true
   github:
     identifier: keycloak/keycloak

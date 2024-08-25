@@ -1,7 +1,7 @@
 package:
   name: tomcat-10.1
-  version: 10.1.26
-  epoch: 0
+  version: 10.1.28
+  epoch: 1
   description: Apache Tomcat Web Server
   copyright:
     - license: Apache-2.0
@@ -10,6 +10,13 @@ package:
       - tomcat=${{package.full-version}}
       - tomcat-10=${{package.full-version}}
 
+data:
+  - name: openjdk-versions
+    items:
+      21: "openjdk-21"
+      17: "openjdk-17"
+      11: "openjdk-11"
+
 environment:
   contents:
     packages:
@@ -17,16 +24,20 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
+      - curl
+      - openjdk-11
       - openjdk-17
-  environment:
-    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      # Only 17 is used during the build process
+      # 11 and 21 are included for tests
+      - openjdk-21
+      - tomcat-native
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/apache/tomcat
       tag: ${{package.version}}
-      expected-commit: 43731ff263f74ec9949a3f535fd9254baa932603
+      expected-commit: aae1e30f78ba5ace25848084a500662ecff0b75f
 
   - runs: |
       cat <<EOF > build.properties
@@ -35,40 +46,83 @@ pipeline:
       compile.debug=false
       EOF
 
-  - runs: |
-      ant
-
-      mkdir -p ${{targets.destdir}}/usr/share/tomcat
-      cp LICENSE ${{targets.destdir}}/usr/share/tomcat/
-
-      mkdir -p ${{targets.destdir}}/usr/share/tomcat/bin
-      cp output/build/bin/* ${{targets.destdir}}/usr/share/tomcat/bin
-
-      mkdir -p ${{targets.destdir}}/usr/share/tomcat/conf
-      cp output/build/conf/* ${{targets.destdir}}/usr/share/tomcat/conf
-
-      mkdir -p ${{targets.destdir}}/usr/share/tomcat/lib
-      cp output/build/lib/* ${{targets.destdir}}/usr/share/tomcat/lib
-
-      mkdir -p ${{targets.destdir}}/usr/share/tomcat/logs
-      mkdir -p ${{targets.destdir}}/usr/share/tomcat/temp
-      mkdir -p ${{targets.destdir}}/usr/share/tomcat/webapps
-
 subpackages:
-  # This package includes the manager and host-manager apps.
-  # The apps are not directly usable without copying into the webapps directory.
-  # See https://github.com/docker-library/tomcat/pull/181 for more context.
-  - name: ${{package.name}}-webapps
+  - range: openjdk-versions
+    name: ${{package.name}}-${{range.value}}
     dependencies:
-      provides:
-        - tomcat-webapps=${{package.full-version}}
-        - tomcat-10-webapps=${{package.full-version}}
       runtime:
-        - tomcat
+        - ${{range.value}}-default-jvm
+        - tomcat-native
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/share/tomcat/webapps.dist
-          cp -r output/build/webapps/* ${{targets.subpkgdir}}/usr/share/tomcat/webapps.dist/
+          # Only OpenJDK 17 is supported at buildtime
+          # However, we're able to run Tomcat with OpenJDK 11-21
+          export JAVA_HOME="/usr/lib/jvm/java-17-openjdk"
+
+          ant -Dskip.build.java.version=true
+
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat
+          cp LICENSE ${{targets.contextdir}}/usr/share/tomcat/
+
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat/bin
+          cp output/build/bin/* ${{targets.contextdir}}/usr/share/tomcat/bin
+
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat/conf
+          cp output/build/conf/* ${{targets.contextdir}}/usr/share/tomcat/conf
+
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat/lib
+          cp output/build/lib/* ${{targets.contextdir}}/usr/share/tomcat/lib
+
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat/logs
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat/temp
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat/webapps
+
+          # This includes the manager and host-manager apps.
+          # The apps are not directly usable without copying into the webapps directory.
+          # See https://github.com/docker-library/tomcat/pull/181 for more context.
+          mkdir -p ${{targets.contextdir}}/usr/share/tomcat/webapps.dist
+          rm -rf output/build/webapps/examples
+          cp -r output/build/webapps/* ${{targets.contextdir}}/usr/share/tomcat/webapps.dist/
+      - name: Test tomcat with OpenJDK ${{range.key}}
+        uses: test/daemon-check-output
+        with:
+          setup: |
+            #!/bin/sh -ex
+            rm -rf /usr/share/tomcat/*
+            mkdir -p /usr/share/tomcat
+            cp -rf ${{targets.contextdir}}/usr/share/tomcat/* /usr/share/tomcat
+            cp /usr/share/tomcat/webapps.dist/docs/appdev/sample/sample.war /usr/share/tomcat/webapps/
+          start: |
+            sh -c "
+            if [[ "${{range.key}}" == "8" ]]; then
+              export JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk
+            else
+              export JAVA_HOME=/usr/lib/jvm/java-${{range.key}}-openjdk
+            fi
+            export LD_LIBRARY_PATH=/usr/lib/tomcat-native
+            /usr/share/tomcat/bin/catalina.sh run
+            "
+          timeout: 30
+          expected_output: |
+            Tomcat/${{package.version}}
+            JVM.Version
+            Deploying.*sample.war
+            Server startup in
+          post: |
+            #!/bin/sh -e
+            url=http://localhost:8080/sample/
+            echo "testing $url"
+            response=$(curl -s "$url") || {
+              echo "curl $url failed $?"
+              exit 1
+            }
+            expected="Sample.*Hello.*World.*Application"
+            echo "$response" | grep -q "$expected" || {
+              echo "response from $url did not contain \"$expected\""
+              echo "response: $response"
+              exit 1
+            }
+            echo "found \"$expected\" in output of curl $url"
 
 update:
   enabled: true

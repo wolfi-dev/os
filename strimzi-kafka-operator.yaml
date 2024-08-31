@@ -1,0 +1,149 @@
+package:
+  name: strimzi-kafka-operator
+  version: 0.43.0
+  epoch: 0
+  description: Apache Kafka® running on Kubernetes
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - coreutils
+      - curl
+      - docker # not gonna be needed but their script requires docker to be installed
+      - helm
+      - make
+      - maven
+      - openjdk-17
+      - openjdk-17-default-jvm
+      - perl-utils
+      - unzip
+      - wget
+      - yq
+      - zip
+
+vars:
+  shellcheck_version: 0.10.0
+  shellcheck_aarch64_shasum512: 77abeaa8bee293264ebfd94a2021bd490695ed5518f2da7c0f9ec4b402cd1e5da6642a0e9f953961510cef7351cc9afae7c7a528a597d1befd1867b8c69e15b1
+  shellcheck_x86_64_shasum512: 31006830087c2b9ffe9fa36c1ab4a8b11c85078cac8203265d0cfd630c70a4a506e66dd9d7ccde964360ad95045894149de457db34f10cad76708c7a4aa544ca
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/strimzi/strimzi-kafka-operator
+      tag: ${{package.version}}
+      expected-commit: 23c0fb0726e1f212c6182eb251ff23697e72a353
+
+  - runs: |
+      export JAVA_HOME="/usr/lib/jvm/java-17-openjdk"
+      # Download the shellcheck tarball
+      wget -qO- "https://github.com/koalaman/shellcheck/releases/download/v${{vars.shellcheck_version}}/shellcheck-v${{vars.shellcheck_version}}.linux.${{build.arch}}.tar.xz" -O shellcheck.tar.xz
+
+      # Perform shasum check based on architecture
+      if [[ "${{build.arch}}" == "aarch64" ]]; then
+          echo "${{vars.shellcheck_aarch64_shasum512}}  shellcheck.tar.xz" | shasum -a 512 -c
+      elif [[ "${{build.arch}}" == "x86_64" ]]; then
+          echo "${{vars.shellcheck_x86_64_shasum512}}  shellcheck.tar.xz" | shasum -a 512 -c
+      else
+          echo "Unsupported architecture: ${{build.arch}}"
+          exit 1
+      fi
+
+      # Extract the tarball
+      tar -xJf shellcheck.tar.xz
+
+      # Copy shellcheck binary to /usr/bin/
+      cp "shellcheck-v${{vars.shellcheck_version}}/shellcheck" /usr/bin/
+
+
+      for i in mockkube config-model certificate-manager operator-common; do
+        make -C $i MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true" java_build
+        make -C $i MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true -e -V -B" java_install
+      done
+
+      mvn clean
+      mvn install -B -DskipTests -Dmaven.javadoc.skip=true
+      make MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true" java_build
+      make MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true  -e -V -B" java_install
+
+      # Set the source and destination directories
+      SRC_DIR="./docker-images/artifacts/binaries"
+      DEST_DIR="opt/strimzi"
+      mkdir -p "${{targets.contextdir}}"/$DEST_DIR/bin
+      mkdir -p "${{targets.contextdir}}"/$DEST_DIR/lib
+      install -Dm755 ./docker-images/operator/scripts/launch_java.sh ${{targets.contextdir}}/$DEST_DIR/bin/launch_java.sh
+
+
+      # List of file name patterns, space-separated
+      file_patterns="topic-operator user-operator cluster-operator kafka-init"
+
+      # Iterate over each pattern and match the corresponding zip files
+      for file in $file_patterns; do
+          # Find the zip file that matches the pattern
+          zipfile=$(ls "$SRC_DIR"/${file}-*-dist.zip 2>/dev/null)
+
+          # Check if the zip file exists
+          if [[ -f "$zipfile" ]]; then
+              # Extract the zip file into the destination directory
+              unzip -o "$zipfile" -d tmp
+
+              cp -r tmp/lib/* "${{targets.contextdir}}"/$DEST_DIR/lib/
+              cp -r tmp/bin/* "${{targets.contextdir}}"/$DEST_DIR/bin/
+
+              # Check if the unzip command was successful
+              if [[ $? -eq 0 ]]; then
+                  echo "Successfully unzipped $zipfile to $DEST_DIR"
+              else
+                  echo "Failed to unzip $zipfile"
+              fi
+          else
+              echo "No zip file found for pattern: ${file}-*-dist.zip"
+          fi
+      done
+
+update:
+  enabled: true
+  github:
+    identifier: strimzi/strimzi-kafka-operator
+
+test:
+  pipeline:
+    - name: check folders are not empty
+      runs: |
+        # Check if /opt/strimzi/lib is not empty
+        if [ -d "/opt/strimzi/lib" ] && [ "$(ls -A /opt/strimzi/lib)" ]; then
+          echo "/opt/strimzi/lib is not empty."
+        else
+          echo "Error: /opt/strimzi/lib is empty or does not exist."
+          exit 1
+        fi
+
+        # Check if /opt/strimzi/bin is not empty
+        if [ -d "/opt/strimzi/bin" ] && [ "$(ls -A /opt/strimzi/bin)" ]; then
+          echo "/opt/strimzi/bin is not empty."
+        else
+          echo "Error: /opt/strimzi/bin is empty or does not exist."
+          exit 1
+        fi
+
+        echo "Both directories are not empty."
+    - name: check files are there
+      runs: |
+        # Directory to check
+        dir="/opt/strimzi/bin"
+
+        # Check if each file exists in the directory
+        for file in cluster_operator_run.sh kafka_init_run.sh launch_java.sh tls_prepare_certificates.sh topic_operator_run.sh user_operator_run.sh; do
+          if [ -f "$dir/$file" ]; then
+            echo "$file exists in $dir."
+          else
+            echo "Error: $file does not exist in $dir."
+            exit 1
+          fi
+        done
+
+        echo "All required files exist in $dir."

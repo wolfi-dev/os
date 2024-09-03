@@ -1,11 +1,21 @@
 # Contributing to wolfi-dev/os
 
 <!-- toc -->
+- [Criteria for packages in Wolfi](#criteria-for-packages-in-wolfi)
 - [Setup development environment](#setup-development-environment)
 - [Write your first Wolfi package](#write-your-first-wolfi-package)
 - [Package versioning](#package-versioning)
 - [Some tips](#some-tips)
 <!-- /toc -->
+
+## Criteria for packages in Wolfi
+
+When you're thinking about adding a new package to Wolfi, make sure it meets all of the following criteria before taking the time to define, build, and test the package:
+
+1. The package must use the latest version of the upstream project, and the package must **not** use a _pre-release_ version.
+2. The package's upstream source must use an [OSI-approved](https://opensource.org/licenses) license.
+
+In addition to the above, the Wolfi Maintainers reserve the right to reject other package contributions for other reasons, too. If you are unsure whether a particular package qualifies for acceptance into Wolfi, consider opening an issue on GitHub before putting time into the PR itself, and the maintainers will provide feedback as soon as possible.
 
 ## Setup development environment
 
@@ -61,8 +71,6 @@ Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CV
 - `epoch` needs to be bump when package version remains the same but something else changes. `epoch` needs to be reset to 0 when it's a new version of the package.
 
 - `melange` CLI has a command `bump` to make it easier. More details are [available here](https://github.com/chainguard-dev/melange/blob/f52b622351657fd9ccdb7e3bfb124caef61ad651/NEWS.md).
-
-- We will consider contributions for latest package versions. However, we do not build pre-release versions until they are officially released.
 
 ## Some tips
 

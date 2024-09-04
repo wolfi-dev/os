@@ -1,0 +1,84 @@
+package:
+  name: kserve-modelmesh-serving
+  version: 0.12.0
+  epoch: 0
+  description: ModelMesh Serving is the Controller for managing ModelMesh, a general-purpose model serving management/routing layer.
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kserve/modelmesh-serving.git
+      tag: v${{package.version}}
+      expected-commit: d0e56fa4ac7547e644c87d63dc97a14f612c0391
+
+  - uses: go/build
+    with:
+      packages: .
+      output: manager
+
+  - name: Copy default config
+    runs: |
+      mkdir -p ${{targets.destdir}}/etc/model-serving/config/default
+      cp ./config/default/config-defaults.yaml ${{targets.destdir}}/etc/model-serving/config/default/config-defaults.yaml
+
+test:
+  environment:
+    contents:
+      packages:
+        - kustomize
+        - make
+        - go
+        - curl
+        - openssl
+        - jq
+  pipeline:
+    - uses: test/kwok/cluster
+    - name: Wait for nodes
+      runs: kubectl wait --for=condition=Ready nodes --all
+    - uses: git-checkout
+      with:
+        repository: https://github.com/kserve/modelmesh-serving.git
+        tag: v${{package.version}}
+        expected-commit: d0e56fa4ac7547e644c87d63dc97a14f612c0391
+    - name: Create openssl mount parent
+      # This seems somewhat silly do to, but the pod uses this dir to mount CA roots and
+      # because of that the binary assumes it always exists.
+      runs: mkdir /etc/ssl/openssl.cnf
+    - name: Install CRDs
+      runs: |
+        kubectl create ns modelmesh-serving
+        # We exit 0 here, because this fails trying to wait for the Pods to come up (I don't think they ever will because kwok is not a full k8s cluster).
+        # However, this does a bunch of very useful things for us like installing the CRDs and generating mTLS certs that the manager expects to exist.
+        ./scripts/install.sh --namespace modelmesh-serving --fvt || exit 0
+    # Binary assumes that a configmap named `model-serving-config` exists.
+    - name: Set default configmap
+      runs: |
+        kubectl apply -f - <<EOF
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: model-serving-config
+          namespace: modelmesh-serving
+        EOF
+    # Binary assumes mTLS certs are mounted locally.
+    - name: Download mTLS certs
+      runs: |
+        certdir="/tmp/k8s-webhook-server/serving-certs"
+        mkdir -p "${certdir}"
+        kubectl get secrets modelmesh-webhook-server-cert -o jsonpath='{.data.tls\.crt}' | base64 -d > ${certdir}/tls.crt
+        kubectl get secrets modelmesh-webhook-server-cert -o jsonpath='{.data.tls\.key}' | base64 -d > ${certdir}/tls.key
+    - name: Verify installation
+      runs: |
+        manager &
+        sleep 5
+        # We're using this as a proxy for "is the controller up and serving"
+        curl -s localhost:8080/metrics
+
+update:
+  enabled: true
+  github:
+    identifier: kserve/modelmesh-serving
+    strip-prefix: v

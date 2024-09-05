@@ -1,0 +1,118 @@
+package:
+  name: kserve
+  version: 0.13.1
+  epoch: 2
+  description: "Standardized Serverless ML Inference Platform on Kubernetes"
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - go
+      - py3.11-pip
+      - python-3.11-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kserve/kserve
+      tag: v${{package.version}}
+      expected-commit: e7d9ac8c48900bfd6db4821305b762bc51d8a67b
+
+data:
+  - name: go-components
+    items:
+      agent: "."
+      router: "."
+      manager: "."
+      qpext: "qpext"
+
+subpackages:
+  - range: go-components
+    name: kserve-${{range.key}}
+    pipeline:
+      - uses: go/build
+        working-directory: ${{range.value}}
+        with:
+          modroot: .
+          packages: ./cmd/${{range.key}}
+          output: ${{range.key}}
+
+  - range: go-components
+    name: kserve-${{range.key}}-compat
+    dependencies:
+      runtime:
+        - kserve-${{range.key}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/ko-app"
+          ln -s ../usr/bin/${{range.key}} "${{targets.contextdir}}/ko-app/${{range.key}}"
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+      pipeline:
+        - name: "check paths"
+          runs: |
+            [ -x /ko-app/${{range.key}} -a -f /ko-app/${{range.key}} ]
+
+  - name: kserve-storage-controller
+    options:
+      no-commands: true
+    pipeline:
+      - working-directory: ./python
+        runs: |
+          python=$(which python3.11)
+
+          (
+            set -x
+            cd kserve
+
+            # get poetry - until poetry is multi-versioned, just install from pip
+            workd=$(mktemp -d)
+            $python -m venv "$workd"
+            $workd/bin/pip install poetry
+
+            $workd/bin/poetry build
+
+            wheel=$(echo dist/*.whl)
+            [ -f "$wheel" ] || { echo "not exactly one wheel: $wheel"; exit 1; }
+
+            # just let pip handle deps for now.
+            $python -m pip install --verbose --prefix=/usr "--root=${{targets.contextdir}}" \
+               "$wheel[storage]"
+
+            rm -Rf "$workd"
+          )
+
+          (
+            d=${{targets.contextdir}}/storage-initializer/scripts/
+            mkdir -p "$d"
+            cp storage-initializer/scripts/initializer-entrypoint "$d"
+            cd "$d"
+            chmod 755 initializer-entrypoint
+
+            # update shbang to point to the python used rather than '/usr/bin/env python'
+            sed -i.dist "1s,#!/usr/bin/env python[^ ]*,#!$python," initializer-entrypoint
+            # exit fail if it did not change anything
+            diff -u initializer-entrypoint.dist initializer-entrypoint && exit 1
+            rm initializer-entrypoint.dist
+          )
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+      pipeline:
+        - name: "test entrypoint usage"
+          runs: |
+            /storage-initializer/scripts/initializer-entrypoint --help
+
+update:
+  enabled: true
+  github:
+    identifier: kserve/kserve
+    strip-prefix: v

@@ -6,15 +6,6 @@ package:
   copyright:
     - license: Apache-2.0
 
-environment:
-  contents:
-    packages:
-      - busybox
-      - ca-certificates-bundle
-      - go
-  environment:
-    CGO_ENABLED: "0"
-
 pipeline:
   - uses: git-checkout
     with:
@@ -30,6 +21,7 @@ pipeline:
     with:
       output: manager
       packages: .
+      ldflags: -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.version=${{package.version}} -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.buildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ") -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.agent=$(grep -v '\#' versions.txt | grep cloudwatch-agent | awk -F= '{print $$2}') -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationJava=$(grep -v '\#' versions.txt | grep aws-otel-java-instrumentation | awk -F= '{print $$2}') -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationPython=$(grep -v '\#' versions.txt | grep aws-otel-python-instrumentation | awk -F= '{print $$2}') -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationDotNet=$(grep -v '\#' versions.txt | grep aws-otel-dotnet-instrumentation | awk -F= '{print $$2}') -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationNodeJS=$(grep -v '\#' versions.txt | grep aws-otel-nodejs-instrumentation | awk -F= '{print $$2}') -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.dcgmExporter=$(grep -v '\#' versions.txt | grep dcgm-exporter | awk -F= '{print $$2}') -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.neuronMonitor=$(grep -v '\#' versions.txt | grep neuron-monitor | awk -F= '{print $$2}')
 
   - uses: strip
 
@@ -38,7 +30,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/bin
-          ln -sf /manager ${{targets.contextdir}}/usr/bin/manager
+          ln -sf /usr/bin/manager ${{targets.contextdir}}/manager
     description: Compatibility symlink for ${{package.name}}
 
 update:
@@ -46,3 +38,45 @@ update:
   github:
     identifier: aws/amazon-cloudwatch-agent-operator
     strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - kustomize
+        - kubectl
+        - git
+        - mkcert
+        - nss
+        - curl
+  pipeline:
+    - uses: test/kwok/cluster
+    - name: Fetch the testdata from the source repo
+      runs: |
+        git clone --depth=1 https://github.com/aws/amazon-cloudwatch-agent-operator
+    - name: Install CRDs
+      working-directory: amazon-cloudwatch-agent-operator/config/crd/
+      runs: |
+        kubectl wait --for=condition=Ready nodes --all
+        kustomize build | kubectl apply --server-side=true -f -
+        # wait for all CRDs to be created
+        sleep 3
+    - name: Verify Installation
+      runs: |
+        mkdir -p /tmp/k8s-webhook-server/serving-certs/
+        mkcert -install
+        mkcert -key-file /tmp/k8s-webhook-server/serving-certs/tls.key -cert-file /tmp/k8s-webhook-server/serving-certs/tls.crt localhost
+        /usr/bin/manager &
+        sleep 3
+        # Perform the curl request and capture the HTTP status code
+        STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" http://localhost:8081/healthz)
+        
+        # Check if the status code is 200, if so exit 0, otherwise exit 1
+        if [ "$STATUS" -eq 200 ]; then
+            echo "Health check passed with status code 200"
+            exit 0
+        else
+            echo "Health check failed with status code $STATUS"
+            exit 1
+        fi
+

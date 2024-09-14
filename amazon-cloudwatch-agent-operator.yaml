@@ -1,0 +1,96 @@
+package:
+  name: amazon-cloudwatch-agent-operator
+  version: 1.6.0
+  epoch: 0
+  description: Software developed to manage the CloudWatch Agent on kubernetes.
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: e4fd9a62a095b26e58fdc09cc59a0e9f10b0e333
+      repository: https://github.com/aws/amazon-cloudwatch-agent-operator
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: golang.org/x/net@v0.23.0 github.com/hashicorp/go-retryablehttp@v0.7.7 github.com/Azure/azure-sdk-for-go/sdk/azidentity@v1.6.0 github.com/docker/docker@v25.0.6
+
+  - uses: go/build
+    with:
+      output: manager
+      packages: .
+      ldflags: |
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.version=${{package.version}}
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.buildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.agent=$(grep -v '\#' versions.txt | grep cloudwatch-agent | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationJava=$(grep -v '\#' versions.txt | grep aws-otel-java-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationPython=$(grep -v '\#' versions.txt | grep aws-otel-python-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationDotNet=$(grep -v '\#' versions.txt | grep aws-otel-dotnet-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationNodeJS=$(grep -v '\#' versions.txt | grep aws-otel-nodejs-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.dcgmExporter=$(grep -v '\#' versions.txt | grep dcgm-exporter | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.neuronMonitor=$(grep -v '\#' versions.txt | grep neuron-monitor | awk -F= '{print $$2}')
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf /usr/bin/manager ${{targets.contextdir}}/manager
+    description: Compatibility symlink for ${{package.name}}
+
+update:
+  enabled: true
+  github:
+    identifier: aws/amazon-cloudwatch-agent-operator
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - kustomize
+        - kubectl
+        - git
+        - mkcert
+        - nss
+        - curl
+  pipeline:
+    - uses: test/kwok/cluster
+    - name: Fetch the testdata from the source repo
+      runs: git clone --depth=1 https://github.com/aws/amazon-cloudwatch-agent-operator
+    - name: Install CRDs
+      working-directory: amazon-cloudwatch-agent-operator/config/crd/
+      runs: |
+        kubectl wait --for=condition=Ready nodes --all
+        kustomize build | kubectl apply --server-side=true -f -
+        # wait for all CRDs to be created
+        sleep 3
+    - name: "Test manager run"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/k8s-webhook-server/serving-certs/
+          mkcert -install
+          mkcert -key-file /tmp/k8s-webhook-server/serving-certs/tls.key -cert-file /tmp/k8s-webhook-server/serving-certs/tls.crt localhost
+        start: /usr/bin/manager
+        timeout: 30
+        expected_output: |
+          starting manager
+          Starting webhook server
+          starting server
+          Starting workers
+        post: |
+          sleep 3
+          STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" http://localhost:8081/healthz)
+          # Check if the status code is 200, if so exit 0, otherwise exit 1
+          if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed with status code 200"
+              exit 0
+          else
+              echo "Health check failed with status code $STATUS"
+              exit 1
+          fi

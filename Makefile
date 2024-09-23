@@ -137,11 +137,17 @@ test/%:
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
 
 dev-container:
-	docker run --privileged --rm -it \
+	@CONTAINER_ID=$$(docker run --privileged -d \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:e8c9680e3262d27b28c38e84f51f8a8587c84dc192b0f198b96b11de27aafc34
+		--entrypoint="/bin/sh" \
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:e8c9680e3262d27b28c38e84f51f8a8587c84dc192b0f198b96b11de27aafc34 -c "while true; do sleep 1000; done") && \
+	echo "Copying ${KEY}.pub to container $$CONTAINER_ID..." && \
+	docker cp ${KEY}.pub $$CONTAINER_ID:/etc/apk/keys/${KEY}.pub && \
+	docker exec -it $$CONTAINER_ID /bin/sh
+
+
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 TMP_REPOSITORIES_DIR := $(shell mktemp -d)

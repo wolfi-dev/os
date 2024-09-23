@@ -51,6 +51,44 @@ update:
     strip-prefix: lvm-localpv-
 
 test:
+  environment:
+    contents:
+      packages:
+        - kubernetes-csi-node-driver-registrar
+        - git
   pipeline:
+    - uses: test/kwok/cluster
     - runs: |
-        lvm-driver --version version 2>&1 | grep -q ${{package.version}}
+        sleep 5
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        mkdir -p /var/lib/kubelet/plugins/lvm-localpv
+        mkdir -p /plugin
+        mkdir -p /registration
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+        cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        kubectl create clusterrolebinding default --clusterrole=cluster-admin --serviceaccount=default:default
+        kubectl create token default > /var/run/secrets/kubernetes.io/serviceaccount/token
+        export KUBERNETES_SERVICE_HOST=127.0.0.1
+        export KUBE_NODE_NAME=node-000000
+        export KUBERNETES_SERVICE_PORT=32764
+        csi-node-driver-registrar --v=5 --csi-address=/plugin/csi.sock --kubelet-registration-path=/var/lib/kubelet/plugins/lvm-localpv/csi.sock &
+        sleep 10
+        git clone --depth=1 https://github.com/openebs/lvm-localpv
+        cd lvm-localpv
+        kubectl apply --server-side=true -f deploy/yamls/lvmnode-crd.yaml
+        lvm-driver --plugin=controller --endpoint=unix:///plugin/csi.sock --nodeid=node-000000 > lvm-driver.log 2>&1 &
+        LMV_DRIVER_PID=$!
+
+        # Terminate the lvm-driver process after we've grabbed some logs
+        sleep 5
+        kill $LMV_DRIVER_PID
+
+        if grep -q 'Listening for connections' lvm-driver.log; then
+          echo "Test passed: Found expected log output."
+        else
+          echo "Test failed: Did not find expected log output."
+          echo "LVM Driver logs:"
+          cat lvm-driver.log
+          exit 1
+        fi

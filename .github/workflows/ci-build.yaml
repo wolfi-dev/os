@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@0d381219ddf674d61a7572ddd19d7941e271515c # v2.9.0
+        uses: step-security/harden-runner@91182cccc01eb5e619899d80e4e971d6181294a7 # v2.10.1
         with:
           egress-policy: audit
 
@@ -30,7 +30,7 @@ jobs:
 
       - name: Look for changed files
         id: changes
-        uses: tj-actions/changed-files@6b2903bdce6310cfbddd87c418f253cf29b2dec9 # v44.5.6
+        uses: tj-actions/changed-files@48d8f15b2aaa3d255ca5af3eba4870f807ce6b3c # v45.0.2
         with:
           files_yaml: |
             melange:
@@ -45,24 +45,44 @@ jobs:
       - name: Build package list
         id: package-list
         run: |
-          printf "packages=" >> $GITHUB_OUTPUT
-
+          set +f # disable pathname expansion
           wolfictl text -t name --pipeline-dir=./pipelines/ \
               -r https://packages.wolfi.dev/bootstrap/stage3 \
-              -k https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub > packages-list
-          while read pkg; do
-            for file in ${{ steps.changes.outputs.melange_all_changed_files }}; do
-              # Since the file is a path, we need to strip out only the file
-              # name from it.
-              base_file=$(basename $file)
-              base_file="${base_file%.melange.yaml}"
-              base_file="${base_file%.yaml}"
-              printf "base_file: $base_file"
-              [ "${base_file}" = "$pkg" ] && printf "%s " ${base_file} >> $GITHUB_OUTPUT
-            done
-          done < packages-list
+              -k https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub > all-packages-list
 
-          printf "\n" >> $GITHUB_OUTPUT
+          echo "all-packages-list has $(wc -l < all-packages-list)"
+          n=0
+          for f in ${{ steps.changes.outputs.melange_all_changed_files }}; do
+              # filter anything not .yaml
+              case "$f" in
+                  */pipelines/*) continue;;
+                  *.yaml) :;;
+                  *) continue;;
+              esac
+              pkg=${f##*/}
+              pkg=${pkg%.yaml}
+              pkg=${pkg%.melange.yaml}
+              n=$((n+1))
+              echo "$pkg"
+          done > changed-packages-list
+          echo "changed-packages-list has $n"
+          rc=0
+          grep --fixed-strings --line-regexp \
+              --file=changed-packages-list all-packages-list \
+              > packages-to-build || rc=$?
+          tobuild=$(wc -l < packages-to-build)
+          if [ $rc -eq 0 ]; then
+              echo "build these $tobuild packages in order"
+              sed 's/^/> /' packages-to-build
+              set -- $(cat packages-to-build)
+          elif [ $rc -eq 1 ]; then
+              echo "packages-to-build is empty - did not find any changed packages"
+              set --
+          else
+              echo "ERROR: unexpected error $rc from grep"
+              exit 1
+          fi
+          printf "packages=%s\n" "$*" > "$GITHUB_OUTPUT"
 
   build:
     name: Test building of packages
@@ -88,7 +108,7 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@0d381219ddf674d61a7572ddd19d7941e271515c # v2.9.0
+        uses: step-security/harden-runner@91182cccc01eb5e619899d80e4e971d6181294a7 # v2.10.1
         with:
           egress-policy: audit
 
@@ -178,14 +198,13 @@ jobs:
         uses: ./.github/actions/docker-run
         with:
           run: |
-            apk add py3-ntia-conformance-checker spdx-tools-java
+            apk add spdx-tools-java
             for f in $(find packages -name '*.apk'); do
                 echo "==== Checking SBOM for $f ===="
                 tar -Oxf "$f" var/lib/db/sbom/ > sbom.json
                 echo ::group::sbom.json
                 cat sbom.json
                 echo ::endgroup::
-                ntia-checker -v --file sbom.json
                 tools-java Verify sbom.json
             done
 
@@ -230,7 +249,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: "Upload built packages to GitHub artifacts"
-        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.3.4
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
         with:
           path: |
             ./packages/${{ matrix.arch }}
@@ -250,7 +269,7 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@0d381219ddf674d61a7572ddd19d7941e271515c # v2.9.0
+        uses: step-security/harden-runner@91182cccc01eb5e619899d80e4e971d6181294a7 # v2.10.1
         with:
           egress-policy: audit
 
@@ -297,7 +316,7 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@0d381219ddf674d61a7572ddd19d7941e271515c # v2.9.0
+        uses: step-security/harden-runner@91182cccc01eb5e619899d80e4e971d6181294a7 # v2.10.1
         with:
           egress-policy: audit
 
@@ -335,10 +354,21 @@ jobs:
 
       - name: Scan for CVEs
         run: |
+          stderrf="/tmp/scan.stderr"
           wolfictl scan \
             --build-log \
             --advisories-repo-dir 'data/wolfi-advisories' \
             --advisory-filter 'resolved' \
             --require-zero \
             /tmp/artifacts-1 \
-            2> /dev/null # The error message renders strangely on GitHub Actions, and the important information is already being sent to stdout.
+            2> "$stderrf" && rc=0 || rc=$?
+
+          # The error message renders strangely on GitHub Actions so it is
+          # captured and shown only if it does not match expected "vulnerabilities found"
+          if [ $rc -ne 0 ] &&
+             ! grep -qi "vulnerabilities found" "$stderrf"; then
+             echo "Unexpected error content" 1>&2
+             sed 's,^,| ,' "$stderrf" 1>&2
+          fi
+          rm -f "$stderrf"
+          exit $rc

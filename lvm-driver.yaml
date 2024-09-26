@@ -1,0 +1,94 @@
+package:
+  name: lvm-driver
+  version: 1.6.2
+  epoch: 0
+  description: Dynamically provision Stateful Persistent Node-Local Volumes & Filesystems for Kubernetes that is integrated with a backend LVM2 data storage stack.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - btrfs-progs
+      - busybox
+      - ca-certificates-bundle
+      - device-mapper
+      - e2fsprogs
+      - e2fsprogs-extra
+      - lvm2
+      - util-linux
+      - xfsprogs
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/openebs/lvm-localpv
+      tag: lvm-localpv-${{package.version}}
+      expected-commit: 45e0fbdd6af38f3025132fff5b6d10c3c2eec1fb
+
+  - uses: go/bump
+    with:
+      deps: golang.org/x/net@v0.23.0 google.golang.org/grpc@v1.56.3 google.golang.org/protobuf@v1.33.0 github.com/golang/protobuf@v1.5.4
+
+  - uses: go/build
+    with:
+      packages: ./cmd/main.go
+      ldflags: |
+        -X github.com/openebs/lvm-localpv/pkg/version.Version=${{package.version}}
+        -X github.com/openebs/lvm-localpv/pkg/version.GitCommit=$(git rev-parse HEAD)
+      output: lvm-driver
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "upstream image have executable placed at /usr/local/bin"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin/
+          ln -sf /usr/bin/lvm-driver ${{targets.contextdir}}/usr/local/bin/lvm-driver
+
+update:
+  enabled: true
+  github:
+    identifier: openebs/lvm-localpv
+    strip-prefix: lvm-localpv-
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubernetes-csi-node-driver-registrar
+        - git
+  pipeline:
+    - uses: test/kwok/cluster
+    - runs: |
+        sleep 5
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        mkdir -p /var/lib/kubelet/plugins/lvm-localpv
+        mkdir -p /plugin
+        mkdir -p /registration
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+        cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        kubectl create clusterrolebinding default --clusterrole=cluster-admin --serviceaccount=default:default
+        kubectl create token default > /var/run/secrets/kubernetes.io/serviceaccount/token
+        export KUBERNETES_SERVICE_HOST=127.0.0.1
+        export KUBE_NODE_NAME=node-000000
+        export KUBERNETES_SERVICE_PORT=32764
+        csi-node-driver-registrar --v=5 --csi-address=/plugin/csi.sock --kubelet-registration-path=/var/lib/kubelet/plugins/lvm-localpv/csi.sock &
+        sleep 10
+        git clone --depth=1 https://github.com/openebs/lvm-localpv
+        cd lvm-localpv
+        kubectl apply --server-side=true -f deploy/yamls/lvmnode-crd.yaml
+        lvm-driver --plugin=controller --endpoint=unix:///plugin/csi.sock --nodeid=node-000000 > lvm-driver.log 2>&1 &
+        LMV_DRIVER_PID=$!
+
+        # Terminate the lvm-driver process after we've grabbed some logs
+        sleep 5
+        kill $LMV_DRIVER_PID
+
+        if grep -q 'Listening for connections' lvm-driver.log; then
+          echo "Test passed: Found expected log output."
+        else
+          echo "Test failed: Did not find expected log output."
+          echo "LVM Driver logs:"
+          cat lvm-driver.log
+          exit 1
+        fi

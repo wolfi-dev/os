@@ -1,6 +1,6 @@
 package:
   name: jenkins
-  version: "2.463"
+  version: "2.478"
   epoch: 0
   description: Open-source CI/CD application.
   copyright:
@@ -44,13 +44,16 @@ pipeline:
     with:
       repository: https://github.com/jenkinsci/jenkins
       tag: jenkins-${{package.version}}
-      expected-commit: 713aa9a163fb335782966fa478761c0111e5eebf
+      expected-commit: 7df633dcf9e8190906f4bf105397f521afc1eb0a
 
   - uses: patch
     with:
       patches: ignoreArchiveNotReadableTest.patch
 
   - runs: |
+      # Use commit timestamp as build date to satisfy Jenkins in-place upgrade functionality (.war file needs to match release date)
+      export SOURCE_DATE_EPOCH=$(git show -s --format=%ct)
+
       export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
       export LANG=en_US.UTF-8
 
@@ -92,9 +95,38 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/share/jenkins
           remoting_version=$(xmllint --xpath "//*[local-name()='remoting.version']/text()" pom.xml)
-          cp "remoting/target/remoting-${remoting_version}.jar" "${{targets.subpkgdir}}"/usr/share/jenkins/
-          ln -sf "/usr/share/jenkins/remoting-${remoting_version}.jar" "${{targets.subpkgdir}}"/usr/share/jenkins/agent.jar
-          ln -sf "/usr/share/jenkins/remoting-${remoting_version}.jar" "${{targets.subpkgdir}}"/usr/share/jenkins/slave.jar
+
+          #  the jar contains version number sometimes
+          #  example below from the remoting version number
+          # originating from https://github.com/jenkinsci/remoting/blob/3256.3258.v858f3c9a_f69d/pom.xml#L37
+          #  remoting-3256.3256.3258.v858f3c9a_f69d.jar
+          #  remoting-3256.3258.v858f3c9a_f69d.jar
+
+          # Find the correct remoting jar file, excluding *-tests.jar
+          remoting_jar=$(find remoting/target -name "remoting-*${remoting_version}*.jar" -type f ! -name "*-test*.jar")
+
+          if [ -z "$remoting_jar" ]; then
+            echo "Error: Remoting jar file not found"
+            exit 1
+          fi
+
+          if [ $(echo "$remoting_jar" | wc -l) -gt 1 ]; then
+            echo "Error: Multiple matching jar files found:"
+            echo "$remoting_jar"
+            exit 1
+          fi
+
+          # Extract just the filename
+          remoting_jar_name=$(basename "$remoting_jar")
+
+          echo "Copying $remoting_jar_name to ${{targets.subpkgdir}}/usr/share/jenkins/"
+          cp "$remoting_jar" "${{targets.subpkgdir}}"/usr/share/jenkins/
+
+          echo "Creating symlinks for agent.jar and slave.jar"
+          ln -sf "/usr/share/jenkins/${remoting_jar_name}" "${{targets.subpkgdir}}"/usr/share/jenkins/agent.jar
+          ln -sf "/usr/share/jenkins/${remoting_jar_name}" "${{targets.subpkgdir}}"/usr/share/jenkins/slave.jar
+
+          echo "Remoting jar installation completed successfully"
 
 update:
   enabled: true
@@ -120,3 +152,10 @@ test:
         timeout: 120
         expected_output: |
           Jenkins is fully up and running
+    - name: "Check .war timestamp is being set correctly (not zero)"
+      runs: |
+        WAR_TIME=$(stat -c %Y /usr/share/java/jenkins/jenkins.war)
+        if [ "$WAR_TIME" -ne 0 ]; then
+          echo "WAR file timestamp is zero"
+          exit 1
+        fi

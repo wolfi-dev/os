@@ -20,6 +20,8 @@ environment:
     LANG: en_US.UTF-8
     JAVA_HOME: /usr/lib/jvm/java-1.8-openjdk
     HIVE_VERSION: 4.0.0
+    HADOOP_VERSION: 3.3.6
+    TEZ_VERSION: 0.10.4
 
 pipeline:
   - uses: git-checkout
@@ -35,17 +37,58 @@ pipeline:
       patches: rat.patch
 
   - runs: |
-      mvn package -Dhadoop.version=3.3.6 -Dtez.version=0.10.4 -DskipTests -Dmaven.javadoc.skip=true -Pdist
+      mvn package -DskipTests -Dmaven.javadoc.skip=true -Pdist \
+        -Dhadoop.version="${HADOOP_VERSION}" \
+        -Dtez.version="${TEZ_VERSION}"
+      mkdir -p ${{targets.destdir}}/usr/share/java/hive
+      tar -xf packaging/target/apache-hive-${{package.version}}-bin.tar.gz \
+        --strip-component=1 -C ${{targets.destdir}}/usr/share/java/hive
 
 test:
   environment:
     contents:
       packages:
         - bash
+        - gpg
+        - gpg-agent
+        - gnupg-dirmngr
+        - curl
+        - libnss
+        - libnss-dev
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-1.8-openjdk
+      HADOOP_VERSION: 3.3.6
+      HADOOP_HOME: /home/build/hadoop-3.3.6
+      HIVE_HOME: /usr/share/java/hive
   pipeline:
-    - name: hive check
+    - name: Download Hadoop
       runs: |
-        ls packaging/target/apache-hive-${{package.version}}}-SNAPSHOT-bin/apache-hive-${{package.version}}-SNAPSHOT-bin
+        gpg --keyserver hkps://keyserver.ubuntu.com --recv-key CD32D773FF41C3F9E74BDB7FB362E1C021854B9D
+        curl -sLO https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz.asc
+        curl -sLO https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz
+        gpg --verify hadoop-${HADOOP_VERSION}.tar.gz.asc hadoop-${HADOOP_VERSION}.tar.gz
+        tar -zxf hadoop-${HADOOP_VERSION}.tar.gz && rm *.tar.gz*
+    - name: Prepare Hadoop standalone
+      runs: |
+        echo "JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk" >> hadoop-${HADOOP_VERSION}/etc/hadoop-env.sh
+        echo "127.0.0.1 $(hostname)" >> /etc/hosts
+    # This test suite starts Beeline and HiveServer2 in the same process.
+    # Ref: https://cwiki.apache.org/confluence/display/Hive/HiveServer2+Overview
+    - name: Create a table in Hive
+      runs: |
+        # Prepare HDFS directories
+        echo "test:x:$(id -u):$(id -g):test user:/:/bin/sh:" >> /etc/passwd
+        $HADOOP_HOME/bin/hadoop fs -mkdir -p /tmp
+        $HADOOP_HOME/bin/hadoop fs -mkdir -p /user/hive/warehouse
+        $HADOOP_HOME/bin/hadoop fs -chmod g+w /tmp
+        $HADOOP_HOME/bin/hadoop fs -chmod g+w /user/hive/warehouse
+
+        # Initialize the metastore database (derby type)
+        $HIVE_HOME/bin/schematool -dbType derby -initSchema
+
+        # Start Beeline and HiveServer2 in the same process and run Hive queries
+        $HIVE_HOME/bin/beeline -u jdbc:hive2:// --silent=true -e 'CREATE TABLE pokes (foo INT, bar STRING)' 2>/dev/null
+        $HIVE_HOME/bin/beeline -u jdbc:hive2:// --silent=true -e 'SHOW TABLES' 2>/dev/null | grep -s pokes
 
 update:
   enabled: true

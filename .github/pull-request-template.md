@@ -39,6 +39,14 @@ addressed, and remove any items that are not relevant to this PR.
 - [ ] The upstream project actually supports multiple concurrent versions.
 - [ ] Any subpackages include the version string in their package name (e.g. `name: ${{package.name}}-compat`)
 - [ ] The package (and subpackages) `provides:` logical unversioned forms of the package (e.g. `nodejs`, `nodejs-lts`)
+- [ ] If non-streamed package names no longer built, open PR to withdraw them (see [WITHDRAWING PACKAGES](https://github.com/wolfi-dev/os/blob/main/WITHDRAWING_PACKAGES.md))
+
+#### For package updates (renames) in the base images
+<!-- remove if unrelated -->
+When updating packages part of base images (i.e. cgr.dev/chainguard/wolfi-base or ghcr.io/wolfi-dev/sdk)
+- [ ] REQUIRED cgr.dev/chainguard/wolfi-base and ghcr.io/wolfi-dev/sdk images successfully build
+- [ ] REQUIRED cgr.dev/chainguard/wolfi-base and ghcr.io/wolfi-dev/sdk contain no obsolete (no longer built) packages
+- [ ] Upon launch, does `apk upgrade --latest` successfully upgrades packages or performs no actions
 
 #### For security-related PRs
 <!-- remove if unrelated -->

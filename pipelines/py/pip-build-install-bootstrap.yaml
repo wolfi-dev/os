@@ -1,0 +1,79 @@
+name: Use pip from a zipapp for bootstrap. Only for use with bootstrapping.
+
+needs:
+  packages:
+    - pip-zipapp
+
+inputs:
+  python:
+    description: which python to use
+    default: DEFAULT
+  wheel:
+    description: build a wheel?
+    required: false
+    default: true
+  dest:
+    description: the destination
+    default: ${{targets.contextdir}}
+
+pipeline:
+  - name: "pip-bootstrap build"
+    runs: |
+      export SOURCE_DATE_EPOCH=315532800
+      py=${{inputs.python}}
+      pipzip=/usr/share/pip-zipapp/pip-zipapp.pyz
+      [ -e "$pipzip" ] || { echo "missing pip-zip - $pipzip does not exist"; exit 1; }
+      [ -f "$pipzip" ] || { echo "missing pip-zip - $pipzip is not a file"; exit 1; }
+      if [ "$py" = "DEFAULT" ]; then
+        if p=$(command -v python3); then
+          py=$p
+          if [ -L "$p" ]; then
+            py=$(readlink -f "$p") ||
+              { echo "ERROR: failed 'readlink -f $p'" 1>&2; exit 1; }
+          fi
+        else
+          glob="/usr/bin/python3.[0-9][0-9] /usr/bin/python3.[789]"
+          n=0
+          for p in $glob; do
+            [ -x "$p" ] && n=$((n+1)) && py=$p && found="$found $p"
+          done
+          if [ "$n" -ne 1 ]; then
+            echo "ERROR: must set inputs.python: " \
+                "found $n executables matching $glob" 1>&2
+            [ "$n" -eq 0 ] || echo "  found: $found" 1>&2
+            exit 1
+          fi
+        fi
+      fi
+      pyver=$("$py" -c 'import sys; print("%s.%s" % (sys.version_info.major, sys.version_info.minor))')
+      sitepkgd=$("$py" -c 'import site; print(site.getsitepackages()[0])')
+      sitepkgd=${sitepkgd#/}
+      root=${{inputs.dest}}
+      wd="./.wheels/$pyver"
+      info() { echo "$@" 1>&2; }
+      vr() { info "execute:" "$@"; "$@"; }
+
+      tmpd=$(mktemp -d)
+      trap "rm -Rf '$tmpd'" EXIT
+
+      # --find-links to an empty dir and --no-index makes pip fully "offline"
+      distwheelsd="/usr/share/pip-zipapp/wheels"
+      mkdir -p "$distwheelsd"
+      info "$py is $pyver with site_packages dir '$sitepkgd'"
+
+      if [ "${{inputs.wheel}}" = "false" ]; then
+        info "skipping bdist-wheel"
+        vr "$py" "$pipzip" --python=/usr/bin/$py install --verbose --no-deps \
+            "--find-links=$distwheelsd" --no-index \
+            --force-reinstall --no-compile --prefix=/usr "--root=$root" .
+      else
+        vr "$py" "$pipzip" --python=/usr/bin/$py wheel --verbose "--wheel-dir=$wd" \
+            "--find-links=$distwheelsd" --no-index --no-deps .
+        set -- "$wd"/*.whl
+        [ -f "$1" ] || { info "did not produce a wheel in $wd"; exit 1; }
+        info "produced $# wheels: $*"
+        vr "$py" "$pipzip" --python=/usr/bin/$py install --verbose \
+            "--find-links=$distwheelsd" --no-index --no-build-isolation --no-deps \
+            --force-reinstall --no-compile --prefix=/usr "--root=$root" "$@"
+      fi
+      vr $py -m compileall --invalidation-mode=unchecked-hash -r100 "$root/$sitepkgd"

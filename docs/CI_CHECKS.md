@@ -70,27 +70,41 @@ wolfictl lint
 # So name
 This CI check is particularly important for ensuring that ABI (Application Binary Interface) compatibility is not broken when updating shared object versions.
 
-This check exists to make sure that package updates are backward-compatible and won't break dependent packages. For example, when a shared object version is bumped, it may require dependent packages to be updated as well. This is crucial for maintaining the stability of our systems.
+This check exists to make sure that package updates are backward-compatible and won't break dependent packages. For example, when a shared object version is bumped, it may require dependent packages to be updated as well. **This is crucial for maintaining the stability of our systems**.
 
-### When It Fails
+### When It Fails?
 If this CI check fails, it's usually because of a new major shared object version that's been introduced with a package update. In this case, you'll need to bump the epoch field in the YAML files of downstream dependent packages.
 
-## How to Fix
-Here's how to bump the epoch for downstream dependent packages:
+## What to do when the so name check fails
 
-Find the affected YAML files in your PR. Use GitHub search to identify packages that use your updated package.
 
-Locate the epoch field. It's usually towards the top of the yaml file.
+The action required here is to bump the epoch for all the downstream dependent packages. The "epoch" is a field in the package's YAML file that needs to be incremented when a new major shared object version is introduced.
+
+1. **Find the downstream dependent packages**: Find the affected YAML files in your PR. Use GitHub search to identify packages that use your updated package.
+
+2. **Locate and update the epoch field**: The epoch field is usually towards the top of the YAML file. You'll need to increment the value by one. For example, if the current value is `0`, you would change it to `1`.
 
 ```yaml
-epoch: 0
+package:
+  name: libfoo
+  epoch: 0 // need to increment this by one
 ```
-Increment the epoch by 1.
 
-Push changes to the same PR that has the failing so name check to ensure the build is able to compile all packages that use the package which introduces the new shared object file version.
+3. **Push changes:** Push these changes to the same PR that has the failing so name check. This ensures the build can compile all packages that use the package which introduces the new shared object file version.
 
-Once it's confirmed that downstream packages build with the new shared object version that's being proposed a Wolfi Maintainer admin will be able to review, approve and merge by overriding the failed check.
+4. **Confirm and label:** Once it's confirmed that downstream packages are being built with this new version of the shared object, add the soname-validate label to the PR. This signals to the Wolfi Maintainer admin that they can review, approve, and merge by overriding the failed check.
 
+> **Note:** The So-Name CI check will still fail after all the above steps are completed. This is expected behavior, and a Wolfi Maintainer admin will need to override the failed check.
+
+Example PR: https://github.com/wolfi-dev/os/pull/20198
+
+In this example PR, we can see there is a new shared object version being introduced in the `gsl` package. The `gsl.yaml` file has four packages: `gsl`, `gsl-dev`, `gsl-doc`, and `gsl-static`.
+
+To find the dependent packages of `gsl`, we use [GitHub search](https://github.com/search?q=repo:wolfi-dev/os%20gsl&type=code). In this case, we can see that there are two packages that are dependent on the `gsl-dev` package: `dieharder` and `lsb-release-minimal`. 
+
+Therefore, we need to increment the epoch of these two dependent packages. To do this, locate the epoch field in the YAML files of `dieharder` and `lsb-release-minimal`, and increment the value by one.
+
+> **Note:** We do not need to increment the epoch of the `gsl` package itself, as it is the package that is introducing the new shared object version.
 
 # Wolfi Scan
 

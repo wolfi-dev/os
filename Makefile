@@ -141,7 +141,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:6c001d29fe246547dd24b52682770e4d7770ced4d1f25e534f31237d7308a1ce
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:7f45f37c87c7f6901b1439c07f383439b37f80b7f8704b5daafae2f92bd7fbb1
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -208,6 +208,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:6c001d29fe246547dd24b52682770e4d7770ced4d1f25e534f31237d7308a1ce
+		ghcr.io/wolfi-dev/sdk:latest@sha256:7f45f37c87c7f6901b1439c07f383439b37f80b7f8704b5daafae2f92bd7fbb1
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"

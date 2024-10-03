@@ -1,0 +1,259 @@
+package:
+  name: python-3.13
+  version: 3.13.0_rc3
+  epoch: 0
+  description: "the Python programming language"
+  copyright:
+    - license: PSF-2.0
+  resources:
+    cpu: 8
+    memory: 8Gi
+  dependencies:
+    provides:
+      - python3=0
+      - python-3=0
+    runtime:
+      - ${{package.name}}-base=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - bzip2-dev
+      - ca-certificates-bundle
+      - expat-dev
+      - gdbm-dev
+      - libffi-dev
+      - linux-headers
+      - mpdecimal-dev
+      - ncurses-dev
+      - openssf-compiler-options
+      - openssl-dev
+      - readline-dev
+      - sqlite-dev
+      - xz-dev
+      - zlib-dev
+
+# creates helpfull python3.M and 3.M variables
+var-transforms:
+  - from: ${{package.name}}
+    match: '-'
+    replace: ''
+    to: python
+  - from: ${{package.version}}
+    match: (\d).(\d+).(\d+).*
+    replace: '$1.$2'
+    to: pyversion
+  - from: ${{package.version}}
+    match: '_'
+    replace: ''
+    to: tagname
+  - from: ${{package.version}}
+    match: (\d).(\d+).(\d+).*
+    replace: '$1.$2.$3'
+    to: versionMajMinMic
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: fae84c70fbd9ac391ec0d3826cc114a0036a71e1
+      repository: https://github.com/python/cpython.git
+      tag: v${{vars.tagname}}
+
+  - name: Force use of system libraries
+    runs: |
+      rm -rf Modules/expat \
+        Modules/_ctypes/darwin* \
+        Modules/_ctypes/libffi*
+
+  - uses: patch
+    with:
+      patches: gh-118224.patch
+
+  - name: Configure
+    runs: |
+      ./configure \
+         --host=${{host.triplet.gnu}} \
+         --build=${{host.triplet.gnu}} \
+         --target=${{host.triplet.gnu}} \
+         --prefix=/usr \
+         --enable-ipv6 \
+         --enable-loadable-sqlite-extensions \
+         --enable-optimizations \
+         --enable-shared \
+         --without-lto \
+         --with-computed-gotos \
+         --with-dbmliborder=gdbm:ndbm \
+         --with-system-expat \
+         --with-system-libmpdec \
+         --without-ensurepip \
+         --with-builtin-hashlib-hashes=blake2 \
+         --with-lto \
+         --with-wheel-pkg-dir=/usr/share/python-wheels
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - runs: |
+      find ${{targets.destdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'tests' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+
+      cd ${{targets.destdir}}/usr/bin
+      rm -f idle3* 2to3*
+      rm ${{targets.destdir}}/usr/lib/libpython3.so
+
+      # add dubious python -> python3 link
+      ln -s python3 ${{targets.destdir}}/usr/bin/python
+
+      # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+      cd ${{targets.destdir}}/usr/lib/${{vars.python}}
+      rm site-packages/README.txt
+      rmdir site-packages
+
+  - runs: |
+      rm -R ${{targets.destdir}}/usr/lib/${{vars.python}}/ensurepip/_bundled/
+
+  - runs: |
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+      export LD_LIBRARY_PATH="${{targets.destdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      ${{targets.destdir}}/usr/bin/${{vars.python}} -m compileall --invalidation-mode=unchecked-hash \
+          -r100 ${{targets.destdir}}/usr/lib/
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-base"
+    description: "${{package.name}} without /usr/bin/python3"
+    dependencies:
+      runtime:
+        - py3-pip-wheel
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/bin/${{vars.python}} \
+              ${{targets.destdir}}/usr/bin/pydoc${{vars.pyversion}} \
+              ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/lib/${{vars.python}} \
+             ${{targets.subpkgdir}}/usr/lib
+          mv -v ${{targets.destdir}}/usr/lib/libpython${{vars.pyversion}}.so.* \
+             ${{targets.subpkgdir}}/usr/lib
+
+          # pyconfig.h is needed at runtime... ugh.
+          d=usr/include/${{vars.python}}
+          mkdir -p "${{targets.subpkgdir}}"/$d
+          mv "${{targets.destdir}}"/$d/pyconfig.h "${{targets.subpkgdir}}"/$d/
+
+          # move usr/lib/python3.X/config-3.X-x86_64-linux-gnu
+          # back into main package so the -base-dev can take it below.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.destdir}}/$d"
+          mv -v "${{targets.subpkgdir}}/$d"/config-${{vars.pyversion}}* \
+              "${{targets.destdir}}/$d"
+    test:
+      pipeline:
+        - runs: |
+            ${{vars.python}} version-check.py ${{vars.versionMajMinMic}}
+        - name: Verify venv installs expected packages
+          runs: |
+            set +x
+            d=$(mktemp -d)
+            echo "$ ${{vars.python}} -m venv $d"
+            ${{vars.python}} -m venv "$d"
+            echo "$ $d/bin/pip list"
+            $d/bin/pip list | tee "$d/list.txt"
+            wd=/usr/share/python-wheels
+            for pkg in pip ; do
+              set -- "$wd"/$pkg-*.whl
+              [ $# -eq 1 ] || {
+                echo "ERROR: found $# wheels in $wd matching $pkg-*.whl";
+                exit 1;
+              }
+              [ -f "$1" ] || {
+                echo "ERROR: $wd/$pkg-*.whl ('$1') was not a file"
+                exit 1
+              }
+              # name is like pip-24.2-py3-none-any.whl. second token is version.
+              wheel=${1}
+              tmp=${wheel##*/}
+              tmp=${tmp#*-}
+              ver=${tmp%%-*}
+              if ! grep -q "$pkg[ ]\+${ver}$" "$d/list.txt"; then
+                  echo "FAIL: did not find '$pkg==$ver' in venv"
+                  echo "pip list had:"
+                  sed 's,^,>,' "$d/list.txt"
+                  exit 1
+              fi
+              echo "PASS: venv installed '$pkg==$ver'"
+            done
+
+            rm -Rf "$d"
+
+  - name: "${{package.name}}-doc"
+    description: "python3 documentation"
+    pipeline:
+      - uses: split/manpages
+
+  - name: "${{package.name}}-dev"
+    description: "python3 development headers"
+    dependencies:
+      provides:
+        - python3-dev=0
+        - python-3-dev=0
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - ${{package.name}}-base-dev=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/bin/python3-config ${{targets.subpkgdir}}/usr/bin
+
+          d="usr/lib/pkgconfig"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v \
+             "${{targets.destdir}}"/$d/python3-embed.pc \
+             "${{targets.destdir}}"/$d/python3.pc \
+             "${{targets.subpkgdir}}/$d/"
+
+  - name: "${{package.name}}-base-dev"
+    description: "python3 development headers"
+    dependencies:
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # usr/lib/python3.X/config-3.X-x86_64-linux-gnu
+          # split/dev will only move 2 files from it, but we want all of it.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v "${{targets.destdir}}"/$d/config-${{vars.pyversion}}* \
+             "${{targets.subpkgdir}}"/$d
+      - uses: split/dev
+
+test:
+  pipeline:
+    - runs: |
+        # main package should provide 'python' and 'python3'.
+        python version-check.py ${{vars.versionMajMinMic}}
+        python3 version-check.py ${{vars.versionMajMinMic}}
+    - name: Verify working python3 -m venv
+      runs: |
+        d=$(mktemp -d)
+        python3 -m venv "$d"
+        $d/bin/pip list
+        $d/bin/pip check
+        rm -Rf "$d"
+
+update:
+  enabled: true
+  shared: true
+  github:
+    identifier: python/cpython
+    strip-prefix: v
+    tag-filter: v3.12
+    use-tag: true

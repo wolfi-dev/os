@@ -1,10 +1,16 @@
 package:
   name: strimzi-kafka-operator
   version: 0.43.0
-  epoch: 0
+  epoch: 2
   description: Apache Kafka® running on Kubernetes
   copyright:
     - license: Apache-2.0
+  dependencies:
+    runtime:
+      - strimzi-kafka-operator-cluster-operator
+      - strimzi-kafka-operator-kafka-init
+      - strimzi-kafka-operator-topic-operator
+      - strimzi-kafka-operator-user-operator
 
 environment:
   contents:
@@ -15,16 +21,25 @@ environment:
       - coreutils
       - curl
       - docker # not gonna be needed but their script requires docker to be installed
+      - findutils
       - helm
       - make
       - maven
       - openjdk-17
       - openjdk-17-default-jvm
       - perl-utils
+      - tini
+      - tini-compat
       - unzip
       - wget
       - yq
       - zip
+  environment:
+    KAFKA_HOME: /opt/kafka
+    KAFKA_EXPORTER_HOME: /opt/kafka-exporter
+    CRUISE_CONTROL_HOME: /opt/cruise-control
+    SRC_DIR: ./docker-images/artifacts/binaries
+    DEST_DIR: opt/strimzi
 
 vars:
   shellcheck_version: 0.10.0
@@ -37,6 +52,16 @@ pipeline:
       repository: https://github.com/strimzi/strimzi-kafka-operator
       tag: ${{package.version}}
       expected-commit: 23c0fb0726e1f212c6182eb251ff23697e72a353
+
+  - uses: patch
+    with:
+      patches: 0001-patch-thirdpaty-deps.patch
+
+  - uses: maven/pombump
+    with:
+      patch-file: ""
+      properties-file: pombump-deps.yaml
+      pom: docker-images/artifacts/kafka-thirdparty-libs/cc/pom.xml
 
   - runs: |
       export JAVA_HOME="/usr/lib/jvm/java-17-openjdk"
@@ -59,51 +84,124 @@ pipeline:
       # Copy shellcheck binary to /usr/bin/
       cp "shellcheck-v${{vars.shellcheck_version}}/shellcheck" /usr/bin/
 
-
       for i in mockkube config-model certificate-manager operator-common; do
-        make -C $i MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true" java_build
-        make -C $i MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true -e -V -B" java_install
+        make -C $i MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress" java_build
+        make -C $i MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress -e -V -B" java_install
       done
 
       mvn clean
       mvn install -B -DskipTests -Dmaven.javadoc.skip=true
-      make MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true" java_build
-      make MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true  -e -V -B" java_install
+      make MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress" java_build
+      make MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress -e -V -B" java_install
 
       # Set the source and destination directories
-      SRC_DIR="./docker-images/artifacts/binaries"
-      DEST_DIR="opt/strimzi"
       mkdir -p "${{targets.contextdir}}"/$DEST_DIR/bin
       mkdir -p "${{targets.contextdir}}"/$DEST_DIR/lib
       install -Dm755 ./docker-images/operator/scripts/launch_java.sh ${{targets.contextdir}}/$DEST_DIR/bin/launch_java.sh
 
+data:
+  - name: binaries
+    items:
+      cluster-operator: cluster-operator
+      kafka-init: kafka-init
+      kafka-agent: kafka-agent
+      mirror-maker-agent: mirror-maker-agent
+      topic-operator: topic-operator
+      tracing-agent: tracing-agent
+      user-operator: user-operator
 
-      # List of file name patterns, space-separated
-      file_patterns="topic-operator user-operator cluster-operator kafka-init"
+subpackages:
+  - range: binaries
+    name: ${{package.name}}-${{range.key}}
+    description: ${{range.value}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/$DEST_DIR/bin
+          mkdir -p "${{targets.contextdir}}"/$DEST_DIR/lib
+          mkdir -p "${{targets.contextdir}}"/usr/lib/kafka/libs/
+          unzip -o "$SRC_DIR/${{range.key}}-*-dist.zip" -d tmp
+          cp -r tmp/lib/* "${{targets.contextdir}}"/$DEST_DIR/lib/
+          cp -r tmp/bin/* "${{targets.contextdir}}"/$DEST_DIR/bin/
+          ln -sf /$DEST_DIR/lib/io.strimzi.${{range.key}}-$(cat release.version).jar ${{targets.contextdir}}/usr/lib/kafka/libs/
+          # They omit `io.strimzi` on upstream Makefile
+          ln -sf /$DEST_DIR/lib/io.strimzi.${{range.key}}-$(cat release.version).jar ${{targets.contextdir}}/usr/lib/kafka/libs/${{range.key}}-$(cat release.version).jar
 
-      # Iterate over each pattern and match the corresponding zip files
-      for file in $file_patterns; do
-          # Find the zip file that matches the pattern
-          zipfile=$(ls "$SRC_DIR"/${file}-*-dist.zip 2>/dev/null)
+  - name: "${{package.name}}-kafka-thirdparty-libs"
+    description: "Required libraries for the Strimzi/Kafka"
+    dependencies:
+      replaces:
+        - kafka
+    pipeline:
+      - working-directory: docker-images/artifacts/kafka-thirdparty-libs/3.8.x/target/dependency
+        pipeline:
+          - runs: |
+              mkdir -p "${{targets.contextdir}}"/usr/lib/kafka/libs/
+              cp -r ./* "${{targets.contextdir}}"/usr/lib/kafka/libs/
 
-          # Check if the zip file exists
-          if [[ -f "$zipfile" ]]; then
-              # Extract the zip file into the destination directory
-              unzip -o "$zipfile" -d tmp
+  - name: "${{package.name}}-kafka-thirdparty-libs-cc"
+    description: "Required 3rd party libraries for the Cruise Control"
+    pipeline:
+      - working-directory: docker-images/artifacts/kafka-thirdparty-libs/cc/target/dependency
+        pipeline:
+          - runs: |
+              mkdir -p "${{targets.contextdir}}"/$CRUISE_CONTROL_HOME/libs
+              cp -r ./* "${{targets.contextdir}}"/$CRUISE_CONTROL_HOME/libs/
 
-              cp -r tmp/lib/* "${{targets.contextdir}}"/$DEST_DIR/lib/
-              cp -r tmp/bin/* "${{targets.contextdir}}"/$DEST_DIR/bin/
+  - name: "${{package.name}}-kafka-base"
+    description: "Required files for the Strimzi/Kafka container image"
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+        - curl
+        - gawk
+        - gettext
+        - grep
+        - kafka
+        - kafka_exporter
+        - kafka_exporter-strimzi-compat
+        - kafka-strimzi-compat
+        - net-tools
+        - nmap
+        - openjdk-17-default-jvm
+        - openssl
+        - sed
+        - strimzi-kafka-operator-kafka-agent
+        - strimzi-kafka-operator-mirror-maker-agent
+        - strimzi-kafka-operator-topic-operator
+        - strimzi-kafka-operator-kafka-thirdparty-libs
+        - strimzi-kafka-operator-kafka-thirdparty-libs-cc
+        - tini
+        - tini-compat
+      provides:
+        - strimzi-kafka=${{package.full-version}}
+    pipeline:
+      - working-directory: docker-images/kafka-based/kafka
+        pipeline:
+          - runs: |
+              mkdir -p "${{targets.contextdir}}"/$KAFKA_HOME
+              mkdir -p "${{targets.contextdir}}"/$KAFKA_EXPORTER_HOME
+              mkdir -p "${{targets.contextdir}}"/$CRUISE_CONTROL_HOME
+              cp -avR ./scripts/* "${{targets.contextdir}}/$KAFKA_HOME/"
+              cp -avR ./exporter-scripts/* "${{targets.contextdir}}/$KAFKA_EXPORTER_HOME/"
+              cp -avR ./cruise-control-scripts/* "${{targets.contextdir}}/$CRUISE_CONTROL_HOME/"
 
-              # Check if the unzip command was successful
-              if [[ $? -eq 0 ]]; then
-                  echo "Successfully unzipped $zipfile to $DEST_DIR"
-              else
-                  echo "Failed to unzip $zipfile"
-              fi
-          else
-              echo "No zip file found for pattern: ${file}-*-dist.zip"
-          fi
-      done
+  - name: kafka-strimzi-compat
+    description: "compat package with strimzi/kafka image"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/kafka
+          for dir in bin config libs logs; do
+            ln -s /usr/lib/kafka/$dir ${{targets.contextdir}}/opt/kafka/$dir
+          done
+
+  - name: kafka_exporter-strimzi-compat
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/kafka-exporter
+          # https://github.com/strimzi/strimzi-kafka-operator/blob/23c0fb0726e1f212c6182eb251ff23697e72a353/docker-images/kafka-based/kafka/Dockerfile#L33
+          ln -sf /usr/bin/kafka_exporter ${{targets.contextdir}}/opt/kafka-exporter/kafka_exporter
 
 update:
   enabled: true

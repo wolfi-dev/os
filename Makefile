@@ -141,26 +141,26 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:e8c9680e3262d27b28c38e84f51f8a8587c84dc192b0f198b96b11de27aafc34
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:7f45f37c87c7f6901b1439c07f383439b37f80b7f8704b5daafae2f92bd7fbb1
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
-TMP_REPOSITORIES_DIR := $(shell mktemp -d)
-TMP_REPOSITORIES_FILE := $(TMP_REPOSITORIES_DIR)/repositories
 # This target spins up a docker container that is helpful for testing local
 # changes to the packages. It mounts the local packages folder as a read-only,
 # and sets up the necessary keys for you to run `apk add` commands, and then
 # test the packages however you see fit.
 local-wolfi:
-	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOSITORIES_FILE)
-	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOSITORIES_FILE)
+	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
+	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
+	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
+	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
 	docker run --rm -it \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
-		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
+		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
 		cgr.dev/chainguard/wolfi-base:latest
-	@rm "$(TMP_REPOSITORIES_FILE)"
-	@rmdir "$(TMP_REPOSITORIES_DIR)"
+	@rm "$(TMP_REPOS_FILE)"
+	@rmdir "$(TMP_REPOS_DIR)"
 
 # This target spins up a docker container that is helpful for building images
 # using local packages.
@@ -193,19 +193,21 @@ local-wolfi:
 # docker load -i /tmp/out/conda-test.tar
 # docker run -it
 OUT_LOCAL_DIR ?= /work/out
-OUT_DIR ?= $(shell mktemp -d)
 OS_LOCAL_DIR ?= /work/os
 OS_DIR ?= ${PWD}
 dev-container-wolfi:
-	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOSITORIES_FILE)
-	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOSITORIES_FILE)
+	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
+	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
+	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
+	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
+	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
 	docker run --rm -it \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
-		--mount type=bind,source="$(TMP_REPOSITORIES_FILE)",destination="/etc/apk/repositories",readonly \
+		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:e8c9680e3262d27b28c38e84f51f8a8587c84dc192b0f198b96b11de27aafc34
-	@rm "$(TMP_REPOSITORIES_FILE)"
-	@rmdir "$(TMP_REPOSITORIES_DIR)"
+		ghcr.io/wolfi-dev/sdk:latest@sha256:7f45f37c87c7f6901b1439c07f383439b37f80b7f8704b5daafae2f92bd7fbb1
+	@rm "$(TMP_REPOS_FILE)"
+	@rmdir "$(TMP_REPOS_DIR)"

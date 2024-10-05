@@ -1,0 +1,124 @@
+package:
+  name: amazon-k8s-cni
+  version: 1.18.5
+  epoch: 0
+  description: Networking plugin repository for pod networking in Kubernetes using Elastic Network Interfaces on AWS
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - iptables
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - go
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/aws/amazon-vpc-cni-k8s
+      tag: v${{package.version}}
+      expected-commit: a121a8a80a66d487b5ce65dd778083553a2f8f6b
+
+  - name: Copy conflist
+    runs: |
+      mkdir -p ${{targets.destdir}}/app
+      cp -r misc/10-aws.conflist ${{targets.destdir}}/app
+
+  - uses: go/build
+    with:
+      ldflags: -X pkg/version/info.Version=${{package.version}} -X pkg/awsutils/awssession.version=${{package.version}}
+      output: aws-cni
+      packages: ./cmd/routed-eni-cni-plugin
+
+  - uses: go/build
+    with:
+      ldflags: -X pkg/version/info.Version=${{package.version}} -X pkg/awsutils/awssession.version=${{package.version}}
+      output: aws-k8s-agent
+      packages: ./cmd/aws-k8s-agent
+
+  - uses: go/build
+    with:
+      ldflags: -X pkg/version/info.Version=${{package.version}} -X pkg/awsutils/awssession.version=${{package.version}}
+      output: aws-vpc-cni
+      packages: ./cmd/aws-vpc-cni
+
+  - uses: go/build
+    with:
+      ldflags: -X pkg/version/info.Version=${{package.version}} -X pkg/awsutils/awssession.version=${{package.version}}
+      output: egress-cni
+      packages: ./cmd/egress-cni-plugin
+
+  - uses: go/build
+    with:
+      ldflags: -X pkg/version/info.Version=${{package.version}} -X pkg/awsutils/awssession.version=${{package.version}}
+      output: grpc-health-probe
+      packages: ./cmd/grpc-health-probe
+
+subpackages:
+  - name: "${{package.name}}-init"
+    description: "init package for amazon-k8s-cni"
+    pipeline:
+      - uses: go/build
+        with:
+          ldflags: -X pkg/version/info.Version=${{package.version}} -X pkg/awsutils/awssession.version=${{package.version}}
+          output: aws-vpc-cni-init
+          packages: ./cmd/aws-vpc-cni-init
+
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/app
+          ln -sf /usr/bin/aws-cni ${{targets.subpkgdir}}/app/aws-cni
+          ln -sf /usr/bin/aws-k8s-agent ${{targets.subpkgdir}}/app/aws-k8s-agent
+          ln -sf /usr/bin/aws-vpc-cni ${{targets.subpkgdir}}/app/aws-vpc-cni
+          ln -sf /usr/bin/egress-cni ${{targets.subpkgdir}}/app/egress-cni
+          ln -sf /usr/bin/grpc-health-probe ${{targets.subpkgdir}}/app/grpc-health-probe
+
+  - name: "${{package.name}}-init-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    dependencies:
+      runtime:
+        - cni-plugins-aws-k8s-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/init
+          ln -sf /usr/bin/aws-vpc-cni-init ${{targets.subpkgdir}}/init/aws-vpc-cni-init
+          # Download the debug script from awslabs/amazon-eks-ami
+          curl -L https://raw.githubusercontent.com/awslabs/amazon-eks-ami/master/log-collector-script/linux/eks-log-collector.sh -o ${{targets.subpkgdir}}/init/aws-cni-support.sh
+
+update:
+  enabled: true
+  github:
+    identifier: aws/amazon-vpc-cni-k8s
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}
+        - ${{package.name}}-compat
+        - ${{package.name}}-init
+        - ${{package.name}}-init-compat
+  pipeline:
+    - name: Verify installation
+      runs: |
+        aws-cni 2>&1 | grep -q 'CNI protocol versions supported: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.4.0, 1.0.0, 1.1.0'
+        aws-vpc-cni 2>&1 | grep -q 'Failed to install CNI binaries" error="Failed to install /host/opt/cni/bin/aws-cni: failed to copy file: stat aws-cni: no such file or directory'
+        egress-cni 2>&1 | grep -q 'CNI protocol versions supported: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.4.0, 1.0.0, 1.1.0'
+        grpc-health-probe 2>&1 | grep -q '"caller":"github.com/aws/amazon-vpc-cni-k8s/cmd/grpc-health-probe/main.go:59","msg":"error: --addr not specified"'
+    - name: Verify aws-vpc-cni-init
+      runs: |
+        cd /init
+        HOST_CNI_BIN_PATH="/tmp" aws-vpc-cni-init 2>&1 | grep -q 'Copied all CNI plugin binaries to /tmp'
+        if [ -z "$(ls -A /tmp)" ]; then
+          echo "/tmp should have been populated with CNI plugin binaries."
+          exit 1
+        fi

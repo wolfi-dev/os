@@ -1,0 +1,123 @@
+package:
+  name: vitess
+  version: 20.0.2
+  epoch: 3
+  description: Autoscaling components for Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      # Vitess supports multiple versions of MySQL and percona-server: 5.7 and 8.0
+      # So those runtime dependencies will be added in the image build to properly
+      # build the supported components as needed:
+      # https://github.com/vitessio/vitess/blob/v20.0.2/docker/utils/install_dependencies.sh
+      - bash
+      - bzip2
+      - ca-certificates-bundle
+      - curl
+      - gnupg
+      - gnupg-dirmngr
+      - jemalloc
+      - libaio
+      - libatomic
+      - libcurl-openssl4
+      - libev
+      - perl-libwww
+      - procps
+      - rsync
+      - strace
+      - sysstat
+      - tcmalloc-minimal
+      - wget
+      - zstd
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - go-1.22
+      - nodejs-20
+      - npm
+      - nvm
+  environment:
+    VITE_ENABLE_EXPERIMENTAL_TABLET_DEBUG_VARS: "true"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/vitessio/vitess
+      tag: v${{package.version}}
+      expected-commit: 2592c5932b3036647868299b6df76f8ef28dfbc8
+
+  - uses: go/bump
+    with:
+      deps: google.golang.org/grpc@v1.64.1
+
+  - name: Build binaries
+    runs: |
+      # This build more than 40 binaries located in the `./go/cmd` and `./go/tools` directories.
+      # It runs `go build ./go/...` under the hood but our `go/build` pipeline does not support
+      # building multiple binaries at once.
+      # To use system-wide nvm and npm, we will build the web UI in the next step; so we disable it here.
+      NOVTADMINBUILD=1 make build
+
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      install -m 755 ./bin/* "${{targets.contextdir}}"/usr/bin
+
+  - name: Build web UI
+    working-directory: web/vtadmin
+    runs: |
+      npm install
+      npm run build
+
+      mkdir -p "${{targets.contextdir}}"/vt/web/vtadmin
+      cp -r * "${{targets.contextdir}}"/vt/web/vtadmin
+      cp -r build "${{targets.contextdir}}"/vt/web/vtadmin
+      cp -r node_modules "${{targets.contextdir}}"/vt/web/vtadmin
+
+  - name: Copy configuration files
+    runs: |
+      # https://github.com/vitessio/vitess/blob/3e5371377b43951465687e9eadc4dc5e47467427/docker/lite/Dockerfile#L58-L59
+      mkdir -p "${{targets.contextdir}}"/vt/config
+      cp -r ./config/mycnf/* "${{targets.contextdir}}"/vt/config/
+      cp -r ./config/init_db.sql "${{targets.contextdir}}"/vt/config/
+
+  - runs: |
+      # Remove the clipboard_x86_64.exe binary as it breaks the aarch64 installation
+      # since it installs the ld-linux-x86-64.so.2 library.
+      rm -rf "${{targets.contextdir}}"/vt/web/vtadmin/node_modules/clipboardy/fallbacks/windows/clipboard_x86_64.exe
+      rm -rf "${{targets.contextdir}}"/vt/web/vtadmin/node_modules/clipboardy/fallbacks/linux/xsel
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    pipeline:
+      - runs: |
+          # https://github.com/vitessio/vitess/blob/2592c5932b3036647868299b6df76f8ef28dfbc8/docker/lite/Dockerfile.percona80#L42-L56
+          mkdir -p "${{targets.contextdir}}"/vt/bin
+          mkdir -p "${{targets.contextdir}}"/vt/config
+          mkdir -p "${{targets.contextdir}}"/vt/vtdataroot
+          for bin in ${{targets.destdir}}/usr/bin/*; do
+            ln -sf /usr/bin/$(basename $bin) "${{targets.contextdir}}"/vt/bin/
+          done
+
+update:
+  enabled: true
+  github:
+    identifier: vitessio/vitess
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - vitess-compat
+  pipeline:
+    - name: Smoke test for vitess binaries
+      runs: |
+        for bin in $(ls /vt/bin | grep ^vt); do
+          $bin --help 2>&1 > /dev/null
+        done

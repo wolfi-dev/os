@@ -1,0 +1,135 @@
+package:
+  name: gitlab-rails-17.4
+  version: 17.4.1
+  epoch: 0
+  description: "GitLab's core webapp, built with Ruby on Rails"
+  copyright:
+    - license: MIT
+  dependencies:
+    provides:
+      - gitlab-rails=${{package.full-version}}
+    runtime:
+      - exiftool
+      - graphicsmagick
+      - icu-dev
+      - krb5-dev
+      - libffi-dev
+      - libpq
+      - posix-libc-utils
+      - ruby-3.2
+      - ruby3.2-bundler
+      - tzdata
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang
+      - cmake
+      - git
+      - glibc-dev
+      - go
+      - icu-dev
+      - krb5-dev
+      - libffi-dev
+      - libpq
+      - node-gyp
+      - nodejs-20
+      - posix-libc-utils
+      - postgresql-dev
+      - python3
+      - ruby-3.2
+      - ruby-3.2-dev
+      - ruby3.2-bundler
+      - tzdata
+      - yarn
+      - zlib-dev
+  environment:
+    CC: clang
+    CXX: clang++
+    CXXFLAGS: "-std=c++17 -fPIC"
+    LDSHARED: "clang++-18 -shared"
+    TZINFO_DATA: /usr/share/zoneinfo
+    RAILS_ENV: production
+    NODE_ENV: production
+    USE_DB: false
+    SKIP_STORAGE_VALIDATION: true
+    GITLAB_USER: git
+    RUBY_VERSION: $(ruby -e 'print RUBY_VERSION')
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: f84ae5260f4c1daa1dd92232b58dad673248a4e7
+      repository: https://gitlab.com/gitlab-org/gitlab-foss.git
+      tag: v${{package.version}}
+      destination: ${{targets.contextdir}}/srv/gitlab
+
+  - working-directory: ${{targets.contextdir}}/srv/gitlab
+    runs: |
+      bundle config set --local path ${{targets.contextdir}}/srv/gitlab/vendor/bundle/
+      bundle config set --local clean 'true'
+      bundle config set --local deployment 'true'
+      bundle config set --local without 'development test mysql aws'
+      bundle config build.static_holmes --with-cflags="-fPIC" --with-cxxflags="-std=c++17 -fPIC" --with-ldflags="-shared -lstdc++"
+      bundle install --jobs 4 --retry 5
+
+      # Create GitLab datadir
+      export DATADIR=${{targets.contextdir}}/var/opt/gitlab
+      mkdir -p ${DATADIR}
+
+      cp config/gitlab.yml.example config/gitlab.yml
+      cp config/resque.yml.example config/resque.yml
+      cp config/secrets.yml.example config/secrets.yml
+      cp config/database.yml.postgresql config/database.yml
+
+      sed --in-place "/geo:/,/^$/d" config/database.yml
+      sed --in-place "/host: localhost/d" config/gitlab.yml
+      sed --in-place "/port: 80/d" config/gitlab.yml
+      sed --in-place "s/# user:.*/user: ${GITLAB_USER}/" config/gitlab.yml
+      sed --in-place "s:/home/git/repositories:${DATADIR}/repo:" config/gitlab.yml
+
+      yarn install --production --pure-lockfile
+      bundle exec rake gettext:compile
+      bundle exec rake gitlab:assets:compile
+      mkdir -p ${{targets.contextdir}}/assets/licenses
+      cp LICENSE ${{targets.contextdir}}/assets/licenses/GitLab.txt
+
+      # Some more directories that are needed in image
+      mkdir -p ${{targets.contextdir}}/home/git/gitlab-shell
+      ln -sf /srv/gitlab/GITLAB_SHELL_VERSION ${{targets.contextdir}}/home/git/gitlab-shell/VERSION
+
+      bundle config unset --local path
+
+      # Cleanup
+      rm -rf node_modules/ tmp/ spec/ ee/spec/ qa/ rubocop/ tooling/ .git/ .gitlab/ \
+             .github/ docker/ changelogs/ danger/ Dangerfile
+      # Remove git directories
+      find ${{targets.contextdir}} -name "*.git" -exec rm -rf '{}' +
+
+      /home/build/build-scripts/cleanup-gems
+
+      # Rebuild devfile gem with Go
+      cd ./vendor/bundle/ruby/*/gems/*devfile*/ext
+      # Mitigate CVEs
+      go get golang.org/x/net@v0.23.0
+      go get github.com/docker/docker@v26.1.5
+      go mod tidy
+      rm ../bin/devfile
+      go build \
+        -o ../bin/devfile \
+        -tags "netgo,osusergo" \
+        -ldflags "-w" \
+        -trimpath .
+      cd ${{targets.contextdir}}/srv/gitlab
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: v17.4
+  ignore-regex-patterns:
+    - '-rc*'

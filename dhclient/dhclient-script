@@ -1,0 +1,682 @@
+#!/bin/sh
+# dhclient-script for Linux. Dan Halbert, March, 1997.
+# Updated for Linux 2.[12] by Brian J. Murrell, January 1999.
+# No guarantees about this. I'm a novice at the details of Linux
+# networking.
+
+# Notes:
+
+# 0. This script is based on the netbsd script supplied with dhcp-970306.
+
+# 1. ifconfig down apparently deletes all relevant routes and flushes
+# the arp cache, so this doesn't need to be done explicitly.
+
+# 2. The alias address handling here has not been tested AT ALL.
+# I'm just going by the doc of modern Linux ip aliasing, which uses
+# notations like eth0:0, eth0:1, for each alias.
+
+# 3. I have to calculate the network address, and calculate the broadcast
+# address if it is not supplied. This might be much more easily done
+# by the dhclient C code, and passed on.
+
+# 4. TIMEOUT not tested. ping has a flag I don't know, and I'm suspicious
+# of the $1 in its args.
+
+# 5. Script refresh in 2017. The aliasing code was too convoluted and needs
+# to go away. Migrated DHCPv4 script to ip command from iproute2 suite.
+# This is based on Debian script with some tweaks. ifconfig is no longer
+# used. Everything is done using ip tool from ip-route2.
+
+# 'ip' just looks too weird. Also, we now have unit-tests! Those unit-tests
+# overwirte this line to use a fake ip-echo tool. It's also convenient
+# if your system holds ip tool in a non-standard location.
+ip='/sbin/ip'
+
+# This is a dummy function to prevent shellcheck from complaining about these
+# variables later in this script. It is not used during normal operation and
+# should not slow down the execution of this script at all.
+# If, given the above, it still bothers you, please feel free to delete it.
+# SC2154: These specific variables are assigned external to this script.
+# shellcheck disable=SC2154
+_shellcheck_external_variables() {
+    : alias_ip_address="$alias_ip_address"
+    : alias_subnet_mask="$alias_subnet_mask"
+    : cur_ip6_address="$cur_ip6_address"
+    : cur_ip6_prefixlen="$cur_ip6_prefixlen"
+    : dad_wait_time="$dad_wait_time"
+    : interface="$interface"
+    : new_broadcast_address="$new_broadcast_address"
+    : new_dhcp6_domain_search="$new_dhcp6_domain_search"
+    : new_dhcp6_name_servers="$new_dhcp6_name_servers"
+    : new_domain_name="$new_domain_name"
+    : new_domain_name_servers="$new_domain_name_servers"
+    : new_host_name="$new_host_name"
+    : new_interface_mtu="$new_interface_mtu"
+    : new_ip6_address="$new_ip6_address"
+    : new_ip6_prefixlen="$new_ip6_prefixlen"
+    : new_ip_address="$new_ip_address"
+    : new_max_life="$new_max_life"
+    : new_preferred_life="$new_preferred_life"
+    : new_rfc3442_classless_static_routes="$new_rfc3442_classless_static_routes"
+    : new_routers="$new_routers"
+    : new_subnet_mask="$new_subnet_mask"
+    : old_dhcp6_domain_search="$old_dhcp6_domain_search"
+    : old_dhcp6_name_servers="$old_dhcp6_name_servers"
+    : old_host_name="$old_host_name"
+    : old_ip6_address="$old_ip6_address"
+    : old_ip6_prefixlen="$old_ip6_prefixlen"
+    : old_ip_address="$old_ip_address"
+    : reason="$reason"
+}
+
+print_nameservers() {
+    sed -n '/^[[:space:]]*[Nn][Aa][Mm][Ee][Ss][Ee][Rr][Vv][Ee][Rr]/p' "${@}"
+}
+
+# shellcheck disable=SC2039
+init_resolv_conf() {
+    local tmpfile
+    tmpfile="$(mktemp -q /etc/resolv.conf.dhclient-new.XXXXXXXXXX)"
+    if [ -z "${tmpfile}" ]; then
+        tmpfile='/etc/resolv.conf.dhclient-new'
+        rm -rf "${tmpfile}"
+    fi
+    : >>"${tmpfile}"
+    # shellcheck disable=SC2064
+    trap "rm -f ${tmpfile}" EXIT
+    echo "${tmpfile}"
+}
+
+# shellcheck disable=SC2039
+replace_resolv_conf() {
+    local src="${1}"
+    local dst='/etc/resolv.conf'
+
+    if [ -f "${dst}" ]; then
+        chown --reference="${dst}" "${src}"
+        chmod --reference="${dst}" "${src}"
+    fi
+    mv -f "${src}" "${dst}"
+}
+
+# update /etc/resolv.conf based on received values
+# This updated version mostly follows Debian script by Andrew Pollock et al.
+# shellcheck disable=SC2039
+make_resolv_conf() {
+    local nameserver
+    local new_resolv_conf
+
+    # DHCPv4
+    if [ -n "${new_domain_search}" ] ||
+       [ -n "${new_domain_name}" ] ||
+       [ -n "${new_domain_name_servers}" ]
+    then
+        new_resolv_conf="$(init_resolv_conf)"
+
+        if [ -n "${new_domain_name}" ]; then
+            echo "domain ${new_domain_name%% *}" >>"${new_resolv_conf}"
+        fi
+
+        if [ -n "${new_domain_search}" ]; then
+            if [ -n "${new_domain_name}" ]; then
+                local domain domain_in_search_list=''
+                for domain in ${new_domain_search}; do
+                    if [ "${domain}" = "${new_domain_name}" ] ||
+                       [ "${domain}" = "${new_domain_name}." ]
+                    then
+                        domain_in_search_list='Yes'
+                    fi
+                done
+                if [ -z "${domain_in_search_list}" ]; then
+                    new_domain_search="${new_domain_name} ${new_domain_search}"
+                fi
+            fi
+            echo "search ${new_domain_search}" >>"${new_resolv_conf}"
+        elif [ -n "${new_domain_name}" ]; then
+            echo "search ${new_domain_name}" >>"${new_resolv_conf}"
+        fi
+
+        if [ -n "${new_domain_name_servers}" ]; then
+            for nameserver in ${new_domain_name_servers}; do
+                echo "nameserver ${nameserver}" >>"${new_resolv_conf}"
+            done
+        else # keep 'old' nameservers
+            print_nameservers /etc/resolv.conf >>"${new_resolv_conf}"
+        fi
+
+        replace_resolv_conf "${new_resolv_conf}"
+    # DHCPv6
+    elif [ -n "${new_dhcp6_domain_search}" ] ||
+         [ -n "${new_dhcp6_name_servers}" ]
+    then
+        new_resolv_conf="$(init_resolv_conf)"
+
+        if [ -n "${new_dhcp6_domain_search}" ]; then
+            echo "search ${new_dhcp6_domain_search}" >>"${new_resolv_conf}"
+        fi
+
+        if [ -n "${new_dhcp6_name_servers}" ]; then
+            for nameserver in ${new_dhcp6_name_servers}; do
+                # append %interface to link-local-address nameservers
+                if [ "${nameserver##fe80::}" != "${nameserver}" ] ||
+                   [ "${nameserver##FE80::}" != "${nameserver}" ]
+                then
+                    nameserver="${nameserver}%${interface}"
+                fi
+                echo "nameserver ${nameserver}" >>"${new_resolv_conf}"
+            done
+        else # keep 'old' nameservers
+            print_nameservers /etc/resolv.conf >>"${new_resolv_conf}"
+        fi
+
+        replace_resolv_conf "${new_resolv_conf}"
+    fi
+}
+
+# set host name
+# SC2039: our shell has local for function scope
+# shellcheck disable=SC2039
+set_hostname() {
+    local current_hostname
+
+    if [ -n "${new_host_name}" ]; then
+        current_hostname="$(hostname)"
+
+        # current host name is empty, '(none)' or 'localhost' or
+        # differs from new one from DHCP
+        if [ -z "${current_hostname}" ] ||
+           [ '(none)' = "${current_hostname}" ] ||
+           [ 'localhost' = "${current_hostname}" ] ||
+           [ "${old_host_name}" = "${current_hostname}" ]
+        then
+           if [ "${new_host_name}" != "${old_host_name}" ]; then
+               hostname "${new_host_name}"
+           fi
+        fi
+    fi
+}
+
+# run given script
+# shellcheck disable=SC2039,SC1090
+run_hook() {
+    local script
+    local exit_status
+    script="${1}"
+
+    if [ -f "${script}" ]; then
+        . "${script}"
+    fi
+
+    if [ -n "${exit_status}" ] && [ 0 != "${exit_status}" ]; then
+        logger -t dhclient-script -p daemon.err \
+            "run_hook: ${script} returned non-zero exit status (${exit_status})"
+        [ "${exit_status}" -lt 256 ] 2>/dev/null || exit_status=255
+        [ "${exit_status}" -gt 0 ] 2>/dev/null || exit_status=1
+    fi
+
+    return "${exit_status:-${?}}"
+}
+
+# run scripts in given directory
+# shellcheck disable=SC2039
+run_hookdir() {
+    local dir
+    local script
+    local exit_status
+    dir="${1}"
+
+    if [ -d "${dir}" ]; then
+        for script in $(run-parts --list "${dir}"); do
+            if ! run_hook "${script}"; then
+                exit_status="${?}"
+            fi
+        done
+    fi
+
+    return "${exit_status:-${?}}"
+}
+
+# Must be used on exit.   Invokes the local dhcp client exit hooks, if any.
+# shellcheck disable=SC2039
+exit_with_hooks() {
+    local exit_status
+    exit_status="${1}"
+
+    # Source the documented exit-hook script, if it exists
+    if ! run_hook /etc/dhclient-exit-hooks; then
+        exit_status="${?}"
+    fi
+
+    # Now run scripts in the Debian-specific directory.
+    if ! run_hookdir /etc/dhclient-exit-hooks.d; then
+        exit_status="${?}"
+    fi
+
+    exit "${exit_status}"
+}
+
+ipv6_addr_del() {
+    "${ip}" -6 addr del "$@" dev "${interface}"
+}
+
+# shellcheck disable=SC2039
+ipv6_addr_show() {
+    local dev
+    dev="${1}"
+
+    "${ip}" -6 addr show ${dev:+dev "${dev}"}
+}
+
+# shellcheck disable=SC2039
+ipv6_addr_filter() {
+    local dev
+    dev="${1}"
+    shift
+
+    ipv6_addr_show "${dev}" | grep -F -e "${*}"
+}
+
+# shellcheck disable=SC2039
+ipv6_addr_has_tentative() {
+    local dev
+    dev="${1}"
+    shift
+
+    ipv6_addr_filter "${dev}" "${@}" | grep -F -e tentative >/dev/null 2>&1
+}
+
+ip_link_set() {
+    "${ip}" link set "${@}"
+}
+
+link_set_up() {
+    ip_link_set dev "${interface}" up
+}
+
+link_set_mtu() {
+    [ -n "${1}" ] || return 0
+
+    ip_link_set dev "${interface}" mtu "${1}"
+}
+
+# shellcheck disable=SC2039
+_ip_addr_flush() {
+    local af
+    af="${1}"
+    shift
+
+    case "${af}" in
+        (4|6)
+            ;;
+        (*)
+            return 1
+            ;;
+    esac
+
+    "${ip}" "-${af}" addr flush "${@}"
+}
+
+#ip_addr_flush() {
+#    "${ip}" addr flush "${@}"
+#}
+
+ipv4_addr_flush() {
+    _ip_addr_flush 4 "$@"
+}
+
+ipv6_addr_flush() {
+    _ip_addr_flush 6 "$@"
+}
+
+# shellcheck disable=SC2039
+addr_flush() {
+    local label
+    label="${1}"
+
+    if [ -n "${label}" ]; then
+        ipv4_addr_flush dev "${interface}" label "${label}"
+    else
+        ipv4_addr_flush dev "${interface}"
+    fi
+}
+
+ipv4_route_add() {
+    "${ip}" -4 route add "${@}"
+}
+
+route_add() {
+    ipv4_route_add "$@" dev "${interface}" >/dev/null 2>&1
+}
+
+# shellcheck disable=SC2039
+route_add_default() {
+    local via
+    local metric
+    via="${1}"
+    metric="${2}"
+
+    ipv4_route_add default via "${via}" \
+        dev "${interface}" \
+        ${metric:+metric "${metric}"} \
+        >/dev/null 2>&1
+}
+
+# shellcheck disable=SC2039
+addr_add() {
+    local label
+    local addr
+    local mask
+    local broadcast
+    label="${1}"
+    addr="${2}"
+    mask="${3}"
+    broadcast="${4}"
+
+    "${ip}" -4 addr add \
+        "${addr}${mask:+/${mask}}" \
+        ${broadcast:+broadcast "${broadcast}"} \
+        dev "${label%%:*}" label "${label}"
+}
+
+# This function was largely borrowed from dhclient-script that
+# ships with Centos, authored by Jiri Popelka and David Cantrell
+# of Redhat. Thanks guys.
+# shellcheck disable=SC2039
+add_ipv6_addr_with_DAD() {
+    local _i
+    "${ip}" -6 addr replace "${new_ip6_address}/${new_ip6_prefixlen}" \
+        dev "${interface}" scope global valid_lft "${new_max_life}" \
+        preferred_lft "${new_preferred_life}"
+
+    if [ "${dad_wait_time}" -le 0 ]; then
+        # if we're not waiting for DAD, assume we're good
+        return 0
+    fi
+
+    # Repeatedly test whether newly added address passed
+    # duplicate address detection (DAD)
+    for _i in $(seq 1 "${dad_wait_time}"); do
+        sleep 1 # give the DAD some time
+
+        addr="$(ipv6_addr_filter "${interface}" \
+            "${new_ip6_address}/${new_ip6_prefixlen}")"
+
+        # tentative flag == DAD is still not complete
+        tentative="$(echo "${addr}" | grep tentative)"
+        # dadfailed flag == address is already in use somewhere else
+        dadfailed="$(echo "${addr}" | grep dadfailed)"
+
+        if [ -n "${dadfailed}" ]; then
+            # address was added with valid_lft/preferred_lft 'forever',
+            # remove it
+            ipv6_addr_del "${new_ip6_address}/${new_ip6_prefixlen}"
+
+            exit_with_hooks 3
+        fi
+
+        if [ -z "${tentative}" ]; then
+            if [ -n "${addr}" ]; then
+                # DAD is over
+                return 0
+            else
+                # address was auto-removed (or not added at all)
+                exit_with_hooks 3
+            fi
+        fi
+    done
+
+    return 0
+}
+
+# shellcheck disable=SC2039
+init_if_metric() {
+    local _if_metric
+
+    # set if_metric if IF_METRIC is set or there's more than one router
+    # shellcheck disable=SC2153
+    _if_metric="${IF_METRIC}"
+    if [ "${new_routers%% *}" != "${new_routers}" ]; then
+        _if_metric="${_if_metric:-1}"
+    fi
+
+    if_metric="${_if_metric}"
+    echo "${_if_metric}"
+}
+
+# Invoke the local dhcp client enter hooks, if they exist.
+run_hook /etc/dhclient-enter-hooks
+run_hookdir /etc/dhclient-enter-hooks.d
+
+# Execute the operation
+case "${reason}" in
+
+    ### DHCPv4 Handlers
+
+    MEDIUM|ARPCHECK|ARPSEND)
+        # Do nothing
+        ;;
+    PREINIT)
+        # The DHCP client is requesting that an interface be
+        # configured as required in order to send packets prior to
+        # receiving an actual address. - dhclient-script(8)
+
+        # ensure interface is up
+        link_set_up
+
+        if [ -n "${alias_ip_address}" ]; then
+            # flush alias IP from interface
+            addr_flush "${interface}:0"
+        fi
+
+        ;;
+
+    BOUND|RENEW|REBIND|REBOOT)
+        set_hostname
+
+        if [ -n "${old_ip_address}" ] && [ -n "${alias_ip_address}" ] &&
+           [ "${alias_ip_address}" != "${old_ip_address}" ]; then
+            # alias IP may have changed => flush it
+            addr_flush "${interface}:0"
+        fi
+
+        if [ -n "${old_ip_address}" ] &&
+           [ "${old_ip_address}" != "${new_ip_address}" ]; then
+            # leased IP has changed => flush it
+            addr_flush "${interface}"
+        fi
+
+        if [ -z "${old_ip_address}" ] ||
+           [ "${old_ip_address}" != "${new_ip_address}" ] ||
+           [ "${reason}" = "BOUND" ] || [ "${reason}" = "REBOOT" ]; then
+            # new IP has been leased or leased IP changed => set it
+            addr_add "${interface}" \
+                "${new_ip_address}" "${new_subnet_mask}" \
+                "${new_broadcast_address}"
+
+            link_set_mtu "${new_interface_mtu}"
+
+            # if we have $new_rfc3442_classless_static_routes then we have to
+            # ignore $new_routers entirely
+            if [ -z "${new_rfc3442_classless_static_routes}" ]; then
+                    if_metric="$(init_if_metric)"
+                    for router in ${new_routers}; do
+                        if [ "255.255.255.255" = "${new_subnet_mask}" ]; then
+                            # point-to-point connection => set explicit route
+                            route_add "${router}"
+                        fi
+
+                        # set default route
+                        route_add_default "${router}" "${if_metric}"
+
+                        if [ -n "${if_metric}" ]; then
+                            if_metric="$((1+if_metric))"
+                        fi
+                    done
+            fi
+        fi
+
+        if [ -n "${alias_ip_address}" ] &&
+           [ "${new_ip_address}" != "${alias_ip_address}" ]
+        then
+            # separate alias IP given, which may have changed
+            # => flush it, set it & add host route to it
+            addr_flush "${interface}:0"
+            addr_add "${interface}:0" \
+                "${alias_ip_address}" "${alias_subnet_mask}"
+            route_add "${alias_ip_address}"
+        fi
+
+        # update /etc/resolv.conf
+        make_resolv_conf
+
+        ;;
+
+    EXPIRE|FAIL|RELEASE|STOP)
+        if [ -n "${alias_ip_address}" ]; then
+            # flush alias IP
+            addr_flush "${interface}:0"
+        fi
+
+        if [ -n "${old_ip_address}" ]; then
+            # flush leased IP
+            addr_flush "${interface}"
+        fi
+
+        if [ -n "${alias_ip_address}" ]; then
+            # alias IP given => set it & add host route to it
+            addr_add "${interface}:0" \
+                "${alias_ip_address}" "${alias_subnet_mask}"
+            route_add "${alias_ip_address}"
+        fi
+
+        ;;
+
+    TIMEOUT)
+        if [ -n "${alias_ip_address}" ]; then
+            # flush alias IP
+            addr_flush "${interface}:0"
+        fi
+
+        # set IP from recorded lease
+        addr_add "${interface}" \
+            "${new_ip_address}" "${new_subnet_mask}" \
+            "${new_broadcast_address}"
+
+        link_set_mtu "${new_interface_mtu}"
+
+        # if there is no router recorded in the lease
+        # or the 1st router answers pings
+        if [ -z "${new_routers}" ] || ping -q -c 1 "${new_routers%% *}"; then
+            # if we have $new_rfc3442_classless_static_routes then we have to
+            # ignore $new_routers entirely
+            if [ -z "${new_rfc3442_classless_static_routes}" ]; then
+                if [ -n "${alias_ip_address}" ] &&
+                   [ "${new_ip_address}" != "${alias_ip_address}" ]
+                then
+                    # separate alias IP given => set up the alias IP & add host route to it
+                    addr_add "${interface}:0" \
+                        "${alias_ip_address}" "${alias_subnet_mask}"
+                    route_add "${alias_ip_address}"
+                fi
+
+                if_metric="$(init_if_metric)"
+                for router in ${new_routers}; do
+                    # set default route
+                    route_add_default "${router}" "${if_metric}"
+
+                    if [ -n "${if_metric}" ]; then
+                        if_metric="$((1+if_metric))"
+                    fi
+                done
+            fi
+
+            # update /etc/resolv.conf
+            make_resolv_conf
+        else
+            # flush all IPs from interface
+            addr_flush
+            exit_with_hooks 2
+        fi
+
+        ;;
+
+    ### DHCPv6 Handlers
+    # TODO handle prefix change: ?based on ${old_ip6_prefix} and ${new_ip6_prefix}?
+
+    PREINIT6)
+        # ensure interface is up
+        link_set_up
+
+        # We need to give the kernel some time to active interface
+        interface_up_wait_time=5
+        # shellcheck disable=SC2034
+        for _i in $(seq 0 ${interface_up_wait_time}); do
+            if ifconfig "${interface}" | grep RUNNING >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done; unset -v _i
+
+        # flush any stale global permanent IPs from interface
+        ipv6_addr_flush dev "${interface}" scope global permanent
+
+        # Wait for duplicate address detection for this interface if the
+        # --dad-wait-time parameter has been specified and is greater than
+        # zero.
+        if [ "${dad_wait_time}" -gt 0 ]; then
+            # Check if any IPv6 address on this interface is marked as
+            # tentative.
+            if ipv6_addr_has_tentative "${interface}" inet6; then
+                # Wait for duplicate address detection to complete or for
+                # the timeout specified as --dad-wait-time.
+                # shellcheck disable=SC2034
+                for _i in $(seq 0 "${dad_wait_time}"); do
+                    # We're going to poll for the tentative flag every second.
+                    sleep 1
+                    if ! ipv6_addr_has_tentative "${interface}" inet6; then
+                        break
+                    fi
+                done; unset -v _i
+            fi
+        fi
+
+        ;;
+
+    BOUND6|RENEW6|REBIND6)
+        if [ "${new_ip6_address}" ] && [ "${new_ip6_prefixlen}" ]; then
+            # set leased IP
+            add_ipv6_addr_with_DAD
+        fi
+
+        # update /etc/resolv.conf
+        if [ "${reason}" = BOUND6 ] ||
+           [ "${new_dhcp6_name_servers}" != "${old_dhcp6_name_servers}" ] ||
+           [ "${new_dhcp6_domain_search}" != "${old_dhcp6_domain_search}" ]; then
+            make_resolv_conf
+        fi
+
+        ;;
+
+    DEPREF6)
+        if [ -z "${cur_ip6_prefixlen}" ]; then
+            exit_with_hooks 2
+        fi
+
+        # set preferred lifetime of leased IP to 0
+        "${ip}" -6 addr change "${cur_ip6_address}/${cur_ip6_prefixlen}" \
+            dev "${interface}" scope global preferred_lft 0
+
+        ;;
+
+    EXPIRE6|RELEASE6|STOP6)
+        if [ -z "${old_ip6_address}" ] || [ -z "${old_ip6_prefixlen}" ]; then
+            exit_with_hooks 2
+        fi
+
+        # delete leased IP
+        ipv6_addr_del "${old_ip6_address}/${old_ip6_prefixlen}"
+
+        ;;
+esac
+
+exit_with_hooks 0

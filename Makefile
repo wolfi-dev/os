@@ -137,7 +137,7 @@ test/%:
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
 
 test-debug/%:
-	MELANGE_EXTRA_OPTS="--interactive" make test/$*
+	MELANGE_EXTRA_OPTS="--interactive" $(MAKE) test/$*
 
 dev-container:
 	docker run --privileged --rm -it \

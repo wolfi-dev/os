@@ -86,8 +86,6 @@ ${KEY}:
 
 clean:
 	rm -rf packages/${ARCH}
-	rm -rf /tmp/melange-*
-	rm -rf /tmp/apko-*
 
 .PHONY: list list-yaml
 list:

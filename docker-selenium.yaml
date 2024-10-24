@@ -18,11 +18,6 @@ package:
       - bash
       - busybox
       - coreutils
-      - openjdk-11
-      - selenium-server-compat
-      - sudo-rs
-      - supervisor
-      - tzdata
 
 environment:
   contents:
@@ -67,41 +62,68 @@ pipeline:
     with:
       patches: 0001-fix-paths.patch
 
-  - runs: |
-      mkdir -p ${{targets.destdir}}/usr/bin
-      mkdir -p ${{targets.destdir}}/etc/supervisor/conf.d
-      mkdir -p ${{targets.destdir}}/var/tmp
-
-  # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Base/Dockerfile
-  - working-directory: Base
+subpackages:
+  - name: ${{package.name}}-base
+    dependencies:
+      runtime:
+        - bash
+        - busybox
+        - coreutils
+        - openjdk-11
+        - selenium-server-compat
+        - sudo-rs
+        - supervisor
+        - tzdata
+        - ${{package.name}}-supervisor-config
     pipeline:
       - runs: |
-          mkdir -p ${{targets.destdir}}/opt/bin
-          install -Dm755 check-grid.sh ${{targets.destdir}}/opt/bin/
-          install -Dm755 entry_point.sh ${{targets.destdir}}/opt/bin/
-          install -Dm755f supervisord.conf ${{targets.destdir}}/etc
-          mkdir -p ${{targets.destdir}}/var/run/supervisor
-      - runs: |
-          mkdir -p ${{targets.destdir}}/opt/selenium
-          echo "${SEL_PASSWD}" > ${{targets.destdir}}/opt/selenium/initialPasswd
-      # TODO: Implement malware scan for jars retrieved by coursier
-      - runs: |
-          # Retrieve OpenTelemetry/GRPC Java versions
-          export OPENTELEMETRY_VERSION=$(curl "https://api.github.com/repos/open-telemetry/opentelemetry-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
-          export GRPC_VERSION=$(curl "https://api.github.com/repos/grpc/grpc-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+          mkdir -p ${{targets.contextdir}}/var/tmp
+      # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Base/Dockerfile
+      - working-directory: Base
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              cp check-grid.sh ${{targets.contextdir}}/opt/bin/
+              cp entry_point.sh ${{targets.contextdir}}/opt/bin/
+              cp supervisord.conf ${{targets.contextdir}}/etc
+              mkdir -p ${{targets.contextdir}}/var/run/supervisor
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/opt/selenium
+              echo "${SEL_PASSWD}" > ${{targets.contextdir}}/opt/selenium/initialPasswd
+          # TODO: Implement malware scan for jars retrieved by coursier
+          - runs: |
+              # Retrieve OpenTelemetry/GRPC Java versions
+              export OPENTELEMETRY_VERSION=$(curl "https://api.github.com/repos/open-telemetry/opentelemetry-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
+              export GRPC_VERSION=$(curl "https://api.github.com/repos/grpc/grpc-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
 
-          mkdir -p ${{targets.destdir}}/external_jars
-          curl -sSLfO https://github.com/coursier/launchers/raw/master/coursier
-          chmod +x coursier
-          # The netty-codec-http bump is for CVE-2024-29025
-          ./coursier fetch --classpath --cache ${{targets.destdir}}/external_jars \
-            io.opentelemetry:opentelemetry-exporter-otlp:${OPENTELEMETRY_VERSION} \
-            io.netty:netty-codec-http:4.1.108.Final \
-            io.grpc:grpc-netty:${GRPC_VERSION} > ${{targets.destdir}}/external_jars/.classpath.txt
+              mkdir -p ${{targets.contextdir}}/external_jars
+              curl -sSLfO https://github.com/coursier/launchers/raw/master/coursier
+              chmod +x coursier
+              # The netty-codec-http bump is for CVE-2024-29025
+              ./coursier fetch --classpath --cache ${{targets.contextdir}}/external_jars \
+                io.opentelemetry:opentelemetry-exporter-otlp:${OPENTELEMETRY_VERSION} \
+                io.netty:netty-codec-http:4.1.108.Final \
+                io.grpc:grpc-netty:${GRPC_VERSION} > ${{targets.contextdir}}/external_jars/.classpath.txt
+              chmod 665 ${{targets.contextdir}}/external_jars/.classpath.txt
+    test:
+      environment:
+        environment:
+          SE_SUPERVISORD_LOG_FILE: "/tmp/supervisord.log"
+          SE_SUPERVISORD_CHILD_LOG_DIR: "/tmp"
+          SE_SUPERVISORD_PID_FILE: "/tmp/supervisord.pid"
+          SE_SUPERVISORD_LOG_LEVEL: "info"
+          SEL_USER: seluser
+      pipeline:
+        - name: "Check selenium base status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/entry_point.sh"
+            timeout: 60
+            expected_output: |
+              supervisord started
 
-  - uses: strip
-
-subpackages:
   - name: ${{package.name}}-config
     pipeline:
       - runs: |
@@ -118,8 +140,9 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/etc
-          mv ${{targets.destdir}}/etc/supervisord.conf ${{targets.contextdir}}/etc
-          mv ${{targets.destdir}}/etc/supervisor ${{targets.contextdir}}/etc
+          cd ./Base
+          install supervisord.conf ${{targets.contextdir}}/etc
+          mv ${{targets.contextdir}}/etc/supervisord.conf ${{targets.contextdir}}/etc
 
           # Unset setuid bit
           # jason@ copied this directly from https://serverfault.com/a/238964
@@ -130,7 +153,7 @@ subpackages:
     dependencies:
       runtime:
         - selenium-server-standalone
-        - ${{package.name}}
+        - ${{package.name}}-base
         - ${{package.name}}-config
     pipeline:
       - working-directory: Standalone
@@ -178,7 +201,7 @@ subpackages:
     description: Docker Selenium Hub
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}-base
         - ${{package.name}}-config
         - selenium-server
     pipeline:
@@ -194,10 +217,6 @@ subpackages:
               install -Dm755 start-selenium-grid-hub.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
-        contents:
-          packages:
-            - ${{package.name}}
-            - selenium-server
         environment:
           SE_RELAX_CHECKS: True
           SE_BIND_HOST: False
@@ -247,7 +266,7 @@ subpackages:
         - xmessage
         - xvfb-run
         - openjdk-11
-        - ${{package.name}}
+        - ${{package.name}}-base
         - ${{package.name}}-config
         - selenium-server
         - ${{package.name}}-supervisor-config
@@ -266,7 +285,7 @@ subpackages:
               install -Dm755 start-vnc.sh ${{targets.contextdir}}/opt/bin/
               install -Dm755 start-novnc.sh ${{targets.contextdir}}/opt/bin/
               install -Dm755 selenium_grid_logo.png ${{targets.contextdir}}/usr/share/images/fluxbox/ubuntu-light.png
-              install -Dm755 generate_relay_config ${{targets.contextdir}}/opt/bin/
+              install -Dm755 generate_config ${{targets.contextdir}}/opt/bin/generate_relay_config
 
               mkdir -p ${{targets.contextdir}}/home/$SEL_USER/.fluxbox
               mkdir -p ${{targets.contextdir}}/tmp/.X11-unix
@@ -278,9 +297,6 @@ subpackages:
       environment:
         contents:
           packages:
-            - ${{package.name}}
-            - ${{package.name}}-config
-            - selenium-server
             - geckodriver
         environment:
           SE_EVENT_BUS_PUBLISH_PORT: 4442
@@ -402,7 +418,7 @@ subpackages:
     description: Docker Selenium event-bus
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}-base
     pipeline:
       - working-directory: EventBus
         pipeline:
@@ -429,7 +445,7 @@ subpackages:
     description: Docker Selenium distributor
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}-base
         - selenium-server
     pipeline:
       - working-directory: Distributor
@@ -468,7 +484,7 @@ subpackages:
     description: Docker Selenium node docker
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}-base
         - ${{package.name}}-config
         - socat
     pipeline:
@@ -508,7 +524,7 @@ subpackages:
     description: Docker Selenium router
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}-base
         - ${{package.name}}-config
         - selenium-server
     pipeline:
@@ -549,7 +565,7 @@ subpackages:
     description: Docker Selenium SessionQueue
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}-base
         - selenium-server
     pipeline:
       - working-directory: SessionQueue
@@ -580,7 +596,7 @@ subpackages:
     description: Docker Selenium Sessions
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}-base
         - selenium-server
     pipeline:
       - working-directory: Sessions
@@ -682,12 +698,3 @@ update:
       replace: $1.$2
   github:
     identifier: SeleniumHQ/docker-selenium
-
-test:
-  environment:
-    contents:
-      packages:
-        - ${{package.name}}-supervisor-config
-  pipeline:
-    - runs: |
-        "/opt/bin/entry_point.sh" && echo $?

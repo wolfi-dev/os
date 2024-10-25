@@ -17,6 +17,8 @@ MELANGE_OPTS += --signing-key ${KEY}
 MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
+MELANGE_OPTS += --license 'Apache-2.0'
+MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
 MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
@@ -156,7 +158,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:2c0bb15be045537c2b9b27f87be39378955e8c1b32a062c3db572d457abcc263
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:055f990c8ce28987bf249eafba3011e47f3decff35e8a07aacb76475a7a4457d
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -223,6 +225,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:2c0bb15be045537c2b9b27f87be39378955e8c1b32a062c3db572d457abcc263
+		ghcr.io/wolfi-dev/sdk:latest@sha256:055f990c8ce28987bf249eafba3011e47f3decff35e8a07aacb76475a7a4457d
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"

@@ -1,0 +1,198 @@
+package:
+  name: strongswan
+  version: 5.9.14
+  epoch: 0
+  description: IPsec-based VPN solution focused on security and ease of use, supporting IKEv1/IKEv2 and MOBIKE
+  copyright:
+    # GPL-2.0-or-later WITH OpenSSL-Exception
+    - license: LicenseRef-strongswan
+      license-path: LICENSE
+  dependencies:
+    runtime:
+      - iproute2
+  scriptlets:
+    pre-install: |
+      #!/bin/sh
+
+      # Create PID dir, if it doesn't exist
+      mkdir -p /var/run 2>/dev/null
+
+      # Fall back to non-root ipsec user
+      addgroup -S ipsec 2>/dev/null
+      adduser -S -D -H -h /var/empty -s /sbin/nologin -G ipsec -g ipsec ipsec 2>/dev/null
+
+      exit 0
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '300'
+
+environment:
+  contents:
+    packages:
+      - bison
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl-dev
+      - flex
+      - gettext-dev
+      - gmp-dev
+      - gperf
+      - libcap-dev
+      - libtool
+      - linux-headers
+      - openssl-dev
+      - pkgconf-dev
+      - py3-supported-pip
+      - sqlite-dev
+  environment:
+    CFLAGS: -Wno-error=calloc-transposed-args
+
+pipeline:
+  - name: "Checkout strongSwan"
+    uses: git-checkout
+    with:
+      repository: https://github.com/strongswan/strongswan
+      tag: ${{package.version}}
+      expected-commit: dea8493f3a6a5ef16ee97d0d446ca52f8f8afa3c
+
+  - name: "Configure strongSwan"
+    uses: autoconf/configure
+    with:
+      opts: |
+        --with-ipsecdir=/usr/lib/strongswan \
+        --with-capabilities=libcap \
+        --with-user=ipsec \
+        --with-group=ipsec \
+        --enable-curl \
+        --disable-ldap \
+        --disable-aes \
+        --disable-des \
+        --disable-rc2 \
+        --disable-md5 \
+        --disable-sha1 \
+        --disable-sha2 \
+        --enable-gmp \
+        --disable-hmac \
+        --disable-mysql \
+        --enable-sqlite \
+        --enable-eap-sim \
+        --enable-eap-sim-file \
+        --enable-eap-aka \
+        --enable-eap-aka-3gpp2 \
+        --enable-eap-simaka-pseudonym \
+        --enable-eap-simaka-reauth \
+        --enable-eap-identity \
+        --enable-eap-md5 \
+        --enable-eap-tls \
+        --disable-eap-gtc \
+        --enable-eap-mschapv2 \
+        --enable-eap-radius \
+        --enable-xauth-eap \
+        --enable-farp \
+        --enable-vici \
+        --enable-attr-sql \
+        --enable-dhcp \
+        --enable-openssl \
+        --enable-unity \
+        --enable-ha \
+        --enable-cmd \
+        --enable-python-eggs \
+        --enable-swanctl \
+        --enable-shared \
+        --disable-static \
+        --enable-bypass-lan \
+        $(if [ "${{build.arch}}" = "x86_64" ]; then echo "--enable-aesni"; fi)
+
+  - name: "Build strongSwan"
+    uses: autoconf/make
+
+  - name: "Package strongSwan"
+    uses: autoconf/make-install
+
+  - name: "Strip strongSwan"
+    uses: strip
+
+subpackages:
+  - name: strongswan-doc
+    pipeline:
+      - name: "Split strongSwan manpages"
+        uses: split/manpages
+    description: strongSwan manpages
+
+  - name: strongswan-dbg
+    pipeline:
+      - name: "Split strongSwan debug files"
+        uses: split/debug
+    description: strongSwan debug
+
+  - range: py-versions
+    name: py${{range.key}}-vici
+    description: VICI for python${{range.key}}
+    dependencies:
+      provides:
+        - py3-vici
+      provider-priority: ${{range.value}}
+    pipeline:
+      - name: "Build and package VICI"
+        working-directory: src/libcharon/plugins/vici/python
+        uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - name: "Remove compiled bytecode"
+        runs: find ${{targets.contextdir}} -name "*.pyc" -exec rm -rf '{}' +
+      - name: "Strip vici"
+        uses: strip
+    test:
+      pipeline:
+        - name: "Import VICI"
+          uses: python/import
+          with:
+            python: python${{range.key}}
+            import: vici
+
+  - name: py3-supported-vici
+    description: Meta package providing VICI for supported Python versions.
+    dependencies:
+      runtime:
+        - py3.10-vici
+        - py3.11-vici
+        - py3.12-vici
+        - py3.13-vici
+
+update:
+  enabled: true
+  github:
+    identifier: strongswan/strongswan
+    use-tag: true
+  ignore-regex-patterns:
+    - '.*android.*'
+    - '.*beta.*'
+    - '.*rc.*'
+    - '.*dr.*'
+
+test:
+  pipeline:
+    - name: "Test strongSwan"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /var/run
+          # Configure charon for current user
+          # Must be a superuser
+          cat > /etc/strongswan.d/charon.conf <<EOF
+          charon {
+            user = $(whoami)
+            group = $(whoami)
+          }
+          EOF
+        # Fails in bubblewrap due to privs
+        start: ipsec start --nofork
+        # We don't get further than this testing in Docker (requires additional caps)
+        expected_output: "Starting IKE charon daemon"
+        post: ipsec stop

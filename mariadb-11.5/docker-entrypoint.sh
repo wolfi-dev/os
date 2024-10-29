@@ -246,6 +246,7 @@ docker_init_database_dir() {
 		fi
 	done
 	mariadb-install-db "${installArgs[@]}" "${mariadbdArgs[@]}" \
+		--cross-bootstrap \
 		--skip-test-db \
 		--old-mode='UTF8_IS_UTF8MB3' \
 		--default-time-zone=SYSTEM --enforce-storage-engine= \

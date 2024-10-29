@@ -1,0 +1,196 @@
+package:
+  name: prism
+  version: 5.11.2
+  epoch: 1
+  description: "A set of packages for API mocking and contract testing with OpenAPI v2 and OpenAPI v3.x"
+  url: https://github.com/stoplightio/prism
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - nodejs-18
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - jq
+      - nodejs-18
+      - npm
+      - ts-patch
+      - yarn
+  environment:
+    NODE_ENV: "production"
+
+# The prism project uses the deprecated compiler, ttsc, from the ttypescript project (https://github.com/cevek/ttypescript).
+# The compiler supports typescript 4, which is the primary language of prism, but we decided to build prism with a maintained
+# compiler anyway. We chose to use the tspc compiler from the ts-patch project (https://github.com/nonara/ts-patch) per the
+# recommendation found in the README of ttypescript (https://github.com/cevek/ttypescript/blob/master/README.md).
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: f7788e25710a03628f81bb86e8d6657dc72b7c49
+      repository: https://github.com/stoplightio/prism
+      tag: v${{package.version}}
+  # The updated tspc compiler assumes typescript 5. Since prism uses typescript 4,
+  # we add a compiler option to tsconfig.json to permit features that are deprecated in typescript 5.
+  - uses: patch
+    with:
+      patches: tsconfig.json.diff
+  - runs: |
+      # Create a top-level project directory to house our prism installation
+      # See 'dependencies' build stage of prism/Dockerfile (https://github.com/stoplightio/prism/blob/master/Dockerfile)
+
+      mkdir -p ${{targets.destdir}}/usr/src/prism/node_modules
+      cp package.json ${{targets.destdir}}/usr/src/prism/
+
+      # Copy subpackages into the project directory
+      for pkg in core http http-server cli
+      do
+        mkdir -p ${{targets.destdir}}/usr/src/prism/packages/$pkg/node_modules
+        cp packages/$pkg/package.json ${{targets.destdir}}/usr/src/prism/packages/$pkg/
+      done
+  - working-directory: ${{targets.destdir}}/usr/src/prism/
+    runs: |
+      resolutions='{
+        "jsonpath-plus": "^10.0.0"
+      }'
+      jq --argjson resolutions "$resolutions" '.resolutions += $resolutions' package.json > temp.json && mv temp.json package.json
+  - working-directory: ${{targets.destdir}}/usr/src/prism/
+    runs: |
+      # Install production dependencies for subpackages
+      yarn --production
+  - working-directory: /home/build/
+  - runs: |
+      # Build the project
+      # See 'compiler' build stage of prism/Dockerfile (https://github.com/stoplightio/prism/blob/master/Dockerfile)
+
+      # The dev packages add typescript type annotations, without which tspc won't build
+      NODE_ENV=dev yarn install
+
+      # This command is derived from the top-level package.json file. Notice we have edited it to use tspc instead of ttsc.
+      tspc --build --verbose ./packages/tsconfig.build.json
+
+      # Copy build artifacts to the target project directory
+      for pkg in core http http-server cli
+      do
+        cp -r packages/$pkg/dist/ ${{targets.destdir}}/usr/src/prism/packages/$pkg/
+      done
+
+      # Make cli binary executable
+      chmod +x ${{targets.destdir}}/usr/src/prism/packages/cli/dist/index.js
+
+      # Create a link to the cli binary
+      mkdir -p ${{targets.destdir}}/usr/bin
+      ln -sf /usr/src/prism/packages/cli/dist/index.js ${{targets.destdir}}/usr/bin/prism
+
+update:
+  enabled: true
+  github:
+    identifier: stoplightio/prism
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - nodejs-18
+        - curl
+  pipeline:
+    - name: Test help
+      runs: |
+        ls -la /usr/src/prism/packages/cli/dist/index.js
+        prism help
+    - name: Test version
+      runs: |
+        prism --version | tee >(grep "${{package.version}}")
+    - name: Test mock & proxy servers
+      runs: |
+        # From "Mocking" in prism README (https://github.com/stoplightio/prism/blob/master/README.md#mocking)
+
+        # Start the mock server
+        prism mock petstore-mock-spec.yaml &
+        sleep 2
+        MOCK_BASE_URL="http://127.0.0.1:4010/pets"
+
+        # Setup test method
+        check_status() {
+          if [ "$1" -eq "$2" ]; then
+            echo "Test passed for: $3 (Expected: $2, Got: $1)"
+          else
+            echo "Test failed for: $3 (Expected: $2, Got: $1)"
+            exit 1
+          fi
+        }
+
+        # Test the mock API endpoints
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL?limit=10&tags=dog")
+        check_status $response 200 "GET /pets with limit and tags"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL")
+        check_status $response 200 "GET /pets without parameters"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL?limit=abc")
+        check_status $response 422 "GET /pets with invalid limit"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$MOCK_BASE_URL" \
+          -H "Content-Type: application/json" \
+          -d '{"name": "Fluffy", "tag": "dog"}')
+        check_status $response 200 "POST /pets (Create a new pet)"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$MOCK_BASE_URL" \
+          -H "Content-Type: application/json" \
+          -d '{"tag": "cat"}')
+        check_status $response 422 "POST /pets without required field"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL/123")
+        check_status $response 200 "GET /pets/123 (Fetch by ID)"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL/abc")
+        check_status $response 422 "GET /pets/abc with invalid ID"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -H "Prefer: code=404" "$MOCK_BASE_URL/999")
+        check_status $response 404 "GET /pets/999 but force 404"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$MOCK_BASE_URL/1")
+        check_status $response 204 "DELETE /pets/123 (Delete by ID)"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$MOCK_BASE_URL/abc")
+        check_status $response 422 "DELETE /pets/abc with invalid ID"
+
+        response=$(curl -s -D - -o /dev/null -X POST "$MOCK_BASE_URL" \
+          -H "Content-Type: application/json" \
+          -d '{"tag":"dog"}')
+        validation_error=$(echo "$response" | grep "sl-violations")
+        if [[ "$validation_error" == *"required property 'name'"* ]]; then
+          echo "Request Validation is working as expected"
+        else
+          echo "Request Validation is failing"
+          exit 1
+        fi
+
+        # Test the proxy server
+        # From "Validation Proxy" in prism README (https://github.com/stoplightio/prism/blob/master/README.md/#validation-proxy)
+
+        # Start the proxy server
+        prism proxy petstore-proxy-spec.yaml http://localhost:4010 --errors -p 3000 &
+        sleep 2
+        PROXY_BASE_URL="http://localhost:3000/pets"
+
+        # Test the proxy API endpoints
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$PROXY_BASE_URL")
+        check_status $response 200 "GET /pets via proxy"
+
+        # This is an unimplemented endpoint in the mock server, so it returns a 501
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$MOCK_BASE_URL/123" \
+          -H "Content-Type: application/json" \
+          -d '{"name": "Fluffy", "tag": "dog"}')
+        check_status $response 501 "PUT /pets/123 to the mock server"
+
+        # When the same PUT request is made to the proxy server, it should mock the unimplemented endpoint and return a 200
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$PROXY_BASE_URL/123" \
+          -H "Content-Type: application/json" \
+          -d '{"name": "Fluffy", "tag": "dog"}')
+        check_status $response 200 "PUT /pets/123 via proxy"

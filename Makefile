@@ -11,6 +11,9 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
+# Default Melange runner is Docker.
+MELANGE_RUNNER ?= docker
+
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
@@ -21,6 +24,7 @@ MELANGE_OPTS += --license 'Apache-2.0'
 MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
 MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
 MELANGE_OPTS += --pipeline-dir ./pipelines/
+MELANGE_OPTS += --runner=$(MELANGE_RUNNER)
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 # Enter interactive mode on failure for debug
@@ -41,6 +45,7 @@ MELANGE_TEST_OPTS += --repository-append https://packages.wolfi.dev/os
 MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 MELANGE_TEST_OPTS += --test-package-append wolfi-base
 MELANGE_TEST_OPTS += --debug
+MELANGE_TEST_OPTS += --runner=$(MELANGE_RUNNER)
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
@@ -59,9 +64,8 @@ PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
 
 BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
 BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
-WOLFI_REPO ?= https://packages.wolfi.dev/os
-WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
+WOLFI_REPO ?= https://apk.cgr.dev/chainguard
 
 ifeq (${BOOTSTRAP}, yes)
 	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
@@ -69,10 +73,10 @@ ifeq (${BOOTSTRAP}, yes)
 	PKGLISTCMD += -k ${BOOTSTRAP_KEY}
 	PKGLISTCMD += -r ${BOOTSTRAP_REPO}
 else
-	MELANGE_OPTS += -k ${WOLFI_KEY}
 	MELANGE_OPTS += -r ${WOLFI_REPO}
-	PKGLISTCMD += -k ${WOLFI_KEY}
-	PKGLISTCMD += -r ${WOLFI_REPO}
+	PKGLISTCMD += -k https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+	PKGLISTCMD += -r https://packages.wolfi.dev/os
+
 endif
 
 all: ${KEY} .build-packages
@@ -158,7 +162,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:324d0447f968368e177749aaa4eabc8f4c58c015ca7c7e53d2741375e526723e
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:48e8649ff6a26ba32533be015d8dbe4c5014860f6cb82ce7fdcadb02363e4afc
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -225,6 +229,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:324d0447f968368e177749aaa4eabc8f4c58c015ca7c7e53d2741375e526723e
+		ghcr.io/wolfi-dev/sdk:latest@sha256:48e8649ff6a26ba32533be015d8dbe4c5014860f6cb82ce7fdcadb02363e4afc
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"

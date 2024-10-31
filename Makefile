@@ -11,9 +11,6 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
-# Default Melange runner is Docker.
-MELANGE_RUNNER ?= docker
-
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
@@ -24,7 +21,6 @@ MELANGE_OPTS += --license 'Apache-2.0'
 MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
 MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
 MELANGE_OPTS += --pipeline-dir ./pipelines/
-MELANGE_OPTS += --runner=$(MELANGE_RUNNER)
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 # Enter interactive mode on failure for debug
@@ -45,7 +41,6 @@ MELANGE_TEST_OPTS += --repository-append https://packages.wolfi.dev/os
 MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 MELANGE_TEST_OPTS += --test-package-append wolfi-base
 MELANGE_TEST_OPTS += --debug
-MELANGE_TEST_OPTS += --runner=$(MELANGE_RUNNER)
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
@@ -64,8 +59,9 @@ PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
 
 BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
 BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
+WOLFI_REPO ?= https://packages.wolfi.dev/os
+WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
-WOLFI_REPO ?= https://apk.cgr.dev/chainguard
 
 ifeq (${BOOTSTRAP}, yes)
 	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
@@ -73,10 +69,10 @@ ifeq (${BOOTSTRAP}, yes)
 	PKGLISTCMD += -k ${BOOTSTRAP_KEY}
 	PKGLISTCMD += -r ${BOOTSTRAP_REPO}
 else
+	MELANGE_OPTS += -k ${WOLFI_KEY}
 	MELANGE_OPTS += -r ${WOLFI_REPO}
-	PKGLISTCMD += -k https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
-	PKGLISTCMD += -r https://packages.wolfi.dev/os
-
+	PKGLISTCMD += -k ${WOLFI_KEY}
+	PKGLISTCMD += -r ${WOLFI_REPO}
 endif
 
 all: ${KEY} .build-packages
@@ -101,6 +97,15 @@ list:
 list-yaml:
 	$(info $(addsuffix .yaml,$(shell $(PKGLISTCMD))))
 	@printf ''
+
+fetch-kernel:
+	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
+	@curl -s -LSo linux-virt.apk "https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/$(KERNEL_PKG)"
+	@mkdir -p /tmp/kernel
+	@tar -xf ./linux-virt.apk -C /tmp/kernel/ 2>/dev/null
+	export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz-virt
+	export QEMU_KERNEL_MODULES=/tmp/kernel/lib/modules/
+	export MELANGE_OPTS="--runner=qemu"
 
 package/%:
 	$(eval yamlfile := $*.yaml)

@@ -59,8 +59,9 @@ PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
 
 BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
 BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
+WOLFI_REPO ?= https://packages.wolfi.dev/os
+WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
-WOLFI_REPO ?= https://apk.cgr.dev/chainguard
 
 ifeq (${BOOTSTRAP}, yes)
 	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
@@ -68,10 +69,10 @@ ifeq (${BOOTSTRAP}, yes)
 	PKGLISTCMD += -k ${BOOTSTRAP_KEY}
 	PKGLISTCMD += -r ${BOOTSTRAP_REPO}
 else
+	MELANGE_OPTS += -k ${WOLFI_KEY}
 	MELANGE_OPTS += -r ${WOLFI_REPO}
-	PKGLISTCMD += -k https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
-	PKGLISTCMD += -r https://packages.wolfi.dev/os
-
+	PKGLISTCMD += -k ${WOLFI_KEY}
+	PKGLISTCMD += -r ${WOLFI_REPO}
 endif
 
 all: ${KEY} .build-packages
@@ -166,7 +167,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:48e8649ff6a26ba32533be015d8dbe4c5014860f6cb82ce7fdcadb02363e4afc
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:500078db1378f2561098d1d71f85f90b289a646c5d850aad0db211491723e627
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -233,6 +234,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:48e8649ff6a26ba32533be015d8dbe4c5014860f6cb82ce7fdcadb02363e4afc
+		ghcr.io/wolfi-dev/sdk:latest@sha256:500078db1378f2561098d1d71f85f90b289a646c5d850aad0db211491723e627
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"

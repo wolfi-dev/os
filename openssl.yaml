@@ -1,7 +1,8 @@
+#nolint:forbidden-repository-used,forbidden-keyring-used
 package:
   name: openssl
-  version: 3.3.2
-  epoch: 0
+  version: 3.4.0
+  epoch: 1
   description: "the OpenSSL cryptography suite"
   copyright:
     - license: Apache-2.0
@@ -17,15 +18,26 @@ package:
 
 environment:
   contents:
+    # NB! accessing historic, but certified build of
+    # jitterentropy-library-dev=3.5.0-r0. In a fresh bootstrap build
+    # any version of jitternetropy-library and get an ESV certificate
+    # for it.
+    build_repositories:
+      - https://packages.wolfi.dev/os
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
     packages:
       - build-base
       - busybox
       - ca-certificates-bundle
+      # NB! pinned to version https://csrc.nist.gov/projects/cryptographic-module-validation-program/entropy-validations/certificate/191
+      - jitterentropy-library-dev=3.5.0-r0
+      - jitterentropy-library=3.5.0-r0
       - openssf-compiler-options
       - perl
   environment:
     # Using openssf-compiler-options instead
-    CFLAGS: ""
+    CFLAGS: "-g -ffile-prefix-map=/home/build=/usr/src/${{package.name}}"
     CPPFLAGS: ""
     CXXFLAGS: ""
     LDFLAGS: ""
@@ -33,9 +45,20 @@ environment:
 pipeline:
   - uses: git-checkout
     with:
-      repository: https://github.com/openssl/openssl.git
+      repository: https://github.com/openssl/openssl
       tag: openssl-${{package.version}}
-      expected-commit: fb7fab9fa6f4869eaa8fbb97e0d593159f03ffe4
+      expected-commit: 98acb6b02839c609ef5b837794e08d906d965335
+
+  - name: Create dbg sourcecode
+    runs: |
+      SRCDIR=$(mktemp -d)
+      cp -r . $SRCDIR/
+      mkdir -p ${{targets.destdir}}-dbg/usr/src/
+      mv $SRCDIR ${{targets.destdir}}-dbg/usr/src/${{package.name}}
+      # Note that mktemp -d created it as 700, whilst the contents
+      # inside is 644 for files and 755 for dirs, without this gdb
+      # doesn't work for non-root user, fix this up.
+      chmod 755 ${{targets.destdir}}-dbg/usr/src/${{package.name}}
 
   - name: Configure and build
     runs: |
@@ -49,7 +72,9 @@ pipeline:
          --libdir=lib \
          --openssldir=/etc/ssl \
          enable-ktls \
+         enable-jitter \
          shared \
+         enable-pie \
          no-zlib \
          no-async \
          no-comp \
@@ -65,6 +90,7 @@ pipeline:
          -Wa,--noexecstack
       perl configdata.pm --dump
       make -j$(nproc)
+      make tests HARNESS_JOBS=10
 
   - uses: autoconf/make-install
 
@@ -85,8 +111,6 @@ pipeline:
       # This also removes the need to have things coupled with
       # openssl-config-fipshardened going forward.
 
-  - uses: strip
-
 data:
   - name: engines
     items:
@@ -95,6 +119,11 @@ data:
       padlock: VIA Padlock engine
 
 subpackages:
+  - name: "openssl-dbg"
+    description: "OpenSSL debug symbols"
+    pipeline:
+      - uses: split/debug
+
   - name: "openssl-doc"
     description: "OpenSSL documentation"
     pipeline:
@@ -118,6 +147,13 @@ subpackages:
 
   - name: "openssl-dev"
     description: "OpenSSL headers"
+    dependencies:
+      runtime:
+        # TODO: for static linking only, split into openssl-static, or
+        # fix upstream (note .so actually links 3.5.0-r0 but melange
+        # hates that here)
+        - jitterentropy-library-dev
+        - jitterentropy-library
     pipeline:
       - uses: split/dev
     test:
@@ -156,7 +192,15 @@ test:
   pipeline:
     - uses: test/hardening-check
       with:
-        package-match: "^openssl$\\|libssl3\\|libcrypto3"
+        package-match: "^openssl$\\|libssl3"
+    - uses: test/hardening-check
+      with:
+        # jitterentropy is without CF protection so far
+        args: "--nocfprotection"
+        package-match: "^libcrypto3$"
+    - runs: |
+        openssl --version
+        openssl --help
     - name: Verify curl still works
       runs: |
         curl -I https://github.com/openssl/openssl

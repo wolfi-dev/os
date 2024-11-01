@@ -17,6 +17,8 @@ MELANGE_OPTS += --signing-key ${KEY}
 MELANGE_OPTS += --arch ${ARCH}
 MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
+MELANGE_OPTS += --license 'Apache-2.0'
+MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
 MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
@@ -96,6 +98,15 @@ list-yaml:
 	$(info $(addsuffix .yaml,$(shell $(PKGLISTCMD))))
 	@printf ''
 
+fetch-kernel:
+	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
+	@curl -s -LSo linux-virt.apk "https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/$(KERNEL_PKG)"
+	@mkdir -p /tmp/kernel
+	@tar -xf ./linux-virt.apk -C /tmp/kernel/ 2>/dev/null
+	export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz-virt
+	export QEMU_KERNEL_MODULES=/tmp/kernel/lib/modules/
+	export MELANGE_OPTS="--runner=qemu"
+
 package/%:
 	$(eval yamlfile := $*.yaml)
 	@if [ -z "$(yamlfile)" ]; then \
@@ -156,7 +167,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:c44b9aee987d6af22d32fa05ad9d7803841ff882bd6078799fd736c8134ca68c
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:500078db1378f2561098d1d71f85f90b289a646c5d850aad0db211491723e627
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -223,6 +234,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:c44b9aee987d6af22d32fa05ad9d7803841ff882bd6078799fd736c8134ca68c
+		ghcr.io/wolfi-dev/sdk:latest@sha256:500078db1378f2561098d1d71f85f90b289a646c5d850aad0db211491723e627
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"

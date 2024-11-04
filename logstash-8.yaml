@@ -16,8 +16,8 @@
 #    subpackage to be installed separately.
 package:
   name: logstash-8
-  version: 8.15.2
-  epoch: 3
+  version: 8.15.3
+  epoch: 6
   description: Logstash - transport and process your logs, events, or other data
   copyright:
     - license: Apache-2.0
@@ -30,6 +30,15 @@ package:
       - busybox
       - openjdk-17-jre
       - openjdk-17-default-jvm
+
+# Create a new major-version variable that contains only the major version
+# to use in the bitnami/compat pipeline to find out the correct folder for the image.
+# e.g. 25.0.2 will create a new var major-version=25
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
 
 environment:
   contents:
@@ -64,7 +73,7 @@ pipeline:
     with:
       repository: https://github.com/elastic/logstash
       tag: v${{package.version}}
-      expected-commit: 7a9f41a0f5f5b854f0e5599ae742236cef5e8624
+      expected-commit: 8364c8e89cfb113e38ec3f966df7eb1e9abe9d33
 
   - name: Patch sources
     runs: |
@@ -165,6 +174,139 @@ subpackages:
           install -m644 "${src}/config/log4j2.properties"      "${dst}/config/log4j2.properties"
           install -m644 "${src}/pipeline/default.conf"         "${dst}/pipeline/default.conf"
           install -m755 "${src}/bin/docker-entrypoint"         "${{targets.contextdir}}/usr/bin/docker-entrypoint"
+
+  - name: ${{package.name}}-bitnami-compat
+    description: "compat package with bitnami/logstash image"
+    dependencies:
+      runtime:
+        - bash # some helper scripts use bash and busybox utilities
+        - busybox
+        - yq
+        - posix-libc-utils # Required for getent
+        - openjdk-17-jre
+        - openjdk-17-default-jvm
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: logstash
+          version-path: ${{vars.major-version}}/debian-12
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/logstash
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/scripts/logstash/
+
+          chmod g+rwX ${{targets.subpkgdir}}/opt/bitnami
+
+          src=docker/data/logstash
+          dst="${{targets.contextdir}}/opt/bitnami/logstash"
+          mkdir -p "${dst}/config" \
+                   "${dst}/pipeline"
+
+          tarball=$(find . -type f -name "logstash-oss-${{package.version}}-SNAPSHOT-no-jdk.tar.gz")
+          if [ -z $tarball ]; then
+            echo "Could not find logstash-oss tarball, nothing to unpack"
+            exit 1
+          fi
+
+          tar --strip-components 1 \
+            -C ${{targets.contextdir}}/opt/bitnami/logstash \
+            -xf $tarball
+
+          install -m666 config/jvm.options                     "${dst}/config/jvm.options"
+          install -m644 "${src}/config/pipelines.yml"          "${dst}/config/pipelines.yml"
+          install -m644 "${src}/config/logstash-oss.yml"       "${dst}/config/logstash-oss.yml"
+          install -m644 "${src}/config/logstash-full.yml"      "${dst}/config/logstash-full.yml"
+
+          # Replace the incorrect Java paths in the Bitnami scripts
+          sed -i 's/export JAVA_HOME=\"${BITNAMI_ROOT_DIR}\/java\"/export JAVA_HOME="\/usr\/lib\/jvm\/java-17-openjdk"/g' ${{targets.contextdir}}/opt/bitnami/scripts/logstash-env.sh
+          sed -i 's/export LS_JAVA_HOME=\/opt\/bitnami\/java/export LS_JAVA_HOME="\/usr\/lib\/jvm\/java-17-openjdk"/g' ${{targets.contextdir}}/opt/bitnami/scripts/logstash/run.sh
+
+          # Disable some commands used in Bitnami scripts. These commands more likely fail in this since this image take non root approach
+          sed -i 's/ensure_user_exists/# ensure_user_exists/g' ${{targets.contextdir}}/opt/bitnami/scripts/logstash/postunpack.sh
+          sed -i 's/am_i_root/# am_i_root/g' ${{targets.contextdir}}/opt/bitnami/scripts/logstash/setup.sh
+
+          # Use package path while unpacking
+          find . -iname "*.sh" -exec sed 's#/opt/bitnami#${{targets.contextdir}}/opt/bitnami#g' -i {} \;
+            ${{targets.contextdir}}/opt/bitnami/scripts/java/postunpack.sh || true
+            ${{targets.contextdir}}/opt/bitnami/scripts/logstash/postunpack.sh || true
+          # Restore path
+          find ${{targets.contextdir}}/opt/bitnami -type f -exec sed 's#${{targets.contextdir}}##g' -i {} \;
+
+          chmod -R u+rwX,g+rwX,o+rw ${{targets.subpkgdir}}/opt/bitnami/
+          find / -perm /6000 -type f -exec chmod a-s {} \; || true
+
+          # Link binaries used by Bitnami config
+          ln -sf /opt/bitnami/scripts/logstash/entrypoint.sh ${{targets.contextdir}}/entrypoint.sh
+          ln -sf /opt/bitnami/scripts/logstash/run.sh ${{targets.contextdir}}/run.sh
+      - runs: |
+          # mkdir these empty directories to quiet various startup messages per upstream
+          mkdir -p "${{targets.subpkgdir}}"/bitnami/logstash/data
+          mkdir -p "${{targets.subpkgdir}}"/bitnami/logstash/pipeline
+          mkdir -p "${{targets.subpkgdir}}"/bitnami/logstash/config
+      - runs: |
+          # cp config to config.default because the entrypoint.sh run.sh init step wants something to copy
+          cp -r "${{targets.subpkgdir}}"/opt/bitnami/logstash/config "${{targets.subpkgdir}}"/opt/bitnami/logstash/config.default
+          cp -r "${{targets.subpkgdir}}"/opt/bitnami/logstash/pipeline "${{targets.subpkgdir}}"/opt/bitnami/logstash/pipeline.default
+          # bitnami have a custom log4j2.properties
+          cp "${{targets.subpkgdir}}"/opt/bitnami/logstash/config.default/log4j2.properties "${{targets.subpkgdir}}"/opt/bitnami/logstash/config.default/log4j2.orig.properties
+          rm -f "${{targets.subpkgdir}}"/opt/bitnami/logstash/config.default/log4j2.properties
+          install -Dm755 log4j2.custom.properties "${{targets.subpkgdir}}"/opt/bitnami/logstash/config.default/log4j2.properties
+          # also have a custom logstash.yml
+          rm "${{targets.subpkgdir}}"/opt/bitnami/logstash/config.default/logstash.yml
+          install -Dm755 logstash.custom.yml "${{targets.subpkgdir}}"/opt/bitnami/logstash/config.default/logstash.yml
+    test:
+      environment:
+        contents:
+          packages:
+            - bash
+            - curl
+            - busybox
+            - openjdk-17-jre
+            - openjdk-17-default-jvm
+        accounts:
+          groups:
+            - groupname: logstash
+              gid: 1001
+          users:
+            - username: logstash
+              gid: 1001
+              uid: 1001
+          run-as: 1001
+        environment:
+          LS_JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      pipeline:
+        - working-directory: /tmp
+          pipeline:
+            - runs: |
+                run-script --version
+                run-script --help
+            - name: "start daemon on localhost"
+              uses: test/daemon-check-output
+              with:
+                start: |
+                  env "BITNAMI_APP_NAME=logstash" \
+                    "APP_VERSION=${{package.version}}" \
+                    "PATH=/opt/bitnami/logstash/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+                    /opt/bitnami/scripts/logstash/entrypoint.sh \
+                    /opt/bitnami/scripts/logstash/run.sh
+                timeout: 120
+                expected_output: |
+                  Welcome to the Bitnami logstash container
+                  Starting Logstash setup
+                  Starting Logstash
+                  Starting http input listener
+                post: |
+                  #!/bin/sh -e
+                  url=http://localhost:8080
+                  response=$(curl -fsS --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40 "$url") || {
+                    echo "curl ${url} failed $?"
+                    exit 1
+                  }
+                  echo "$response" | grep -q ok || {
+                    echo "response from $url did not contain \"ok\""
+                    echo "response: $response"
+                    exit 1
+                  }
+                  echo "$url had expected output: $response"
 
   - name: ${{package.name}}-env2yaml
     description: Merge environment variables into logstash.yml

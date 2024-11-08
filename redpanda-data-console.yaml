@@ -1,0 +1,120 @@
+package:
+  name: redpanda-data-console
+  version: 2.7.2
+  description: "Redpanda Console (previously known as Kowl) is a web application that helps you manage and debug your Kafka/Redpanda workloads effortlessly."
+  epoch: 0
+  copyright:
+    - license: "BUSL-1.1"
+  resources:
+    cpu: 8
+    memory: 8Gi
+  dependencies:
+    runtime:
+      - curl
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - nodejs-20
+      - npm
+      - typescript
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/redpanda-data/console.git
+      tag: v${{package.version}}
+      expected-commit: 5f15d4ce029fe0a996cc3db4bf993bd41bf52d9d
+
+  - name: Build Frontend
+    working-directory: frontend
+    pipeline:
+      - runs: |
+          npm ci
+
+          REACT_APP_CONSOLE_GIT_SHA=$(git rev-parse --short HEAD)
+          REACT_APP_CONSOLE_GIT_REF=$(git rev-parse --abbrev-ref HEAD)
+          REACT_APP_BUILD_TIMESTAMP=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+          REACT_APP_DEV_HINT=true
+
+          # Hacky-fix for "Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory" error
+          GENERATE_SOURCEMAP=false NODE_OPTIONS="--max-old-space-size=8192" npm run build
+
+  - name: Embed frontend into backend
+    runs: |
+      cp -r frontend/build/* backend/pkg/embed/frontend
+      cp -R frontend/node_modules/ backend/pkg/embed/frontend/node_modules
+      cp -R frontend/public/ backend/pkg/embed/frontend/public
+
+  - name: Build Backend
+    uses: go/build
+    with:
+      modroot: ./backend
+      packages: ./cmd/api
+      ldflags: -X github.com/redpanda-data/console/backend/pkg/version.Version=${{package.version}} -X github.com/redpanda-data/console/backend/pkg/version.BuiltAt=$(date +%s)
+      output: console
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/app
+          ln -sf /usr/bin/console ${{targets.subpkgdir}}/app/console
+
+update:
+  enabled: true
+  github:
+    identifier: redpanda-data/console
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - kafka
+        - uuidgen
+        - ${{package.name}}-compat
+    environment:
+      JAVA_HOME: "/usr/lib/jvm/default-jvm"
+      KAFKA_BROKERS: "localhost:9092"
+  pipeline:
+    - runs: console -h
+    - name: "Test with Kafka"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          cd /usr/lib/kafka
+          bin/zookeeper-server-start.sh config/zookeeper.properties &
+          mv config/server.properties.original config/server.properties
+          bin/kafka-server-start.sh config/server.properties &
+          sleep 5
+          TOPIC_NAME="test-topic-$(uuidgen)"
+          PARTITIONS=1
+          REPLICATION_FACTOR=1
+          # Create a Kafka topic
+          bin/kafka-topics.sh --create --topic "${TOPIC_NAME}" --partitions "${PARTITIONS}" --replication-factor "${REPLICATION_FACTOR}" --if-not-exists --bootstrap-server localhost:9092
+          # Produce a test message
+          echo "Hello Kafka" | bin/kafka-console-producer.sh --broker-list localhost:9092 --topic "${TOPIC_NAME}"
+        start: "/app/console"
+        timeout: 15
+        expected_output: |
+          started Redpanda Console
+          successfully connected to kafka cluster
+          Server listening on address
+        post: |
+          #!/bin/sh -e
+          url=http://localhost:8080/api/cluster/overview
+          response=$(curl -fsS --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40 "$url") || {
+            echo "curl ${url} failed $?"
+            exit 1
+          }
+          echo "$response" | grep -qi HEALTHY || {
+            echo "response from $url did not contain \"ok\""
+            echo "response: $response"
+            exit 1
+          }
+          echo "$url had expected output: $response"

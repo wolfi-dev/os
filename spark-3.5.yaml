@@ -1,7 +1,7 @@
 package:
   name: spark-3.5
   version: 3.5.3
-  epoch: 4
+  epoch: 1
   description: Unified engine for large-scale data analytics
   copyright:
     - license: Apache-2.0
@@ -224,19 +224,95 @@ subpackages:
           ln -s /usr/lib/spark/kubernetes ${{targets.subpkgdir}}/opt/bitnami/spark/kubernetes
           ln -s /usr/lib/spark/sbin ${{targets.subpkgdir}}/opt/bitnami/spark/sbin
           ln -s /usr/lib/spark/yarn ${{targets.subpkgdir}}/opt/bitnami/spark/yarn
+
   - name: ${{package.name}}-scala-2.13
+    dependencies:
+      runtime:
+        - openjdk-17-default-jvm
     pipeline:
       - runs: |
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
           export MAVEN_OPTS="-Xss64m -Xmx2g -XX:ReservedCodeCacheSize=1g"
+          cp pom.xml.orig pom.xml
           mvn clean
           ./dev/change-scala-version.sh 2.13
           ./build/mvn -DskipTests -Pscala-2.13 clean package
           mkdir -p ${{targets.contextdir}}/usr/lib/spark
           mkdir -p ${{targets.contextdir}}/usr/lib/spark/work-dir
-          cp -R bin/ ${{targets.contextdir}}/usr/lib/spark
-          cp -R sbin/ ${{targets.contextdir}}/usr/lib/spark
-          cp -R target ${{targets.contextdir}}/usr/lib/spark
-          cp -R assembly ${{targets.contextdir}}/usr/lib/spark
+          mv bin/ ${{targets.contextdir}}/usr/lib/spark
+          mv sbin/ ${{targets.contextdir}}/usr/lib/spark
+          mv target ${{targets.contextdir}}/usr/lib/spark
+          mv assembly ${{targets.contextdir}}/usr/lib/spark
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-17-default-jvm
+        - bash
+        - ${{package.name}}-scala-2.13
+    environment:
+      LANG: en_US.UTF-8
+      SCALA_VERSION: 2.13
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      SPARK_LOCAL_IP: 127.0.0.1
+      SPARK_LOCAL_HOSTNAME: localhost
+      SPARK_HOME: /usr/lib/spark
+      PATH: $PATH:${SPARK_HOME}/bin
+      SPARK_USER: test
+  pipeline:
+    - name: Test ${{package.name}} with OpenJDK 17
+      pipeline:
+        - name: Test if the Scala versions are correct
+          runs: ls /usr/lib/spark/assembly/target/scala-2.13/jars/scala-* | grep -q $SCALA_VERSION
+        - name: Check spark-shell --version
+          runs: /usr/lib/spark/bin/spark-shell --version
+        - name: Check spark-submit --version
+          runs: /usr/lib/spark/bin/spark-submit --version
+        - name: Check pyspark --version
+          runs: /usr/lib/spark/bin/pyspark --version
+        - name: Check spark-sql --version
+          runs: /usr/lib/spark/bin/spark-sql --version
+        - name: Test entrypoint
+          runs: timeout 10 /usr/lib/spark/bin/spark-shell > spark_log.txt 2>&1 || [ $? -eq 143 ] && grep "Spark session available" spark_log.txt && exit_code=0 || exit_code=$? && echo $exit_code
+        - name: Run a simple Scala test script
+          runs: |
+            cat <<EOF > SimpleJob.scala
+            val data = Seq(1, 2, 3, 4, 5)
+            val rdd = spark.sparkContext.parallelize(data)
+            val sum = rdd.reduce(_ + _)
+            assert(sum == 15)
+            EOF
+            cat SimpleJob.scala | /usr/lib/spark/bin/spark-shell --conf spark.jars.ivy=/tmp/.ivy --master local[*]
+        - name: Perform SQL query on DataFrame in Scala
+          runs: |
+            cat <<EOF > SQLTest.scala
+            import org.apache.spark.sql.SparkSession
+            val spark = SparkSession.builder.appName("SQLTest").getOrCreate()
+            import spark.implicits._
+            val df = Seq((1, "Alice"), (2, "Bob")).toDF("id", "name")
+            df.createOrReplaceTempView("people")
+            val result = spark.sql("SELECT name FROM people WHERE id = 2")
+            assert(result.count() == 1 && result.first().getString(0) == "Bob")
+            EOF
+            cat SQLTest.scala | /usr/lib/spark/bin/spark-shell  --conf spark.jars.ivy=/tmp/.ivy --master local[*]
+        - name: Run basic SQL query with spark-sql
+          runs: |
+            echo 'CREATE OR REPLACE TEMP VIEW test AS SELECT 1 AS id;' > test.sql
+            echo 'SELECT * FROM test;' >> test.sql
+            /usr/lib/spark/bin/spark-sql -f test.sql
+        - name: Run SparkR script
+          runs: |
+            cat <<EOF > sparkr_test.R
+            library(SparkR)
+            sparkR.session()
+            df <- as.DataFrame(data.frame(id = c(1, 2), name = c("Alice", "Bob")))
+            createOrReplaceTempView(df, "people")
+            df2 <- sql("SELECT * FROM people WHERE id > 1")
+            stopifnot(count(df2) == 1)
+            EOF
+            /usr/lib/spark/bin/spark-submit sparkr_test.R
+
 update:
   enabled: true
   github:

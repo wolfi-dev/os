@@ -33,7 +33,7 @@ for p in $(make list); do
 
   # If .test.environment.contents.packages is empty, remove it all.
   if [ "$(yq -r '.test.environment.contents.packages | length' ${fn})" == "0" ]; then
-    yq -i 'del(.test.environment)' ${fn}
+    yq -i 'del(.test.environment.contents)' ${fn}
     yam ${fn}
   fi
 done

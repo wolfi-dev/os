@@ -22,7 +22,6 @@ environment:
       - openjdk-11
       - openjdk-17
       - openjdk-17-default-jvm
-      # Only 8 is used during the build process
       - openjdk-8
       - perl-utils
       - procps
@@ -97,9 +96,20 @@ subpackages:
             - python3
             - openjdk-${{range.key}}-default-jvm
             - R
+            - bash
+            - wolfi-base
+            - libstdc++-11
+            - libavcodec61
         environment:
           LANG: en_US.UTF-8
           JAVA_HOME: /usr/lib/jvm/${{range.value}}
+          SPARK_LOCAL_IP: 127.0.0.1
+          SPARK_LOCAL_HOSTNAME: localhost
+          SPARK_USER: tester
+          HADOOP_USER_NAME: tester
+          SPARK_HOME: /usr/lib/spark
+          PATH: $PATH:${SPARK_HOME}/bin
+          USERNAME: APP
       pipeline:
         - name: Test ${{package.name}} with OpenJDK ${{range.key}}
           pipeline:
@@ -121,7 +131,7 @@ subpackages:
                 val sum = rdd.reduce(_ + _)
                 assert(sum == 15)
                 EOF
-                cat SimpleJob.scala | /usr/lib/spark/bin/spark-shell
+                cat SimpleJob.scala | /usr/lib/spark/bin/spark-shell --conf spark.jars.ivy=/tmp/.ivy
             - name: Run a simple Spark job in Python
               runs: |
                 cat <<EOF > simple_job.py
@@ -132,7 +142,7 @@ subpackages:
                 sum = rdd.reduce(lambda x, y: x + y)
                 assert sum == 15
                 EOF
-                /usr/lib/spark/bin/spark-submit simple_job.py --jars /usr/lib/spark/jars/guava-32.0.1-jre.jar
+                /usr/lib/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/.ivy simple_job.py --jars /usr/lib/spark/jars/guava-32.0.1-jre.jar
             - name: Perform SQL query on DataFrame in Scala
               runs: |
                 cat <<EOF > SQLTest.scala
@@ -144,12 +154,22 @@ subpackages:
                 val result = spark.sql("SELECT name FROM people WHERE id = 2")
                 assert(result.count() == 1 && result.first().getString(0) == "Bob")
                 EOF
-                cat SQLTest.scala | /usr/lib/spark/bin/spark-shell
+                cat SQLTest.scala | /usr/lib/spark/bin/spark-shell --conf spark.jars.ivy=/tmp/.ivy --deploy-mode client
             - name: Run basic SQL query with spark-sql
               runs: |
-                echo 'CREATE OR REPLACE TEMP VIEW test AS SELECT 1 AS id;' > test.sql
-                echo 'SELECT * FROM test;' >> test.sql
-                /usr/lib/spark/bin/spark-sql -f test.sql
+                export HADOOP_USER_NAME=tester
+
+                cat <<EOF >/tmp/db.sql
+                CREATE OR REPLACE TEMP VIEW test AS SELECT 1 AS id;
+                SELECT * FROM test;
+                EOF
+                /usr/lib/spark/bin/spark-sql \
+                  -f /tmp/db.sql \
+                  --master local[*] \
+                  --conf spark.sql.catalogImplementation=in-memory \
+                  --conf spark.jars.ivy=/tmp/.ivy \
+                  --conf spark.hadoop.security.authentication=false \
+                  --conf spark.hadoop.security.authentication=false --deploy-mode client
             - name: Run SparkR script
               runs: |
                 cat <<EOF > sparkr_test.R
@@ -160,7 +180,7 @@ subpackages:
                 df2 <- sql("SELECT * FROM people WHERE id > 1")
                 stopifnot(count(df2) == 1)
                 EOF
-                /usr/lib/spark/bin/spark-submit sparkr_test.R
+                /usr/lib/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/.ivy --master local[*] sparkr_test.R
 
   - name: ${{package.name}}-compat
     description: "Compatibility package to place binaries in the location expected by upstream image"
@@ -233,6 +253,8 @@ subpackages:
       - runs: |
           export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
           export MAVEN_OPTS="-Xss64m -Xmx2g -XX:ReservedCodeCacheSize=1g"
+          ## pom bump seem to mess with the ability to switch scala version
+          ## the solution is to restore the original pom file at the package build stage
           cp pom.xml.orig pom.xml
           mvn clean
           ./dev/change-scala-version.sh 2.13
@@ -243,6 +265,20 @@ subpackages:
           mv sbin/ ${{targets.contextdir}}/usr/lib/spark
           mv target ${{targets.contextdir}}/usr/lib/spark
           mv assembly ${{targets.contextdir}}/usr/lib/spark
+          cp resource-managers/kubernetes/docker/src/main/dockerfiles/spark/entrypoint.sh ${{targets.contextdir}}/usr/lib/spark/
+
+  - name: ${{package.name}}-scala-2.13-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/spark
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          ln -s /usr/lib/spark/ ${{targets.subpkgdir}}/opt/spark
+          ln -sf /usr/lib/spark/entrypoint.sh ${{targets.subpkgdir}}/opt/entrypoint.sh
+          ln -sf /usr/lib/spark/bin/spark-submit ${{targets.subpkgdir}}/usr/bin/spark-submit
+          ln -sf /usr/lib/spark/bin/spark-shell ${{targets.subpkgdir}}/usr/bin/spark-shell
+          ln -sf /usr/lib/spark/bin/spark-class ${{targets.subpkgdir}}/usr/bin/spark-class
+          ln -sf /usr/lib/spark/bin/spark-sql ${{targets.subpkgdir}}/usr/bin/spark-sql
+          ln -sf /usr/lib/spark/assembly/target/scala-2.13/jars ${{targets.contextdir}}/opt/spark/jars
 
 test:
   environment:
@@ -295,23 +331,7 @@ test:
             val result = spark.sql("SELECT name FROM people WHERE id = 2")
             assert(result.count() == 1 && result.first().getString(0) == "Bob")
             EOF
-            cat SQLTest.scala | /usr/lib/spark/bin/spark-shell  --conf spark.jars.ivy=/tmp/.ivy --master local[*]
-        - name: Run basic SQL query with spark-sql
-          runs: |
-            echo 'CREATE OR REPLACE TEMP VIEW test AS SELECT 1 AS id;' > test.sql
-            echo 'SELECT * FROM test;' >> test.sql
-            /usr/lib/spark/bin/spark-sql -f test.sql
-        - name: Run SparkR script
-          runs: |
-            cat <<EOF > sparkr_test.R
-            library(SparkR)
-            sparkR.session()
-            df <- as.DataFrame(data.frame(id = c(1, 2), name = c("Alice", "Bob")))
-            createOrReplaceTempView(df, "people")
-            df2 <- sql("SELECT * FROM people WHERE id > 1")
-            stopifnot(count(df2) == 1)
-            EOF
-            /usr/lib/spark/bin/spark-submit sparkr_test.R
+            cat SQLTest.scala | /usr/lib/spark/bin/spark-shell --conf spark.jars.ivy=/tmp/.ivy --master local[*]
 
 update:
   enabled: true

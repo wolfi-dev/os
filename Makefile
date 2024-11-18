@@ -59,8 +59,9 @@ PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
 
 BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
 BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
+WOLFI_REPO ?= https://packages.wolfi.dev/os
+WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
-WOLFI_REPO ?= https://apk.cgr.dev/chainguard
 
 ifeq (${BOOTSTRAP}, yes)
 	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
@@ -68,10 +69,10 @@ ifeq (${BOOTSTRAP}, yes)
 	PKGLISTCMD += -k ${BOOTSTRAP_KEY}
 	PKGLISTCMD += -r ${BOOTSTRAP_REPO}
 else
+	MELANGE_OPTS += -k ${WOLFI_KEY}
 	MELANGE_OPTS += -r ${WOLFI_REPO}
-	PKGLISTCMD += -k https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
-	PKGLISTCMD += -r https://packages.wolfi.dev/os
-
+	PKGLISTCMD += -k ${WOLFI_KEY}
+	PKGLISTCMD += -r ${WOLFI_REPO}
 endif
 
 all: ${KEY} .build-packages
@@ -96,6 +97,15 @@ list:
 list-yaml:
 	$(info $(addsuffix .yaml,$(shell $(PKGLISTCMD))))
 	@printf ''
+
+fetch-kernel:
+	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
+	@curl -s -LSo linux-virt.apk "https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/$(KERNEL_PKG)"
+	@mkdir -p /tmp/kernel
+	@tar -xf ./linux-virt.apk -C /tmp/kernel/ 2>/dev/null
+	export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz-virt
+	export QEMU_KERNEL_MODULES=/tmp/kernel/lib/modules/
+	export MELANGE_OPTS="--runner=qemu"
 
 package/%:
 	$(eval yamlfile := $*.yaml)
@@ -157,7 +167,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:48e8649ff6a26ba32533be015d8dbe4c5014860f6cb82ce7fdcadb02363e4afc
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:82365afa5cc7b8cdd32b6f61614638c2902782bb3e06f25338d09807f186127b
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -224,6 +234,6 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:48e8649ff6a26ba32533be015d8dbe4c5014860f6cb82ce7fdcadb02363e4afc
+		ghcr.io/wolfi-dev/sdk:latest@sha256:82365afa5cc7b8cdd32b6f61614638c2902782bb3e06f25338d09807f186127b
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"

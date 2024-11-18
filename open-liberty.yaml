@@ -2,16 +2,30 @@
 package:
   name: open-liberty
   version: 24.0.0.11
-  epoch: 0
+  epoch: 1
   description: "Open Liberty is a highly composable, fast to start, dynamic application server runtime environment"
   resources:
     cpu: 32
     memory: 32Gi
   copyright:
     - license: EPL-2.0
+  dependencies:
+    runtime:
+      # Installing open-liberty should at least do something
+      - ${{package.name}}-full
 
 vars:
+  # Tasks to generate zips for OL variants require isAutomatedBuild=true
+  build-opts: "-PisRelease=true -PisAutomatedBuild=true"
   open-liberty-home: "/usr/share/java/open-liberty"
+
+data:
+  # The full variant provides all public plugins at runtime
+  # The kernel variant is just the Open Liberty kernel
+  - name: variants
+    items:
+      full: "full"
+      kernel: "kernel-slim"
 
 environment:
   contents:
@@ -19,9 +33,11 @@ environment:
       - busybox
       - ca-certificates-bundle
       - curl
+      - findutils
       - libarchive-tools
       - openjdk-21
       - openjdk-21-default-jvm
+      - sed
   environment:
     LANG: en_US.UTF-8
     JAVA_HOME: /usr/lib/jvm/java-21-openjdk
@@ -33,40 +49,71 @@ pipeline:
       repository: https://github.com/OpenLiberty/open-liberty
       tag: gm-${{package.version}}
 
-  - working-directory: dev
-    runs: |
-      ./gradlew --parallel cnf:initialize
-      ./gradlew --parallel assemble
-      ./gradlew --parallel releaseNeeded
-
-      mkdir -p ${{targets.contextdir}}/${{vars.open-liberty-home}}
-      bsdtar xvf cnf/release/dev/openliberty/${{package.version}}*/openliberty-${{package.version}}*.zip --strip-components=1 -C ${{targets.contextdir}}/${{vars.open-liberty-home}}
-
-  - uses: strip
-
   # Tags aren't cut, a branch specific to the version of Open Liberty is created before release
   - uses: git-checkout
     with:
       expected-commit: e4fb041438e51f86133be5ad296214e8a4e196d7
       repository: https://github.com/OpenLiberty/ci.docker
       branch: ${{package.version}}-release
+      destination: docker
+
+  - working-directory: dev
+    runs: |
+      # Parsed as a string rather than a boolean
+      sed -i "s|enabled isAutomatedBuild|enabled !!isAutomatedBuild|g" build.image/build.gradle
+
+      ./gradlew --parallel cnf:initialize ${{vars.build-opts}}
+      ./gradlew --parallel assemble ${{vars.build-opts}}
+      ./gradlew --parallel build.image:publish ${{vars.build-opts}}
 
 subpackages:
-  - name: ${{package.name}}-docker-full
-    description: Configuration and scripts for running Open Liberty in Docker - full
+  - range: variants
+    name: ${{package.name}}-${{range.key}}
+    description: "Open Liberty is a highly composable, fast to start, dynamic application server runtime environment - ${{range.key}}"
+    dependencies:
+      runtime:
+        - bash # required by scripts
+        - busybox # utilities used in scripts
+        - openssl # used for cert generation
     pipeline:
-      - runs: |
+      - working-directory: dev/build.image/build/libs/distributions
+        runs: |
           mkdir -p ${{targets.contextdir}}/${{vars.open-liberty-home}}
-          mv releases/${{package.version}}/full/helpers \
+
+          if [ "${{range.key}}" = "kernel" ]; then
+            bsdtar xvf openliberty-kernel-${{package.version}}-*.zip --strip-components=1 -C ${{targets.contextdir}}/${{vars.open-liberty-home}}
+          else
+            bsdtar xvf openliberty-${{package.version}}-*.zip --strip-components=1 -C ${{targets.contextdir}}/${{vars.open-liberty-home}}
+          fi
+
+          # Remove Windows batch scripts and executables
+          find ${{targets.contextdir}} -name "*.bat" -exec rm -rf '{}' +
+          find ${{targets.contextdir}} -name "*.exe" -exec rm -rf '{}' +
+      - uses: strip
+
+  - range: variants
+    name: ${{package.name}}-${{range.key}}-docker
+    description: "Configuration and scripts for running Open Liberty in Docker - ${{range.key}}"
+    dependencies:
+      runtime:
+        - ${{package.name}}-${{range.key}}
+        - dumb-init # used in entrypoint
+        - glibc-locale-en # en-US set as default locale in image
+    pipeline:
+      - working-directory: docker/releases
+        runs: |
+          mkdir -p ${{targets.contextdir}}/${{vars.open-liberty-home}}
+          mv ${{package.version}}/${{range.value}}/helpers \
             ${{targets.contextdir}}/${{vars.open-liberty-home}}/helpers
 
-  - name: ${{package.name}}-docker-slim
-    description: Configuration and scripts for running Open Liberty in Docker - slim
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.contextdir}}/${{vars.open-liberty-home}}
-          mv releases/${{package.version}}/kernel-slim/helpers \
-            ${{targets.contextdir}}/${{vars.open-liberty-home}}/helpers
+          # Create server config directories
+          mkdir -p ${{targets.contextdir}}/config/configDropins/defaults
+          mkdir -p ${{targets.contextdir}}/config/configDropins/overrides
+
+          # Use correct paths
+          find ${{targets.contextdir}} -type f -exec sed -i 's|/opt/ol/wlp|${{vars.open-liberty-home}}|g' {} +
+          find ${{targets.contextdir}} -type f -exec sed -i 's|/opt/ol|${{vars.open-liberty-home}}|g' {} +
+      - uses: strip
 
 update:
   enabled: true
@@ -79,13 +126,17 @@ test:
   environment:
     contents:
       packages:
+        # Tests over ranges don't work so default to testing full
+        - ${{package.name}}-full
+        - ${{package.name}}-full-docker
         - openjdk-21-default-jvm
   pipeline:
-    - runs: |
-        export PATH="/usr/share/java/open-liberty/bin:$PATH"
-        server help
-        client help
-        server create
-        server start
-        client create
-        server stop
+    - uses: test/daemon-check-output
+      with:
+        start: "/usr/share/java/open-liberty/helpers/runtime/docker-server.sh /usr/share/java/open-liberty/bin/server run defaultServer"
+        timeout: 15
+        expected_output: |
+          Server defaultServer created
+          The server defaultServer has been launched
+          Monitoring dropins for applications
+          The defaultServer server is ready to run a smarter planet

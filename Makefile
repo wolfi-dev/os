@@ -175,6 +175,7 @@ PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # and sets up the necessary keys for you to run `apk add` commands, and then
 # test the packages however you see fit.
 local-wolfi:
+	@mkdir -p "${PWD}/packages"
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)

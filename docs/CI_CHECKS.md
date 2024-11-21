@@ -20,19 +20,19 @@ Look for warnings or failures from [Melange lint](https://github.com/chainguard-
 
 # Wolfi Check Updates
 
-This CI validates the `update:` block in a melange yaml file.  The check will use the config provided in the update block to do a dry run of the update and ensure sources can be fetched and `expected-commit` + `expected-sha256` values match.
+Each PR will automatically trigger a `Package Update Config Check` job. This
+validates that the information specified in the `update:` section of the package
+definition (melange yaml), is correct, and aims to catch any issues our
+automation may face checking for future package updates.
+
+If this job fails, the PR will not be merged, and the root cause will need to
+be investigated and rectified.
 
 ### When It Fails
 
-You can run the same CI check locally to help iterate on the correct `update:` config.
-
-Using [wolfictl](https://github.com/wolfi-dev/wolfictl) you can run
-
-```
-wolfictl check update --override-version 0.0.1 foo.yaml
-```
-
-The `--override-version 0.0.1` flag will modify a temporary local copy of the desired yaml file and change the `package.version` to `0.0.1`, the update logic will then run and force the check to find the latest version using the update config backend service and fetch the sources.
+Please validate your configuration and settings in the `update:` block are
+correct. This will need to be remediated before the contribution will be
+accepted.
 
 The most common cause for issues tend to be when an upstream project adds new tags or releases that are used for development or debugging.  To fix this we can include `ignore-regex-patterns`, for example:
 
@@ -44,6 +44,10 @@ update:
     - '.*x-.*'
   ...
 ```
+
+Another common scenario, may be when a project doesn't cut GitHub releases, and
+only publishes Git tags. For such projects, you'll need to specify
+`use-tag: true` in the update block.
 
 # Wolfi Lint
 

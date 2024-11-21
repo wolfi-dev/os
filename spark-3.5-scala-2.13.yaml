@@ -1,0 +1,143 @@
+package:
+  name: spark-3.5-scala-2.13
+  version: 3.5.3
+  epoch: 0
+  description: Unified engine for large-scale data analytics
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bash
+      - busybox
+      - openjdk-17-default-jvm
+      - posix-libc-utils
+      - procps
+      - tini
+      - tini-compat
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - glibc-iconv
+      - glibc-locale-en
+      - grep
+      - maven
+      - openjdk-17-default-jdk
+      - perl-utils
+      - procps
+      - py3.11-pip
+      - python-3.11
+      - wolfi-base
+      - wolfi-baselayout
+      - yaml-dev
+  environment:
+    LANG: en_US.UTF-8
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+    MAVEN_OPTS: "-Xss64m -Xmx2g -XX:ReservedCodeCacheSize=1g"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/spark
+      tag: v${{package.version}}
+      expected-commit: 32232e9ed33bb16b93ad58cfde8b82e0f07c0970
+
+  - runs: |
+      ./dev/change-scala-version.sh 2.13
+
+  - uses: maven/pombump
+    with:
+      properties-file: pombump-properties.yaml
+      pom: pom.xml
+
+  - runs: |
+      ./build/mvn -DskipTests -Pscala-2.13 clean package
+
+      mkdir -p ${{targets.contextdir}}/usr/lib/spark
+      mkdir -p ${{targets.contextdir}}/usr/lib/spark/work-dir
+      mv bin/ ${{targets.contextdir}}/usr/lib/spark
+      mv sbin/ ${{targets.contextdir}}/usr/lib/spark
+      mv target ${{targets.contextdir}}/usr/lib/spark
+      cp resource-managers/kubernetes/docker/src/main/dockerfiles/spark/entrypoint.sh ${{targets.contextdir}}/usr/lib/spark/
+      cp -R assembly/target/scala-2.13/jars ${{targets.contextdir}}/usr/lib/spark/
+      mv assembly ${{targets.contextdir}}/usr/lib/spark
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to place binaries in the location expected by upstream image"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mkdir -p "${{targets.subpkgdir}}"/opt
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          ln -s /usr/lib/spark/ ${{targets.subpkgdir}}/opt/spark
+          ln -sf /usr/lib/spark/bin/spark-submit ${{targets.subpkgdir}}/usr/bin/spark-submit
+          ln -sf /usr/lib/spark/bin/spark-shell ${{targets.subpkgdir}}/usr/bin/spark-shell
+          ln -sf /usr/lib/spark/bin/spark-class ${{targets.subpkgdir}}/usr/bin/spark-class
+          ln -sf /usr/lib/spark/bin/spark-sql ${{targets.subpkgdir}}/usr/bin/spark-sql
+          ln -sf /usr/lib/spark/entrypoint.sh ${{targets.subpkgdir}}/opt/entrypoint.sh
+      - uses: strip
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-17-default-jvm
+        - bash
+    environment:
+      LANG: en_US.UTF-8
+      SCALA_VERSION: 2.13
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      SPARK_LOCAL_IP: 127.0.0.1
+      SPARK_LOCAL_HOSTNAME: localhost
+      SPARK_HOME: /usr/lib/spark
+      SPARK_USER: test
+  pipeline:
+    - name: Test ${{package.name}} with OpenJDK 17
+      pipeline:
+        - name: Test if the Scala versions are correct
+          runs: ls /usr/lib/spark/assembly/target/scala-2.13/jars/scala-* | grep -q $SCALA_VERSION
+        - name: Check spark-shell --version
+          runs: /usr/lib/spark/bin/spark-shell --version
+        - name: Check spark-submit --version
+          runs: /usr/lib/spark/bin/spark-submit --version
+        - name: Check pyspark --version
+          runs: /usr/lib/spark/bin/pyspark --version
+        - name: Check spark-sql --version
+          runs: /usr/lib/spark/bin/spark-sql --version
+        - name: Test entrypoint
+          runs: timeout 10 /usr/lib/spark/bin/spark-shell > spark_log.txt 2>&1 || [ $? -eq 143 ] && grep "Spark session available" spark_log.txt && exit_code=0 || exit_code=$? && echo $exit_code
+        - name: Run a simple Scala test script
+          runs: |
+            cat <<EOF > SimpleJob.scala
+            val data = Seq(1, 2, 3, 4, 5)
+            val rdd = spark.sparkContext.parallelize(data)
+            val sum = rdd.reduce(_ + _)
+            assert(sum == 15)
+            EOF
+            cat SimpleJob.scala | /usr/lib/spark/bin/spark-shell --conf spark.jars.ivy=/tmp/.ivy --master local[*]
+        - name: Perform SQL query on DataFrame in Scala
+          runs: |
+            cat <<EOF > SQLTest.scala
+            import org.apache.spark.sql.SparkSession
+            val spark = SparkSession.builder.appName("SQLTest").getOrCreate()
+            import spark.implicits._
+            val df = Seq((1, "Alice"), (2, "Bob")).toDF("id", "name")
+            df.createOrReplaceTempView("people")
+            val result = spark.sql("SELECT name FROM people WHERE id = 2")
+            assert(result.count() == 1 && result.first().getString(0) == "Bob")
+            EOF
+            cat SQLTest.scala | /usr/lib/spark/bin/spark-shell --conf spark.jars.ivy=/tmp/.ivy --master local[*]
+
+update:
+  enabled: true
+  github:
+    identifier: apache/spark
+    use-tag: true
+    strip-prefix: v
+    tag-filter: v3.5

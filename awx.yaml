@@ -1,7 +1,7 @@
 package:
   name: awx
   version: 24.6.1
-  epoch: 0
+  epoch: 6
   description: AWX provides a web-based user interface, REST API, and task engine built on top of Ansible
   copyright:
     - license: Apache-2.0
@@ -20,8 +20,10 @@ environment:
       - ca-certificates-bundle
       - nodejs
       - npm
+      - gettext-dev
       - nvm
       - py3.11-pip
+      - py3.11-build
       - python-3.11-dev
       - zlib-dev
       - py3.11-aiohttp
@@ -47,6 +49,7 @@ environment:
       - py3.11-pyyaml
       - py3.11-zope.interface
       - py3.11-xmlsec
+      - py3.11-jinja2
       - wolfi-base
       - libxml2
       - libxml2-dev
@@ -73,43 +76,108 @@ pipeline:
     with:
       patches: fix-pip.patch
 
+  - runs: |     
+      # Create virtual environment
+      python -m venv venv --system-site-packages
+      source venv/bin/activate
+
+      # Install Python dependencies
+      pip install --upgrade pip setuptools wheel build
+      pip install -r requirements/requirements.txt ansible-base
+      make sdist 
+      pip install dist/awx.tar.gz
+      rm -rf venv/bin/__pycache*
+      sed -i "s|/home/build/venv|/var/lib/awx/venv|g" venv/pyvenv.cfg
+      sed -i "s|/home/build/venv|/var/lib/awx/venv|g" venv/bin/*
+
   - runs: |
       mkdir -p ${{targets.contextdir}}/var/lib/awx
-      python -m venv --system-site-packages  ${{targets.contextdir}}/var/lib/awx/venv
-      source ${{targets.contextdir}}/var/lib/awx/venv/bin/activate
-      pip uninstall -y certifi idna requests urllib3 python-jose
-      ${{targets.contextdir}}/var/lib/awx/venv/bin/pip install --force-reinstall --upgrade pip==24.0 setuptools==70.0.0 setuptools_scm[toml]==8.0.4 wheel==0.42.0 cython==0.29.37 idna==3.7 setuptools==70.0.0 requests==2.32.0 urllib3==1.26.19 certifi==2024.07.04 zipp==3.19.2
-      export SRC_ONLY_PKGS="cffi,pycparser,psycopg,twilio"
-      export VENV_BASE=${{targets.contextdir}}/var/lib/awx
-      which xmlsec1
-      make requirements_awx
-
-      # CVE-2024-6345 GHSA-cx63-2mw6-8hw5
-      # setuptools comes from airflow/providers/google/provider.yaml having
-      # gcloud-aio-auth>=4.0.0,<5.0.0 . gcloud-aio-auth 4 is backlevel and has
-      # setuptools in it's pyproject.toml 'tool.poetry.dependencies'
-      # The tldr; For that case it is not needed in runtime.
-
-      ${{targets.contextdir}}/var/lib/awx/venv/bin/pip uninstall --yes setuptools pip
-
       # Remove unnecessary cache files
-      rm -rf ${{targets.destdir}}/var/lib/awx/venv/bin/__pycache*
-
-      # Replace build paths in scripts to use `/var/lib/awx/`
-      sed -i "s|/home/build|/var/lib/awx/|g" ${{targets.destdir}}/var/lib/awx/venv/bin/*
-
-      # Ensure system site packages are included by updating `pyvenv.cfg`
-      sed -i "s|include-system-site-packages = false|include-system-site-packages = true|g" ${{targets.destdir}}/var/lib/awx/venv/pyvenv.cfg
-
-  - runs: |
-      npm --legacy-peer-deps --prefix=awx/ui install
-      npm --prefix awx/ui run build
+      find . -name '__pycache__' -exec rm -rf {} +
+      mv venv ${{targets.destdir}}/var/lib/awx
+      ln -s ${{targets.destdir}}/var/lib/awx/venv/bin/awx-manage /usr/bin/awx-manage
+  
+  # - runs: |
+  #     npm --legacy-peer-deps --prefix=awx/ui install
+  #     npm --prefix awx/ui run build
 
   - runs: |
-      mkdir -p ${{targets.destdir}}/app/awx-frontend
-      cp -r ./awx/ui/build ${{targets.destdir}}/app/awx-frontend/
-      cp manage.py MANIFEST.in README.md ${{targets.destdir}}/app/
-      cp awx/ui/package.json ${{targets.destdir}}/app/awx-frontend/
+      mkdir -p ${{targets.destdir}}/var/lib/awx/public
+      mkdir -p ${{targets.destdir}}/usr/local/bin
+      mkdir -p ${{targets.destdir}}/etc/tower
+
+      cp -r ./awx/ui/build ${{targets.destdir}}/var/lib/awx/public
+      # Ensure permissions without ownership change
+      chmod -R 0755 ${{targets.destdir}}/var/lib/awx/public/build
+      cp tools/ansible/roles/dockerfile/files/wait-for-migrations ${{targets.destdir}}/usr/local/bin/wait-for-migrations
+      cp tools/ansible/roles/dockerfile/files/stop-supervisor ${{targets.destdir}}/usr/local/bin/stop-supervisor
+      cp tools/ansible/roles/dockerfile/files/uwsgi.ini ${{targets.destdir}}/etc/tower/uwsgi.ini
+
+  - runs: |
+      # Create directories and copy specific files
+      for dir in \
+          /var/lib/awx \
+          /var/lib/awx/rsyslog \
+          /var/lib/awx/rsyslog/conf.d \
+          /var/run/awx-rsyslog \
+          /var/log/nginx; \
+      do 
+          mkdir -p ${{targets.destdir}}$dir && chmod 0775 ${{targets.destdir}}$dir; 
+      done
+
+      # Copy the required files
+      cp tools/ansible/roles/dockerfile/files/rsyslog.conf ${{targets.destdir}}/var/lib/awx/rsyslog/rsyslog.conf
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/usr/bin
+      mkdir -p ${{targets.destdir}}/etc/supervisord
+
+      # Add runtime scripts
+      cp tools/ansible/roles/dockerfile/files/launch_awx_web.sh ${{targets.destdir}}/usr/bin/
+      cp tools/ansible/roles/dockerfile/files/launch_awx_task.sh ${{targets.destdir}}/usr/bin/
+      cp tools/ansible/roles/dockerfile/files/launch_awx_rsyslog.sh ${{targets.destdir}}/usr/bin/
+      cp tools/scripts/rsyslog-4xx-recovery ${{targets.destdir}}/usr/bin/
+      cp tools/scripts/awx-python ${{targets.destdir}}/usr/bin/
+
+  - runs: |
+      python3 <<EOF
+      from jinja2 import Environment, FileSystemLoader, Undefined
+      import os
+
+      # Define a custom bool filter
+      def bool_filter(value):
+          return bool(value)
+
+      # Define a custom Undefined handler for Jinja2 to prevent errors on undefined variables
+      class SilentUndefined(Undefined):
+          def __str__(self):
+              return ""
+          def __getattr__(self, item):
+              return ""
+
+      template_dir = "tools/ansible/roles/dockerfile/templates"
+      output_dir = "${{targets.destdir}}/etc"
+
+      os.makedirs(output_dir, exist_ok=True)
+
+      env = Environment(loader=FileSystemLoader(template_dir), undefined=SilentUndefined)
+
+      # Add the custom bool filter to the Jinja2 environment
+      env.filters['bool'] = bool_filter
+
+      templates = ["supervisor_web.conf.j2", "supervisor_task.conf.j2", "supervisor_rsyslog.conf.j2"]
+      for template_name in templates:
+          template = env.get_template(template_name)
+          output_path = os.path.join(output_dir, template_name.replace('.j2', ''))
+          with open(output_path, 'w') as f:
+              f.write(template.render(kube_dev=False))  # Provide a default value for kube_dev
+      EOF
+
+  - runs: |
+      DJANGO_SETTINGS_MODULE=awx.settings.defaults \
+      SKIP_SECRET_KEY_CHECK=yes \
+      SKIP_PG_VERSION_CHECK=yes \
+      ${{targets.contextdir}}/var/lib/awx/venv/bin/awx-manage collectstatic --noinput --clear
 
 update:
   enabled: true

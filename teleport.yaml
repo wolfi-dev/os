@@ -107,8 +107,10 @@ test:
     contents:
       packages:
         - wait-for-it
+        - curl
   pipeline:
-    - runs: |
+    - name: Check binary versions
+      runs: |
         tbot version
         tbot --help
         tctl version
@@ -117,7 +119,7 @@ test:
         teleport --help
         tsh version
         tsh --help
-    - name: Functionality test
+    - name: Test auth service and tctl
       runs: |
         #!/bin/bash
         set -e
@@ -128,22 +130,22 @@ test:
 
         # Create minimal config file for auth server
         cat <<-EOF > /tmp/teleport-auth.yaml
-          version: v3
-          teleport:
-            data_dir: /tmp/teleport
-            log:
-              output: stderr
-              severity: DEBUG
-          auth_service:
-            enabled: "yes"
-            cluster_name: "test-cluster"
-            listen_addr: 127.0.0.1:3025
-            tokens:
-              - "proxy,node:test123"
-          proxy_service:
-            enabled: "no"
-          ssh_service:
-            enabled: "no"
+        version: v3
+        teleport:
+          data_dir: /tmp/teleport
+          log:
+            output: stderr
+            severity: DEBUG
+        auth_service:
+          enabled: "yes"
+          cluster_name: "test-cluster"
+          listen_addr: 127.0.0.1:3025
+          tokens:
+            - "proxy,node:test123"
+        proxy_service:
+          enabled: "no"
+        ssh_service:
+          enabled: "no"
         EOF
 
         # Initialize auth server with static UUID for tctl
@@ -160,9 +162,78 @@ test:
         # Give auth server time to initialize
         sleep 5
 
-        # Create base64 encoded config for tctl
+        # Test tctl
         TCTL_CONFIG=$(base64 /tmp/teleport-auth.yaml)
         TELEPORT_CONFIG="$TCTL_CONFIG" tctl get roles --format=text
 
-        echo "Basic services test successful!"
+        echo "Auth service test successful!"
         kill $AUTH_PID
+    - name: Test proxy service
+      runs: |
+        #!/bin/bash
+        set -e
+
+        # Create required directories
+        mkdir -p /tmp/teleport-auth /tmp/teleport-proxy
+
+        # Create auth server config
+        cat <<-EOF > /tmp/teleport-auth.yaml
+        version: v3
+        teleport:
+          data_dir: /tmp/teleport-auth
+          log:
+            output: stderr
+            severity: DEBUG
+        auth_service:
+          enabled: "yes"
+          cluster_name: "test-cluster"
+          listen_addr: 127.0.0.1:3025
+          tokens:
+            - "proxy,node:test123"
+        proxy_service:
+          enabled: "no"
+        ssh_service:
+          enabled: "no"
+        EOF
+
+        # Create proxy config
+        cat <<-EOF > /tmp/teleport-proxy.yaml
+        version: v3
+        teleport:
+          data_dir: /tmp/teleport-proxy
+          auth_token: "test123"
+          auth_server: "127.0.0.1:3025"
+        proxy_service:
+          enabled: "yes"
+          web_listen_addr: "127.0.0.1:3080"
+          listen_addr: "127.0.0.1:3023"
+        auth_service:
+          enabled: "no"
+        ssh_service:
+          enabled: "no"
+        EOF
+
+        # Start auth server
+        teleport start --config=/tmp/teleport-auth.yaml --roles=auth &
+        AUTH_PID=$!
+
+        # Wait for auth server
+        wait-for-it 127.0.0.1:3025 -t 30 || (kill $AUTH_PID; exit 1)
+
+        # Start proxy
+        teleport start --config=/tmp/teleport-proxy.yaml --roles=proxy &
+        PROXY_PID=$!
+
+        # Wait for proxy
+        wait-for-it 127.0.0.1:3080 -t 30 || (kill $AUTH_PID $PROXY_PID; exit 1)
+
+        # Test proxy web interface with HTTPS
+        HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" https://127.0.0.1:3080/webapi/ping)
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "Proxy web interface test failed with HTTP code: $HTTP_CODE"
+          kill $AUTH_PID $PROXY_PID
+          exit 1
+        fi
+
+        echo "Proxy test successful!"
+        kill $AUTH_PID $PROXY_PID

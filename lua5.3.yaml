@@ -1,10 +1,16 @@
 package:
   name: lua5.3
   version: 5.3.6
-  epoch: 5
-  description: "powerful lightweight programming language"
+  epoch: 6
+  description: Powerful light-weight programming language
   copyright:
     - license: MIT
+
+var-transforms:
+  - from: ${{package.version}}
+    match: (\d+\.\d+).\d
+    replace: "$1"
+    to: luaMM
 
 environment:
   contents:
@@ -21,24 +27,20 @@ environment:
 pipeline:
   - uses: fetch
     with:
-      uri: https://www.lua.org/ftp/lua-${{package.version}}.tar.gz
       expected-sha256: fc5fd69bb8736323f026672b1b7235da613d7177e72558893a0bdcd320466d60
+      uri: https://www.lua.org/ftp/lua-${{package.version}}.tar.gz
 
   - uses: patch
     with:
-      patches: lua-5.3-make.patch
-
-  - uses: patch
-    with:
-      patches: lua-5.3-module_paths.patch
-
-  - uses: patch
-    with:
-      patches: linenoise.patch
+      patches: |
+        linenoise.patch
+        module_paths.patch
+        make.patch
 
   - runs: |
       cat >configure.ac <<-EOF
         top_builddir=.
+
         AC_INIT(src/luaconf.h)
         AC_PROG_LIBTOOL
         AC_OUTPUT
@@ -48,43 +50,56 @@ pipeline:
       autoconf
       sed -i '/#define LUA_USE_READLINE/d' src/luaconf.h
 
-  - runs: |
-      ./configure --prefix=/usr
+  - uses: autoconf/configure
 
   - runs: |
-      make -C src V=5.3 \
-        CFLAGS="$CFLAGS -DLUA_USE_LINUX -DLUA_COMPAT_5_2 -DLUA_USE_LINENOISE" \
+      mm=${{vars.luaMM}}
+      major=${mm%.*}
+      minor=${mm#*.}
+      if [ "$minor" = "0" ]; then
+        echo "not using LUA_COMPAT as minor=-"
+      else
+        lastminor=$((minor-1))
+        compat="-DLUA_COMPAT_${major}_${lastminor}"
+        # just be careful do not pass flags that are nonsense.
+        # https://gitlab.alpinelinux.org/alpine/aports/-/issues/13257
+        grep -q -- "$compat" src/Makefile ||
+           { echo "Did not find compat flag $compat in src/Makefile"; exit 1; }
+        echo "Building with compat for $major.$lastminor via $compat"
+      fi
+
+      make -C src V=${{vars.luaMM}} \
+        CFLAGS="$CFLAGS -DLUA_USE_LINUX -DLUA_USE_LINENOISE $compat" \
         SYSLDFLAGS="$LDFLAGS" \
         RPATH="/usr/lib" \
         LIB_LIBS="-lpthread -lm -ldl -llinenoise" \
         alpine_all
 
   - runs: |
-      make V=5.3 \
+      make V=${{vars.luaMM}} \
         INSTALL_TOP="${{targets.destdir}}"/usr \
-        INSTALL_INC="${{targets.destdir}}"/usr/include/lua5.3 \
-        INSTALL_LIB="${{targets.destdir}}"/usr/lib/lua5.3 \
+        INSTALL_INC="${{targets.destdir}}"/usr/include/lua${{vars.luaMM}} \
+        INSTALL_LIB="${{targets.destdir}}"/usr/lib/lua${{vars.luaMM}} \
         alpine_install
-
-      chmod 755 "${{targets.destdir}}"/usr/lib/lua5.3/*.so*
+      chmod 755 "${{targets.destdir}}"/usr/lib/lua${{vars.luaMM}}/*.so*
 
   - runs: |
       for i in "${{targets.destdir}}"/usr/bin/* ; do
-        mv "$i" "$i"5.3
+        mv "$i" "$i"${{vars.luaMM}}
       done
-
-      for i in "${{targets.destdir}}"/usr/lib/lua5.3/*.so.*; do
-        ln -s lua5.3/${i##*/} "${{targets.destdir}}"/usr/lib/${i##*/}
+      for i in "${{targets.destdir}}"/usr/lib/lua${{vars.luaMM}}/*.so.*; do
+        ln -s lua${{vars.luaMM}}/${i##*/} "${{targets.destdir}}"/usr/lib/${i##*/}
       done
-
       for i in lua luac; do
         install -D -m 644 doc/$i.1 "${{targets.destdir}}"/usr/share/man/man1/"$i""$_luaver".1
       done
 
+      rm ${{targets.destdir}}/usr/lib/lua${{vars.luaMM}}/liblua.la \
+
       install -d "${{targets.destdir}}"/usr/lib/pkgconfig
-      cat > "${{targets.destdir}}"/usr/lib/pkgconfig/lua5.3.pc <<-EOF
+      cat > "${{targets.destdir}}"/usr/lib/pkgconfig/lua${{vars.luaMM}}.pc <<-EOF
       # lua.pc -- pkg-config data for Lua
-      V=5.3
+      V=${{vars.luaMM}}
       R=${{package.version}}
       prefix=/usr
       INSTALL_BIN=\${prefix}/bin
@@ -96,7 +111,6 @@ pipeline:
       exec_prefix=\${prefix}
       libdir=\${exec_prefix}/lib/${{package.name}}
       includedir=\${exec_prefix}/include/${{package.name}}
-
       Name: Lua
       Description: An extensible extension language
       Version: ${{package.version}}
@@ -108,18 +122,54 @@ pipeline:
   - uses: strip
 
 subpackages:
-  - name: "lua5.3-doc"
-    description: "lua documentation"
-    pipeline:
-      - uses: split/manpages
-
-  - name: "lua5.3-dev"
-    description: "lua development headers"
+  - name: lua${{vars.luaMM}}-dev
+    description: lua${{vars.luaMM}} dev
+    dependencies:
+      runtime:
+        - lua${{vars.luaMM}}
+        - lua${{vars.luaMM}}-libs
     pipeline:
       - uses: split/dev
     test:
       pipeline:
         - uses: test/pkgconf
+
+  - name: lua${{vars.luaMM}}-libs
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/lib
+          mv -v ${{targets.destdir}}/usr/lib/lib*.so.* \
+            ${{targets.contextdir}}/usr/lib/
+
+          mkdir -p ${{targets.contextdir}}/usr/lib/lua${{vars.luaMM}}
+          mv -v ${{targets.destdir}}/usr/lib/lua${{vars.luaMM}}/lib*.so.* \
+            ${{targets.contextdir}}/usr/lib/lua${{vars.luaMM}}/
+    test:
+      environment:
+        contents:
+          packages:
+            - apk-tools
+      pipeline:
+        - runs: |
+            set +x
+            mm=${{vars.luaMM}}
+            pkg="lua${mm}-libs"
+            soname="liblua-$mm.so.0"
+            pout=$(apk info --provides "$pkg" 2>/dev/null) ||
+              { echo "ERROR: 'apk info --provides $pkg' exited $?"; exit 1; }
+            if out=$(echo "$pout" | grep "so:$soname="); then
+              echo "PASS: $pkg provides $soname. [$out]"
+            else
+              echo "FAIL: $pkg did not provide so:$soname"
+              echo "$ apk info --provides $pkg"
+              echo "$pout"
+              exit 1
+            fi
+
+  - name: lua${{vars.luaMM}}-doc
+    description: lua${{vars.luaMM}} manpages
+    pipeline:
+      - uses: split/manpages
 
 update:
   enabled: true
@@ -128,7 +178,15 @@ update:
 
 test:
   pipeline:
-    # AUTOGENERATED
     - runs: |
-        lua5.3 -v
-        luac5.3 -v
+        set +x
+        mm=${{vars.luaMM}}
+        fail() { echo "FAIL:" "$@" 1>&2; exit 1; }
+        v="${{package.version}}"
+        for p in lua luac ; do
+          prog="$p$mm" # lua5.X
+          out=$($prog -v) || fail "$prog -v - exited $?"
+          echo "$out" | grep -q -F "$v" ||
+            fail "output of '$prog -v' did not contain '$v'. output: $out"
+            echo "PASS: $prog -v output contained expected '$v': $out"
+        done

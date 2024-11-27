@@ -1,0 +1,209 @@
+From: Marek Polacek <polacek@redhat.com>
+To: GCC Patches <gcc-patches@gcc.gnu.org>
+Subject: [PATCH] driver: -fhardened and -z lazy/-z norelro [PR117739]
+Date: Tue, 26 Nov 2024 17:35:50 -0500
+Message-ID: <20241126223550.150544-1-polacek@redhat.com>
+Content-Transfer-Encoding: 8bit
+content-type: text/plain; charset="US-ASCII"; x-default=true
+List-Id: Gcc-patches mailing list <gcc-patches.gcc.gnu.org>
+List-Archive: <https://gcc.gnu.org/pipermail/gcc-patches/>
+List-Post: <mailto:gcc-patches@gcc.gnu.org>
+
+As the manual states, using "-fhardened -fstack-protector" will produce
+a warning because -fhardened wants to enable -fstack-protector-strong,
+but it can't since it's been overriden by the weaker -fstack-protector.
+
+-fhardened also attempts to enable -Wl,-z,relro,-z,now.  By the same
+logic as above, "-fhardened -z norelro" or "-fhardened -z lazy" should
+produce the same warning.  But we don't detect this combination, so
+this patch fixes it.  I also renamed a variable to better reflect its
+purpose.
+
+Also don't check warn_hardened in process_command, since it's always
+true there.
+
+Also tweak wording in the manual as Jon Wakely suggested on IRC.
+
+	PR driver/117739
+
+gcc/ChangeLog:
+
+	* doc/invoke.texi: Tweak wording for -Whardened.
+	* gcc.cc (driver_handle_option): If -z lazy or -z norelro was
+	specified, don't enable linker hardening.
+	(process_command): Don't check warn_hardened.
+
+gcc/testsuite/ChangeLog:
+
+	* c-c++-common/fhardened-16.c: New test.
+	* c-c++-common/fhardened-17.c: New test.
+	* c-c++-common/fhardened-18.c: New test.
+	* c-c++-common/fhardened-19.c: New test.
+	* c-c++-common/fhardened-20.c: New test.
+	* c-c++-common/fhardened-21.c: New test.
+---
+ gcc/doc/invoke.texi                       |  4 ++--
+ gcc/gcc.cc                                | 20 ++++++++++++++------
+ gcc/testsuite/c-c++-common/fhardened-16.c |  5 +++++
+ gcc/testsuite/c-c++-common/fhardened-17.c |  5 +++++
+ gcc/testsuite/c-c++-common/fhardened-18.c |  5 +++++
+ gcc/testsuite/c-c++-common/fhardened-19.c |  5 +++++
+ gcc/testsuite/c-c++-common/fhardened-20.c |  5 +++++
+ gcc/testsuite/c-c++-common/fhardened-21.c |  5 +++++
+ 8 files changed, 46 insertions(+), 8 deletions(-)
+ create mode 100644 gcc/testsuite/c-c++-common/fhardened-16.c
+ create mode 100644 gcc/testsuite/c-c++-common/fhardened-17.c
+ create mode 100644 gcc/testsuite/c-c++-common/fhardened-18.c
+ create mode 100644 gcc/testsuite/c-c++-common/fhardened-19.c
+ create mode 100644 gcc/testsuite/c-c++-common/fhardened-20.c
+ create mode 100644 gcc/testsuite/c-c++-common/fhardened-21.c
+
+diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+index 346ac1369b8..371f723539c 100644
+--- a/gcc/doc/invoke.texi
++++ b/gcc/doc/invoke.texi
+@@ -7012,8 +7012,8 @@ This warning is enabled by @option{-Wall}.
+ Warn when @option{-fhardened} did not enable an option from its set (for
+ which see @option{-fhardened}).  For instance, using @option{-fhardened}
+ and @option{-fstack-protector} at the same time on the command line causes
+-@option{-Whardened} to warn because @option{-fstack-protector-strong} is
+-not enabled by @option{-fhardened}.
++@option{-Whardened} to warn because @option{-fstack-protector-strong} will
++not be enabled by @option{-fhardened}.
+ 
+ This warning is enabled by default and has effect only when @option{-fhardened}
+ is enabled.
+diff --git a/gcc/gcc.cc b/gcc/gcc.cc
+index 92c92996401..d2718d263bb 100644
+--- a/gcc/gcc.cc
++++ b/gcc/gcc.cc
+@@ -305,9 +305,10 @@ static size_t dumpdir_length = 0;
+    driver added to dumpdir after dumpbase or linker output name.  */
+ static bool dumpdir_trailing_dash_added = false;
+ 
+-/* True if -r, -shared, -pie, or -no-pie were specified on the command
+-   line.  */
+-static bool any_link_options_p;
++/* True if -r, -shared, -pie, -no-pie, -z lazy, or -z norelro were
++   specified on the command line, and therefore -fhardened should not
++   add -z now/relro.  */
++static bool avoid_linker_hardening_p;
+ 
+ /* True if -static was specified on the command line.  */
+ static bool static_p;
+@@ -4434,10 +4435,17 @@ driver_handle_option (struct gcc_options *opts,
+ 	    }
+ 	/* Record the part after the last comma.  */
+ 	add_infile (arg + prev, "*");
++	if (strcmp (arg, "-z,lazy") == 0 || strcmp (arg, "-z,norelro") == 0)
++	  avoid_linker_hardening_p = true;
+       }
+       do_save = false;
+       break;
+ 
++    case OPT_z:
++      if (strcmp (arg, "lazy") == 0 || strcmp (arg, "norelro") == 0)
++	avoid_linker_hardening_p = true;
++      break;
++
+     case OPT_Xlinker:
+       add_infile (arg, "*");
+       do_save = false;
+@@ -4642,7 +4650,7 @@ driver_handle_option (struct gcc_options *opts,
+     case OPT_r:
+     case OPT_shared:
+     case OPT_no_pie:
+-      any_link_options_p = true;
++      avoid_linker_hardening_p = true;
+       break;
+ 
+     case OPT_static:
+@@ -5026,7 +5034,7 @@ process_command (unsigned int decoded_options_count,
+   /* TODO: check if -static -pie works and maybe use it.  */
+   if (flag_hardened)
+     {
+-      if (!any_link_options_p && !static_p)
++      if (!avoid_linker_hardening_p && !static_p)
+ 	{
+ #if defined HAVE_LD_PIE && defined LD_PIE_SPEC
+ 	  save_switch (LD_PIE_SPEC, 0, NULL, /*validated=*/true, /*known=*/false);
+@@ -5045,7 +5053,7 @@ process_command (unsigned int decoded_options_count,
+ 	    }
+ 	}
+       /* We can't use OPT_Whardened yet.  Sigh.  */
+-      else if (warn_hardened)
++      else
+ 	warning_at (UNKNOWN_LOCATION, 0,
+ 		    "linker hardening options not enabled by %<-fhardened%> "
+ 		    "because other link options were specified on the command "
+diff --git a/gcc/testsuite/c-c++-common/fhardened-16.c b/gcc/testsuite/c-c++-common/fhardened-16.c
+new file mode 100644
+index 00000000000..7a50ad03e17
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/fhardened-16.c
+@@ -0,0 +1,5 @@
++/* PR driver/117739 */
++/* { dg-do compile { target *-*-linux* *-*-gnu* } } */
++/* { dg-options "-fhardened -O -Wl,-z,lazy -Whardened" } */
++
++/* { dg-warning "linker hardening options not enabled" "" { target *-*-* } 0 } */
+diff --git a/gcc/testsuite/c-c++-common/fhardened-17.c b/gcc/testsuite/c-c++-common/fhardened-17.c
+new file mode 100644
+index 00000000000..acef8c64a9f
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/fhardened-17.c
+@@ -0,0 +1,5 @@
++/* PR driver/117739 */
++/* { dg-do compile { target *-*-linux* *-*-gnu* } } */
++/* { dg-options "-fhardened -O -z lazy -Whardened" } */
++
++/* { dg-warning "linker hardening options not enabled" "" { target *-*-* } 0 } */
+diff --git a/gcc/testsuite/c-c++-common/fhardened-18.c b/gcc/testsuite/c-c++-common/fhardened-18.c
+new file mode 100644
+index 00000000000..1a9a34bd7d8
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/fhardened-18.c
+@@ -0,0 +1,5 @@
++/* PR driver/117739 */
++/* { dg-do compile { target *-*-linux* *-*-gnu* } } */
++/* { dg-options "-Wl,-z,lazy -fhardened -O -Whardened" } */
++
++/* { dg-warning "linker hardening options not enabled" "" { target *-*-* } 0 } */
+diff --git a/gcc/testsuite/c-c++-common/fhardened-19.c b/gcc/testsuite/c-c++-common/fhardened-19.c
+new file mode 100644
+index 00000000000..a871702fd2d
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/fhardened-19.c
+@@ -0,0 +1,5 @@
++/* PR driver/117739 */
++/* { dg-do compile { target *-*-linux* *-*-gnu* } } */
++/* { dg-options "-z lazy -fhardened -O -Whardened" } */
++
++/* { dg-warning "linker hardening options not enabled" "" { target *-*-* } 0 } */
+diff --git a/gcc/testsuite/c-c++-common/fhardened-20.c b/gcc/testsuite/c-c++-common/fhardened-20.c
+new file mode 100644
+index 00000000000..c9f2d89e653
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/fhardened-20.c
+@@ -0,0 +1,5 @@
++/* PR driver/117739 */
++/* { dg-do compile { target *-*-linux* *-*-gnu* } } */
++/* { dg-options "-fhardened -O -Wl,-z,norelro -Whardened" } */
++
++/* { dg-warning "linker hardening options not enabled" "" { target *-*-* } 0 } */
+diff --git a/gcc/testsuite/c-c++-common/fhardened-21.c b/gcc/testsuite/c-c++-common/fhardened-21.c
+new file mode 100644
+index 00000000000..07b7ee10e04
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/fhardened-21.c
+@@ -0,0 +1,5 @@
++/* PR driver/117739 */
++/* { dg-do compile { target *-*-linux* *-*-gnu* } } */
++/* { dg-options "-fhardened -O -z norelro -Whardened" } */
++
++/* { dg-warning "linker hardening options not enabled" "" { target *-*-* } 0 } */
+
+base-commit: 3e2a1b268cf1f8994a63c85412154f01e1a8c7d8
+-- 
+2.47.0
+

@@ -1,0 +1,147 @@
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: opentelemetry-plugin-nginx
+  version: 0_git20241125
+  epoch: 0
+  description: Adds OpenTelemetry distributed tracing support to nginx. This is the otel community plugin for nginx, not the official nginx plugin for otel.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - opentelemetry-cpp
+
+environment:
+  contents:
+    packages:
+      - abseil-cpp-dev
+      - busybox
+      - c-ares-dev
+      - cmake
+      - curl-dev
+      - gcc
+      - glibc-dev
+      - grpc-dev
+      - icu-dev
+      - make
+      - nginx
+      - openssf-compiler-options
+      - opentelemetry-cpp-dev
+      - pcre-dev
+      - protobuf-c-dev
+      - protobuf-dev
+      - re2-dev
+      - systemd-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/open-telemetry/opentelemetry-cpp-contrib
+      branch: main
+      expected-commit: 8933841f0a7f8737f61404cf0a64acf6b079c8a5
+
+  - uses: cmake/configure
+    working-directory: instrumentation/nginx
+
+  - uses: cmake/build
+    working-directory: instrumentation/nginx
+
+  - runs: |
+      mkdir -p ${{targets.contextdir}}/usr/share/nginx/modules
+      cp -p otel_ngx_module.so ${{targets.contextdir}}/usr/share/nginx/modules/
+    working-directory: instrumentation/nginx/output
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/etc/nginx
+          ln -s /usr/share/nginx/modules ${{targets.contextdir}}/etc/nginx/modules
+
+  # This exists to satisfy ingress-nginx-opentelemetry, which ships an image but doesn't expect this
+  # library to work until it's copied over into another image that already has already has all
+  # other dependencies installed.
+  - name: ${{package.name}}-nodepends
+    description: "WARNING: This package is not usable by itself. This is the same as the opentelemetry-plugin-nginx package, but without any dependencies."
+    options:
+      no-depends: true
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/nginx/modules
+          cp -p otel_ngx_module.so ${{targets.contextdir}}/usr/share/nginx/modules/
+        working-directory: instrumentation/nginx/output
+
+update:
+  enabled: true
+  git: {}
+  schedule:
+    period: weekly
+    reason: shared contrib repo that doesn't maintain tags for this component
+
+test:
+  environment:
+    contents:
+      packages:
+        - nginx
+        - opentelemetry-cpp
+  pipeline:
+    - uses: git-checkout
+      with:
+        repository: https://github.com/open-telemetry/opentelemetry-cpp-contrib
+        branch: main
+        expected-commit: 8933841f0a7f8737f61404cf0a64acf6b079c8a5
+    - runs: |
+        cat <<EOF > /etc/nginx/nginx.conf
+        load_module /usr/share/nginx/modules/otel_ngx_module.so;
+
+        user nobody;
+
+        http {
+          opentelemetry_config /etc/nginx/otel-nginx.toml;
+
+          server {
+            listen 80;
+            server_name otel_example;
+
+            root /var/www/html;
+
+            location = / {
+              opentelemetry_operation_name my_example_backend;
+              opentelemetry_propagate;
+              proxy_pass http://localhost:3500/;
+            }
+          }
+        }
+        events {}
+        EOF
+
+        cat <<EOF > /etc/nginx/otel-nginx.toml
+        exporter = "otlp"
+        processor = "batch"
+
+        [exporters.otlp]
+        # Alternatively the OTEL_EXPORTER_OTLP_ENDPOINT environment variable can also be used.
+        host = "localhost"
+        port = 4317
+
+        [processors.batch]
+        max_queue_size = 2048
+        schedule_delay_millis = 5000
+        max_export_batch_size = 512
+
+        [service]
+        # Can also be set by the OTEL_SERVICE_NAME environment variable.
+        name = "nginx-proxy" # Opentelemetry resource name
+
+        [sampler]
+        name = "AlwaysOn" # Also: AlwaysOff, TraceIdRatioBased
+        ratio = 0.1
+        parent_based = false
+        EOF
+
+        # Not sure why this isn't included in main package.
+        mkdir -p /var/lib/nginx/tmp/
+    # -T: test the configuration file: nginx checks the configuration for correct syntax, and then tries to open files referred in the configuration.
+    # additionally dump configuration files to standard output (1.9.2).
+    - runs: nginx -T

@@ -1,0 +1,113 @@
+package:
+  name: postgis-17
+  version: 3.5.0
+  epoch: 0
+  description: Geographic Information Systems Extensions to PostgreSQL
+  copyright:
+    - license: GPL-2.0-or-later
+
+environment:
+  contents:
+    packages:
+      - abseil-cpp-dev
+      - autoconf
+      - build-base
+      - busybox
+      - gdal-dev
+      - geos-dev
+      - json-c-dev
+      - libxml2-dev
+      - make
+      - pcre-dev
+      - perl-dev
+      - postgresql-dev
+      - proj-dev
+      - protobuf-c-dev
+      - protoc
+
+var-transforms:
+  - from: ${{package.name}}
+    match: "postgis-(.+)"
+    replace: "$1"
+    to: postgresql-version
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://download.osgeo.org/postgis/source/postgis-${{package.version}}.tar.gz
+      expected-sha256: ca698a22cc2b2b3467ac4e063b43a28413f3004ddd505bdccdd74c56a647f510
+
+  - runs: |
+      ./configure \
+         --libdir=/usr/lib
+
+  - uses: autoconf/make
+    with:
+      opts: PROTOCC=protoc
+
+  - runs: |
+      make install DESTDIR="${{targets.destdir}}"
+
+  - runs: |
+      cd extensions
+      make
+      make install DESTDIR="${{targets.destdir}}"
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/libexec/postgresql${{vars.postgresql-version}}/
+          install -m755 update-postgis.sh ${{targets.subpkgdir}}/usr/libexec/postgresql${{vars.postgresql-version}}/
+          sed -i "s|/docker-entrypoint-initdb.d|/var/lib/postgres/initdb|g" ${{targets.subpkgdir}}/usr/libexec/postgresql${{vars.postgresql-version}}/*.sh
+          sed -i "s|/usr/local|/usr|g" ${{targets.subpkgdir}}/usr/libexec/postgresql${{vars.postgresql-version}}/*.sh
+
+          mkdir -p ${{targets.subpkgdir}}/var/lib/postgres/initdb/
+          # 644 is important! docker-entrypoint execs 755 files, but sources if there are no exec bits set
+          install -m644 initdb-postgis.sh ${{targets.subpkgdir}}/usr/libexec/postgresql${{vars.postgresql-version}}/initdb-postgis.sh
+          ln -sf /usr/libexec/postgresql${{vars.postgresql-version}}/initdb-postgis.sh ${{targets.subpkgdir}}/var/lib/postgres/initdb/10_postgis.sh
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql
+        - postgresql-client
+        - shadow
+        - sudo-rs
+        - glibc-locales
+    environment:
+      PGDATA: /tmp/test_db
+      PGUSER: wolfi
+  pipeline:
+    - name: "Test database creation"
+      runs: |
+        useradd $PGUSER
+        sudo -u $PGUSER initdb -D /tmp/test_db
+        sudo -u $PGUSER pg_ctl -D /tmp/test_db -l /tmp/logfile start
+        createdb testdb
+        psql -lqt | cut -d \| -f 1 | grep -qw testdb
+        pgtopo_export --help
+        shp2pgsql -v
+        shp2pgsql -h
+    - name: "Test basic read/write operations"
+      runs: |
+        psql -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, test_value VARCHAR(50));"
+        psql -d testdb -c "INSERT INTO test_table (test_value) VALUES ('Hello, PostgreSQL!');"
+        psql -d testdb -t -A -c "SELECT test_value FROM test_table WHERE id=1;"
+    - name: "Test server can run and respond to requests"
+      runs: |
+        psql -d testdb -c "\conninfo"
+    - name: "Test PostGIS extension is installed and working"
+      runs: |
+        psql -d testdb -c "CREATE EXTENSION postgis;"
+        psql -d testdb -c "SELECT PostGIS_Full_Version();" | grep -q "POSTGIS="
+    - name: "Test PostGIS extension is installed and working"
+      runs: |
+        psql -d testdb -c "CREATE EXTENSION address_standardizer;"
+        psql -d testdb -c "SELECT num, street, city, state, zip FROM parse_address('1 Devonshire Place PH301, Boston, MA 02109');" |grep 'Devonshire Place PH301'
+
+update:
+  enabled: true
+  release-monitor:
+    identifier: 3694

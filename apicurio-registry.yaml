@@ -1,0 +1,109 @@
+package:
+  name: apicurio-registry
+  version: 3.0.4
+  epoch: 0
+  description: An API/Schema registry - stores APIs and Schemas
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - go
+      - icu
+      - maven
+      - openjdk-17
+      - openjdk-17-default-jvm
+      - openssf-compiler-options
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/Apicurio/apicurio-registry
+      tag: v${{package.version}}
+      expected-commit: f417d2192cdef84dc7587842d98ed721dc3901e3
+
+  - name: Build
+    runs: |
+      ./mvnw clean install \
+        -DskipTests \
+        -T$(nproc)C \
+        --no-snapshot-updates \
+        --no-transfer-progress \
+        --fail-fast
+
+  - name: Install
+    runs: |
+      dest="${{targets.contextdir}}/usr/share/java/${{package.name}}"
+      mkdir -p "$dest"
+
+      install -Dm644 ./LICENSE "${dest}/LICENSE"
+      install -Dm644 ./README.md "${dest}/README.md"
+
+      find . -type f -path "*/target/*-${{package.version}}.jar" -exec cp {} "$dest" \;
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: Apicurio/apicurio-registry
+    use-tag: true
+    strip-prefix: v
+    tag-filter: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-17
+        - bash
+        - busybox
+        - curl
+        - jq
+  pipeline:
+    - name: Validate essential JARs
+      runs: |
+        dest="/usr/share/java/apicurio-registry"
+        [ -d "$dest" ]
+        stat "$dest/apicurio-registry-app-${{package.version}}.jar"
+        stat "$dest/apicurio-registry-common-${{package.version}}.jar"
+        stat "$dest/apicurio-registry-utils-tools-${{package.version}}.jar"
+
+    - name: Validate schema utility JARs
+      runs: |
+        dest="/usr/share/java/apicurio-registry"
+        for jar in schema-util-json schema-util-avro schema-util-protobuf; do
+          stat "$dest/apicurio-registry-${jar}-${{package.version}}.jar"
+        done
+
+    - name: Ensure main JAR runs
+      runs: |
+        java -jar /usr/share/java/apicurio-registry/apicurio-registry-app-${{package.version}}.jar --help | grep -qi 'usage'
+
+    - name: Test REST API health check
+      runs: |
+        java -jar /usr/share/java/apicurio-registry/apicurio-registry-app-${{package.version}}.jar &
+        REGISTRY_PID=$!
+        sleep 10
+        curl -s localhost:8080/health | jq -e '.status' | grep -q "UP"
+        kill $REGISTRY_PID
+
+    - name: Validate schema registration
+      runs: |
+        java -jar /usr/share/java/apicurio-registry/apicurio-registry-app-${{package.version}}.jar &
+        REGISTRY_PID=$!
+        sleep 10
+        SCHEMA='{"schema": "{\"type\":\"string\"}", "schemaType": "AVRO"}'
+        curl -s -X POST http://localhost:8080/apis/registry/v2/groups/default/subjects/test-schema/versions \
+          -H "Content-Type: application/json" \
+          -d "$SCHEMA" | jq -e '.id'
+        curl -s http://localhost:8080/apis/registry/v2/groups/default/subjects/test-schema/versions | jq -e '.[0].id'
+        kill $REGISTRY_PID

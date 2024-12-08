@@ -1,6 +1,6 @@
 package:
   name: prometheus-jmx-exporter
-  version: 1.0.1
+  version: 1.1.0
   epoch: 0
   url: https://github.com/prometheus/jmx_exporter
   description: JMX to Prometheus exporter javaagent
@@ -25,25 +25,16 @@ pipeline:
     with:
       repository: https://github.com/prometheus/jmx_exporter
       tag: ${{package.version}}
-      expected-commit: 328d8a36cd4b81c99d19c7490a78f49ddf6fda24
+      expected-commit: 00fd35dc2e0a03eefe49ef1182280fc9319bbe70
 
   - name: build
     runs: |
-      mvn -pl jmx_prometheus_javaagent,jmx_prometheus_httpserver -am package
+      mvn -pl jmx_prometheus_javaagent -am package
 
   - name: install
     runs: |
       mkdir -p ${{targets.destdir}}/usr/lib/prometheus
       mv jmx_prometheus_javaagent/target/jmx_prometheus_javaagent-${{package.version}}.jar ${{targets.destdir}}/usr/lib/prometheus/jmx_prometheus_javaagent.jar
-
-subpackages:
-  - name: ${{package.name}}-httpserver
-    description: "JMX to Prometheus exporter httpserver"
-    pipeline:
-      - name: install
-        runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/lib/prometheus
-          mv jmx_prometheus_httpserver/target/jmx_prometheus_httpserver-${{package.version}}.jar ${{targets.subpkgdir}}/usr/lib/prometheus/jmx_prometheus_httpserver.jar
 
 update:
   enabled: true
@@ -58,20 +49,66 @@ test:
         - openjdk-11
         - openjdk-11-default-jvm
         - ${{package.name}}-httpserver
+        - curl
+    environment:
+      JAVA_HOME: /usr/lib/jvm/default-jvm
   pipeline:
-    - name: Create a sample config files
+    - name: Create Sample Config Files
       runs: |
         echo -e "rules:\n- pattern: \".*\"" > agent-config.yaml
         echo -e "hostPort: localhost:1234\nrules:\n- pattern: \".*\"" > server-config.yaml
-    - name: Verify agent jar
+    - name: Compile Simple Java Application
       runs: |
-        java -javaagent:/usr/lib/prometheus/jmx_prometheus_javaagent.jar=1234:agent-config.yaml --version
-    - name: Verify httpserver jar
+        cat <<EOF > SimpleApp.java
+        import java.lang.management.ManagementFactory;
+        import javax.management.*;
+
+        public class SimpleApp {
+            public static void main(String[] args) throws Exception {
+                MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+                ObjectName name = new ObjectName("com.example:type=Simple");
+                mbs.registerMBean(new Simple(), name);
+                System.out.println("SimpleApp running...");
+                Thread.sleep(Long.MAX_VALUE);
+            }
+
+            public interface SimpleMBean {
+                int getValue();
+                void setValue(int value);
+            }
+
+            public static class Simple implements SimpleMBean {
+                private int value = 42;
+
+                public int getValue() { return value; }
+                public void setValue(int value) { this.value = value; }
+            }
+        }
+        EOF
+        javac SimpleApp.java
+    - name: Run Application with JMX Exporter
       runs: |
-        java -jar /usr/lib/prometheus/jmx_prometheus_httpserver.jar 1234 server-config.yaml > output.log 2>&1 &
-        sleep 10
-        if ! grep -q 'io.prometheus.jmx.WebServer | Running' output.log; then
-          echo "Expected log message not found" >&2
-          cat output.log
+        set -e
+
+        # Start the Java application with JMX Exporter in the background
+        java -javaagent:/usr/lib/prometheus/jmx_prometheus_javaagent.jar=1234:agent-config.yaml \
+             SimpleApp > app.log 2>&1 &
+        echo $! > app.pid
+
+        # Wait for the application to initialize
+        sleep 5
+
+        # Check if the Java process is still running
+        if ! kill -0 $(cat app.pid) 2>/dev/null; then
+          echo "Java application failed to start."
           exit 1
         fi
+
+        echo "Java application started successfully."
+    - name: Check JMX Exporter Metrics
+      runs: |
+        if ! curl -s http://localhost:1234/metrics | grep -q 'jvm_memory_used_bytes'; then
+          echo "Error: JMX Exporter did not serve expected metrics"
+          exit 1
+        fi
+        echo "JMX Exporter is serving metrics successfully."

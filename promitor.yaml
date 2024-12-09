@@ -1,0 +1,94 @@
+package:
+  name: promitor
+  version: 2.12.0
+  epoch: 0
+  description: Bringing Azure Monitor metrics where you need them.
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - aspnet-8-runtime-default
+      - dotnet-8-runtime-default
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - dotnet-8-sdk
+      - openssf-compiler-options
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/tomkerkhove/promitor
+      tag: Scraper-v${{package.version}}
+      expected-commit: 71d6827c48516c7b11a298c9d812f64832a841c8
+
+  - working-directory: src
+    pipeline:
+      - name: "Build Promitor Scraper"
+        runs: |
+          # Set runtime arch
+          if [[ "${{build.arch}}" == "aarch64" ]]; then
+            runtime_arch="arm64"
+          elif [[ "${{build.arch}}" == "x86_64" ]]; then
+            runtime_arch="x64"
+          fi
+
+          dotnet publish \
+            Promitor.Agents.Scraper/Promitor.Agents.Scraper.csproj \
+            --configuration release \
+            --output app \
+            --runtime linux-$runtime_arch \
+            --no-self-contained \
+            /p:Version=${{package.version}} \
+            -p:DebugSymbols=false \
+            -p:DebugType=none
+
+          mkdir -p "${{targets.contextdir}}"/usr/lib
+          cp -dr app "${{targets.contextdir}}"/usr/lib/promitor
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream image"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/app"
+          ln -sf /usr/lib/promitor/Promitor.Agents.Scraper.dll "${{targets.contextdir}}/app/Promitor.Agents.Scraper.dll"
+
+update:
+  enabled: true
+  github:
+    identifier: tomkerkhove/promitor
+    use-tag: true
+    strip-prefix: Scraper-v
+    tag-filter: Scraper-v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - promitor-compat
+    environment:
+      PROMITOR_CONFIG_FOLDER: "/config"
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "false"
+  pipeline:
+    - name: "start daemon"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # Config will be mounted on deployment time already so we can just download it for testing
+          # There is two "Validation failed" errors in the logs, its because upstream configs seems to be outdated a bit
+          # Azure related options also requires real Azure credentials to be set, that we cant provide in here
+          mkdir -p /config
+          curl -sL https://raw.githubusercontent.com/tomkerkhove/promitor/refs/heads/master/config/promitor/scraper/runtime.yaml -o /config/runtime.yaml
+          curl -sL https://raw.githubusercontent.com/tomkerkhove/promitor/refs/heads/master/config/promitor/scraper/metrics.yaml -o /config/metrics-declaration.yaml
+        start: "dotnet /app/Promitor.Agents.Scraper.dll"
+        timeout: 60
+        expected_output: |
+          Booting up Promitor
+          OpenTelemetry Collector Metric   │ Success │ Everything is well-configured.
+          Prometheus Scraping Endpoint     │ Success │ Everything is well-configured.

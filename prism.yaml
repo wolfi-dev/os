@@ -1,6 +1,6 @@
 package:
   name: prism
-  version: 5.11.2
+  version: 5.12.1
   epoch: 0
   description: "A set of packages for API mocking and contract testing with OpenAPI v2 and OpenAPI v3.x"
   url: https://github.com/stoplightio/prism
@@ -8,7 +8,7 @@ package:
     - license: Apache-2.0
   dependencies:
     runtime:
-      - nodejs
+      - nodejs-18
 
 environment:
   contents:
@@ -16,7 +16,8 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
-      - nodejs
+      - jq
+      - nodejs-18
       - npm
       - ts-patch
       - yarn
@@ -30,7 +31,7 @@ environment:
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: f7788e25710a03628f81bb86e8d6657dc72b7c49
+      expected-commit: 197eb6f9cc4067da6806c14a2919419624609e9a
       repository: https://github.com/stoplightio/prism
       tag: v${{package.version}}
   # The updated tspc compiler assumes typescript 5. Since prism uses typescript 4,
@@ -38,6 +39,10 @@ pipeline:
   - uses: patch
     with:
       patches: tsconfig.json.diff
+  # fix: error TS2353: Object literal may only specify known properties, and '__bundled__' does not exist in type 'JSONSchema6 | JSONSchema7'
+  - uses: patch
+    with:
+      patches: json_schema.patch
   - runs: |
       # Create a top-level project directory to house our prism installation
       # See 'dependencies' build stage of prism/Dockerfile (https://github.com/stoplightio/prism/blob/master/Dockerfile)
@@ -89,23 +94,101 @@ test:
   environment:
     contents:
       packages:
-        - nodejs
-        - npm
-        - coreutils
+        - nodejs-18
+        - curl
   pipeline:
-    - name: Test version
+    - name: Test help
       runs: |
         ls -la /usr/src/prism/packages/cli/dist/index.js
+        prism help
     - name: Test version
       runs: |
         prism --version | tee >(grep "${{package.version}}")
-    - name: Test mock
+    - name: Test mock & proxy servers
       runs: |
         # From "Mocking" in prism README (https://github.com/stoplightio/prism/blob/master/README.md#mocking)
-        timeout 5s prism mock https://raw.githack.com/OAI/OpenAPI-Specification/master/examples/v3.0/petstore-expanded.yaml \
-        | tee >(grep "Prism is listening")
-    - name: Test proxy
-      runs: |
+
+        # Start the mock server
+        prism mock petstore-mock-spec.yaml &
+        sleep 2
+        MOCK_BASE_URL="http://127.0.0.1:4010/pets"
+
+        # Setup test method
+        check_status() {
+          if [ "$1" -eq "$2" ]; then
+            echo "Test passed for: $3 (Expected: $2, Got: $1)"
+          else
+            echo "Test failed for: $3 (Expected: $2, Got: $1)"
+            exit 1
+          fi
+        }
+
+        # Test the mock API endpoints
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL?limit=10&tags=dog")
+        check_status $response 200 "GET /pets with limit and tags"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL")
+        check_status $response 200 "GET /pets without parameters"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL?limit=abc")
+        check_status $response 422 "GET /pets with invalid limit"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$MOCK_BASE_URL" \
+          -H "Content-Type: application/json" \
+          -d '{"name": "Fluffy", "tag": "dog"}')
+        check_status $response 200 "POST /pets (Create a new pet)"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$MOCK_BASE_URL" \
+          -H "Content-Type: application/json" \
+          -d '{"tag": "cat"}')
+        check_status $response 422 "POST /pets without required field"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL/123")
+        check_status $response 200 "GET /pets/123 (Fetch by ID)"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$MOCK_BASE_URL/abc")
+        check_status $response 422 "GET /pets/abc with invalid ID"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -H "Prefer: code=404" "$MOCK_BASE_URL/999")
+        check_status $response 404 "GET /pets/999 but force 404"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$MOCK_BASE_URL/1")
+        check_status $response 204 "DELETE /pets/123 (Delete by ID)"
+
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$MOCK_BASE_URL/abc")
+        check_status $response 422 "DELETE /pets/abc with invalid ID"
+
+        response=$(curl -s -D - -o /dev/null -X POST "$MOCK_BASE_URL" \
+          -H "Content-Type: application/json" \
+          -d '{"tag":"dog"}')
+        validation_error=$(echo "$response" | grep "sl-violations")
+        if [[ "$validation_error" == *"required property 'name'"* ]]; then
+          echo "Request Validation is working as expected"
+        else
+          echo "Request Validation is failing"
+          exit 1
+        fi
+
+        # Test the proxy server
         # From "Validation Proxy" in prism README (https://github.com/stoplightio/prism/blob/master/README.md/#validation-proxy)
-        timeout 5s prism proxy petstore.oas2.yaml https://petstore.swagger.io/v2 \
-        | tee >(grep "Prism is listening")
+
+        # Start the proxy server
+        prism proxy petstore-proxy-spec.yaml http://localhost:4010 --errors -p 3000 &
+        sleep 2
+        PROXY_BASE_URL="http://localhost:3000/pets"
+
+        # Test the proxy API endpoints
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$PROXY_BASE_URL")
+        check_status $response 200 "GET /pets via proxy"
+
+        # This is an unimplemented endpoint in the mock server, so it returns a 501
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$MOCK_BASE_URL/123" \
+          -H "Content-Type: application/json" \
+          -d '{"name": "Fluffy", "tag": "dog"}')
+        check_status $response 501 "PUT /pets/123 to the mock server"
+
+        # When the same PUT request is made to the proxy server, it should mock the unimplemented endpoint and return a 200
+        response=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$PROXY_BASE_URL/123" \
+          -H "Content-Type: application/json" \
+          -d '{"name": "Fluffy", "tag": "dog"}')
+        check_status $response 200 "PUT /pets/123 via proxy"

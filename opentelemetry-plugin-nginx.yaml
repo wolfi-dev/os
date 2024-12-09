@@ -1,0 +1,120 @@
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: opentelemetry-plugin-nginx
+  version: 0_git20241209
+  epoch: 0
+  description: Adds OpenTelemetry distributed tracing support to nginx. This is the otel community plugin for nginx, not the official nginx plugin for otel.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - opentelemetry-cpp
+
+environment:
+  contents:
+    packages:
+      - abseil-cpp-dev
+      - busybox
+      - c-ares-dev
+      - cmake
+      - curl-dev
+      - gcc
+      - glibc-dev
+      - icu-dev
+      - make
+      - nginx
+      - openssf-compiler-options
+      - opentelemetry-cpp-dev
+      - pcre-dev
+      - protobuf-c-dev
+      - protobuf-dev
+      - re2-dev
+      - systemd-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/open-telemetry/opentelemetry-cpp-contrib
+      branch: main
+      expected-commit: 6a110537e2be97ab5ac397962941dde601a9c8dc
+
+  - working-directory: instrumentation/nginx
+    runs: |
+      mkdir build
+      cd build
+
+      # The version prints to stderr for some reason, output to stdout
+      nginx_version=$(nginx -v 2>&1 | sed "s/.*nginx\///")
+
+      cmake -DNGINX_VERSION=$nginx_version ..
+      make
+
+      # Copy over plugin
+      mkdir -p ${{targets.contextdir}}/usr/share/nginx/modules
+      cp -p otel_ngx_module.so ${{targets.contextdir}}/usr/share/nginx/modules/
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/etc/nginx/modules
+          ln -s /usr/share/nginx/modules/otel_ngx_module.so ${{targets.contextdir}}/etc/nginx/modules/
+
+  # This exists to satisfy ingress-nginx-opentelemetry, which ships an image but doesn't expect this
+  # library to work until it's copied over into another image that already has already has all
+  # other dependencies installed.
+  - name: ${{package.name}}-nodepends
+    description: "WARNING: This package is not usable by itself. This is the same as the opentelemetry-plugin-nginx package, but without any dependencies."
+    options:
+      no-depends: true
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/nginx/modules
+          cp -p otel_ngx_module.so ${{targets.contextdir}}/usr/share/nginx/modules/
+        working-directory: instrumentation/nginx/build
+
+update:
+  enabled: true
+  git: {}
+  schedule:
+    period: weekly
+    reason: shared contrib repo that doesn't maintain tags for this component
+
+test:
+  environment:
+    contents:
+      packages:
+        - nginx
+  pipeline:
+    - runs: |
+        cat <<EOF > /etc/nginx/nginx.conf
+        load_module /usr/share/nginx/modules/otel_ngx_module.so;
+
+        http {
+          opentelemetry_service_name "nginx-proxy";
+          opentelemetry_otlp_traces_endpoint "http://collector:4318/v1/traces";
+
+          server {
+            listen 80;
+            server_name otel_example;
+
+            root /var/www/html;
+
+            location = / {
+              opentelemetry_operation_name my_example_backend;
+              opentelemetry_propagate;
+              proxy_pass http://localhost:3501/;
+            }
+          }
+        }
+        events {}
+        EOF
+
+        # Not sure why this isn't included in main package.
+        mkdir -p /var/lib/nginx/tmp/
+        adduser -D -H -s /sbin/nologin nginx
+    # -T: test the configuration file: nginx checks the configuration for correct syntax, and then tries to open files referred in the configuration.
+    # additionally dump configuration files to standard output (1.9.2).
+    - runs: nginx -T

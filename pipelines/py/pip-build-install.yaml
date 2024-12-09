@@ -7,12 +7,34 @@ inputs:
   dest:
     description: the destination
     default: ${{targets.contextdir}}
+  needs-exe-named-python3:
+    description: Does the build actually need 'python3' in its PATH
+    default: false
+  needs-exe-named-python:
+    description: Does the build actually need 'python' in its PATH
+    default: false
+  prevent-inclusion:
+    description: |
+      prevent the provided filesystem entries from being included in
+      the wheel by means of hiding them from build.
+    required: false
 
 pipeline:
   - name: "pip build"
     runs: |
       export SOURCE_DATE_EPOCH=315532800
       py=${{inputs.python}}
+      pyexe=${{inputs.needs-exe-named-python}}
+      py3exe=${{inputs.needs-exe-named-python3}}
+      [ "$pyexe" = "true" -o "$pyexe" = "false" ] || {
+        echo "inputs.needs-exe-named-python must be true or false, not '$pyexe'";
+        exit
+      }
+      [ "$py3exe" = "true" -o "$py3exe" = "false" ] || {
+        echo "inputs.needs-exe-named-python3 must be true or false, not '$py3exe'";
+        exit
+      }
+
       if [ "$py" = "DEFAULT" ]; then
         if p=$(command -v python3); then
           py=$p
@@ -34,6 +56,14 @@ pipeline:
           fi
         fi
       fi
+      pyfullpath=$(which "$py") || {
+        echo "ERROR: '$py' appears not in PATH. Could not 'which $py'"
+        exit 1
+      }
+      rfp=$(readlink -f "$pyfullpath") || {
+        echo "ERROR: could not resolve full path to '$pyfullpath' via 'readlink -f'"
+        exit 1
+      }
       pyver=$("$py" -c 'import sys; print("%s.%s" % (sys.version_info.major, sys.version_info.minor))')
       sitepkgd=$("$py" -c 'import site; print(site.getsitepackages()[0])')
       sitepkgd=${sitepkgd#/}
@@ -44,6 +74,34 @@ pipeline:
       tmpd=$(mktemp -d)
       trap "rm -Rf '$tmpd'" EXIT
 
+      if [ "$pyexe" = "true" -o "$py3exe" = "true" ]; then
+        mkdir "$tmpd/bin" || exit 1
+        export PATH="$tmpd/bin:$PATH"
+        # use a shell script with exec in the case that $py is 'python' or 'python3'
+        if [ "$pyexe" = "true" ]; then
+          echo "wrapping 'python' in PATH -> '$rfp'"
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$rfp" > "$tmpd/bin/python" &&
+            chmod 755 "$tmpd/bin/python" ||
+            { echo "ERROR: failed creating wrapper 'python'"; exit 1; }
+        fi
+        if [ "$py3exe" = "true" ]; then
+          echo "wrapping 'python3' in PATH -> '$rfp'"
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$rfp" > "$tmpd/bin/python3" &&
+            chmod 755 "$tmpd/bin/python3" ||
+            { echo "ERROR: failed creating wrapper 'python3'"; exit 1; }
+        fi
+      fi
+
+      prevents="${{inputs.prevent-inclusion}}"
+      if [ -n "$prevents" ]; then
+         # do not allow expansion of prevents
+         ( set -f; vr tar -cpf "$tmpd/prevent-inclusion.tar" $prevents &&
+           vr rm -rf $prevents ) ||
+           { echo "ERROR: failed creation of prevent-inclusion.tar with $prevents"; exit 1; }
+         echo "prevented-inclusion of $prevents"
+      fi
+
+      [ -d build ] && hadbuild=true || hadbuild=false
       # --find-links to an empty dir and --no-index makes pip fully "offline"
       distwheelsd="$tmpd/dist-wheels"
       mkdir -p "$distwheelsd"
@@ -54,3 +112,13 @@ pipeline:
           "--find-links=$distwheelsd" --no-index --no-build-isolation --no-deps \
           --force-reinstall --no-compile --prefix=/usr "--root=$root" "$wd"/*.whl
       vr $py -m compileall --invalidation-mode=unchecked-hash -r100 "$root/$sitepkgd"
+
+      if [ "$hadbuild" = "false" -a -d build ]; then
+        vr rm -Rf build
+      fi
+      if [ -n "$prevents" ]; then
+        vr tar -xpf "$tmpd/prevent-inclusion.tar" ||
+          { echo "ERROR: failed restoring 'prevent-inclusion' files"; exit 1; }
+        echo "restored $prevents"
+      fi
+      exit 0

@@ -28,15 +28,18 @@ for p in $(make list); do
   # Don't specify wolfi-base or any of its packages, or the main package, for test pipelines.
   for pkg in wolfi-base busybox apk-tools wolfi-keys ${p}; do
     yq -i 'del(.test.environment.contents.packages[] | select(. == "'${pkg}'"))' ${fn}
-    yam ${fn}
   done
 
   # If .test.environment.contents.packages is empty, remove it all.
   if [ "$(yq -r '.test.environment.contents.packages | length' ${fn})" == "0" ]; then
-    yq -i 'del(.test.environment)' ${fn}
-    yam ${fn}
+    yq -i 'del(.test.environment.contents)' ${fn}
   fi
+
+  yam ${fn}
 done
+
+git --no-pager diff # Show any diff.
+git diff --quiet    # Fail any diff.
 
 # New section to check for .sts.yaml files under ./.github/chainguard/
 echo "Checking for .sts.yaml files in ./.github/chainguard/..."

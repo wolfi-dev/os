@@ -70,7 +70,7 @@ Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CV
 
 - `epoch` needs to be bumped when the package version remains the same but something else changes. `epoch` needs to be reset to 0 when it's a new version of the package.
 
-- `melange` CLI has a command `bump` to make it easier. More details are [available here](https://github.com/chainguard-dev/melange/blob/f52b622351657fd9ccdb7e3bfb124caef61ad651/NEWS.md).
+- `melange` CLI has a command `bump` to make it easier. More details are [available here](https://github.com/chainguard-dev/melange/blob/main/docs/md/melange_bump.md).
 
 ## Some tips
 

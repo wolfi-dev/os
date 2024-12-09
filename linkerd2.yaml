@@ -1,0 +1,179 @@
+package:
+  name: linkerd2
+  version: 24.11.8
+  epoch: 0
+  description: "meta linkerd package"
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cargo-auditable
+      - clang
+      - cmake
+      - nodejs
+      - openssf-compiler-options
+      - openssl-dev
+      - perl-dev
+      - rust
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 43335fd90603d511bc898942b40f0ac15671b593
+      repository: https://github.com/linkerd/linkerd2/
+      tag: edge-${{package.version}}
+
+subpackages:
+  - name: ${{package.name}}-web
+    pipeline:
+      - runs: |
+          ./bin/web setup install --frozen-lockfile
+          ./bin/web build
+          go build -mod=readonly -o web/web -ldflags "-w" ./web
+          mkdir -p ${{targets.contextdir}}/app
+          mkdir -p ${{targets.contextdir}}/templates
+          cp -r ./web/app/dist ${{targets.contextdir}}/app
+          cp -r ./web/templates ${{targets.contextdir}}/
+          cp ./web/web ${{targets.contextdir}}/
+    test:
+      pipeline:
+        - name: version and help message
+          runs: |
+            /web -version
+            /web -help
+            /web 2>&1 | grep 'starting admin server'
+
+  - name: ${{package.name}}-cli
+    pipeline:
+      - runs: |
+          go generate -mod=readonly ./pkg/charts/static
+          go generate -mod=readonly ./jaeger/static
+          go generate -mod=readonly ./multicluster/static
+          go generate -mod=readonly ./viz/static
+      - uses: go/build
+        with:
+          packages: ./cli
+          tags: prod
+          output: linkerd
+          ldflags: -X github.com/linkerd/linkerd2/pkg/version.Version=edge-${{package.version}}
+    test:
+      pipeline:
+        - name: linkerd version check
+          runs: linkerd version --client | grep ${{package.version}}
+
+  - name: ${{package.name}}-proxy-identity
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./proxy-identity/main.go
+          output: linkerd2-proxy-identity
+          install-dir: lib/linkerd
+    test:
+      pipeline:
+        - name: check presence of required files
+          runs: |
+            # executable doesn't have help or version flag.
+            stat /usr/lib/linkerd/linkerd2-proxy-identity
+
+  - name: ${{package.name}}-controller
+    pipeline:
+      - runs: |
+          go generate -mod=readonly ./pkg/charts/static
+      - uses: go/build
+        with:
+          packages: ./controller/cmd/main.go
+          tags: prod
+          output: controller
+    test:
+      pipeline:
+        - name: check presence of required files
+          runs: |
+            # executable doesn't have help or version flag.
+            stat /usr/bin/controller
+
+  - name: ${{package.name}}-controller-compat
+    description: "upstream image have executable placed at /"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf /usr/bin/controller ${{targets.contextdir}}/controller
+
+  - name: ${{package.name}}-policy-controller
+    pipeline:
+      - runs: |
+          export RUSTFLAGS="$RUSTFLAGS --cfg tokio_unstable"
+          cargo fetch
+          cargo auditable build --frozen --release --package=linkerd-policy-controller
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          mv ./target/release/linkerd-policy-controller ${{targets.contextdir}}/usr/bin
+      - uses: strip
+    test:
+      pipeline:
+        - name: check presence of required files
+          runs: |
+            # executable doesn't have help or version flag.
+            stat /usr/bin/linkerd-policy-controller
+
+  - name: ${{package.name}}-policy-controller-compat
+    description: "upstream image have executable placed at /bin"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/bin/
+          ln -sf /usr/bin/linkerd-policy-controller ${{targets.contextdir}}/bin/linkerd-policy-controller
+
+  - name: ${{package.name}}-metrics-api
+    dependencies:
+      runtime:
+        - ca-certificates-bundle
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./viz/metrics-api/cmd/main.go
+          tags: prod
+          output: metrics-api
+    test:
+      pipeline:
+        - name: version and help message
+          runs: |
+            /usr/bin/metrics-api -version
+            /usr/bin/metrics-api -help
+
+  - name: ${{package.name}}-metrics-api-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -sf /usr/bin/metrics-api ${{targets.contextdir}}/metrics-api
+
+  - name: ${{package.name}}-tap
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./viz/tap/cmd/main.go
+          tags: prod
+          output: tap
+    test:
+      pipeline:
+        - runs: |
+            # executable doesn't have help or version flags
+            # it only take two args https://github.com/linkerd/linkerd2/blob/main/viz/tap/cmd/main.go (to be run inside kubernetes)
+            stat /usr/bin/tap
+            /usr/bin/tap api 2>&1 | grep "starting admin server"
+
+  - name: ${{package.name}}-tap-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -sf /usr/bin/tap ${{targets.contextdir}}/tap
+
+update:
+  enabled: true
+  github:
+    identifier: linkerd/linkerd2
+    tag-filter: edge-
+    strip-prefix: edge-

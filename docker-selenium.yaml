@@ -4,7 +4,7 @@ package:
   # But the '-' is not a valid character according to APK versioning spec; and resulting
   # 'package format error' when trying to install the package. The workaround is
   # to replace '-' with '.', then mangling the version to replace back.
-  version: 4.25.0.20241024
+  version: 4.27.0.20241127
   epoch: 0
   description: Provides a simple way to run Selenium Grid with Chrome, Firefox, and Edge using Docker, making it easier to perform browser automation
   copyright:
@@ -18,11 +18,6 @@ package:
       - bash
       - busybox
       - coreutils
-      - openjdk-11
-      - selenium-server-compat
-      - sudo-rs
-      - supervisor
-      - tzdata
 
 environment:
   contents:
@@ -37,14 +32,15 @@ environment:
       - git
       - gnupg
       - jq
-      - openjdk-11
-      - openjdk-11-default-jvm
-      - openjdk-11-jre
+      - openjdk-17
+      - openjdk-17-default-jvm
+      - openjdk-17-jre
+      - openssf-compiler-options
       - openssl
       - x11vnc
       - yq
   environment:
-    JAVA_HOME: /usr/lib/jvm/java-11-openjdk
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
     TC: UTC
     SEL_USER: seluser
     SEL_PASSWD: secret
@@ -61,48 +57,85 @@ pipeline:
     with:
       repository: https://github.com/SeleniumHQ/docker-selenium
       tag: ${{vars.mangled-package-version}}
-      expected-commit: 653af3e22860eea2fd236c8289c874ba15837a98
+      expected-commit: c5e10a7c7f8e6538f5bee7079a7d6f7e0587368b
 
   - uses: patch
     with:
       patches: 0001-fix-paths.patch
 
-  - runs: |
-      mkdir -p ${{targets.destdir}}/usr/bin
-      mkdir -p ${{targets.destdir}}/etc/supervisor/conf.d
-      mkdir -p ${{targets.destdir}}/var/tmp
-
-  # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Base/Dockerfile
-  - working-directory: Base
+subpackages:
+  - name: ${{package.name}}-base
+    dependencies:
+      runtime:
+        - bash
+        - busybox
+        - coreutils
+        - selenium-server-compat
+        - sudo-rs
+        - supervisor
+        - tzdata
+        - ${{package.name}}-supervisor-config
+        - selenium-server
     pipeline:
       - runs: |
-          mkdir -p ${{targets.destdir}}/opt/bin
-          install -Dm755 check-grid.sh ${{targets.destdir}}/opt/bin/
-          install -Dm755 entry_point.sh ${{targets.destdir}}/opt/bin/
-          install -Dm755f supervisord.conf ${{targets.destdir}}/etc
-          mkdir -p ${{targets.destdir}}/var/run/supervisor
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+          mkdir -p ${{targets.contextdir}}/var/tmp
+          mkdir -p ${{targets.contextdir}}/opt/bin
       - runs: |
-          mkdir -p ${{targets.destdir}}/opt/selenium
-          echo "${SEL_PASSWD}" > ${{targets.destdir}}/opt/selenium/initialPasswd
-      # TODO: Implement malware scan for jars retrieved by coursier
+          cp ./charts/selenium-grid/configs/node/nodeGridUrl.sh ${{targets.contextdir}}/opt/bin
+          cp ./charts/selenium-grid/configs/node/nodePreStop.sh ${{targets.contextdir}}/opt/bin
+      # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Base/Dockerfile
+      - working-directory: Base
+        pipeline:
+          - runs: |
+              cp check-grid.sh ${{targets.contextdir}}/opt/bin/
+              cp entry_point.sh ${{targets.contextdir}}/opt/bin/
+              cp supervisord.conf ${{targets.contextdir}}/etc
+              mkdir -p ${{targets.contextdir}}/var/run/supervisor
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/opt/selenium
+              echo "${SEL_PASSWD}" > ${{targets.contextdir}}/opt/selenium/initialPasswd
+          # TODO: Implement malware scan for jars retrieved by coursier
+          - runs: |
+              # Retrieve OpenTelemetry/GRPC Java versions
+              export OPENTELEMETRY_VERSION=$(curl "https://api.github.com/repos/open-telemetry/opentelemetry-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
+              export GRPC_VERSION=$(curl "https://api.github.com/repos/grpc/grpc-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
+
+              mkdir -p ${{targets.contextdir}}/external_jars
+              curl -sSLfO https://github.com/coursier/launchers/raw/master/coursier
+              chmod +x coursier
+              # The netty-codec-http bump is for CVE-2024-29025
+              ./coursier fetch --classpath --cache ${{targets.contextdir}}/external_jars \
+                io.opentelemetry:opentelemetry-exporter-otlp:${OPENTELEMETRY_VERSION} \
+                io.netty:netty-codec-http:4.1.108.Final \
+                io.grpc:grpc-netty:${GRPC_VERSION} > ${{targets.contextdir}}/external_jars/.classpath.txt
+              chmod 665 ${{targets.contextdir}}/external_jars/.classpath.txt
+              sed -i 's|${{targets.contextdir}}||g' ${{targets.contextdir}}/external_jars/.classpath.txt
+    test:
+      environment:
+        environment:
+          SE_SUPERVISORD_LOG_FILE: "/tmp/supervisord.log"
+          SE_SUPERVISORD_CHILD_LOG_DIR: "/tmp"
+          SE_SUPERVISORD_PID_FILE: "/tmp/supervisord.pid"
+          SE_SUPERVISORD_LOG_LEVEL: "info"
+          SEL_USER: seluser
+      pipeline:
+        - name: "Check selenium base status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/entry_point.sh"
+            timeout: 60
+            expected_output: |
+              supervisord started
+
+  - name: ${{package.name}}-config
+    pipeline:
       - runs: |
-          # Retrieve OpenTelemetry/GRPC Java versions
-          export OPENTELEMETRY_VERSION=$(curl "https://api.github.com/repos/open-telemetry/opentelemetry-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
-          export GRPC_VERSION=$(curl "https://api.github.com/repos/grpc/grpc-java/releases/latest" | jq -r ".tag_name" | sed 's/v//')
+          mkdir -p ${{targets.contextdir}}/opt/selenium/
+          install -m644 "./example-config.toml" ${{targets.contextdir}}/opt/selenium/config.toml
 
-          mkdir -p ${{targets.destdir}}/external_jars
-          curl -sSLfO https://github.com/coursier/launchers/raw/master/coursier
-          chmod +x coursier
-          # The netty-codec-http bump is for CVE-2024-29025
-          ./coursier fetch --classpath --cache ${{targets.destdir}}/external_jars \
-            io.opentelemetry:opentelemetry-exporter-otlp:${OPENTELEMETRY_VERSION} \
-            io.netty:netty-codec-http:4.1.108.Final \
-            io.grpc:grpc-netty:${GRPC_VERSION} > ${{targets.destdir}}/external_jars/.classpath.txt
-
-  - uses: strip
-
-subpackages:
-  - name: docker-selenium-supervisor-config
+  - name: ${{package.name}}-supervisor-config
     description: Docker Selenium supervisor configuration
     dependencies:
       replaces:
@@ -111,39 +144,104 @@ subpackages:
         - supervisor-config
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/etc
-          mv ${{targets.destdir}}/etc/supervisord.conf ${{targets.subpkgdir}}/etc
-          mv ${{targets.destdir}}/etc/supervisor ${{targets.subpkgdir}}/etc
+          mkdir -p ${{targets.contextdir}}/etc
+          cd ./Base
+          install supervisord.conf ${{targets.contextdir}}/etc
+          mv ${{targets.contextdir}}/etc/supervisord.conf ${{targets.contextdir}}/etc
 
           # Unset setuid bit
           # jason@ copied this directly from https://serverfault.com/a/238964
           # The extra 0 is to unset the setuid bit apparently.
-          chmod 00775 ${{targets.subpkgdir}}/etc/supervisord.conf
+          chmod 0775 ${{targets.contextdir}}/etc/supervisord.conf
+
+  - name: ${{package.name}}-standalone
+    dependencies:
+      runtime:
+        - selenium-server-standalone
+        - ${{package.name}}-base
+        - ${{package.name}}-config
+    pipeline:
+      - working-directory: Standalone
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 start-selenium-standalone.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 selenium.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 generate_config ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        contents:
+          packages:
+            - chromium
+            - chromium-docker-selenium-compat
+        environment:
+          SE_SESSION_REQUEST_TIMEOUT: 300
+          SE_SESSION_RETRY_INTERVAL: 15
+          SE_HEALTHCHECK_INTERVAL: 120
+          SE_RELAX_CHECKS: true
+          SE_REJECT_UNSUPPORTED_CAPS: true
+          SE_OTEL_SERVICE_NAME: "selenium-standalone"
+          SE_NODE_SESSION_TIMEOUT: 150
+          SE_NODE_OVERRIDE_MAX_SESSIONS: 10
+          DRAIN_AFTER_SESSION_COUNT: 10
+          SE_DRAIN_AFTER_SESSION_COUNT: 4
+          SE_NODE_MAX_SESSIONS: 10
+          SE_NODE_BROWSER_NAME: chrome
+          SE_NODE_BROWSER_VERSION: $(chromium --version | cut -d ' ' -f 2)
+          SE__BROWSER_BINARY_LOCATION: "/usr/bin/chromium-browser"
+          SE_BIND_HOST: false
+      pipeline:
+        - name: "Check selenium standalone status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-standalone.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium Standalone
 
   # selenium-hub does not handle rendering or direct interaction with browsers
   # we can skip adding chromium, Xvfb, fluxbox, and related font packages.
-  - name: docker-selenium-hub
+  - name: ${{package.name}}-hub
     description: Docker Selenium Hub
+    dependencies:
+      runtime:
+        - ${{package.name}}-base
+        - ${{package.name}}-config
+        - selenium-server
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/opt/bin
-          mkdir -p ${{targets.subpkgdir}}/opt/selenium
+          mkdir -p ${{targets.contextdir}}/opt/bin
+          mkdir -p ${{targets.contextdir}}/opt/selenium
       # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Hub/Dockerfile
       - working-directory: Hub
         pipeline:
           - runs: |
-              mkdir -p ${{targets.subpkgdir}}/etc/supervisor/conf.d
-              cp selenium-grid-hub.conf ${{targets.subpkgdir}}/etc/supervisor/conf.d/
-              install -Dm755 start-selenium-grid-hub.sh ${{targets.subpkgdir}}/opt/bin/
-              cp example-config.toml ${{targets.subpkgdir}}/opt/selenium/config.toml
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              install -Dm755 selenium-grid-hub.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-selenium-grid-hub.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        environment:
+          SE_RELAX_CHECKS: True
+          SE_BIND_HOST: False
+          SE_SESSION_RETRY_INTERVAL: 50
+          SE_HEALTHCHECK_INTERVAL: 500
+          SE_SESSION_REQUEST_TIMEOUT: 500
+      pipeline:
+        - name: "Check selenium hub status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-hub.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium Hub
 
-  - name: docker-selenium-standalone-chrome
-    description: Docker Selenium supervisor configuration
+  - name: ${{package.name}}-node-base
+    description: Node base
     dependencies:
       runtime:
         - Xvfb
-        - chromium
-        - chromium-docker-selenium-compat
         - fluxbox
         - font-ipa
         - font-liberation
@@ -162,7 +260,6 @@ subpackages:
         - libxcb
         - mcookie
         - novnc
-        - openjdk-11
         - pulseaudio
         - pulseaudio-utils
         - ttf-dejavu
@@ -173,47 +270,427 @@ subpackages:
         - xkeyboard-config
         - xmessage
         - xvfb-run
+        - ${{package.name}}-base
+        - ${{package.name}}-config
+        - selenium-server
     pipeline:
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/etc
-          mkdir -p ${{targets.subpkgdir}}/opt/bin
-      # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/NodeBase/Dockerfile
       - working-directory: NodeBase
         pipeline:
+          # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/NodeBase/Dockerfile
           - runs: |
-              mkdir -p ${{targets.subpkgdir}}/etc/supervisor/conf.d
-              mkdir -p ${{targets.subpkgdir}}/usr/share/images/fluxbox
-              cp start-selenium-node.sh ${{targets.subpkgdir}}/opt/bin/
-              cp start-xvfb.sh ${{targets.subpkgdir}}/opt/bin/
-              cp selenium.conf ${{targets.subpkgdir}}/etc/supervisor/conf.d/
-              cp start-vnc.sh ${{targets.subpkgdir}}/opt/bin/
-              cp start-novnc.sh ${{targets.subpkgdir}}/opt/bin/
-              cp selenium_grid_logo.png ${{targets.subpkgdir}}/usr/share/images/fluxbox/ubuntu-light.png
-              cp generate_relay_config ${{targets.subpkgdir}}/opt/bin/generate_relay_config
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/usr/share/images/fluxbox
+              mkdir -p ${{targets.contextdir}}/home/$SEL_USER/.fluxbox
+              mkdir -p ${{targets.contextdir}}/tmp/.X11-unix
+              mkdir -p ${{targets.contextdir}}/home/$SEL_USER/.vnc
+              mkdir -p ${{targets.contextdir}}/opt/selenium
+          - runs: |
+              install -Dm755 start-selenium-node.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 start-xvfb.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 selenium.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-vnc.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 start-novnc.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 selenium_grid_logo.png ${{targets.contextdir}}/usr/share/images/fluxbox/ubuntu-light.png
+              install -Dm755 generate_config ${{targets.contextdir}}/opt/bin/
+              install -Dm755 generate_relay_config ${{targets.contextdir}}/opt/bin/
+              echo "${SEL_PASSWD}" | x11vnc -storepasswd - ${{targets.contextdir}}/home/$SEL_USER/.vnc/passwd
+    test:
+      environment:
+        contents:
+          packages:
+            - geckodriver
+        environment:
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_EVENT_BUS_HOST: selenium-hub
+          CONFIG_FILE: /opt/selenium/config.toml
+          SE_BIND_HOST: true
+      pipeline:
+        - name: "Check selenium node-base status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-node.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium node
 
-              mkdir -p ${{targets.subpkgdir}}/home/$SEL_USER/.fluxbox
-              mkdir -p ${{targets.subpkgdir}}/tmp/.X11-unix
-              mkdir -p ${{targets.subpkgdir}}/home/$SEL_USER/.vnc
-              mkdir -p ${{targets.subpkgdir}}/opt/selenium
-              mkdir -p ${{targets.subpkgdir}}/opt/selenium
-              echo "${SEL_PASSWD}" | x11vnc -storepasswd - ${{targets.subpkgdir}}/home/$SEL_USER/.vnc/passwd
-      # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/NodeChrome/Dockerfile
-      - working-directory: NodeChrome
+  # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/node-chromium/Dockerfile
+  - name: ${{package.name}}-node-chromium
+    description: NodeChromium
+    dependencies:
+      runtime:
+        - ${{package.name}}-node-base
+        - chromium-docker-selenium-compat
+        - chromium
+    pipeline:
+      - working-directory: NodeChromium
         pipeline:
           - runs: |
-              cp wrap_chrome_binary ${{targets.subpkgdir}}/opt/bin/wrap_chrome_binary
-      # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Standalone/Dockerfile
-      - working-directory: Standalone
+              mkdir -p ${{targets.contextdir}}/opt/bin/
+              mkdir -p ${{targets.contextdir}}/opt/selenium/
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 wrap_chromium_binary ${{targets.contextdir}}/opt/bin/
+              install -Dm755 chrome-cleanup.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 chrome-cleanup.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+    test:
+      environment:
+        environment:
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_EVENT_BUS_HOST: selenium-hub
+          CONFIG_FILE: /opt/selenium/config.toml
+          SE_BIND_HOST: true
+      pipeline:
+        - name: "Check selenium node-chromium status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-node.sh"
+            timeout: 60
+            expected_output: |
+              Adding Chrome for
+              Started Selenium node
+
+  - name: ${{package.name}}-node-firefox
+    dependencies:
+      runtime:
+        - ${{package.name}}-node-base
+        - geckodriver
+        - firefox
+    pipeline:
+      - working-directory: NodeFirefox
         pipeline:
           - runs: |
-              cp start-selenium-standalone.sh ${{targets.subpkgdir}}/opt/bin/start-selenium-standalone.sh
-              cp selenium.conf ${{targets.subpkgdir}}/etc/supervisor/conf.d/
-              cp generate_config ${{targets.subpkgdir}}/opt/bin/generate_config
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              mkdir -p ${{targets.contextdir}}/opt/selenium/
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 firefox-cleanup.sh ${{targets.contextdir}}/opt/bin/firefox-cleanup.sh
+              install -Dm755 firefox-cleanup.conf ${{targets.contextdir}}/etc/supervisor/conf.d/firefox-cleanup.conf
+              echo "firefox" > ${{targets.contextdir}}/opt/selenium/browser_name
+              firefox --version | awk '{print $3}' > ${{targets.contextdir}}/opt/selenium/browser_version
+              echo "\"moz:firefoxOptions\": {\"binary\": \"/usr/bin/firefox\"}" > ${{targets.contextdir}}/opt/selenium/browser_binary_location
+    test:
+      environment:
+        environment:
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_EVENT_BUS_HOST: selenium-hub
+          CONFIG_FILE: /opt/selenium/config.toml
+          SE_BIND_HOST: true
+      pipeline:
+        - runs: |
+            firefox --version
+        - name: "Check selenium node-firefox status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-node.sh"
+            timeout: 60
+            expected_output: |
+              Adding Firefox for
+              Started Selenium node
+
+  - name: ${{package.name}}-standalone-chromium
+    description: Docker Selenium standalone
+    dependencies:
+      runtime:
+        - ${{package.name}}-node-chromium
+        - ${{package.name}}-standalone
+    test:
+      environment:
+        environment:
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_EVENT_BUS_HOST: selenium-hub
+          CONFIG_FILE: /opt/selenium/config.toml
+          SE_BIND_HOST: true
+      pipeline:
+        - name: "Check selenium standalone-chromium status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-node.sh"
+            timeout: 60
+            expected_output: |
+              Starting Selenium Grid Node
+
+  - name: ${{package.name}}-event-bus
+    description: Docker Selenium event-bus
+    dependencies:
+      runtime:
+        - ${{package.name}}-base
+    pipeline:
+      - working-directory: EventBus
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 selenium-grid-eventbus.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-selenium-grid-eventbus.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        environment:
+          SE_DISTRIBUTOR_PORT: 5553
+          SE_BIND_HOST: False
+      pipeline:
+        - name: "Check selenium eventbus status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-eventbus.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium EventBus
+
+  - name: ${{package.name}}-distributor
+    description: Docker Selenium distributor
+    dependencies:
+      runtime:
+        - ${{package.name}}-base
+        - selenium-server
+    pipeline:
+      - working-directory: Distributor
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 selenium-grid-distributor.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-selenium-grid-distributor.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        environment:
+          SE_SESSION_REQUEST_TIMEOUT: 300
+          SE_SESSION_RETRY_INTERVAL: 15
+          SE_HEALTHCHECK_INTERVAL: 120
+          SE_BIND_HOST: true
+          SE_EVENT_BUS_HOST: "127.0.0.1"
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_SESSIONS_MAP_HOST: "127.0.0.1"
+          SE_SESSIONS_MAP_PORT: 5556
+          SE_SESSION_QUEUE_HOST: "127.0.0.1"
+          SE_SESSION_QUEUE_PORT: 5559
+          SE_DISTRIBUTOR_HOST: "127.0.0.1"
+          SE_DISTRIBUTOR_PORT: 5553
+      pipeline:
+        - name: "Check selenium distributor status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-distributor.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium Distributor
+
+  - name: ${{package.name}}-node-docker
+    description: Docker Selenium node docker
+    dependencies:
+      runtime:
+        - ${{package.name}}-base
+        - ${{package.name}}-config
+        - socat
+    pipeline:
+      - working-directory: NodeDocker
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 selenium-grid-docker.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-selenium-grid-docker.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 start-socat.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        environment:
+          SE_DISTRIBUTOR_PORT: 5553
+          SE_BIND_HOST: false
+          SE_NODE_GRID_URL: http://127.0.0.1:4444
+          SE_EVENT_BUS_HOST: 127.0.0.1
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_ROUTER_PORT: 4444
+          SE_ROUTER_HOST: selenium-hub
+          SE_SESSION_RETRY_INTERVAL: 15
+          SE_SESSION_REQUEST_TIMEOUT: 300
+          SE_SESSIONS_MAP_HOST: "127.0.0.1"
+          SE_SESSION_QUEUE_PORT: 5559
+      pipeline:
+        - name: "Check selenium nodedocker status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-docker.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium node
+
+  - name: ${{package.name}}-router
+    description: Docker Selenium router
+    dependencies:
+      runtime:
+        - ${{package.name}}-base
+        - ${{package.name}}-config
+        - selenium-server
+    pipeline:
+      - working-directory: Router
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 selenium-grid-router.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-selenium-grid-router.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        environment:
+          SE_DISTRIBUTOR_PORT: 5553
+          SE_BIND_HOST: false
+          SE_NODE_GRID_URL: http://127.0.0.1:4444
+          SE_EVENT_BUS_HOST: 127.0.0.1
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_SESSION_QUEUE_HOST: "127.0.0.1"
+          SE_DISTRIBUTOR_HOST: "127.0.0.1"
+          SE_SESSIONS_MAP_HOST: "127.0.0.1"
+          SE_SESSIONS_MAP_PORT: 5556
+          SE_SESSION_QUEUE_PORT: 5559
+          SE_SESSION_RETRY_INTERVAL: 15
+          SE_SESSION_REQUEST_TIMEOUT: 500
+          SE_HEALTHCHECK_INTERVAL: 120
+      pipeline:
+        - name: "Check selenium router status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-router.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium Router
+
+  - name: ${{package.name}}-session-queue
+    description: Docker Selenium SessionQueue
+    dependencies:
+      runtime:
+        - ${{package.name}}-base
+        - selenium-server
+    pipeline:
+      - working-directory: SessionQueue
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 selenium-grid-session-queue.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-selenium-grid-session-queue.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        environment:
+          SE_SESSION_QUEUE_HOST: "127.0.0.1"
+          SE_SESSION_QUEUE_PORT: 5559
+          SE_BIND_HOST: false
+          SE_SESSION_RETRY_INTERVAL: 15
+          SE_SESSION_REQUEST_TIMEOUT: 300
+      pipeline:
+        - name: "Check selenium session-queue status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-session-queue.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium SessionQueue
+
+  - name: ${{package.name}}-sessions
+    description: Docker Selenium Sessions
+    dependencies:
+      runtime:
+        - ${{package.name}}-base
+        - selenium-server
+    pipeline:
+      - working-directory: Sessions
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 selenium-grid-sessions.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 start-selenium-grid-sessions.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        environment:
+          SE_SESSION_QUEUE_HOST: "127.0.0.1"
+          SE_SESSION_QUEUE_PORT: 5559
+          SE_BIND_HOST: true
+          SE_EVENT_BUS_PUBLISH_PORT: 4442
+          SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
+          SE_EVENT_BUS_HOST: 127.0.0.1
+      pipeline:
+        - name: "Check selenium sessions status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-sessions.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium SessionMap
+
+  - name: ${{package.name}}-standalone-docker
+    description: Docker Selenium Standalone Docker
+    dependencies:
+      runtime:
+        - ${{package.name}}-node-docker
+        - ${{package.name}}-config
+    pipeline:
+      - working-directory: StandaloneDocker
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/opt/bin
+              install -Dm755 start-selenium-grid-docker.sh ${{targets.contextdir}}/opt/bin/
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-config
+        environment:
+          SE_BIND_HOST: true
+          SE_SESSION_REQUEST_TIMEOUT: 300
+          SE_SESSION_RETRY_INTERVAL: 15
+          SE_RELAX_CHECKS: true
+      pipeline:
+        - name: "Check selenium sessions status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-grid-docker.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium Standalone
+
+  - name: ${{package.name}}-standalone-firefox
+    description: Docker Selenium Standalone Firefox
+    dependencies:
+      runtime:
+        - ${{package.name}}-node-firefox
+        - ${{package.name}}-standalone
+    pipeline:
+    test:
+      environment:
+        environment:
+          SE_SESSION_REQUEST_TIMEOUT: 300
+          SE_SESSION_RETRY_INTERVAL: 15
+          SE_HEALTHCHECK_INTERVAL: 120
+          SE_RELAX_CHECKS: true
+          SE_REJECT_UNSUPPORTED_CAPS: true
+          SE_OTEL_SERVICE_NAME: "selenium-standalone"
+          SE_NODE_SESSION_TIMEOUT: 150
+          SE_NODE_OVERRIDE_MAX_SESSIONS: 10
+          DRAIN_AFTER_SESSION_COUNT: 10
+          SE_DRAIN_AFTER_SESSION_COUNT: 4
+          SE_NODE_MAX_SESSIONS: 10
+          SE_NODE_BROWSER_NAME: chrome
+          SE_NODE_BROWSER_VERSION: $(chromium --version | cut -d ' ' -f 2)
+          SE__BROWSER_BINARY_LOCATION: "/opt/selenium/browser_binary_location"
+          SE_BIND_HOST: false
+      pipeline:
+        - name: "Check selenium standalone status"
+          uses: test/daemon-check-output
+          with:
+            start: "/opt/bin/start-selenium-standalone.sh"
+            timeout: 60
+            expected_output: |
+              Started Selenium Standalone
 
 update:
   enabled: true
   ignore-regex-patterns:
-    - '.*grid.*'
+    - ".*grid.*"
   version-transform:
     - match: ^(.+)\-(\d+)$
       replace: $1.$2

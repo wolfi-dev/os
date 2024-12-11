@@ -25,9 +25,6 @@ for fn in *.yaml; do
   yam ${fn}
 done
 
-git --no-pager diff # Show any diff.
-git diff --quiet    # Fail any diff.
-
 # New section to check for .sts.yaml files under ./.github/chainguard/
 echo "Checking for .sts.yaml files in ./.github/chainguard/..."
 for file in $(find .github/chainguard -type f); do

@@ -51,12 +51,6 @@ ifeq (${LINT}, yes)
 	MELANGE_OPTS += --fail-on-lint-warning
 endif
 
-# The list of packages to be built. The order matters.
-# wolfictl determines the list and order
-# set only to be called when needed, so make can be instant to run
-# when it is not
-PKGLISTCMD ?= $(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/
-
 BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
 BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
 WOLFI_REPO ?= https://packages.wolfi.dev/os
@@ -66,37 +60,16 @@ BOOTSTRAP ?= no
 ifeq (${BOOTSTRAP}, yes)
 	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
 	MELANGE_OPTS += -r ${BOOTSTRAP_REPO}
-	PKGLISTCMD += -k ${BOOTSTRAP_KEY}
-	PKGLISTCMD += -r ${BOOTSTRAP_REPO}
 else
 	MELANGE_OPTS += -k ${WOLFI_KEY}
 	MELANGE_OPTS += -r ${WOLFI_REPO}
-	PKGLISTCMD += -k ${WOLFI_KEY}
-	PKGLISTCMD += -r ${WOLFI_REPO}
 endif
-
-all: ${KEY} .build-packages
-ifeq ($(MAKECMDGOALS),all)
-  PKGLIST := $(addprefix package/,$(shell $(PKGLISTCMD)))
-else
-  PKGLIST :=
-endif
-.build-packages: $(PKGLIST)
 
 ${KEY}:
 	${MELANGE} keygen ${KEY}
 
 clean:
 	rm -rf packages/${ARCH}
-
-.PHONY: list list-yaml
-list:
-	$(info $(shell $(PKGLISTCMD)))
-	@printf ''
-
-list-yaml:
-	$(info $(addsuffix .yaml,$(shell $(PKGLISTCMD))))
-	@printf ''
 
 fetch-kernel:
 	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
@@ -167,7 +140,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:77da1186e7c2d9796bcaf4fb035e8675cd822d67a1d8a530cc0f1ceb5df80110
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:ff191d976f24586394d0a03df7900a8f6f76fe1adbbe209e9f92e960bd7e8120
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -235,6 +208,12 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:77da1186e7c2d9796bcaf4fb035e8675cd822d67a1d8a530cc0f1ceb5df80110
+		ghcr.io/wolfi-dev/sdk:latest@sha256:ff191d976f24586394d0a03df7900a8f6f76fe1adbbe209e9f92e960bd7e8120
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"
+
+# Checks that the repo can be built in order from bootstrap packages.
+check-bootstrap:
+	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
+		-k ${BOOTSTRAP_KEY} \
+		-r ${BOOTSTRAP_REPO}

@@ -1,0 +1,176 @@
+package:
+  name: python-as-wrapper
+  version: 0.1.0
+  epoch: 0
+  description: Shell script wrapper to exec python3.XX
+  copyright:
+    - license: Apache-2.0
+
+# In a "normal" installation of python, 'python3' is a symlink
+# to 'pythonX.Y' where X.Y is Major.Minor (3.13).  In that scenario,
+# if caller invokes 'python3', then when python reads its sys.executable,
+# he executable is 'python3'.
+#
+# That value of sys.executable is "sticky" and finds its way into shbangs that
+# are installed with 'pip install' or other places.
+#
+# In the vast majority of places, we do not want shebang with
+# /usr/bin/python3 because at runtime:
+#  * python3 might be a symlink to another python version
+#  * python3 may not exist at all - with only python3.XX installed.
+#
+# Using the wrapper that this package provides if you do
+# 'python3 -m pip install pkg', then 'pkg's provided scripts will have
+# a shbang of /usr/bin/python3.XX.
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+  - name: python-as-names
+    items:
+      python: PYTHON_AS
+      python3: PYTHON3_AS
+
+environment:
+  contents:
+    packages:
+      - busybox
+
+pipeline:
+  - runs: |
+      cat > write-strict <<"EOF"
+      #!/bin/sh -e
+      input="$1"
+      outf="$2"
+      mkdir -p "${outf%/*}"
+      printf '#!/bin/sh\nexec "%s" "$@"\n' "$input" > "$outf"
+      chmod 755 "$outf"
+      EOF
+      chmod 755 write-strict
+
+      cat > wrapper-env.tmpl <<"EOF"
+      #!/bin/sh
+      fail() { echo "FATAL:" "$0" "$@"; exit 9; }
+      [ -n "${ENV_NAME}" ] || fail "invoked without ENV_NAME set"
+      [ "$ENV_NAME" -ef "$0" ] && fail "invoked with ENV_NAME = $0"
+      [ "${ENV_NAME}" != "${0##*/}" ] || fail "invoked with ENV_NAME = basename($0)"
+      command -v "$ENV_NAME" >/dev/null ||
+        fail "invoked with ENV_NAME=$ENV_NAME, but $ENV_NAME not found in PATH"
+      exec "${ENV_NAME}" "$@"
+      EOF
+
+      cat > write-env <<"EOF"
+      #!/bin/sh -e
+      input="$1"
+      outf="$2"
+      d=$(dirname "$0")
+      tmpl="$d/wrapper-env.tmpl"
+      [ -f "$tmpl" ] || { echo "no 'wrapper-env.tmpl' in dir '$d/'"; exit 1; }
+      mkdir -p "${outf%/*}"
+      sed "s,ENV_NAME,$input,g" "$tmpl" > "$outf"
+      chmod 755 "$outf"
+      EOF
+      chmod 755 write-env
+
+subpackages:
+  - range: py-versions
+    name: python3-as-${{range.key}}
+    description: provides /usr/bin/python3 that execs python${{range.key}}
+    dependencies:
+      runtime:
+        - python-${{range.key}}-base
+    pipeline:
+      - runs: |
+          ./write-strict "python${{range.key}}" ${{targets.contextdir}}/usr/bin/python3
+    test:
+      pipeline:
+        - name: validate wrapper 'python3' for ${{range.key}}
+          runs: |
+            set +x
+            tmpd=$(mktemp -d)
+            tmpf="$tmpd/test-wrapper.py"
+            trap "rm -r $tmpd" EXIT
+
+            cat >"$tmpf" <<"EOF"
+            #!/usr/bin/env python3
+            import os, sys
+            assert "/usr/bin/python${{range.key}}" == sys.executable
+            assert "${{range.key}}" == "%s.%s" % (sys.version_info.major, sys.version_info.minor)
+            assert os.path.basename(sys.argv[0]) == "test-wrapper.py"
+            assert len(sys.argv) == 3
+            print("PASS: %s wrapped %s successfully" % (sys.argv[1], sys.executable))
+            EOF
+            chmod 755 "$tmpf"
+            "$tmpf" python3 "argument 1"
+
+  - range: py-versions
+    name: python-as-${{range.key}}
+    description: provides /usr/bin/python that execs python${{range.key}}
+    dependencies:
+      runtime:
+        - python-${{range.key}}-base
+    pipeline:
+      - runs: |
+          ./write-strict "python${{range.key}}" ${{targets.contextdir}}/usr/bin/python
+    test:
+      pipeline:
+        - name: validate wrapper 'python' for ${{range.key}}
+          runs: |
+            set +x
+            tmpd=$(mktemp -d)
+            tmpf="$tmpd/test-wrapper.py"
+            trap "rm -r $tmpd" EXIT
+
+            cat >"$tmpf" <<"EOF"
+            #!/usr/bin/env python
+            import os, sys
+            assert "/usr/bin/python${{range.key}}" == sys.executable
+            assert "${{range.key}}" == "%s.%s" % (sys.version_info.major, sys.version_info.minor)
+            assert os.path.basename(sys.argv[0]) == "test-wrapper.py"
+            assert len(sys.argv) == 3
+            print("PASS: %s wrapped %s successfully" % (sys.argv[1], sys.executable))
+            EOF
+            chmod 755 "$tmpf"
+            "$tmpf" python "argument 1"
+
+  - range: python-as-names
+    name: ${{range.key}}-as-env
+    description: provides /usr/bin/${{range.key}} that execs ${{range.value}}
+    pipeline:
+      - runs: |
+          ./write-env "${{range.value}}" ${{targets.contextdir}}/usr/bin/${{range.key}}
+    test:
+      pipeline:
+        - name: validate wrapper '${{range.key}}'
+          runs: |
+            set +x
+            fail() { echo "FAIL:" "$@"; exit 1; }
+            p=/usr/bin/${{range.key}}
+            [ -x "$p" ] || fail "$p is not executable file"
+            echo "PASS: $p is executable"
+
+            env "${{range.value}}=true" "$p" &&
+              echo "PASS: ${{range.value}}=true exited 0" ||
+              fail "$p exited $? with ${{range.value}}=true"
+
+            env "${{range.value}}=false" "$p" &&
+              fail "$p exited 0 with ${{range.value}}=false" ||
+              echo "PASS: ${{range.value}}=false exited $?"
+
+            # test that bad values are caught by the wrapper
+            # range.value here is 'python' or 'python3' which might cause recursive
+            for val in bogus-prog-name ${{range.key}} /usr/bin/${{range.key}}; do
+              out=$(env "${{range.value}}=$val" "$p" 2>&1) && rc=0 || rc=$?
+              case "$rc" in
+                9) echo "PASS: $p exited $rc with ${{range.value}}=$val";;
+                *) echo "output: $out";
+                   fail "$p exited $rc with ${{range.value}}=$val";;
+              esac
+            done
+
+update:
+  enabled: false
+  exclude-reason: No source to watch for the new versions - this is the source.

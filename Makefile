@@ -25,6 +25,7 @@ MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 # Enter interactive mode on failure for debug
 MELANGE_DEBUG_OPTS += --interactive
+MELANGE_DEBUG_OPTS += --debug
 MELANGE_DEBUG_OPTS += --package-append apk-tools
 MELANGE_DEBUG_OPTS += ${MELANGE_OPTS}
 
@@ -140,7 +141,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:2e3b5215dc97a856e7d097bc9526980e67c954fad99f718bc506f75374396425
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:ff191d976f24586394d0a03df7900a8f6f76fe1adbbe209e9f92e960bd7e8120
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -208,7 +209,7 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:2e3b5215dc97a856e7d097bc9526980e67c954fad99f718bc506f75374396425
+		ghcr.io/wolfi-dev/sdk:latest@sha256:ff191d976f24586394d0a03df7900a8f6f76fe1adbbe209e9f92e960bd7e8120
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"
 

@@ -25,6 +25,7 @@ MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 # Enter interactive mode on failure for debug
 MELANGE_DEBUG_OPTS += --interactive
+MELANGE_DEBUG_OPTS += --debug
 MELANGE_DEBUG_OPTS += --package-append apk-tools
 MELANGE_DEBUG_OPTS += ${MELANGE_OPTS}
 

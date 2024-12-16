@@ -13,9 +13,6 @@
 
 set -e
 
-# TODO: remove
-set -x
-
 # first arg is `-something` or `+something`
 if [ "${1#-}" != "$1" ] || [ "${1#+}" != "$1" ]; then
 	set -- /opt/couchdb/bin/couchdb "$@"

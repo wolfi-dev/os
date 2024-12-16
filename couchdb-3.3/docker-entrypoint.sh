@@ -86,23 +86,22 @@ if [ "$1" = '/opt/couchdb/bin/couchdb' ]; then
 
 	chown -f couchdb:couchdb /opt/couchdb/etc/local.d/docker.ini || true
 
-	# TODO: enable check
 	# if we don't find an [admins] section followed by a non-comment, display a warning
-#         if ! grep -Pzoqr '\[admins\]\n[^;]\w+' /opt/couchdb/etc/default.d/*.ini /opt/couchdb/etc/local.d/*.ini /opt/couchdb/etc/local.ini; then
-# 		# The - option suppresses leading tabs but *not* spaces. :)
-# 		cat >&2 <<-'EOWARN'
-# *************************************************************
-# ERROR: CouchDB 3.0+ will no longer run in "Admin Party"
-#        mode. You *MUST* specify an admin user and
-#        password, either via your own .ini file mapped
-#        into the container at /opt/couchdb/etc/local.ini
-#        or inside /opt/couchdb/etc/local.d, or with
-#        "-e COUCHDB_USER=admin -e COUCHDB_PASSWORD=password"
-#        to set it via "docker run".
-# *************************************************************
-# EOWARN
-# 		exit 1
-# 	fi
+    if ! (grep -B0 -A1 -h -E '^\[admins\]' /opt/couchdb/etc/default.d/*.ini /opt/couchdb/etc/local.d/*.ini /opt/couchdb/etc/local.ini | grep -v -E '^(\[admins\]|[[:space:]]*(;|#))' | grep '=' >/dev/null); then
+		# The - option suppresses leading tabs but *not* spaces. :)
+		cat >&2 <<-'EOWARN'
+*************************************************************
+ERROR: CouchDB 3.0+ will no longer run in "Admin Party"
+       mode. You *MUST* specify an admin user and
+       password, either via your own .ini file mapped
+       into the container at /opt/couchdb/etc/local.ini
+       or inside /opt/couchdb/etc/local.d, or with
+       "-e COUCHDB_USER=admin -e COUCHDB_PASSWORD=password"
+       to set it via "docker run".
+*************************************************************
+EOWARN
+		exit 1
+	fi
 
 	export HOME=$(echo ~couchdb)
 	set -- su-exec couchdb "$@"

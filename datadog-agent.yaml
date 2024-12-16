@@ -2,7 +2,7 @@ package:
   name: datadog-agent
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: 7.58.0
+  version: 7.59.1
   epoch: 1
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
@@ -15,6 +15,23 @@ package:
       - grep
       - libseccomp
       - shadow
+
+vars:
+  py-version: "3.11"
+  destd: /opt/datadog-agent
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    # this is used in the datadog-agent-core-integrations sub package git checkout as there will not always be a
+    # corresponding tag of the same name as the origin package version. There does however appear to be a pattern of
+    # maintaining the same major.minor.x branch for the integrations-core repo. This was first observed with the
+    # 7.58.1 tag/release of the datadog-agent package.
+    # Upstream bug https://github.com/DataDog/integrations-core/issues/18955 created seeking clarification on why there
+    # appears to be a missing tag in DataDog/integrations-core. Until that is resolved
+    # or until the next release we can use the 7.58.x branch of the DataDog/integrations-core repo
+    replace: "$1.x"
+    to: datadog-major-minor-x
 
 environment:
   contents:
@@ -47,11 +64,13 @@ environment:
       - libzip
       - linux-headers
       - ninja
+      - openssf-compiler-options
       - procps-dev
-      - py3.11-pip
-      - py3.11-semver
-      - python3-dev~3.11 # strictly requires python3.11
+      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-semver
+      - python-${{vars.py-version}}-dev # strictly requires python3.11
       - systemd-dev
+      - util-linux-misc # unshare
       - wget # Required for downloading clang-12 and kernel headers from debian
   environment:
     # CGo allows Go programs to call C code
@@ -73,20 +92,20 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: cf3983981cf2ac2fdc6b907aa70d86c1d9736b66
+      expected-commit: 3638fcd32dcce71adaebe6eb4be4283ab139f6a3
 
   # Install `invoke` (build) dependencies. We ultimately package with venv so
   # these won't leak into the package.
   - runs: |
       # install `invoke` and its dependencies
-      python3.11 -m pip install invoke requests toml pyyaml packaging
+      python${{vars.py-version}} -m pip install invoke requests toml pyyaml packaging
 
       # install `gitlab`
-      python3.11 -m pip install python-gitlab
+      python${{vars.py-version}} -m pip install python-gitlab
 
   - uses: go/bump
     with:
-      deps: github.com/moby/buildkit@v0.13.1 github.com/docker/docker@v26.1.5
+      deps: github.com/moby/buildkit@v0.13.1 golang.org/x/crypto@v0.31.0
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
 
@@ -129,7 +148,8 @@ pipeline:
 
       # Build once to correctly setup links/generates. The system-probe we end
       # up using will be part of the multicall below.
-      invoke -e system-probe.build \
+      unshare --user --map-root-user \
+        invoke -e system-probe.build \
         --strip-object-files \
         --no-bundle \
         --bundle-ebpf
@@ -166,37 +186,53 @@ pipeline:
         --embedded-path /usr/lib
 
   - runs: |
-      install -Dm755 bin/agent/agent ${{targets.destdir}}/usr/bin/agent
+      mkdir -p \
+        ${{targets.contextdir}}${{vars.destd}}/bin/agent \
+        ${{targets.contextdir}}${{vars.destd}}/embedded/bin
+
+      install -Dm755 bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent
       # *-agent is just a symlink to the "agent" multicall
-      ln -s agent ${{targets.destdir}}/usr/bin/process-agent
-      ln -s agent ${{targets.destdir}}/usr/bin/security-agent
-      ln -s agent ${{targets.destdir}}/usr/bin/trace-agent
-      ln -s agent ${{targets.destdir}}/usr/bin/system-probe
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/process-agent
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/security-agent
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-agent
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/system-probe
 
-      mkdir -p ${{targets.destdir}}/etc/datadog-agent/
+      mkdir -p ${{targets.contextdir}}/etc/datadog-agent/
 
-      cp -r Dockerfiles/agent/s6-services ${{targets.destdir}}/etc/services.d
-      cp -r Dockerfiles/agent/cont-init.d ${{targets.destdir}}/etc/cont-init.d
+      cp -r Dockerfiles/agent/s6-services ${{targets.contextdir}}/etc/services.d
+      cp -r Dockerfiles/agent/cont-init.d ${{targets.contextdir}}/etc/cont-init.d
 
-      install -Dm644 Dockerfiles/agent/datadog-docker.yaml ${{targets.destdir}}/etc/datadog-agent/datadog-docker.yaml
-      install -Dm644 Dockerfiles/agent/datadog-ecs.yaml ${{targets.destdir}}/etc/datadog-agent/datadog-ecs.yaml
-      install -Dm644 bin/agent/dist/datadog.yaml ${{targets.destdir}}/etc/datadog-agent/datadog.yaml.example
-      install -Dm644 bin/agent/dist/system-probe.yaml ${{targets.destdir}}/etc/datadog-agent/system-probe.yaml.example
-      install -Dm644 bin/agent/dist/security-agent.yaml ${{targets.destdir}}/etc/datadog-agent/security-agent.yaml.example
+      install -Dm644 Dockerfiles/agent/datadog-docker.yaml ${{targets.contextdir}}/etc/datadog-agent/datadog-docker.yaml
+      install -Dm644 Dockerfiles/agent/datadog-ecs.yaml ${{targets.contextdir}}/etc/datadog-agent/datadog-ecs.yaml
+      install -Dm644 bin/agent/dist/datadog.yaml ${{targets.contextdir}}/etc/datadog-agent/datadog.yaml.example
+      install -Dm644 bin/agent/dist/system-probe.yaml ${{targets.contextdir}}/etc/datadog-agent/system-probe.yaml.example
+      install -Dm644 bin/agent/dist/security-agent.yaml ${{targets.contextdir}}/etc/datadog-agent/security-agent.yaml.example
 
-      install -Dm755 Dockerfiles/agent/entrypoint.sh ${{targets.destdir}}/bin/entrypoint.sh
-      install -Dm755 Dockerfiles/agent/probe.sh ${{targets.destdir}}/probe.sh
-      install -Dm755 Dockerfiles/agent/initlog.sh ${{targets.destdir}}/initlog.sh
-      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.py ${{targets.destdir}}/readsecret.py
-      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.sh ${{targets.destdir}}/readsecret.sh
-      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret_multiple_providers.sh ${{targets.destdir}}/readsecret_multiple_providers.sh
+      install -Dm755 Dockerfiles/agent/entrypoint.sh ${{targets.contextdir}}/bin/entrypoint.sh
+      install -Dm755 Dockerfiles/agent/probe.sh ${{targets.contextdir}}/probe.sh
+      install -Dm755 Dockerfiles/agent/initlog.sh ${{targets.contextdir}}/initlog.sh
+      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.py ${{targets.contextdir}}/readsecret.py
+      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.sh ${{targets.contextdir}}/readsecret.sh
+      install -Dm755 Dockerfiles/agent/secrets-helper/readsecret_multiple_providers.sh ${{targets.contextdir}}/readsecret_multiple_providers.sh
 
-      cp -r bin/agent/dist/conf.d ${{targets.destdir}}/etc/datadog-agent/conf.d
+      confd=${{targets.contextdir}}/etc/datadog-agent/conf.d
+      cp -r bin/agent/dist/conf.d "$confd"
+      # https://github.com/NixOS/nixpkgs/pull/189795
+      # the agent apparently loads .yaml.default files, which then cause noise in logs.
+      rm -rf \
+          "$confd/apm.yaml.default" \
+          "$confd/process_agent.yaml.default" \
+          "$confd/winproc.d"
 
       # Setup s3-overlay overrides
-      mkdir -p ${{targets.destdir}}/etc/s6/init
-      cp -r Dockerfiles/agent/init-stage3 ${{targets.destdir}}/etc/s6/init/init-stage3
-      cp Dockerfiles/agent/init-stage3-host-pid ${{targets.destdir}}/etc/s6/init/init-stage3-host-pid
+      mkdir -p ${{targets.contextdir}}/etc/s6/init
+      cp -r Dockerfiles/agent/init-stage3 ${{targets.contextdir}}/etc/s6/init/init-stage3
+      cp Dockerfiles/agent/init-stage3-host-pid ${{targets.contextdir}}/etc/s6/init/init-stage3-host-pid
+
+      # Needed by the system-probe and runtime security agent sockets.
+      # The default system-probe socket path is /opt/datadog-agent/run/sysprobe.sock
+      # The default runtime security agent socket path is /opt/datadog-agent/run/runtime-security.sock
+      mkdir ${{targets.contextdir}}${{vars.destd}}/run
 
   - uses: strip
 
@@ -211,7 +247,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/bin/dist/jmx
-          ln -sf /opt/datadog-agent/bin/agent/dist/jmx/jmxfetch.jar ${{targets.contextdir}}/usr/bin/dist/jmx/jmxfetch.jar
+          ln -sf ${{vars.destd}}/bin/agent/dist/jmx/jmxfetch.jar ${{targets.contextdir}}/usr/bin/dist/jmx/jmxfetch.jar
 
   - name: datadog-agent-oci-compat
     dependencies:
@@ -223,50 +259,43 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p \
-            ${{targets.subpkgdir}}/conf.d \
-            ${{targets.subpkgdir}}/checks.d \
-            ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist \
-            ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin
+            ${{targets.contextdir}}/conf.d \
+            ${{targets.contextdir}}/checks.d \
+            ${{targets.contextdir}}${{vars.destd}}/embedded \
+            ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist
 
-          # several startup scripts assume binaries are located in /opt/datadog-agent/...
-          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/agent
-          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/system-probe
-          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/security-agent
-          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/process-agent
-          ln -s /usr/bin/agent ${{targets.subpkgdir}}/opt/datadog-agent/embedded/bin/trace-agent
+          cp -r ${{vars.destd}}/embedded/share ${{targets.contextdir}}${{vars.destd}}/embedded/share
 
-          cp -r /opt/datadog-agent/embedded/share ${{targets.subpkgdir}}/opt/datadog-agent/embedded/share
+          cp -r bin/agent/dist/checks ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist/
+          install -Dm644 bin/agent/dist/config.py ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist/config.py
+          cp -r bin/agent/dist/utils ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist/
+          cp -r bin/agent/dist/views ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist/
 
-          cp -r bin/agent/dist/checks ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/
-          install -Dm644 bin/agent/dist/config.py ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/config.py
-          cp -r bin/agent/dist/utils ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/
-          cp -r bin/agent/dist/views ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent/dist/
-
-          cp -r Dockerfiles/agent/entrypoint.d ${{targets.subpkgdir}}/opt/entrypoints
+          cp -r Dockerfiles/agent/entrypoint.d ${{targets.contextdir}}/opt/entrypoints
 
   - name: datadog-agent-core-integrations
     dependencies:
       runtime:
         - bash
         - coreutils
-        - python-3.11
+        - python-${{vars.py-version}}-base
     pipeline:
       - working-directory: /home/integrations
         pipeline:
           - uses: git-checkout
             with:
               repository: https://github.com/DataDog/integrations-core
-              tag: ${{package.version}}
-              expected-commit: 32f78c0c8aae400ecc1c14a5369e7f702be7b572 # needs to be updated with each new release
+              branch: ${{vars.datadog-major-minor-x}} # 7.59.x
+              expected-commit: cff91adb18fe879fd875d62d285a67deb69040fe # needs to be updated with each new release
           - uses: patch
             with:
-              patches: /home/build/cve-fixes.patch
+              patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch /home/build/int-core-snowflake-pyproject-toml.patch
           - runs: |
               # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
               SOURCE_DATE_EPOCH=315532800
 
               # Create virtual environment
-              python3.11 -m venv .venv
+              python${{vars.py-version}} -m venv .venv
 
               # Install locked dependencies
               .venv/bin/pip install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_py3.txt
@@ -274,27 +303,28 @@ subpackages:
               excludes="datadog_checks_base datadog_checks_dev datadog_checks_tests_helper docker_daemon esxi teleport"
               checks=$(invoke -r /home/build agent.collect-integrations /home/integrations/ 3 linux --excluded "$excludes")
 
-              # Install core and dependencies
+              # Install core, downloader, and dependencies
               .venv/bin/pip install \
                 "./datadog_checks_base[deps, http]" \
+                "./datadog_checks_downloader" \
                 $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
 
               find .venv -name "*.pyc" -delete
               find .venv -name "__pycache__" -exec rm -rf {} +
 
-              mkdir -p ${{targets.contextdir}}/opt/datadog-agent
-              .venv/bin/pip freeze > ${{targets.contextdir}}/opt/datadog-agent/final_constraints-py3.txt
+              mkdir -p ${{targets.contextdir}}${{vars.destd}}
+              .venv/bin/pip freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
 
               # Include the agent's requirements for the core integrations.
-              cp requirements-agent-release.txt ${{targets.contextdir}}/opt/datadog-agent/
+              cp requirements-agent-release.txt ${{targets.contextdir}}${{vars.destd}}/
 
               # Use Python in virtual environment
-              sed -i "s|$(pwd)/.venv|/usr/share/datadog-agent|g" .venv/pyvenv.cfg
-              sed -i "s|$(pwd)/.venv|/usr/share/datadog-agent|g" .venv/bin/*
+              sed -i "s|$(pwd)/.venv|${{vars.destd}}/embedded|g" .venv/pyvenv.cfg
+              sed -i "s|$(pwd)/.venv|${{vars.destd}}/embedded|g" .venv/bin/*
 
               # Install virtual environment
-              mkdir -p ${{targets.contextdir}}/usr/share/datadog-agent
-              cp -r .venv/* ${{targets.contextdir}}/usr/share/datadog-agent/
+              mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded
+              cp -r .venv/* ${{targets.contextdir}}${{vars.destd}}/embedded/
 
               # this is intentionally referencing the main package, since we only "install" if a config doesn't already exist
               conf_dir="${{targets.destdir}}/etc/datadog-agent/conf.d"
@@ -355,9 +385,9 @@ subpackages:
         - coreutils
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/opt/datadog-agent/bin/
-          ln -s /usr/bin/datadog-cluster-agent ${{targets.subpkgdir}}/opt/datadog-agent/bin/datadog-cluster-agent
-          ln -s /usr/bin/datadog-cluster-agent ${{targets.subpkgdir}}/opt/datadog-agent/bin/agent
+          mkdir -p ${{targets.subpkgdir}}${{vars.destd}}/bin/
+          ln -s /usr/bin/datadog-cluster-agent ${{targets.subpkgdir}}${{vars.destd}}/bin/datadog-cluster-agent
+          ln -s /usr/bin/datadog-cluster-agent ${{targets.subpkgdir}}${{vars.destd}}/bin/agent
       - working-directory: Dockerfiles/cluster-agent
         runs: |
           install -Dm755 entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
@@ -524,24 +554,39 @@ test:
         - datadog-agent-fakeintake=${{package.full-version}}
         - datadog-agent-core-integrations=${{package.full-version}}
     environment:
-      PYTHONPATH: "/usr/share/datadog-agent/lib/python3.11/site-packages"
+      # cannot use vars.destd here. https://github.com/chainguard-dev/melange/issues/1402
+      # setting PATH here has no effect.
+      mypath: /opt/datadog-agent/bin/agent:/opt/datadog-agent/embedded/bin
   pipeline:
     - name: Ensure the agent's requirements.txt for integrations is included
       runs: |
-        ls /opt/datadog-agent/requirements-agent-release.txt
+        PATH=$mypath:$PATH
+        ls ${{vars.destd}}/requirements-agent-release.txt
+    - name: Ensure the agent integration subcommand works
+      runs: |
+        PATH=$mypath:$PATH
+        agent integration freeze >/dev/null
     - name: Ensure checks can be loaded
       runs: |
-        python -c "import datadog_checks.base"
-        agent version
-        agent --help
+        PATH=$mypath:$PATH
+        # this is left without path to be explicit which python is used.
+        ${{vars.destd}}/embedded/bin/python3 -c "import datadog_checks.base"
+        ${{vars.destd}}/embedded/bin/python3 -c "import datadog_checks.downloader"
+    - name: Execute bins
+      runs: |
+        PATH=$mypath:$PATH
         process-agent --version
         process-agent --help
         security-agent --help
         system-probe --help
         trace-agent --version
         trace-agent --help
+
+        agent version
+        agent --help
     - name: Ensure agent can be started
       runs: |
+        PATH=$mypath:$PATH
         cat > /etc/datadog-agent/datadog.yaml <<EOF
         api_key: "test"
         dd_url: "http://localhost:80"
@@ -554,6 +599,7 @@ test:
         agent check disk
     - name: Validate multicall components are correctly linked
       runs: |
+        PATH=$mypath:$PATH
         trace-agent version | grep trace-agent
         security-agent version | grep "Security agent"
         process-agent version | grep Agent

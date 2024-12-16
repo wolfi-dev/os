@@ -1,0 +1,169 @@
+package:
+  name: tileserver-gl
+  version: 5.0.0
+  epoch: 4
+  description: Vector and raster maps with GL styles. Server side rendering by MapLibre GL Native. Map tile server for MapLibre GL JS, Android, iOS, Leaflet, OpenLayers, GIS via WMTS, etc.
+  copyright:
+    - license: BSD-2-Clause
+  dependencies:
+    runtime:
+      - Xvfb
+      - busybox
+      - mesa
+      - mesa-glx
+      - nodejs-20
+      - npm
+      - xkbcomp
+      - xkeyboard-config
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - cairo-dev
+      - cmake
+      - curl-dev
+      - fribidi-dev
+      - harfbuzz-dev
+      - icu-dev
+      - jq
+      - libglfw-dev
+      - libglvnd-dev
+      - libjpeg-turbo-dev
+      - libpng-dev
+      - libuv-dev
+      - libwebp
+      - libwebp-dev
+      - libxft-dev
+      - mesa
+      - mesa-glx
+      - nodejs-20
+      - npm
+      - openssf-compiler-options
+      - pango-dev
+      - pixman-dev
+      - py3.11-pip
+      - python-3.11
+      - xorg-server-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/maptiler/tileserver-gl
+      tag: v${{package.version}}
+      expected-commit: 6cda7a0b384940b781838be7415b2ae448edcd29
+      destination: app
+      cherry-picks: |
+        master/93f72c1fe7671429f234c853e81f202e635522e9: GHSA-3xgq-45jj-v275 fix. Bumps cross-spawn to fix version.
+
+  # patch and install npm dependencies
+  - uses: patch
+    with:
+      patches: package-json.patch
+
+  # install packages
+  - working-directory: app
+    runs: |
+      npm install --omit=dev
+
+  # remove test code for resolve module that is triggering a false positive CVE scan
+  # see https://github.com/browserify/resolve/issues/319 for more details
+  - working-directory: app
+    runs: |
+      rm -fR node_modules/resolve/test
+
+  # build canvas from source code to use system libraries
+  - working-directory: app/node_modules/canvas
+    runs: |
+      ../.bin/node-pre-gyp install --build-from-source
+      # Clean up intermediate build files
+      find . -name "*.o" -type f -delete
+      find . -path "*/obj.target/*" -type f -delete
+
+  # reinstall sharp and remove any musl packages
+  - working-directory: app
+    runs: |
+      rm -fR node_modules/@img/*musl* node_modules/sharp
+      sharp_version="$(jq <package-lock.json -r ".packages[\"node_modules/sharp\"].version")"
+      npm install --install-from-source "sharp@${sharp_version}"
+      rm -fR node_modules/@img/*musl*
+
+  # check maplibre-gl-native package matches expected version
+  - working-directory: app
+    runs: |
+      version="$(jq <package-lock.json ".packages[\"node_modules/@maplibre/maplibre-gl-native\"].version" -r)"
+      if [ "$version" != "6.0.0" ] ; then
+        echo "Application version of maplibre-gl-native incorrect: $version"
+        exit 1
+      fi
+
+  # build maplibre-native node 20.x module
+  - uses: git-checkout
+    with:
+      repository: https://github.com/maplibre/maplibre-native.git
+      tag: node-v6.0.0
+      expected-commit: 9dbc0ae91c2e1b4e5deacb0cae6390e8e49d2edf
+      destination: maplibre-native
+      recurse-submodules: true
+
+  # compile and replace mbgl.node binary as node-gyp can't be used for compilation
+  - working-directory: maplibre-native
+    runs: |
+      cmake . -DMLN_WITH_NODE=ON && make -C platform/node -j$(nproc) mbgl-node.abi-115
+      cp platform/node/lib/node-v115/mbgl.node ../app/node_modules/@maplibre/maplibre-gl-native/lib/node-v115/mbgl.node
+
+  # move required components of app to /usr/src/app
+  - working-directory: app
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/src/app
+      mv node_modules package.json package-lock.json public src ${{targets.destdir}}/usr/src/app/
+
+subpackages:
+  - name: tileserver-gl-compat
+    description: "Compatibility package to allow replacing upstream image"
+    dependencies:
+      provides:
+        - ${{package.name}}-entrypoint=${{package.full-version}}
+      runtime:
+        - Xvfb
+        - busybox
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/bin"
+          install -m755 ./docker-entrypoint.sh "${{targets.subpkgdir}}/usr/bin/docker-entrypoint.sh"
+          mkdir -p "${{targets.subpkgdir}}/usr/src/app"
+          ln -s "/usr/bin/docker-entrypoint.sh" "${{targets.subpkgdir}}/usr/src/app/docker-entrypoint.sh"
+
+update:
+  enabled: true
+  github:
+    identifier: maptiler/tileserver-gl
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - binutils
+        - curl
+        - file
+        - nodejs-20
+        - npm
+        - tileserver-gl-compat
+  pipeline:
+    - runs: |
+        /usr/src/app/docker-entrypoint.sh &
+        for attempt in 1 2 3 4 5 ; do
+          if curl -v --fail http://localhost:8080/styles/basic-preview/512/10/537/358.png >/tmp/test.png ; then
+            if file /tmp/test.png | grep PNG >/dev/null ; then
+              echo "PNG file downloaded successfully"
+              exit 0
+            fi
+          fi
+          sleep $attempt
+        done
+
+        echo "Unable to retrieve map PNG file - type is $(file /tmp/test.png)"
+        ls -la /tmp/test.png
+        exit 1

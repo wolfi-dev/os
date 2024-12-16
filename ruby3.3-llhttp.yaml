@@ -1,0 +1,164 @@
+package:
+  name: ruby3.3-llhttp
+  version: 2023.03.29
+  # NOTE: There are also environment variables in this melange which may have to be bumped between upgrades.
+  epoch: 0
+  description: Ruby bindings for llhttp.
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - ruby${{vars.rubyMM}}-llhttp-ffi
+      - ruby${{vars.rubyMM}}-llhttp-mri
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl # required for tests
+      - grep
+      - ruby${{vars.rubyMM}}-bundler
+      - ruby-${{vars.rubyMM}}
+      - ruby-${{vars.rubyMM}}-dev
+  environment:
+    # TODO: Melange pipeline does not support evaluating expressions in the `uses/with`.
+    # We also cannot pass environment variables between steps. So, until we
+    # figure out a better way, set a hardcoded version here.
+    LLHTTP_FFI_VERSION: 0.5.0
+    LLHTTP_MRI_VERSION: 0.6.0
+
+# The original release tag is in the format: 2023-03-29. We need to convert
+# back into that format before performing a git clone.
+var-transforms:
+  - from: ${{package.version}}
+    match: \.
+    replace: '-'
+    to: mangled-package-version
+  - from: ${{package.name}}
+    match: ^ruby(\d\.\d+)-.*
+    replace: $1
+    to: rubyMM
+
+vars:
+  gem-ffi: llhttp-ffi
+  gem-mri: llhttp
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: eb61456a325d87fcbc9e4c5a7512d9589737abae
+      repository: https://github.com/bryanp/llhttp.git
+      tag: ${{vars.mangled-package-version}}
+
+  - runs: |
+      bundle install && bundle update
+      gem pristine debug
+      gem pristine rbs
+
+subpackages:
+  - name: ${{package.name}}-mri
+    description: Ruby bindings for llhttp.
+    pipeline:
+      - working-directory: mri
+        pipeline:
+          - runs: |
+              bundle install && bundle update
+              rake compile
+              rake test
+          - uses: ruby/build
+            with:
+              gem: ${{vars.gem-mri}}
+          - name: Sanity check, compare ACTUAL_LLHTTP_VERSION with LLHTTP_VERSION
+            runs: |
+              export ACTUAL_LLHTTP_VERSION=$(grep -oP 'VERSION = "\K[0-9]+\.[0-9]+\.[0-9]+' lib/llhttp/version.rb)
+              if [ "${ACTUAL_LLHTTP_VERSION}" != "${LLHTTP_MRI_VERSION}" ]; then
+                echo "Expected version: ${LLHTTP_MRI_VERSION}, but got: ${ACTUAL_LLHTTP_VERSION}. Please update the version in the environment section."
+                exit 1
+              fi
+              mv ${{vars.gem-mri}}-*.gem ${{vars.gem-mri}}.gem
+          - uses: ruby/install
+            with:
+              gem-file: ${{vars.gem-mri}}.gem
+              version: ${LLHTTP_MRI_VERSION}
+          - uses: ruby/clean
+
+  - name: ${{package.name}}-ffi
+    description: Ruby FFI bindings for llhttp.
+    dependencies:
+      runtime:
+        - ruby${{vars.rubyMM}}-ffi
+        - ruby${{vars.rubyMM}}-ffi-compiler
+    pipeline:
+      - working-directory: ffi
+        pipeline:
+          - runs: |
+              bundle install && bundle update
+              rake compile
+              rake test
+          - uses: ruby/build
+            with:
+              gem: ${{vars.gem-ffi}}
+          - name: Sanity check, compare ACTUAL_LLHTTP_VERSION with LLHTTP_VERSION
+            runs: |
+              export ACTUAL_LLHTTP_VERSION=$(grep -oP 'VERSION = "\K[0-9]+\.[0-9]+\.[0-9]+' lib/llhttp/version.rb)
+              if [ "${ACTUAL_LLHTTP_VERSION}" != "${LLHTTP_FFI_VERSION}" ]; then
+                echo "Expected version: ${LLHTTP_FFI_VERSION}, but got: ${ACTUAL_LLHTTP_VERSION}. Please update the version in the environment section."
+                exit 1
+              fi
+              mv ${{vars.gem-ffi}}-*.gem ${{vars.gem-ffi}}.gem
+          - uses: ruby/install
+            with:
+              gem-file: ${{vars.gem-ffi}}.gem
+              version: ${LLHTTP_FFI_VERSION}
+          - uses: ruby/clean
+
+update:
+  enabled: true
+  manual: true
+  # The original release tag is in the format: 2023-03-29, but that is not a
+  # valid apk package version, so we need to convert it to 2023.03.29.
+  version-transform:
+    - match: \-
+      replace: .
+  github:
+    identifier: bryanp/llhttp
+
+test:
+  environment:
+    contents:
+      packages:
+        - ruby-${{vars.rubyMM}}
+  pipeline:
+    - name: Import dependencies
+      runs: |
+        ruby -e "require 'ffi'"
+        ruby -e "require 'llhttp'"
+    - name: Basic HTTP request parsing
+      runs: |
+        cat <<EOF > /tmp/test.rb
+        require "llhttp"
+        # Define a delegate class for handling callbacks:
+        #
+        class Delegate < LLHttp::Delegate
+          def on_message_begin
+            puts 'Request Parsed'
+          end
+        end
+
+        delegate = Delegate.new
+
+        # Create a parser:
+        #
+        parser = LLHttp::Parser.new(delegate)
+
+        # Parse a request:
+        #
+        parser << "GET / HTTP/1.1\r\n\r\n"
+
+        # Reset the parser for the next request:
+        #
+        parser.finish
+        EOF
+        ruby /tmp/test.rb | grep -qi 'Request Parsed'

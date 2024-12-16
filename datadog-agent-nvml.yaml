@@ -1,0 +1,121 @@
+package:
+  name: datadog-agent-nvml
+  version: 1.0.9
+  epoch: 3
+  description: "Checks NVIDIA Management Library (NVML) exposed metrics through the Datadog Agent and can correlate them with the exposed Kubernetes devices"
+  copyright:
+    - license: Apache-2.0
+  options:
+    # We're creating a virtual environment.
+    # Don't pull in other packages if dependencies are already vendored.
+    no-depends: true
+    # Don't install if something is vendored that another package depends on.
+    no-provides: true
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - datadog-agent
+      - datadog-agent-core-integrations
+      - python-${{vars.python_version}}-dev # strictly requires python3.11
+      - rsync
+
+vars:
+  dd_conf: /etc/datadog-agent/conf.d
+  dd_home: / # agent being run by root expects /.
+  dd_shared: /opt/datadog-agent/embedded
+  python_version: "3.11"
+
+pipeline:
+  # This integration wheel comes from the integrations-extras repository
+  - uses: git-checkout
+    with:
+      repository: https://github.com/DataDog/integrations-extras
+      tag: nvml-${{package.version}}
+      expected-commit: d38c5cdb4ab4d07f4432afb25e0ccd70341efb51
+
+  - runs: |
+      # Create and activate a virtual environment.
+      python -m venv .venv
+      . .venv/bin/activate
+
+      # Use embedded Python in virtual environment.
+      sed -i "s|$(pwd)/.venv|${{vars.dd_shared}}|g" .venv/pyvenv.cfg
+      sed -i "s|$(pwd)/.venv|${{vars.dd_shared}}|g" .venv/bin/*
+
+      # Dump the packages.
+      mkdir site-packages
+      rsync -az ${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages/ ./site-packages/
+
+      # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
+      SOURCE_DATE_EPOCH=315532800
+
+      # Validate the minimum version allowed by the agent release.
+      # See: https://github.com/DataDog/datadog-agent/blob/6f52a65f70bd94220d49e8b7434c2b162dab30be/cmd/agent/subcommands/integrations/command.go#L458
+      # This integration isn't listed in the agent release requirements (requirements-agent-release.txt).
+
+      # Install integration.
+      # Replicating: https://github.com/DataDog/datadog-agent/blob/6f52a65f70bd94220d49e8b7434c2b162dab30be/cmd/agent/subcommands/integrations/command.go#L385
+      # --no-deps: This is partially to prevent accidental installation / updates of third-party dependencies from PyPI.
+      # --no-cache-dir: We don't use pip to download wheels, so we don't need a cache.
+      # --constraint: Match the core integrations constraint.
+      #
+      # This has been omitted intentionally.
+      # The project is managed with Hatch and it needs hatchling build backend as a build time dependency to create the wheel.
+      # --no-index: Specify to not use any index since we won't/shouldn't download anything with pip anyway.
+      #
+      # This project uses hatchling as build backend, instead of setuptools, as defaulted in pip.
+      pip install --no-deps --no-cache-dir --constraint /opt/datadog-agent/final_constraints-py3.txt ./nvml
+      pip install -r ./nvml/requirements.in
+
+      # Cleanup before preparing the package content.
+      find ${{vars.dd_shared}} -name "*.pyc" -delete
+      find ${{vars.dd_shared}} -name "__pycache__" -exec rm -rf {} +
+
+      # Prepare the package content.
+      diff_packages=$(rsync --include='*/' --exclude='*' --ignore-existing -rv --dry-run ${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages/ ./site-packages/ | grep -v "sending incremental file list" | grep -v -E "^\./$|^sent .+ bytes|total size|^$")
+
+      # Include the new packages.
+      packages_dir="${{targets.contextdir}}${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages/"
+      mkdir -p "${packages_dir}/datadog_checks"
+      for package in $diff_packages; do
+        rsync -avz "${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages/${package}" "${packages_dir}/${package}";
+      done
+
+      # Include the new configurations.
+      conf_dir="${{targets.destdir}}${{vars.dd_conf}}/nvml.d"
+      mkdir -p $conf_dir
+      rsync -avz ${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages/datadog_checks/nvml/data/ $conf_dir/
+
+      deactivate
+
+test:
+  environment:
+    contents:
+      packages:
+        - datadog-agent
+        - datadog-agent-core-integrations
+        - datadog-agent-nvml=${{package.full-version}}
+    environment:
+      PYTHONPATH: ${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages
+  pipeline:
+    - runs: |
+        stat /etc/datadog-agent/conf.d/nvml.d/conf.yaml.example
+        stat ${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages/datadog_checks/nvml/__init__.py
+        stat ${{vars.dd_shared}}/lib/python${{vars.python_version}}/site-packages/datadog_nvml-${{package.version}}.dist-info/WHEEL
+    - name: Verify the integration is installed # https://docs.datadoghq.com/agent/guide/integration-management/?tab=linux#install
+      runs: |
+        /opt/datadog-agent/bin/agent/agent integration show datadog-nvml
+    - name: Verify the integration version
+      runs: |
+        VERSION="$(/opt/datadog-agent/bin/agent/agent integration show datadog-nvml | cut -d ':' -f2 | tr -d ' ')"
+        test $VERSION = ${{package.version}}
+
+update:
+  enabled: true
+  github:
+    identifier: DataDog/integrations-extras
+    strip-prefix: nvml-
+    tag-filter: nvml-
+    use-tag: true

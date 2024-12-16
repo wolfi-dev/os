@@ -1,43 +1,49 @@
+#nolint:forbidden-repository-used,forbidden-keyring-used
 package:
   name: openssl
-  version: 3.3.2
-  epoch: 2
+  version: 3.4.0
+  epoch: 4
   description: "the OpenSSL cryptography suite"
   copyright:
     - license: Apache-2.0
   resources:
     cpu: 16
     memory: 16Gi
-  # For now, continue to install the legacy openssl provider if the parent openssl
-  # package is installed.  This is done because users may be installing the openssl
-  # package to gain that provider.
-  dependencies:
-    runtime:
-      - openssl-provider-legacy
 
 environment:
   contents:
+    # NB! accessing historic, but certified build of
+    # jitterentropy-library-dev=3.5.0-r0. In a fresh bootstrap build
+    # any version of jitternetropy-library and get an ESV certificate
+    # for it.
+    build_repositories:
+      - https://packages.wolfi.dev/os
     packages:
       - build-base
       - busybox
       - ca-certificates-bundle
+      # NB! pinned to version https://csrc.nist.gov/projects/cryptographic-module-validation-program/entropy-validations/certificate/191
+      - jitterentropy-library-dev=3.5.0-r0
+      - jitterentropy-library=3.5.0-r0
       - openssf-compiler-options
       - perl
   environment:
-    # Using openssf-compiler-options instead
+    # To support automatic discovery of source code in debug symbols
+    # packaged in openssl-dbg, build with debug symbols &
+    # file-prefix-map. Also see "Create dbg sourcecode" and
+    # split/debug.
     CFLAGS: "-g -ffile-prefix-map=/home/build=/usr/src/${{package.name}}"
-    CPPFLAGS: ""
-    CXXFLAGS: ""
-    LDFLAGS: ""
 
 pipeline:
   - uses: git-checkout
     with:
-      repository: https://github.com/openssl/openssl.git
+      repository: https://github.com/openssl/openssl
       tag: openssl-${{package.version}}
-      expected-commit: fb7fab9fa6f4869eaa8fbb97e0d593159f03ffe4
-      cherry-picks: |
-        openssl-3.3/c0d3e4d32d2805f49bec30547f225bc4d092e1f4: CVE-2024-9143 fixes
+      expected-commit: 98acb6b02839c609ef5b837794e08d906d965335
+
+  - uses: patch
+    with:
+      patches: fix-jitter-old-providers.patch
 
   - name: Create dbg sourcecode
     runs: |
@@ -52,17 +58,15 @@ pipeline:
 
   - name: Configure and build
     runs: |
-      export CC=${{host.triplet.gnu}}-gcc
-      export CXX=${{host.triplet.gnu}}-g++
-      export CPP=${{host.triplet.gnu}}-cpp
-
       perl ./Configure \
-         linux-$(uname -m) \
+         linux-${{build.arch}} \
          --prefix=/usr \
          --libdir=lib \
          --openssldir=/etc/ssl \
          enable-ktls \
+         enable-jitter \
          shared \
+         enable-pie \
          no-zlib \
          no-async \
          no-comp \
@@ -78,6 +82,7 @@ pipeline:
          -Wa,--noexecstack
       perl configdata.pm --dump
       make -j$(nproc)
+      make tests HARNESS_JOBS=10
 
   - uses: autoconf/make-install
 
@@ -134,6 +139,13 @@ subpackages:
 
   - name: "openssl-dev"
     description: "OpenSSL headers"
+    dependencies:
+      runtime:
+        # TODO: for static linking only, split into openssl-static, or
+        # fix upstream (note .so actually links 3.5.0-r0 but melange
+        # hates that here)
+        - jitterentropy-library-dev
+        - jitterentropy-library
     pipeline:
       - uses: split/dev
     test:
@@ -167,13 +179,20 @@ test:
     contents:
       packages:
         - curl
+        - gdb
         - git
+        - openssl-dbg
         - wget
   pipeline:
     - uses: test/hardening-check
       with:
-        package-match: "^openssl$\\|libssl3\\|libcrypto3"
-      runs: |
+        package-match: "^openssl$\\|libssl3"
+    - uses: test/hardening-check
+      with:
+        # jitterentropy is without CF protection so far
+        args: "--nocfprotection"
+        package-match: "^libcrypto3$"
+    - runs: |
         openssl --version
         openssl --help
     - name: Verify curl still works
@@ -187,6 +206,71 @@ test:
       runs: |
         wget -O /dev/null https://github.com/openssl/openssl
         ! wget https://expired.badssl.com/
+    - name: Verify jitter cherry-pick has no effect by default
+      runs: |
+        # Possibly python gdb would be easier to read
+        cat <<EOF >openssl.gdb
+        set pagination off
+        set logging file gdb.log
+        set logging on
+        set width 0
+        set height 0
+        set verbose off
+        set breakpoint pending on
+        break get_jitter_random_value
+        commands 1
+          continue
+        end
+        break syscall_random
+        commands 2
+          continue
+        end
+        run genrsa -out /dev/null
+        EOF
+        gdb --batch --command ./openssl.gdb openssl
+        # Assert that jitter entropy was not used
+        grep -q 'Breakpoint 1,' gdb.log && exit 1
+        # Assert that getrandom syscall wrapper was used
+        grep -q 'Breakpoint 2,' gdb.log || exit 1
+    - name: Verify jitter entropy source opt-in works
+      runs: |
+        cat <<EOF >openssl.cnf
+        openssl_conf = openssl_init
+        [openssl_init]
+        providers = provider_sect
+        random = random
+        [random]
+        seed = JITTER
+        [provider_sect]
+        default = default_sect
+        [default_sect]
+        activate = 1
+        EOF
+        export OPENSSL_CONF=openssl.cnf
+        # Possibly python gdb would be easier to read
+        cat <<EOF >openssl.gdb
+        set pagination off
+        set logging file jitter.log
+        set logging on
+        set width 0
+        set height 0
+        set verbose off
+        set breakpoint pending on
+        break get_jitter_random_value
+        commands 1
+          continue
+        end
+        break syscall_random
+        commands 2
+          continue
+        end
+        run genrsa -out /dev/null
+        EOF
+        gdb --batch --command ./openssl.gdb openssl
+        # Assert that jitter entropy was not used
+        grep -q 'Breakpoint 1,' jitter.log || exit 1
+        # Assert that getrandom syscall wrapper was used
+        grep -q 'Breakpoint 2,' jitter.log && exit 1
 
 update:
   enabled: true

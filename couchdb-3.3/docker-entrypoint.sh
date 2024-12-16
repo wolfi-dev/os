@@ -13,6 +13,9 @@
 
 set -e
 
+# TODO: remove
+set -x
+
 # first arg is `-something` or `+something`
 if [ "${1#-}" != "$1" ] || [ "${1#+}" != "$1" ]; then
 	set -- /opt/couchdb/bin/couchdb "$@"
@@ -25,28 +28,30 @@ if [ "$1" = 'couchdb' ]; then
 fi
 
 if [ "$1" = '/opt/couchdb/bin/couchdb' ]; then
-	# Check that we own everything in /opt/couchdb and fix if necessary. We also
-	# add the `-f` flag in all the following invocations because there may be
-	# cases where some of these ownership and permissions issues are non-fatal
-	# (e.g. a config file owned by root with o+r is actually fine), and we don't
-	# to be too aggressive about crashing here ...
-	find /opt/couchdb \! \( -user couchdb -group couchdb \) -exec chown -f couchdb:couchdb '{}' +
+	if [ "$(id -u)" = "0" ] ; then
+		# Check that we own everything in /opt/couchdb and fix if necessary. We also
+		# add the `-f` flag in all the following invocations because there may be
+		# cases where some of these ownership and permissions issues are non-fatal
+		# (e.g. a config file owned by root with o+r is actually fine), and we don't
+		# to be too aggressive about crashing here ...
+		find /opt/couchdb -follow \! \( -user couchdb -group couchdb \) -exec chown -f couchdb:couchdb '{}' +
 
-	# Ensure that data files have the correct permissions. We were previously
-	# preventing any access to these files outside of couchdb:couchdb, but it
-	# turns out that CouchDB itself does not set such restrictive permissions
-	# when it creates the files. The approach taken here ensures that the
-	# contents of the datadir have the same permissions as they had when they
-	# were initially created. This should minimize any startup delay.
-	find /opt/couchdb/data -type d ! -perm 0755 -exec chmod -f 0755 '{}' +
-	find /opt/couchdb/data -type f ! -perm 0644 -exec chmod -f 0644 '{}' +
+		# Ensure that data files have the correct permissions. We were previously
+		# preventing any access to these files outside of couchdb:couchdb, but it
+		# turns out that CouchDB itself does not set such restrictive permissions
+		# when it creates the files. The approach taken here ensures that the
+		# contents of the datadir have the same permissions as they had when they
+		# were initially created. This should minimize any startup delay.
+		find /opt/couchdb/data -type d ! -perm 0755 -exec chmod -f 0755 '{}' +
+		find /opt/couchdb/data -type f ! -perm 0644 -exec chmod -f 0644 '{}' +
 
-	# Do the same thing for configuration files and directories. Technically
-	# CouchDB only needs read access to the configuration files as all online
-	# changes will be applied to the "docker.ini" file below, but we set 644
-	# for the sake of consistency.
-	find /opt/couchdb/etc -type d ! -perm 0755 -exec chmod -f 0755 '{}' +
-	find /opt/couchdb/etc -type f ! -perm 0644 -exec chmod -f 0644 '{}' +
+		# Do the same thing for configuration files and directories. Technically
+		# CouchDB only needs read access to the configuration files as all online
+		# changes will be applied to the "docker.ini" file below, but we set 644
+		# for the sake of consistency.
+		find /opt/couchdb/etc -type d ! -perm 0755 -exec chmod -f 0755 '{}' +
+		find /opt/couchdb/etc -type f ! -perm 0644 -exec chmod -f 0644 '{}' +
+	fi
 
 	if [ ! -z "$NODENAME" ] && ! grep "couchdb@" /opt/couchdb/etc/vm.args; then
 		echo "-name couchdb@$NODENAME" >> /opt/couchdb/etc/vm.args
@@ -80,11 +85,15 @@ if [ "$1" = '/opt/couchdb/bin/couchdb' ]; then
 		else
 			echo "$COUCHDB_ERLANG_COOKIE" > "$cookieFile"
 		fi
-		chown couchdb:couchdb "$cookieFile"
+		if [ "$(id -u)" = "0" ] ; then
+			chown couchdb:couchdb "$cookieFile"
+		fi
 		chmod 600 "$cookieFile"
 	fi
 
-	chown -f couchdb:couchdb /opt/couchdb/etc/local.d/docker.ini || true
+	if [ "$(id -u)" = "0" ] ; then
+		chown -f couchdb:couchdb /opt/couchdb/etc/local.d/docker.ini || true
+	fi
 
 	# if we don't find an [admins] section followed by a non-comment, display a warning
     if ! (grep -B0 -A1 -h -E '^\[admins\]' /opt/couchdb/etc/default.d/*.ini /opt/couchdb/etc/local.d/*.ini /opt/couchdb/etc/local.ini | grep -v -E '^(\[admins\]|[[:space:]]*(;|#))' | grep '=' >/dev/null); then
@@ -103,8 +112,11 @@ EOWARN
 		exit 1
 	fi
 
-	export HOME=$(echo ~couchdb)
-	set -- su-exec couchdb "$@"
+	# if running as root, use su-exec to start the process ; otherwise default to exec as current user below
+	if [ "$(id -u)" = "0" ] ; then
+		export HOME=$(echo ~couchdb)
+		set -- su-exec couchdb "$@"
+	fi
 fi
 
 exec "$@"

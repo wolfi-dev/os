@@ -1,6 +1,6 @@
 package:
   name: teleport
-  version: 17.0.1
+  version: 17.0.5
   epoch: 0
   description: The easiest, and most secure way to access and protect all of your infrastructure.
   copyright:
@@ -18,6 +18,7 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
+      - cargo-auditable
       - corepack
       - go
       - node-gyp
@@ -26,6 +27,7 @@ environment:
       - openssl-dev
       - pnpm
       - python3
+      - rust
       - rustup
       - wasm-pack
       - yarn
@@ -35,32 +37,55 @@ pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/gravitational/teleport
-      expected-commit: dc5837102a82fdfc4807a8c760839f4ca4be08a9
+      expected-commit: 7cc4c2a0fc54fb120a8a19f86f0acfc1d0c703a8
       tag: v${{package.version}}
 
   - uses: go/bump
     with:
       deps: github.com/golang-jwt/jwt/v4@v4.5.1
 
+  # Fixes build failure introduced with 17.0.5 version:
+  # "([wasm-validator error in function fastpathprocessor_process\20externref\20shim]
+  # unexpected false: table.fill requires bulk-memory [--enable-bulk-memory])"
+  # Should be able to remove this patch once the following issue is resolved:
+  # https://github.com/gravitational/teleport/issues/50194
+  - uses: patch
+    with:
+      patches: bulk-memory.patch
+
   - runs: |
-      # https://github.com/gravitational/teleport#building-teleport
       mkdir -p "${{targets.contextdir}}"/var/lib/teleport
       mkdir -p "${{targets.contextdir}}"/usr/local/bin
 
-      # This build requires the stable version of rust, managed by rustup, because it requires a few other toolchains too.
       rustup install stable
+      rustup default stable
+      ARCH=$(uname -m)
+      export PATH="$HOME/.rustup/toolchains/stable-${ARCH}-unknown-linux-gnu/bin:$PATH"
       rustup target add wasm32-unknown-unknown
 
-      # This is a bit of a hack, but it's the easiest way to get the right version of rustc and cargo in the path.
-      export PATH="$HOME/.rustup/toolchains/stable-${{host.triplet.rust}}/bin:$PATH"
-      make full
+      pnpm config set package-import-method copy
 
-      # create me a for loop that iterates over the binaries in build/
-      # and installs them to "${{targets.contextdir}}"/usr/local/bin
-      for bin in build/*; do
-        echo "Installing $bin to /usr/local/bin"
-        install -Dm755 $bin -t "${{targets.contextdir}}"/usr/local/bin
-      done
+      # Install dependencies and build web assets
+      make ensure-js-deps
+      make ensure-webassets
+
+  - uses: go/build
+    with:
+      packages: ./tool/teleport
+      prefix: usr/local
+      output: ./
+      tags: webassets_embed,kustomize_disable_go_plugin_support
+
+  - uses: go/build
+    with:
+      packages: ./tool/tctl ./tool/tsh ./tool/tbot ./tool/teleport-update
+      prefix: usr/local
+      output: ./
+      tags: kustomize_disable_go_plugin_support
+
+  - runs: |
+      cd tool/fdpass-teleport && cargo auditable build --release --locked
+      install -Dm755 target/release/fdpass-teleport "${{targets.contextdir}}"/usr/local/bin/
 
   - uses: strip
 
@@ -75,18 +100,10 @@ test:
     contents:
       packages:
         - wait-for-it
+        - curl
   pipeline:
-    - runs: |
-        teleport configure -o file
-        teleport start -c /etc/teleport.yaml &
-
-        # wait for teleport to start :3080
-        wait-for-it localhost:3080 -t 10
-
-        echo "Teleport is running on port 3080!"
-
-        # create a user
-        tctl get roles --format=text
+    - name: Check binary versions
+      runs: |
         tbot version
         tbot --help
         tctl version
@@ -95,3 +112,121 @@ test:
         teleport --help
         tsh version
         tsh --help
+    - name: Test auth service and tctl
+      runs: |
+        #!/bin/bash
+        set -e
+
+        # Create required directories
+        mkdir -p /tmp/teleport
+        mkdir -p /var/lib/teleport
+
+        # Create minimal config file for auth server
+        cat <<-EOF > /tmp/teleport-auth.yaml
+        version: v3
+        teleport:
+          data_dir: /tmp/teleport
+          log:
+            output: stderr
+            severity: DEBUG
+        auth_service:
+          enabled: "yes"
+          cluster_name: "test-cluster"
+          listen_addr: 127.0.0.1:3025
+          tokens:
+            - "proxy,node:test123"
+        proxy_service:
+          enabled: "no"
+        ssh_service:
+          enabled: "no"
+        EOF
+
+        # Initialize auth server with static UUID for tctl
+        echo "00000000-0000-0000-0000-000000000000" > /var/lib/teleport/host_uuid
+        chmod 644 /var/lib/teleport/host_uuid
+
+        # Start auth server
+        teleport start --config=/tmp/teleport-auth.yaml --roles=auth &
+        AUTH_PID=$!
+
+        # Wait for auth server
+        wait-for-it 127.0.0.1:3025 -t 30 || (kill $AUTH_PID; exit 1)
+
+        # Give auth server time to initialize
+        sleep 5
+
+        # Test tctl
+        TCTL_CONFIG=$(base64 /tmp/teleport-auth.yaml)
+        TELEPORT_CONFIG="$TCTL_CONFIG" tctl get roles --format=text
+
+        echo "Auth service test successful!"
+        kill $AUTH_PID
+    - name: Test proxy service
+      runs: |
+        #!/bin/bash
+        set -e
+
+        # Create required directories
+        mkdir -p /tmp/teleport-auth /tmp/teleport-proxy
+
+        # Create auth server config
+        cat <<-EOF > /tmp/teleport-auth.yaml
+        version: v3
+        teleport:
+          data_dir: /tmp/teleport-auth
+          log:
+            output: stderr
+            severity: DEBUG
+        auth_service:
+          enabled: "yes"
+          cluster_name: "test-cluster"
+          listen_addr: 127.0.0.1:3025
+          tokens:
+            - "proxy,node:test123"
+        proxy_service:
+          enabled: "no"
+        ssh_service:
+          enabled: "no"
+        EOF
+
+        # Create proxy config
+        cat <<-EOF > /tmp/teleport-proxy.yaml
+        version: v3
+        teleport:
+          data_dir: /tmp/teleport-proxy
+          auth_token: "test123"
+          auth_server: "127.0.0.1:3025"
+        proxy_service:
+          enabled: "yes"
+          web_listen_addr: "127.0.0.1:3080"
+          listen_addr: "127.0.0.1:3023"
+        auth_service:
+          enabled: "no"
+        ssh_service:
+          enabled: "no"
+        EOF
+
+        # Start auth server
+        teleport start --config=/tmp/teleport-auth.yaml --roles=auth &
+        AUTH_PID=$!
+
+        # Wait for auth server
+        wait-for-it 127.0.0.1:3025 -t 30 || (kill $AUTH_PID; exit 1)
+
+        # Start proxy
+        teleport start --config=/tmp/teleport-proxy.yaml --roles=proxy &
+        PROXY_PID=$!
+
+        # Wait for proxy
+        wait-for-it 127.0.0.1:3080 -t 30 || (kill $AUTH_PID $PROXY_PID; exit 1)
+
+        # Test proxy web interface with HTTPS
+        HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" https://127.0.0.1:3080/webapi/ping)
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "Proxy web interface test failed with HTTP code: $HTTP_CODE"
+          kill $AUTH_PID $PROXY_PID
+          exit 1
+        fi
+
+        echo "Proxy test successful!"
+        kill $AUTH_PID $PROXY_PID

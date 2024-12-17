@@ -1,7 +1,7 @@
 #nolint:valid-pipeline-git-checkout-commit,valid-pipeline-git-checkout-tag
 package:
   name: cilium-1.16
-  version: 1.16.3
+  version: 1.16.4
   epoch: 1
   description: Cilium is a networking, observability, and security solution with an eBPF-based dataplane
   copyright:
@@ -40,8 +40,6 @@ environment:
       - clang-17-dev
       - cmake
       - coreutils # for GNU install
-      # We need to stick to gcc 12 for now, envoy doesn't build with gcc >= 13
-      - gcc-12-default
       - git
       - go
       - grep
@@ -49,6 +47,9 @@ environment:
       - iptables # for cilium-iptables
       - isl-dev
       - libtool
+      - llvm-libcxx-17
+      - llvm-libcxx-17-dev
+      - llvm-libcxxabi-17
       - llvm-lld-17
       - llvm17
       - llvm17-dev
@@ -61,19 +62,19 @@ environment:
       - wolfi-baselayout
 
 vars:
-  # https://github.com/cilium/cilium/blob/v1.15.6/images/cilium/Dockerfile
-  CILIUM_PROXY_COMMIT: "0d05e48bfbb8c4737ec40d5781d970a550ed2bbd"
+  # https://github.com/cilium/cilium/blob/v1.16.4/images/cilium/Dockerfile
+  CILIUM_PROXY_COMMIT: "97edc2815e2c6a174d3d12e71731d54f5d32ea16"
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/cilium/cilium
       tag: v${{package.version}}
-      expected-commit: f221719170636b0e0da2c7b8227c18967a1201c8
+      expected-commit: 0380724290f01576aa053c2c2ad35532063c695e
 
   - uses: go/bump
     with:
-      deps: google.golang.org/grpc@v1.64.1
+      deps: google.golang.org/grpc@v1.64.1 golang.org/x/crypto@v0.31.0
 
   - uses: patch
     with:
@@ -109,20 +110,12 @@ pipeline:
       # Branch from https://github.com/cilium/cilium/blob/v1.15.5/images/cilium/Dockerfile
       # Note often the branch is updated with dependencies updates, no tags
       # See CILIUM_PROXY_COMMIT for anchor point
-      branch: v1.29
+      branch: v1.30
       depth: 1000
       destination: envoy
 
   - runs: |
       git -C envoy reset --hard ${{vars.CILIUM_PROXY_COMMIT}}
-
-  - uses: patch
-    with:
-      patches: toolchains-paths.patch
-
-  - uses: patch
-    with:
-      patches: envoy-55b0fc45cfdc2c0df002690606853540cf794fab.patch
 
   - runs: |
       # Bazel errors out on toolchain stanza
@@ -139,10 +132,15 @@ pipeline:
       cd /home/build/envoy
       # The Python interpreter complains about being run as root, there's a flag to pass to disable that warning.
       sed -i 's/envoy_dependencies_extra()/envoy_dependencies_extra(ignore_root_user_error=True)/g' WORKSPACE
+      # The toolchain at cilium/proxy has paths that are specific to their CI.
+      # Unregister to use Wolfi's.
+      sed 's/register_toolchains/#register_toolchains/g' -i WORKSPACE
       export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
       mkdir -p .cache/bazel/_bazel_root
 
       ./bazel/setup_clang.sh /usr
+      # Use libc++ to be consistent with our Envoys.
+      echo "build --config=libc++" >> user.bazelrc
 
       mkdir -p ${{targets.destdir}}/usr/bin
 
@@ -152,6 +150,8 @@ pipeline:
           --nokeep_state_after_build \
           --notrack_incremental_state \
           --conlyopt="-Wno-strict-prototypes" \
+          `# The thread-saftey analysis flagged some issue in upstream code` \
+          --cxxopt="-Wno-thread-safety" \
           --verbose_failures -c opt //:${target}
         cp -v bazel-bin/${target} ${{targets.destdir}}/usr/bin/${target}
       done

@@ -1,7 +1,7 @@
 package:
   name: spark-3.5-scala-2.13
   version: 3.5.3
-  epoch: 0
+  epoch: 2
   description: Unified engine for large-scale data analytics
   copyright:
     - license: Apache-2.0
@@ -9,7 +9,6 @@ package:
     runtime:
       - bash
       - busybox
-      - openjdk-17-default-jvm
       - posix-libc-utils
       - procps
       - tini
@@ -26,11 +25,12 @@ environment:
       - glibc-locale-en
       - grep
       - maven
-      - openjdk-17-default-jdk
+      - openjdk-17
       - perl-utils
       - procps
+      - py3-setuptools
       - py3.11-pip
-      - python-3.11
+      - python-3.13
       - wolfi-base
       - wolfi-baselayout
       - yaml-dev
@@ -38,6 +38,7 @@ environment:
     LANG: en_US.UTF-8
     JAVA_HOME: /usr/lib/jvm/java-17-openjdk
     MAVEN_OPTS: "-Xss64m -Xmx2g -XX:ReservedCodeCacheSize=1g"
+    APACHE_MIRROR: "https://repo.maven.apache.org/maven2/org"
 
 pipeline:
   - uses: git-checkout
@@ -46,27 +47,32 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: 32232e9ed33bb16b93ad58cfde8b82e0f07c0970
 
+  - uses: patch
+    with:
+      patches: make-distribution.patch mvn.patch
+
   - runs: |
       ./dev/change-scala-version.sh 2.13
 
   - uses: maven/pombump
     with:
       properties-file: pombump-properties.yaml
-      pom: pom.xml
 
   - runs: |
-      ./build/mvn -DskipTests -Pscala-2.13 clean package
-
-      mkdir -p ${{targets.contextdir}}/usr/lib/spark
-      mkdir -p ${{targets.contextdir}}/usr/lib/spark/work-dir
-      mv bin/ ${{targets.contextdir}}/usr/lib/spark
-      mv sbin/ ${{targets.contextdir}}/usr/lib/spark
-      mv target ${{targets.contextdir}}/usr/lib/spark
+      mkdir -p ${{targets.contextdir}}/usr/lib/spark/
+      ./dev/make-distribution.sh --name pyspark-2.13 --pip --tgz -Pscala-2.13 -Phive -Phive-thriftserver -Pyarn
+      mv dist/* ${{targets.contextdir}}/usr/lib/spark/
       cp resource-managers/kubernetes/docker/src/main/dockerfiles/spark/entrypoint.sh ${{targets.contextdir}}/usr/lib/spark/
-      cp -R assembly/target/scala-2.13/jars ${{targets.contextdir}}/usr/lib/spark/
-      mv assembly ${{targets.contextdir}}/usr/lib/spark
 
 subpackages:
+  - name: pyspark-scala-2.13
+    description: Pyspark built with scala-2.13
+    pipeline:
+      - working-directory: python
+        pipeline:
+          - uses: python/build
+          - uses: python/install
+
   - name: ${{package.name}}-compat
     description: "Compatibility package to place binaries in the location expected by upstream image"
     pipeline:
@@ -74,7 +80,6 @@ subpackages:
           mkdir -p "${{targets.subpkgdir}}"/usr/bin
           mkdir -p "${{targets.subpkgdir}}"/opt
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/bin
           ln -s /usr/lib/spark/ ${{targets.subpkgdir}}/opt/spark
           ln -sf /usr/lib/spark/bin/spark-submit ${{targets.subpkgdir}}/usr/bin/spark-submit
           ln -sf /usr/lib/spark/bin/spark-shell ${{targets.subpkgdir}}/usr/bin/spark-shell
@@ -89,6 +94,7 @@ test:
       packages:
         - openjdk-17-default-jvm
         - bash
+        - python-3.13
     environment:
       LANG: en_US.UTF-8
       SCALA_VERSION: 2.13
@@ -101,7 +107,7 @@ test:
     - name: Test ${{package.name}} with OpenJDK 17
       pipeline:
         - name: Test if the Scala versions are correct
-          runs: ls /usr/lib/spark/assembly/target/scala-2.13/jars/scala-* | grep -q $SCALA_VERSION
+          runs: ls /usr/lib/spark/jars/scala-* | grep -q $SCALA_VERSION
         - name: Check spark-shell --version
           runs: /usr/lib/spark/bin/spark-shell --version
         - name: Check spark-submit --version
@@ -133,6 +139,17 @@ test:
             assert(result.count() == 1 && result.first().getString(0) == "Bob")
             EOF
             cat SQLTest.scala | /usr/lib/spark/bin/spark-shell --conf spark.jars.ivy=/tmp/.ivy --master local[*]
+        - name: Run a simple Spark job in Python
+          runs: |
+            cat <<EOF > /tmp/simple_job.py
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.appName("SimpleJob").getOrCreate()
+            data = [1, 2, 3, 4, 5]
+            rdd = spark.sparkContext.parallelize(data)
+            sum = rdd.reduce(lambda x, y: x + y)
+            assert sum == 15
+            EOF
+            /usr/lib/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/.ivy --master local[*] /tmp/simple_job.py
 
 update:
   enabled: true

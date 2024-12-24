@@ -1,0 +1,122 @@
+#nolint:valid-pipeline-git-checkout-commit,valid-pipeline-git-checkout-tag
+package:
+  name: cilium-envoy-1.16
+  version: 1.16.5
+  epoch: 0
+  description: Envoy with additional cilium plugins
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: 20
+    memory: 50Gi
+  dependencies:
+    provides:
+      - cilium-envoy=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - bash
+      - bazel-6
+      - binutils
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-17
+      - clang-17-dev
+      - cmake
+      - coreutils # for GNU install
+      - git
+      - go
+      - isl-dev
+      - libtool
+      - llvm-libcxx-17
+      - llvm-libcxx-17-dev
+      - llvm-libcxxabi-17
+      - llvm-lld-17
+      - llvm17
+      - llvm17-dev
+      - openjdk-11
+      - openssf-compiler-options
+      - patch
+      - python3-dev
+      - samurai
+      - wolfi-baselayout
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/cilium/cilium
+      tag: v${{package.version}}
+      expected-commit: ad6882773c5f89feda9c295276707f01de269296
+      destination: cilium
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/cilium/proxy
+      # Branch from https://github.com/cilium/cilium/blob/v1.16.5/images/cilium/Dockerfile
+      # Note often the branch is updated with dependencies updates, no tags
+      # See CILIUM_PROXY_COMMIT for anchor point
+      branch: v1.30
+      depth: 1000
+
+  - name: Get the CILIUM_PROXY_COMMIT and reset to it
+    runs: |
+      ENVOY_SHA=$(grep 'ARG.*cilium-envoy' ./cilium/images/cilium/Dockerfile \
+        | sed "s/^ARG.*:v[0-9.]\+-[0-9]\+-//g" | cut -d@ -f1)
+      git reset --hard $ENVOY_SHA
+
+  - name: Build and Install proxylib
+    runs: |
+      cd ./proxylib
+      make
+      mkdir -p ${{targets.destdir}}/usr/lib
+      cp -v libcilium.so ${{targets.destdir}}/usr/lib/libcilium.so
+
+  - name: Fix the toolchain and root user error
+    runs: |
+      # The Python interpreter complains about being run as root, there's a flag to pass to disable that warning.
+      sed -i 's/envoy_dependencies_extra()/envoy_dependencies_extra(ignore_root_user_error=True)/g' WORKSPACE
+      # The toolchain at cilium/proxy has paths that are specific to their CI. https://github.com/cilium/proxy/blob/main/WORKSPACE#L3
+      # Unregister to use Wolfi's toolchain available in the build env.
+      sed 's/register_toolchains/#register_toolchains/g' -i WORKSPACE
+
+  - runs: |
+      export JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+      mkdir -p .cache/bazel/_bazel_root
+      mkdir -p ${{targets.destdir}}/usr/bin
+
+      # Use libc++ to be consistent with other Wolfi Envoy packages.
+      echo "build --config=libc++" >> user.bazelrc
+
+      ./bazel/setup_clang.sh /usr
+
+      bazel build --fission=no --config=clang \
+        --discard_analysis_cache \
+        --nokeep_state_after_build \
+        --notrack_incremental_state \
+        --conlyopt="-Wno-strict-prototypes" \
+        `# The thread-saftey analysis flagged some issue in upstream code` \
+        --cxxopt="-Wno-thread-safety" \
+        --verbose_failures -c opt //:cilium-envoy-starter
+      install -m 755 bazel-bin/cilium-envoy-starter ${{targets.destdir}}/usr/bin/cilium-envoy-starter
+
+      bazel build --fission=no --config=clang \
+        --discard_analysis_cache \
+        --nokeep_state_after_build \
+        --notrack_incremental_state \
+        --conlyopt="-Wno-strict-prototypes" \
+        `# The thread-saftey analysis flagged some issue in upstream code` \
+        --cxxopt="-Wno-thread-safety" \
+        --verbose_failures -c opt //:cilium-envoy
+      install -m 755 bazel-bin/cilium-envoy ${{targets.destdir}}/usr/bin/cilium-envoy
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    use-tag: true
+    identifier: cilium/cilium
+    strip-prefix: v
+    tag-filter-prefix: v1.16.

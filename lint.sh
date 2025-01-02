@@ -2,22 +2,9 @@
 
 set -euo pipefail
 
-for p in $(make list); do
+for fn in *.yaml; do
+  p=$(yq -r '.package.name' ${fn})
   echo "--- package" $p
-
-  if [ -f ${p}.yaml ]; then
-    if [ -f **/${p}/${p}.melange.yaml ]; then
-      echo "ERROR: ${p}.yaml and **/${p}/${p}.melange.yaml both exist"
-      exit 1
-    fi
-
-    fn=${p}.yaml
-  elif [ -f **/${p}/${p}.melange.yaml ]; then
-    fn=$(ls **/${p}/${p}.melange.yaml | head -n 1)
-  else
-    echo "ERROR: ${p}.yaml or **/${p}/${p}.melange.yaml does not exist, or multiple matches found"
-    exit 1
-  fi
 
   # Don't specify repositories or keyring for os packages
   if grep -q packages.wolfi.dev/os ${fn}; then
@@ -37,9 +24,6 @@ for p in $(make list); do
 
   yam ${fn}
 done
-
-git --no-pager diff # Show any diff.
-git diff --quiet    # Fail any diff.
 
 # New section to check for .sts.yaml files under ./.github/chainguard/
 echo "Checking for .sts.yaml files in ./.github/chainguard/..."

@@ -2,10 +2,15 @@
 package:
   name: openssl
   version: 3.4.0
-  epoch: 3
+  epoch: 5
   description: "the OpenSSL cryptography suite"
   copyright:
     - license: Apache-2.0
+  dependencies:
+    # For apk upgrades
+    replaces:
+      - openssl-config<3.4.0
+    replaces-priority: 5
   resources:
     cpu: 16
     memory: 16Gi
@@ -28,11 +33,11 @@ environment:
       - openssf-compiler-options
       - perl
   environment:
-    # Using openssf-compiler-options instead
+    # To support automatic discovery of source code in debug symbols
+    # packaged in openssl-dbg, build with debug symbols &
+    # file-prefix-map. Also see "Create dbg sourcecode" and
+    # split/debug.
     CFLAGS: "-g -ffile-prefix-map=/home/build=/usr/src/${{package.name}}"
-    CPPFLAGS: ""
-    CXXFLAGS: ""
-    LDFLAGS: ""
 
 pipeline:
   - uses: git-checkout
@@ -58,12 +63,8 @@ pipeline:
 
   - name: Configure and build
     runs: |
-      export CC=${{host.triplet.gnu}}-gcc
-      export CXX=${{host.triplet.gnu}}-g++
-      export CPP=${{host.triplet.gnu}}-cpp
-
       perl ./Configure \
-         linux-$(uname -m) \
+         linux-${{build.arch}} \
          --prefix=/usr \
          --libdir=lib \
          --openssldir=/etc/ssl \
@@ -97,6 +98,10 @@ pipeline:
       rm ${{targets.destdir}}/etc/ssl/openssl.cnf
       # Second identical copy of the above
       rm ${{targets.destdir}}/etc/ssl/openssl.cnf.dist
+      # Provide our hardened configuration for ca & req apps, note
+      # ca.cnf is shipped with libraries to be reusable without
+      # openssl tool
+      cp openssl.cnf ${{targets.destdir}}/etc/ssl/
       # Empty CT log
       rm ${{targets.destdir}}/etc/ssl/ct_log_list.cnf
       # Second copy of CT log
@@ -133,6 +138,10 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib
           mv "${{targets.destdir}}"/usr/lib/libcrypto.so.3 "${{targets.subpkgdir}}"/usr/lib
+          # Provide our hardened configuration for ca & req apps, note
+          # ca.cnf is shipped here to be reusable without the openssl tool
+          mkdir -p "${{targets.subpkgdir}}"/etc/ssl
+          cp ca.cnf ${{targets.subpkgdir}}/etc/ssl/
 
   - name: "libssl3"
     description: "OpenSSL libssl library"
@@ -275,6 +284,34 @@ test:
         grep -q 'Breakpoint 1,' jitter.log || exit 1
         # Assert that getrandom syscall wrapper was used
         grep -q 'Breakpoint 2,' jitter.log && exit 1
+    - name: docker-dind certificate generation
+      runs: |
+        # Distilled from dockerd-entrypoint.sh
+        set -x
+        tmpdir="$(mktemp -d)"
+        trap "rm -rf "$tmpdir"" EXIT
+        rm -rf "$tmpdir/certs/"
+        mkdir -p "$tmpdir/certs/ca"
+        openssl genrsa -out "$tmpdir/certs/ca/key.pem" 4096
+        openssl req -new -key "$tmpdir/certs/ca/key.pem" \
+          -out "$tmpdir/certs/ca/cert.pem" -subj '/CN=docker:dind CA' \
+          -x509 -days 825
+        mkdir -p "$tmpdir/certs/server"
+        openssl genrsa -out "$tmpdir/certs/server/key.pem" 4096
+        openssl req -new -key "$tmpdir/certs/server/key.pem" \
+          -out "$tmpdir/certs/server/csr.pem" -subj '/CN=docker:dind server'
+        cat << EOF >"$tmpdir/certs/server/openssl.cnf"
+        [ x509_exts ]
+        subjectAltName = DNS:b51ddd7b8dcd,DNS:docker,DNS:localhost,IP:127.0.0.1,IP:172.17.0.4,IP:::1
+        EOF
+        openssl x509 -req -in "$tmpdir/certs/server/csr.pem"\
+          -CA "$tmpdir/certs/ca/cert.pem" -CAkey "$tmpdir/certs/ca/key.pem" \
+          -CAcreateserial -out "$tmpdir/certs/server/cert.pem" \
+          -days 825 -extfile "$tmpdir/certs/server/openssl.cnf" \
+          -extensions x509_exts
+        cp "$tmpdir/certs/ca/cert.pem" "$tmpdir/certs/server/ca.pem"
+        openssl verify -CAfile "$tmpdir/certs/server/ca.pem" \
+          "$tmpdir/certs/server/cert.pem"
 
 update:
   enabled: true

@@ -1,12 +1,18 @@
 package:
   name: nvidia-container-toolkit
-  version: 1.16.2
-  epoch: 1
+  version: 1.17.3
+  epoch: 0
   description: Build and run containers leveraging NVIDIA GPUs
   copyright:
     - license: Apache-2.0
   dependencies:
+    provider-priority: 10
+    provides:
+      - ${{package.name}}-nvidia-cdi-hook
+      - ${{package.name}}-nvidia-container-runtime
+      - ${{package.name}}-nvidia-container-runtime-hook
     runtime:
+      - ${{package.name}}-base
       - libnvidia-container
 
 environment:
@@ -18,75 +24,119 @@ environment:
       - go
       - openssf-compiler-options
   environment:
-    GCC_SPEC_FILE: /dev/null
+    # See https://github.com/wolfi-dev/os/issues/34568
+    GCC_SPEC_FILE: /home/build/openssf.spec
+
+vars:
+  base-cmds: nvidia-container-runtime nvidia-ctk nvidia-cdi-hook
+  main-cmds: nvidia-container-runtime-hook
+  operator-extensions-cmds: nvidia-container-runtime.cdi nvidia-container-runtime.legacy
 
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: a5a5833c14a15fd9c86bcece85d5ec6621b65652
+      expected-commit: cb82e29c75d387992bf59eb6eadf5d96cb6d4747
       repository: https://github.com/NVIDIA/nvidia-container-toolkit
       tag: v${{package.version}}
 
-data:
-  - name: commands
-    items:
-      nvidia-container-runtime-hook: nvidia-container-runtime-hook
-      nvidia-container-runtime-cdi: nvidia-container-runtime.cdi
-      nvidia-container-runtime-legacy: nvidia-container-runtime.legacy
-      nvidia-container-runtime: nvidia-container-runtime
-      nvidia-cdi-hook: nvidia-cdi-hook
-      nvidia-ctk: nvidia-ctk
+  - runs: |
+      gccdir="$(GCC_SPEC_FILE=/dev/null gcc --print-search-dirs | grep ^install: | cut -d' ' -f2)"
+      sed -r 's/,?-z,now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
 
-  - name: tools
-    items:
-      containerd: containerd
-      crio: crio
-      docker: docker
-      nvidia-toolkit: nvidia-toolkit
-      operator: operator
-      toolkit: toolkit
+  - runs: |
+      make -j$(nproc) cmds
+
+  - runs: |
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      mv ${{vars.main-cmds}} ${{targets.contextdir}}/usr/bin
+
+  - uses: strip
+
+test:
+  pipeline:
+    - runs: |
+        for cmd in ${{vars.main-cmds}}; do
+          $cmd --help
+        done
 
 subpackages:
-  - range: commands
-    name: "${{package.name}}-${{range.key}}"
+  - name: ${{package.name}}-base
+    dependencies:
+      provider-priority: 10
+      provides:
+        - ${{package.name}}-containerd
+        - ${{package.name}}-crio
+        - ${{package.name}}-docker
+        - ${{package.name}}-nvidia-ctk
     pipeline:
-      - uses: go/build
-        with:
-          modroot: .
-          packages: ./cmd/${{range.value}}
-          ldflags: -s -w '-extldflags=-Wl,-undefined,dynamic_lookup' -X github.com/NVIDIA/nvidia-container-toolkit/internal/info.gitCommit=$(git rev-parse HEAD) -X github.com/NVIDIA/nvidia-container-toolkit/internal/info.version=${{package.version}}
-          output: ${{range.value}}
-          vendor: true
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          mv ${{vars.base-cmds}} ${{targets.contextdir}}/usr/bin
+      - uses: strip
     test:
+      environment:
+        contents:
+          packages:
+            - runc # runc is just a placeholder, the actual runtime binary is TBD by the user
       pipeline:
         - runs: |
-            apk add runc # runc is just a placeholder, the actual runtime binary is TBD by the user
-            ${{range.value}} --help
+            for cmd in ${{vars.base-cmds}}; do
+              $cmd --help
+            done
 
-  - range: tools
-    name: "${{package.name}}-${{range.key}}"
+  - name: ${{package.name}}-operator-extensions
+    dependencies:
+      provider-priority: 10
+      provides:
+        - ${{package.name}}-nvidia-container-runtime-cdi
+        - ${{package.name}}-nvidia-container-runtime-legacy
+      runtime:
+        - ${{package.name}}-base
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          mv ${{vars.operator-extensions-cmds}} ${{targets.contextdir}}/usr/bin
+      - uses: strip
+      - name: Check for new, not-yet-packaged commands
+        runs: |
+          # At this point, all expected commands have been moved into
+          # package directories. If any remain, then upstream may have
+          # added more, and we should update our packaging.
+          [ "$(find . -maxdepth 1 -type f -perm -111)" = "" ]
+    test:
+      environment:
+        contents:
+          packages:
+            - runc # runc is just a placeholder, the actual runtime binary is TBD by the user
+      pipeline:
+        - runs: |
+            for cmd in ${{vars.operator-extensions-cmds}}; do
+              $cmd --help
+            done
+
+  - name: "${{package.name}}-nvidia-toolkit"
+    dependencies:
+      provider-priority: 10
+      provides:
+        - ${{package.name}}-operator
+        - ${{package.name}}-toolkit
     pipeline:
       - uses: go/build
         with:
           modroot: .
-          packages: ./tools/container/${{range.key}}
+          packages: ./tools/container/nvidia-toolkit
           ldflags: -s -w -X main.Version=${{package.version}}
-          output: ${{range.key}}
+          output: nvidia-toolkit
           vendor: true
       - runs: |
           # Ref: https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.15.0/deployments/container/Dockerfile.ubi8#L74
           mkdir -p ${{targets.contextdir}}/work
-          ln -sf /usr/bin/${{range.key}} ${{targets.contextdir}}/work/${{range.key}}
+          ln -sf /usr/bin/nvidia-toolkit ${{targets.contextdir}}/work/nvidia-toolkit
+      - uses: strip
     test:
       pipeline:
         - runs: |
-            # Operator requires root privileges to run
-            if [ "${{range.key}}" = "operator" ]; then
-              set +e
-              /work/${{range.key}} 2>&1 | grep -q "Permission denied"
-              exit $?
-            fi
-            /work/${{range.key}} --version
+            /work/nvidia-toolkit --version
 
 update:
   enabled: true

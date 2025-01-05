@@ -1,0 +1,286 @@
+Upstream: https://github.com/python/cpython/pull/127301
+
+diff --git a/Lib/hashlib.py b/Lib/hashlib.py
+index 1b2c30cc32f..b71fe5eb90e 100644
+--- a/Lib/hashlib.py
++++ b/Lib/hashlib.py
+@@ -79,6 +79,23 @@
+     'blake2b', 'blake2s',
+ }
+ 
++# Wrapper that only allows usage when usedforsecurity=False
++# (effectively unapproved service indicator)
++def __usedforsecurity_check(md, name, *args, **kwargs):
++    if kwargs.get("usedforsecurity", True):
++        raise ValueError(name + " is blocked when usedforsecurity=True")
++    return md(*args, **kwargs)
++
++# If the _hashlib OpenSSL wrapper is in FIPS mode, wrap other implementations
++# to check the usedforsecurity kwarg. All builtin implementations are treated
++# as only available for useforsecurity=False purposes in the presence of such
++# a configured and linked OpenSSL.
++def __get_wrapped_builtin(md, name):
++    if __openssl_fips_mode != 0:
++        from functools import partial
++        return partial(__usedforsecurity_check, md, name)
++    return md
++
+ def __get_builtin_constructor(name):
+     cache = __builtin_constructor_cache
+     constructor = cache.get(name)
+@@ -87,32 +104,32 @@ def __get_builtin_constructor(name):
+     try:
+         if name in {'SHA1', 'sha1'}:
+             import _sha1
+-            cache['SHA1'] = cache['sha1'] = _sha1.sha1
++            cache['SHA1'] = cache['sha1'] = __get_wrapped_builtin(_sha1.sha1, name)
+         elif name in {'MD5', 'md5'}:
+             import _md5
+-            cache['MD5'] = cache['md5'] = _md5.md5
++            cache['MD5'] = cache['md5'] = __get_wrapped_builtin(_md5.md5, name)
+         elif name in {'SHA256', 'sha256', 'SHA224', 'sha224'}:
+             import _sha2
+-            cache['SHA224'] = cache['sha224'] = _sha2.sha224
+-            cache['SHA256'] = cache['sha256'] = _sha2.sha256
++            cache['SHA224'] = cache['sha224'] = __get_wrapped_builtin(_sha2.sha224, name)
++            cache['SHA256'] = cache['sha256'] = __get_wrapped_builtin(_sha2.sha256, name)
+         elif name in {'SHA512', 'sha512', 'SHA384', 'sha384'}:
+             import _sha2
+-            cache['SHA384'] = cache['sha384'] = _sha2.sha384
+-            cache['SHA512'] = cache['sha512'] = _sha2.sha512
++            cache['SHA384'] = cache['sha384'] = __get_wrapped_builtin(_sha2.sha384, name)
++            cache['SHA512'] = cache['sha512'] = __get_wrapped_builtin(_sha2.sha512, name)
+         elif name in {'blake2b', 'blake2s'}:
+             import _blake2
+-            cache['blake2b'] = _blake2.blake2b
+-            cache['blake2s'] = _blake2.blake2s
++            cache['blake2b'] = __get_wrapped_builtin(_blake2.blake2b, name)
++            cache['blake2s'] = __get_wrapped_builtin(_blake2.blake2s, name)
+         elif name in {'sha3_224', 'sha3_256', 'sha3_384', 'sha3_512'}:
+             import _sha3
+-            cache['sha3_224'] = _sha3.sha3_224
+-            cache['sha3_256'] = _sha3.sha3_256
+-            cache['sha3_384'] = _sha3.sha3_384
+-            cache['sha3_512'] = _sha3.sha3_512
++            cache['sha3_224'] = __get_wrapped_builtin(_sha3.sha3_224, name)
++            cache['sha3_256'] = __get_wrapped_builtin(_sha3.sha3_256, name)
++            cache['sha3_384'] = __get_wrapped_builtin(_sha3.sha3_384, name)
++            cache['sha3_512'] = __get_wrapped_builtin(_sha3.sha3_512, name)
+         elif name in {'shake_128', 'shake_256'}:
+             import _sha3
+-            cache['shake_128'] = _sha3.shake_128
+-            cache['shake_256'] = _sha3.shake_256
++            cache['shake_128'] = __get_wrapped_builtin(_sha3.shake_128, name)
++            cache['shake_256'] = __get_wrapped_builtin(_sha3.shake_256, name)
+     except ImportError:
+         pass  # no extension module, this hash is unsupported.
+ 
+@@ -161,9 +178,8 @@ def __hash_new(name, data=b'', **kwargs):
+     except ValueError:
+         # If the _hashlib module (OpenSSL) doesn't support the named
+         # hash, try using our builtin implementations.
+-        # This allows for SHA224/256 and SHA384/512 support even though
+-        # the OpenSSL library prior to 0.9.8 doesn't provide them.
+-        return __get_builtin_constructor(name)(data)
++        # OpenSSL may not have been compiled to support everything.
++        return __get_builtin_constructor(name)(data, **kwargs)
+ 
+ 
+ try:
+@@ -172,10 +188,15 @@ def __hash_new(name, data=b'', **kwargs):
+     __get_hash = __get_openssl_constructor
+     algorithms_available = algorithms_available.union(
+             _hashlib.openssl_md_meth_names)
++    try:
++        __openssl_fips_mode = _hashlib.get_fips_mode()
++    except ValueError:
++        __openssl_fips_mode = 0
+ except ImportError:
+     _hashlib = None
+     new = __py_new
+     __get_hash = __get_builtin_constructor
++    __openssl_fips_mode = 0
+ 
+ try:
+     # OpenSSL's PKCS5_PBKDF2_HMAC requires OpenSSL 1.0+ with HMAC and SHA
+diff --git a/Lib/test/_test_hashlib_fips.py b/Lib/test/_test_hashlib_fips.py
+new file mode 100644
+index 00000000000..92537245954
+--- /dev/null
++++ b/Lib/test/_test_hashlib_fips.py
+@@ -0,0 +1,64 @@
++# Test the hashlib module usedforsecurity wrappers under fips.
++#
++#  Copyright (C) 2024   Dimitri John Ledkov (dimitri.ledkov@surgut.co.uk)
++#  Licensed to PSF under a Contributor Agreement.
++#
++
++"""Primarily executed by test_hashlib.py. It can run stand alone by humans."""
++
++import os
++import unittest
++
++OPENSSL_CONF_BACKUP = os.environ.get("OPENSSL_CONF")
++
++
++class HashLibFIPSTestCase(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        # This openssl.cnf mocks FIPS mode without any digest
++        # loaded. It means all digests must raise ValueError when
++        # usedforsecurity=True via either openssl or builtin
++        # constructors
++        OPENSSL_CONF = os.path.join(os.path.dirname(__file__), "hashlibdata", "openssl.cnf")
++        os.environ["OPENSSL_CONF"] = OPENSSL_CONF
++        # Ensure hashlib is loading a fresh libcrypto with openssl
++        # context affected by the above config file. Check if this can
++        # be folded into test_hashlib.py, specifically if
++        # import_fresh_module() results in a fresh library context
++        import hashlib
++
++    def setUp(self):
++        try:
++            from _hashlib import get_fips_mode
++        except ImportError:
++            self.skipTest('_hashlib not available')
++
++        if get_fips_mode() != 1:
++            self.skipTest('mocking fips mode failed')
++
++    @classmethod
++    def tearDownClass(cls):
++        if OPENSSL_CONF_BACKUP is not None:
++            os.environ["OPENSSL_CONF"] = OPENSSL_CONF_BACKUP
++        else:
++            os.environ.pop("OPENSSL_CONF", None)
++
++    def test_algorithms_available(self):
++        import hashlib
++        self.assertTrue(set(hashlib.algorithms_guaranteed).
++                            issubset(hashlib.algorithms_available))
++        # all available algorithms must be loadable, bpo-47101
++        self.assertNotIn("undefined", hashlib.algorithms_available)
++        for name in hashlib.algorithms_available:
++            with self.subTest(name):
++                digest = hashlib.new(name, usedforsecurity=False)
++
++    def test_usedforsecurity_true(self):
++        import hashlib
++        for name in hashlib.algorithms_available:
++            with self.subTest(name):
++                with self.assertRaises(ValueError):
++                    digest = hashlib.new(name, usedforsecurity=True)
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/Lib/test/hashlibdata/openssl.cnf b/Lib/test/hashlibdata/openssl.cnf
+new file mode 100644
+index 00000000000..9a936ddc5ef
+--- /dev/null
++++ b/Lib/test/hashlibdata/openssl.cnf
+@@ -0,0 +1,19 @@
++# Activate base provider only, with default properties fips=yes. It
++# means that fips mode is on, and no digest implementations are
++# available. Perfect for mock testing builtin FIPS wrappers.
++
++config_diagnostics = 1
++openssl_conf = openssl_init
++
++[openssl_init]
++providers = provider_sect
++alg_section = algorithm_sect
++
++[provider_sect]
++base = base_sect
++
++[base_sect]
++activate = 1
++
++[algorithm_sect]
++default_properties = fips=yes
+diff --git a/Lib/test/support/script_helper.py b/Lib/test/support/script_helper.py
+index 46ce950433d..7b83c8e0632 100644
+--- a/Lib/test/support/script_helper.py
++++ b/Lib/test/support/script_helper.py
+@@ -303,7 +303,14 @@ def make_zip_pkg(zip_dir, zip_basename, pkg_name, script_basename,
+ 
+ 
+ @support.requires_subprocess()
+-def run_test_script(script):
++def run_test_script(script, **kwargs):
++    """Run the file *script* in a child interpreter.
++
++    Keyword arguments are passed on to subprocess.run() within.
++
++    Asserts if the child exits non-zero.  Prints child output after
++    execution when run in verbose mode.
++    """
+     # use -u to try to get the full output if the test hangs or crash
+     if support.verbose:
+         def title(text):
+@@ -315,7 +322,7 @@ def title(text):
+         # In verbose mode, the child process inherit stdout and stdout,
+         # to see output in realtime and reduce the risk of losing output.
+         args = [sys.executable, "-E", "-X", "faulthandler", "-u", script, "-v"]
+-        proc = subprocess.run(args)
++        proc = subprocess.run(args, **kwargs)
+         print(title(f"{name} completed: exit code {proc.returncode}"),
+               flush=True)
+         if proc.returncode:
+diff --git a/Lib/test/test_hashlib.py b/Lib/test/test_hashlib.py
+index 575b2cd0da7..f1ff7c33004 100644
+--- a/Lib/test/test_hashlib.py
++++ b/Lib/test/test_hashlib.py
+@@ -21,6 +21,7 @@
+ from test.support.import_helper import import_fresh_module
+ from test.support import os_helper
+ from test.support import requires_resource
++from test.support import script_helper
+ from test.support import threading_helper
+ from http.client import HTTPException
+ 
+@@ -1196,6 +1197,18 @@ def test_file_digest(self):
+             with open(os_helper.TESTFN, "wb") as f:
+                 hashlib.file_digest(f, "sha256")
+ 
++    def test_builtins_in_openssl_fips_mode(self):
++        try:
++            from _hashlib import get_fips_mode
++        except ImportError:
++            self.skipTest('OpenSSL _hashlib not available')
++        from test import _test_hashlib_fips
++        child_test_path = _test_hashlib_fips.__file__
++        env = os.environ.copy()
++        # A config to mock FIPS mode, see _test_hashlib_fips.py.
++        env["OPENSSL_CONF"] = os.path.join(os.path.dirname(__file__), "hashlibdata", "openssl.cnf")
++        script_helper.run_test_script(child_test_path, env=env)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/Makefile.pre.in b/Makefile.pre.in
+index 8d94ba361fd..908717f1791 100644
+--- a/Makefile.pre.in
++++ b/Makefile.pre.in
+@@ -2447,6 +2447,7 @@ TESTSUBDIRS=	idlelib/idle_test \
+ 		test/decimaltestdata \
+ 		test/dtracedata \
+ 		test/encoded_modules \
++		test/hashlibdata \
+ 		test/leakers \
+ 		test/libregrtest \
+ 		test/mathdata \
+diff --git a/Misc/NEWS.d/next/Library/2024-11-26-16-31-40.gh-issue-127298.jqYJvn.rst b/Misc/NEWS.d/next/Library/2024-11-26-16-31-40.gh-issue-127298.jqYJvn.rst
+new file mode 100644
+index 00000000000..e555661a195
+--- /dev/null
++++ b/Misc/NEWS.d/next/Library/2024-11-26-16-31-40.gh-issue-127298.jqYJvn.rst
+@@ -0,0 +1,8 @@
++:mod:`hashlib`'s builtin hash implementations now check ``usedforsecurity=False``,
++when the OpenSSL library default provider is in OpenSSL's FIPS mode.  This helps
++ensure that only US FIPS approved implementations are in use by default on systems
++configured as such.
++
++This is only active when :mod:`hashlib` has been built with OpenSSL implementation
++support and said OpenSSL library includes the FIPS mode feature.  Not all variants
++do, and OpenSSL is not a *required* build time dependency of ``hashlib``.

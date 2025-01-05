@@ -1,0 +1,118 @@
+package:
+  name: apicurio-registry
+  version: 3.0.6
+  epoch: 0
+  description: An API/Schema registry - stores APIs and Schemas
+  copyright:
+    - license: Apache-2.0
+  target-architecture:
+    - x86_64 # Currently, we can't build for aarch64: https://github.com/Apicurio/apicurio-registry/issues/5633
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - go
+      - icu
+      - maven
+      - nodejs-20
+      - npm
+      - openjdk-17
+      - openjdk-17-default-jvm
+      - openssf-compiler-options
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/Apicurio/apicurio-registry
+      tag: v${{package.version}}
+      expected-commit: 779f0994a1de5ebd48f617f476f3e3b7c5a36e48
+
+  - uses: patch
+    with:
+      patches: CVE-2024-31141.patch
+
+  - name: Build
+    runs: |
+      ./mvnw clean install \
+        -Pprod \
+        -DskipTests \
+        -T$(nproc)C \
+        --no-snapshot-updates \
+        --no-transfer-progress \
+        --fail-fast
+
+  - name: Install
+    runs: |
+      dest="${{targets.contextdir}}/usr/share/java/${{package.name}}"
+      mkdir -p "$dest"
+
+      install -Dm644 ./LICENSE "${dest}/LICENSE"
+      install -Dm644 ./README.md "${dest}/README.md"
+
+      tar -zxf ./app/target/apicurio-registry-app-${{package.version}}-all.tar.gz -C "$dest"
+      find . -type f -path "*/target/*-${{package.version}}.jar" -exec cp {} "$dest" \;
+      find . -type f -path "*/target/*-${{package.version}}-runner.jar" -exec cp {} "$dest" \;
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-ui
+    description: Web UI for Apicurio Registry (apicurio-registry-ui)
+    dependencies:
+      runtime:
+        - nodejs-20
+    pipeline:
+      - working-directory: ui
+        runs: |
+          npm install
+          npm audit fix --package-lock-only --legacy-peer-deps || true
+          npm run build
+
+          mkdir -p ${{targets.contextdir}}/opt/app-root/src
+          cp -r ui-app/dist/* ${{targets.contextdir}}/opt/app-root/src/
+
+update:
+  enabled: true
+  github:
+    identifier: Apicurio/apicurio-registry
+    use-tag: true
+    strip-prefix: v
+    tag-filter: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-17
+        - openjdk-17-default-jvm
+        - bash
+        - curl
+        - jq
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      DEST: /usr/share/java/apicurio-registry
+  pipeline:
+    - name: Validate essential JARs
+      runs: |
+        stat "$DEST/apicurio-registry-app-${{package.version}}.jar"
+        stat "$DEST/apicurio-registry-common-${{package.version}}.jar"
+        stat "$DEST/apicurio-registry-utils-tools-${{package.version}}.jar"
+    - name: Ensure lib dir
+      runs: stat "$DEST/lib"
+    - name: "Test runner"
+      uses: test/daemon-check-output
+      with:
+        start: "java -jar $DEST/apicurio-registry-app-${{package.version}}-runner.jar --server.port=8080"
+        timeout: 60
+        expected_output: |
+          constructed successfully
+          Initializing the Apicurio Registry
+        post: |
+          curl -s http://localhost:8080/apis/registry/v2 | grep -qi "Core Registry API"

@@ -2,7 +2,7 @@ package:
   name: datadog-agent
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: 7.59.1
+  version: 7.60.1
   epoch: 1
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
@@ -13,11 +13,12 @@ package:
       - datadog-agent-core-integrations
       - findutils
       - grep
+      - libpcap
       - libseccomp
       - shadow
 
 vars:
-  py-version: "3.11"
+  py-version: "3.12"
   destd: /opt/datadog-agent
 
 var-transforms:
@@ -61,14 +62,14 @@ environment:
       - krb5-dev
       - libbpf-dev
       - libedit-dev
+      - libpcap-dev
       - libzip
       - linux-headers
       - ninja
       - openssf-compiler-options
       - procps-dev
-      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-build-base-dev
       - py${{vars.py-version}}-semver
-      - python-${{vars.py-version}}-dev # strictly requires python3.11
       - systemd-dev
       - util-linux-misc # unshare
       - wget # Required for downloading clang-12 and kernel headers from debian
@@ -76,12 +77,13 @@ environment:
     # CGo allows Go programs to call C code
     CGO_ENABLED: "1"
     # -Os optimizes the code for size and add the directory to rtlinkers includes
-    CGO_CFLAGS: "-Os -I${{targets.destdir}}/usr/include/"
+    CGO_CFLAGS: "-Os -I/usr/include/"
     # Pass options to the linker.
-    CGO_LDFLAGS: "-L${{targets.destdir}}/usr/lib/"
+    CGO_LDFLAGS: "-L/usr/lib/"
+    # See https://github.com/wolfi-dev/os/issues/34568
+    GCC_SPEC_FILE: /home/build/openssf.spec
     # disables generation of debugging information
-    # omits the symbol table and debug information, further reducing the size of the binary.
-    GOFLAGS: "-ldflags=-w -ldflags=-s"
+    GOFLAGS: "-ldflags=-w"
     # The version of linux-headers to fetch kernel headers for
     LINUX_HEADERS_VERSION: "5.10.0-0.deb10.29"
     # The version of linux to fetch kernel headers for
@@ -92,7 +94,11 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: 3638fcd32dcce71adaebe6eb4be4283ab139f6a3
+      expected-commit: 646618687e4f9351b5fe19cce678c9cd4b011e74
+
+  - runs: |
+      gccdir="$(GCC_SPEC_FILE=/dev/null gcc --print-search-dirs | grep ^install: | cut -d' ' -f2)"
+      sed -r 's/,?-z,now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
 
   # Install `invoke` (build) dependencies. We ultimately package with venv so
   # these won't leak into the package.
@@ -105,7 +111,7 @@ pipeline:
 
   - uses: go/bump
     with:
-      deps: github.com/moby/buildkit@v0.13.1 golang.org/x/crypto@v0.31.0
+      deps: github.com/moby/buildkit@v0.13.1 golang.org/x/net@v0.33.0 github.com/go-git/go-git/v5@v5.13.0
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
 
@@ -133,6 +139,11 @@ pipeline:
       # https://github.com/DataDog/datadog-agent-buildimages/blob/main/system-probe_x64/Dockerfile#L80
       wget "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.1/clang+llvm-12.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz" -O /tmp/clang.tar.xz  -o /dev/null
       echo "6b3cc55d3ef413be79785c4dc02828ab3bd6b887872b143e3091692fc6acefe7  /tmp/clang.tar.xz" | sha256sum --check
+
+  # need to link libpcap.a to /home/build/dev/lib/libpcap.a else the build will attempt to download libpcap
+  - runs: |
+      mkdir -p /home/build/dev/lib
+      ln -s /usr/lib/libpcap.a /home/build/dev/lib/libpcap.a
 
   - runs: |
       wget -O common.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-common_${LINUX_KERNEL_VERSION}_all.deb
@@ -164,7 +175,6 @@ pipeline:
 
   - runs: |
       invoke -e rtloader.make \
-        --python-runtimes=3 \
         --install-prefix="${{targets.destdir}}/usr" \
         --cmake-options="\
           -DCMAKE_INSTALL_LIBDIR=lib \
@@ -180,7 +190,6 @@ pipeline:
         --bundle system-probe \
         --bundle security-agent \
         --exclude-rtloader \
-        --python-runtimes 3 \
         --no-development \
         --bundle-ebpf \
         --embedded-path /usr/lib
@@ -286,7 +295,7 @@ subpackages:
             with:
               repository: https://github.com/DataDog/integrations-core
               branch: ${{vars.datadog-major-minor-x}} # 7.59.x
-              expected-commit: cff91adb18fe879fd875d62d285a67deb69040fe # needs to be updated with each new release
+              expected-commit: 3189af0e0ae840c9a4bab3131662c7fd6b0de7fb # needs to be updated with each new release
           - uses: patch
             with:
               patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch /home/build/int-core-snowflake-pyproject-toml.patch
@@ -298,13 +307,13 @@ subpackages:
               python${{vars.py-version}} -m venv .venv
 
               # Install locked dependencies
-              .venv/bin/pip install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_py3.txt
+              .venv/bin/pip${{vars.py-version}} install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
 
               excludes="datadog_checks_base datadog_checks_dev datadog_checks_tests_helper docker_daemon esxi teleport"
               checks=$(invoke -r /home/build agent.collect-integrations /home/integrations/ 3 linux --excluded "$excludes")
 
               # Install core, downloader, and dependencies
-              .venv/bin/pip install \
+              .venv/bin/pip${{vars.py-version}} install \
                 "./datadog_checks_base[deps, http]" \
                 "./datadog_checks_downloader" \
                 $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
@@ -313,7 +322,7 @@ subpackages:
               find .venv -name "__pycache__" -exec rm -rf {} +
 
               mkdir -p ${{targets.contextdir}}${{vars.destd}}
-              .venv/bin/pip freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
+              .venv/bin/pip${{vars.py-version}} freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
 
               # Include the agent's requirements for the core integrations.
               cp requirements-agent-release.txt ${{targets.contextdir}}${{vars.destd}}/
@@ -566,12 +575,16 @@ test:
       runs: |
         PATH=$mypath:$PATH
         agent integration freeze >/dev/null
-    - name: Ensure checks can be loaded
-      runs: |
-        PATH=$mypath:$PATH
-        # this is left without path to be explicit which python is used.
-        ${{vars.destd}}/embedded/bin/python3 -c "import datadog_checks.base"
-        ${{vars.destd}}/embedded/bin/python3 -c "import datadog_checks.downloader"
+    - name: Ensure checks can be loaded (base)
+      uses: python/import
+      with:
+        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
+        import: datadog_checks.base
+    - name: Ensure checks can be loaded (downloader)
+      uses: python/import
+      with:
+        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
+        import: datadog_checks.downloader
     - name: Execute bins
       runs: |
         PATH=$mypath:$PATH

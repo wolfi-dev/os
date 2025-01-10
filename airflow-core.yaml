@@ -17,17 +17,23 @@ package:
       - gnupg-utils
       - gzip
       - mariadb-dev
-      - mysql
       - openssl
       - postgresql-client
       - postgresql-dev
-      - python-3.12
+      - python-${{vars.py-version}}
   copyright:
     - license: Apache-2.0
+
+# As of now airflow is primarily available for python 3.12 and will break for python 3.13
+# For ref: https://airflow.apache.org/blog/airflow-2.9.0
+vars:
+  py-version: 3.12
 
 environment:
   contents:
     packages:
+      - bash
+      - busybox
       - gcc
       - glibc-dev
       - mariadb-connector-c-dev
@@ -35,12 +41,14 @@ environment:
       - openssf-compiler-options
       - pkgconf-dev
       - postgresql-dev
-      - py3.12-build-bin
-      - py3.12-pip
-      - python-3.12
-      - python-3.12-dev
-      - wolfi-base
+      - py${{vars.py-version}}-build-bin
+      - py${{vars.py-version}}-pip
+      - python-${{vars.py-version}}
+      - python-${{vars.py-version}}-dev
       - zlib-dev
+  environment:
+    # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
+    SOURCE_DATE_EPOCH: 315532800
 
 pipeline:
   - uses: git-checkout
@@ -50,10 +58,6 @@ pipeline:
       expected-commit: c083e456fa02c6cb32cdbe0c9ed3c3b2380beccd
 
   - runs: |
-      # Set required build environment variables
-      export SOURCE_DATE_EPOCH=315532800
-      export MYSQLCLIENT_CFLAGS=$(mysql_config --cflags)
-
       # Install airflow core, the upstream sets this as directory
       export PYTHONUSERBASE=${{targets.destdir}}/home/airflow/.local
       pip install --no-cache-dir --user apache-airflow[core]==${{package.version}}
@@ -62,13 +66,13 @@ pipeline:
       pip install --no-cache-dir --user aiohttp>=3.10.11 tornado>=6.4.2
       pip install --no-cache-dir --user --force-reinstall packaging statsd
 
-  - runs: |
       # CVE-2024-6345 GHSA-cx63-2mw6-8hw5
       # setuptools comes from airflow/providers/google/provider.yaml having
       # gcloud-aio-auth>=4.0.0,<5.0.0 . gcloud-aio-auth 4 is backlevel and has
       # setuptools in it's pyproject.toml 'tool.poetry.dependencies'
       # The tldr; For that case it is not needed in runtime.
       pip uninstall --yes setuptools
+
       find . -name '__pycache__' -exec rm -rf {} +
 
   - runs: |
@@ -79,7 +83,7 @@ pipeline:
       # The first time you run Airflow, it will create a file called `airflow.cfg` in
       # `$AIRFLOW_HOME` directory
       # However, for production case it is advised to generate the configuration
-      export PYTHONPATH=${{targets.destdir}}/home/airflow/.local/lib/python3.12/site-packages
+      export PYTHONPATH=${{targets.destdir}}/home/airflow/.local/lib/python${{vars.py-version}}/site-packages
 
       ${{targets.destdir}}/home/airflow/.local/bin/airflow config list --defaults > ${{targets.destdir}}/opt/airflow/"airflow.cfg"
 
@@ -102,7 +106,46 @@ pipeline:
       cp scripts/docker/install_postgres.sh ${{targets.destdir}}/scripts/docker
       chmod 755 ${{targets.destdir}}/scripts/docker/*
 
-# We don't need subpackages for airflow-core as we can resuse airflow's subpackages
+# We re-use airflow-compat package to symlink libstdc++ from usr/lib to /usr/lib/$(uname -m)-linux-gnu/
+# And create this oci-entrypoint subpackage to have it compliant with upstream.
+subpackages:
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint for using airflow-core in OCI containers
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/airflow/dags
+          mkdir -p ${{targets.contextdir}}/opt/airflow/logs
+          mkdir -p ${{targets.contextdir}}/scripts/docker
+
+          # The first time you run Airflow, it will create a file called `airflow.cfg` in
+          # `$AIRFLOW_HOME` directory
+          # However, for production case it is advised to generate the configuration
+          export PYTHONPATH=${{targets.destdir}}/home/airflow/.local/lib/python${{vars.py-version}}/site-packages
+
+          ${{targets.destdir}}/home/airflow/.local/bin/airflow config list --defaults > ${{targets.contextdir}}/opt/airflow/"airflow.cfg"
+
+          cp airflow/config_templates/default_webserver_config.py ${{targets.contextdir}}/
+
+          cp scripts/docker/entrypoint_prod.sh ${{targets.contextdir}}/entrypoint
+          chmod 755 ${{targets.contextdir}}/entrypoint
+
+          cp scripts/docker/clean-logs.sh ${{targets.contextdir}}/clean-logs
+          chmod 755 ${{targets.contextdir}}/clean-logs
+
+          cp scripts/docker/airflow-scheduler-autorestart.sh ${{targets.contextdir}}/airflow-scheduler-autorestart
+          chmod 755 ${{targets.contextdir}}/airflow-scheduler-autorestart
+
+          # unlike airflow, airflow-core needs only these scripts
+          cp scripts/docker/common.sh ${{targets.contextdir}}/scripts/docker
+          cp scripts/docker/install_mssql.sh ${{targets.contextdir}}/scripts/docker
+          cp scripts/docker/install_mysql.sh ${{targets.contextdir}}/scripts/docker
+          cp scripts/docker/install_os_dependencies.sh ${{targets.contextdir}}/scripts/docker
+          cp scripts/docker/install_postgres.sh ${{targets.contextdir}}/scripts/docker
+          chmod 755 ${{targets.contextdir}}/scripts/docker/*
+
 update:
   enabled: true
   ignore-regex-patterns:
@@ -115,13 +158,14 @@ test:
   environment:
     contents:
       packages:
-        - python3
+        - python-${{vars.py-version}}
+        - airflow-compat
         - bash
   pipeline:
     - runs: |
         # Set environment variables
         export PATH=/home/airflow/.local/bin:$PATH
-        export PYTHONPATH=/home/airflow/.local/lib/python3.12/site-packages
+        export PYTHONPATH=/home/airflow/.local/lib/python${{vars.py-version}}/site-packages
         export AIRFLOW_HOME=/opt/airflow
 
         # Initialize Airflow database

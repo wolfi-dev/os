@@ -38,64 +38,94 @@ pipeline:
       passes=0
       files="${{inputs.files}}"
       packages="${{inputs.packages}}"
-      verbose="${{inputs.verbose}}"
-      case "$verbose" in
+      VERBOSE="${{inputs.verbose}}"
+      case "$VERBOSE" in
         true|false) :;;
-        *) error "verbose must be 'true' or 'false'. found '$verbose'";;
+        *) error "VERBOSE must be 'true' or 'false'. found '$VERBOSE'";;
       esac
       [ -n "${files}${packages}" ] || error "No files or packages specified"
 
       export LANG=C
-      test_file() {
-        outf="$tmpd/out"
-        [ -e "$f" ] || { fail "$f: does not exist"; continue; }
-        [ -f "$f" ] || { fail "$f: not a file"; continue; }
-        ldd "$f" > "$outf" || { fail "$f: ldd exited $?"; continue; }
+
+      vmsg() {
+        [ "$VERBOSE" = "false" ] || echo "$@"
+      }
+
+      failormsg() {
+        local cond="$1" msg="$2"
+        case "$cond" in
+          true|false) :;;
+          *) error "cond=$cond - expected true or false";;
+        esac
+        [ "$cond" = "true" ] && fail "$msg"
+        vmsg "$msg"
+      }
+
+      check_output() {
+        local file="$1" outf="$2" errf="$3"
         missing=$(awk \
-          '$0 ~ /=> not found/ { miss = miss " " $1; }; END { printf("%s\n", miss); }' \
-          "$outf") || error "$f: parsing with awk failed $?";
-        if [ "$verbose" = "true" ]; then
+          '$0 ~ /=> not found/ { miss = miss " " $1; };
+           END { printf("%s\n", miss); }' "$outf") ||
+             error "$f: parsing with awk failed $?";
+        if [ "$VERBOSE" = "true" ]; then
           echo "> $ ldd $f"
           sed 's,^,> ,' "$outf"
         fi
-        [ -z "$missing" ] && { pass "$f"; continue; }
-        fail "$f: missing ${missing# }"
+        [ -z "$missing" ] || fail "$f: missing ${missing# }"
+        pass "$f"
       }
 
-      is_dyn_obj() {
-        errf="$tmpd/ldd.stderr.$$"
-        # ldd has this code already, let's not NIH it
-        # note: the actual ldd check happens in test_file()
-        if ldd "$1" > /dev/null 2> "$errf"; then
+      check_file() {
+        local f="$1" insist_dyn="$2" rc="0"
+        local outf="$tmpd/ldd.stdout" errf="$tmpd/ldd.sterr"
+        if [ ! -e "$f" ]; then
+          failormsg "$insist_dyn" "$f: did not exist"
           return 0
         fi
-        if grep -q 'not a dynamic executable' "$errf"; then
-          return 1
+        if [ ! -f "$f" ]; then
+          failormsg "$insist_dyn" "$f: is not a file"
+          return 0
         fi
-        error "$1: failed to determine if file is a dynamic object: $(< "$errf")"
+
+        ldd "$f" >$outf 2>$errf || rc=$?
+
+        if [ $rc -eq 1 ]; then
+          if grep -q 'not a dynamic executable' "$errf"; then
+            failormsg "$insist_dyn" "$f: not a dynamic exectuable"
+            return 0
+          fi
+          echo "> $ ldd $f"
+          sed 's,^,> ,' "$outf" "$errf"
+          error "$f: ldd exited $rc"
+        elif [ $rc -ne 0 ]; then
+          echo "> $ ldd $f"
+          sed 's,^,> ,' "$outf" "$errf"
+          error "$1: unexpected exit code $rc"
+        fi
+
+        check_output "$f" "$outf" "$errf"
       }
 
       test_files_in() {
+        local f=""
         echo "[ldd-check] Testing binaries in package $pkg"
-        apk info -eq "$pkg" > /dev/null || \
-          { fail "Package $pkg is not installed"; continue; }
+        apk info -eq "$pkg" > /dev/null ||
+          error "Package $pkg is not installed";
         apk info -Lq "$pkg" > "$tmpd/$pkg.list"
         while read f; do
           [ -n "$f" ] || continue
-          f="/$f"
-          [ -f "$f" ] || continue
-          is_dyn_obj "$f" || continue
-          test_file "$f"
+          check_file "/$f" false
         done < "$tmpd/$pkg.list"
       }
 
       set -- $files
       for f in "$@"; do
-        test_file "$f"
+        check_file "$f" true
       done
       set -- $packages
       for pkg in "$@"; do
         test_files_in "$pkg"
       done
-      echo "tested $((passes+fails)) files with ldd. $passes passes. $fails fails."
+      echo "tested $((passes+fails)) files with ldd." \
+        "$passes passes. $fails fails."
       exit $fails

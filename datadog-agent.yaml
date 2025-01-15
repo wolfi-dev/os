@@ -3,7 +3,7 @@ package:
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
   version: 7.60.1
-  epoch: 0
+  epoch: 1
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -68,9 +68,8 @@ environment:
       - ninja
       - openssf-compiler-options
       - procps-dev
-      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-build-base-dev
       - py${{vars.py-version}}-semver
-      - python-${{vars.py-version}}-dev
       - systemd-dev
       - util-linux-misc # unshare
       - wget # Required for downloading clang-12 and kernel headers from debian
@@ -81,6 +80,8 @@ environment:
     CGO_CFLAGS: "-Os -I/usr/include/"
     # Pass options to the linker.
     CGO_LDFLAGS: "-L/usr/lib/"
+    # See https://github.com/wolfi-dev/os/issues/34568
+    GCC_SPEC_FILE: /home/build/openssf.spec
     # disables generation of debugging information
     GOFLAGS: "-ldflags=-w"
     # The version of linux-headers to fetch kernel headers for
@@ -95,12 +96,9 @@ pipeline:
       tag: ${{package.version}}
       expected-commit: 646618687e4f9351b5fe19cce678c9cd4b011e74
 
-  # disable GPU support for the agent as it causes test failures at runtime
-  # error: agent: undefined symbol: nvmlVgpuTypeGetCapabilities
-  # upstream issue to track https://github.com/DataDog/datadog-agent/issues/32419
-  - uses: patch
-    with:
-      patches: /home/build/disable-gpu.patch
+  - runs: |
+      gccdir="$(GCC_SPEC_FILE=/dev/null gcc --print-search-dirs | grep ^install: | cut -d' ' -f2)"
+      sed -r 's/,?-z,now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
 
   # Install `invoke` (build) dependencies. We ultimately package with venv so
   # these won't leak into the package.
@@ -113,7 +111,7 @@ pipeline:
 
   - uses: go/bump
     with:
-      deps: github.com/moby/buildkit@v0.13.1 golang.org/x/net@v0.33.0
+      deps: github.com/moby/buildkit@v0.13.1 golang.org/x/net@v0.33.0 github.com/go-git/go-git/v5@v5.13.0
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
 
@@ -309,13 +307,13 @@ subpackages:
               python${{vars.py-version}} -m venv .venv
 
               # Install locked dependencies
-              .venv/bin/pip install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
+              .venv/bin/pip${{vars.py-version}} install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
 
               excludes="datadog_checks_base datadog_checks_dev datadog_checks_tests_helper docker_daemon esxi teleport"
               checks=$(invoke -r /home/build agent.collect-integrations /home/integrations/ 3 linux --excluded "$excludes")
 
               # Install core, downloader, and dependencies
-              .venv/bin/pip install \
+              .venv/bin/pip${{vars.py-version}} install \
                 "./datadog_checks_base[deps, http]" \
                 "./datadog_checks_downloader" \
                 $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
@@ -324,7 +322,7 @@ subpackages:
               find .venv -name "__pycache__" -exec rm -rf {} +
 
               mkdir -p ${{targets.contextdir}}${{vars.destd}}
-              .venv/bin/pip freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
+              .venv/bin/pip${{vars.py-version}} freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
 
               # Include the agent's requirements for the core integrations.
               cp requirements-agent-release.txt ${{targets.contextdir}}${{vars.destd}}/
@@ -577,12 +575,16 @@ test:
       runs: |
         PATH=$mypath:$PATH
         agent integration freeze >/dev/null
-    - name: Ensure checks can be loaded
-      runs: |
-        PATH=$mypath:$PATH
-        # this is left without path to be explicit which python is used.
-        ${{vars.destd}}/embedded/bin/python3 -c "import datadog_checks.base"
-        ${{vars.destd}}/embedded/bin/python3 -c "import datadog_checks.downloader"
+    - name: Ensure checks can be loaded (base)
+      uses: python/import
+      with:
+        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
+        import: datadog_checks.base
+    - name: Ensure checks can be loaded (downloader)
+      uses: python/import
+      with:
+        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
+        import: datadog_checks.downloader
     - name: Execute bins
       runs: |
         PATH=$mypath:$PATH
@@ -615,3 +617,6 @@ test:
         security-agent version | grep "Security agent"
         process-agent version | grep Agent
         system-probe version | grep "System Probe"
+    - uses: test/ldd-check
+      with:
+        packages: ${{package.name}}

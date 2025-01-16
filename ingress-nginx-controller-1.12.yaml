@@ -3,7 +3,7 @@ package:
   name: ingress-nginx-controller-1.12
   version: 1.12.0
   # There are manual changes to review between each package update. See 'vars:' section.
-  epoch: 0
+  epoch: 2
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -54,12 +54,14 @@ var-transforms:
 environment:
   contents:
     packages:
+      - abseil-cpp-dev
       - autoconf
       - automake
       - bash
       - bison
       - brotli-dev
       - busybox
+      - c-ares-dev
       - ca-certificates
       - ca-certificates-bundle
       - clang-15
@@ -72,7 +74,9 @@ environment:
       - gcc
       - gd-dev
       - git
+      - glibc-dev
       - go
+      - icu-dev
       - libaio-dev
       - libcap
       - libcap-utils
@@ -111,13 +115,17 @@ environment:
       - openssh-client
       - openssl
       - openssl-dev
+      - opentelemetry-cpp-dev
       - patch
       - pcre-dev
       - perl-dev
       - pkgconf
+      - protobuf-dev
       - python3
+      - re2-dev
       - scanelf
       - ssdeep
+      - systemd-dev
       - util-linux
       - wget
       - wolfi-base
@@ -148,7 +156,9 @@ vars:
   NGX_BROTLI_SHA: 63ca02abdcf79c9e788d2eedcc388d2335902e52
   # TODO: ModSecurity-nginx needs a release beyond v1.0.3 to work properly
   # see https://github.com/owasp-modsecurity/ModSecurity-nginx/issues/324
-  MODSECURITY_NGINX_VERSION: "ef64996aedd4bb5fa1831631361244813d48b82f"
+  MODSECURITY_NGINX_VERSION: "fb678c5b4456c733e011d4bd6ad0888baca8c124"
+  # Instrumentation for nginx plugin: https://github.com/open-telemetry/opentelemetry-cpp-contrib
+  OTEL_SHA: "a4d3681626082234abb71f118cb9be6e71fc52eb"
 
 pipeline:
   - uses: git-checkout
@@ -492,6 +502,7 @@ subpackages:
       provides:
         - ingress-nginx-controller-compat=${{package.full-version}}
       runtime:
+        - ingress-nginx-opentelemetry-plugin-${{vars.nginx-ingress-major-minor}}
         - modsecurity-config
     pipeline:
       - runs: |
@@ -535,6 +546,31 @@ subpackages:
           modroot: ./images/kube-webhook-certgen/rootfs
           packages: .
 
+  - name: ingress-nginx-opentelemetry-plugin-${{vars.nginx-ingress-major-minor}}
+    description: OTel plugin for ingress nginx controller ${{vars.nginx-ingress-major-minor}}
+    dependencies:
+      provides:
+        - ingress-nginx-opentelemetry-plugin=${{package.full-version}}
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/open-telemetry/opentelemetry-cpp-contrib
+          branch: main
+          expected-commit: ${{vars.OTEL_SHA}}
+      - working-directory: instrumentation/nginx
+        runs: |
+          mkdir build
+          cd build
+
+          # This must be set to whatever ingress nginx is using
+          cmake -DNGINX_VERSION=${{vars.NGINX_VERSION}} ..
+          make
+
+          # Copy over plugin
+          mkdir -p ${{targets.contextdir}}/etc/nginx/modules
+          cp -p otel_ngx_module.so ${{targets.contextdir}}/etc/nginx/modules/
+      - uses: strip
+
 update:
   enabled: true
   manual: true
@@ -544,6 +580,10 @@ update:
     tag-filter: "controller-v1.12"
 
 test:
+  environment:
+    contents:
+      packages:
+        - ingress-nginx-controller-compat-${{vars.nginx-ingress-major-minor}}
   pipeline:
     - runs: |
         /usr/bin/nginx -v
@@ -552,3 +592,33 @@ test:
         nginx -h
         nginx-dbg --help
         nginx-ingress-controller --version
+    - runs: |
+        cat <<EOF > /etc/nginx/nginx.conf
+        load_module /etc/nginx/modules/otel_ngx_module.so;
+
+        http {
+          opentelemetry_service_name "nginx-proxy";
+          opentelemetry_otlp_traces_endpoint "http://collector:4318/v1/traces";
+
+          server {
+            listen 80;
+            server_name otel_example;
+
+            root /var/www/html;
+
+            location = / {
+              opentelemetry_operation_name my_example_backend;
+              opentelemetry_propagate;
+              proxy_pass http://localhost:3501/;
+            }
+          }
+        }
+        events {}
+        EOF
+
+        # Not sure why this isn't included in main package.
+        mkdir -p /var/lib/nginx/tmp/
+        adduser -D -H -s /sbin/nologin www-data
+    # -T: test the configuration file: nginx checks the configuration for correct syntax, and then tries to open files referred in the configuration.
+    # additionally dump configuration files to standard output (1.9.2).
+    - runs: nginx -T

@@ -1,0 +1,120 @@
+package:
+  name: openfga
+  version: "1.8.4"
+  epoch: 0
+  description: A high performance and flexible authorization/permission engine built for developers and inspired by Google Zanzibar
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/openfga/openfga
+      tag: v${{package.version}}
+      expected-commit: dc1a4803b1ae2f539a67cfa78a929923642c631b
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X github.com/openfga/openfga/internal/build.Version=v${{package.version}}
+        -X github.com/openfga/openfga/internal/build.Commit=$(git rev-parse HEAD)
+        -X github.com/openfga/openfga/internal/build.Date=$(TZ="UTC" date +"%Y-%m-%dT%TZ")
+        -X github.com/openfga/openfga/internal/build.ProjectName=${{package.name}}
+      output: openfga
+      packages: ./cmd/openfga
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          ln -sf /usr/bin/openfga ${{targets.subpkgdir}}/openfga
+    test:
+      pipeline:
+        - runs: stat /openfga
+
+  - name: ${{package.name}}-healthcheck-compat
+    pipeline:
+      - runs: |
+          # openfga image has a unique path to its grpc-health-probe binary
+          mkdir -p "${{targets.subpkgdir}}"/usr/local/bin
+          ln -sf /usr/bin/grpc-health-probe ${{targets.subpkgdir}}/usr/local/bin/grpc_health_probe
+    dependencies:
+      runtime:
+        - grpc-health-probe
+    test:
+      pipeline:
+        - runs: stat /usr/local/bin/grpc_health_probe
+
+update:
+  enabled: true
+  github:
+    identifier: openfga/openfga
+    strip-prefix: v
+    tag-filter: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - curl
+        - go
+        - jq
+    environment:
+      STORES_URL: localhost:8080/stores
+  pipeline:
+    - name: Test build with right version
+      runs: |
+        openfga version 2>&1 >/dev/null | grep "${{package.version}}"
+    - name: Test server startup and hitting some endpoints
+      uses: test/daemon-check-output
+      with:
+        start: /openfga run
+        expected_output: |
+          starting openfga service...
+          starting prometheus metrics server
+          starting gRPC server
+          starting openfga playground
+          starting HTTP server
+        error_strings: |
+          "msg":"error"
+          "level":"error"
+          "panic"
+          "fatal"
+          failed
+          Error:
+          error:
+          denied
+        post: |
+          store_id=$(curl -X POST ${STORES_URL} \
+            --fail-with-body \
+            --header "Content-Type: application/json" \
+            --data-raw "{\"name\":\"chainguard-test\"}" | jq -r .id)
+          curl -X GET ${STORES_URL}/${store_id} | grep chainguard-test
+
+          auth_model_id=$(curl -X POST ${STORES_URL}/${store_id}/authorization-models \
+            --fail-with-body \
+            --header "Content-Type: application/json" \
+            --data @test_auth_model.json | jq -r .authorization_model_id)
+          curl -X GET ${STORES_URL}/${store_id}/authorization-models/${auth_model_id} | grep ${auth_model_id} | grep type_definitions
+    - name: Test profiler
+      uses: test/daemon-check-output
+      with:
+        start: /openfga run --profiler-enabled --playground-enabled=false
+        expected_output: |
+          starting openfga service...
+          starting pprof profiler
+          starting prometheus metrics server
+          starting gRPC server
+          starting HTTP server
+        error_strings: |
+          "msg":"error"
+          "level":"error"
+          "panic"
+          "fatal"
+          failed
+          Error:
+          error:
+          denied
+        post: |
+          go tool pprof -proto -seconds 10 http://localhost:3001/debug/pprof/profile

@@ -2,7 +2,16 @@
 
 set -euo pipefail
 
-for fn in *.yaml; do
+# If arguments are passed to the command, only lint the files listed.
+if [ "$#" == 0 ]; then
+  list="*.yaml"
+else
+  list=$*
+fi
+
+for fn in $list; do
+  case $fn in *.yaml) ;; *) echo "--- $fn not a yaml file, skipping"; continue ;; esac
+
   p=$(yq -r '.package.name' ${fn})
   echo "--- package" $p
 

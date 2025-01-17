@@ -1,13 +1,23 @@
 package:
   name: systemd
   version: "257.2"
-  epoch: 2
+  epoch: 6
   description: The systemd System and Service Manager
   copyright:
     - license: LGPL-2.1-or-later AND GPL-2.0-or-later
+  resources:
+    cpu: 4
+    memory: 12Gi
 
 vars:
   llvm-vers: 19
+
+data:
+  - name: standalone-binaries
+    items:
+      "systemd-repart": "systemd-repart.standalone"
+      "systemd-sysusers": "systemd-sysusers.standalone"
+      "systemd-tmpfiles": "systemd-tmpfiles.standalone"
 
 environment:
   contents:
@@ -71,7 +81,8 @@ pipeline:
       opts: |
         -Dmode=release \
         -Dvmspawn=enabled \
-        -Dinstall-tests=true
+        -Dinstall-tests=true \
+        -Dstandalone-binaries=true
 
   - uses: meson/compile
 
@@ -82,6 +93,27 @@ pipeline:
       mv ${{targets.destdir}}/usr/lib/libsystemd.so* ${{targets.destdir}}/lib/
 
 subpackages:
+  - range: standalone-binaries
+    name: ${{range.key}}-standalone
+    description: Standalone version of ${{range.key}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mv ${{targets.destdir}}/usr/bin/${{range.value}} ${{targets.subpkgdir}}/usr/bin/${{range.key}}
+    test:
+      pipeline:
+        - runs: |
+            ${{range.key}} --help
+            ${{range.key}} --version
+
+  - name: systemd-shutdown-standalone
+    description: Standalone version of ${{range.key}}
+    # Can't test this with --version because the binary checks the pid before anything else
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/systemd
+          mv ${{targets.destdir}}/usr/lib/systemd/systemd-shutdown.standalone ${{targets.subpkgdir}}/usr/lib/systemd/systemd-shutdown
+
   - name: "systemd-dev"
     description: "headers for systemd"
     dependencies:
@@ -115,6 +147,31 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/lib
           cp ${{targets.destdir}}/usr/lib/systemd/libsystemd-shared-*.so  ${{targets.subpkgdir}}/usr/lib/
+
+  - name: "systemd-boot-installed"
+    description: "systemd bootloader (installed for EFI)"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/
+      - if: ${{build.arch}} == 'aarch64'
+        runs: |
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootaa64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTAA64.EFI
+      - if: ${{build.arch}} == 'x86_64'
+        runs: |
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootx64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTX64.EFI
+    test:
+      environment:
+        contents:
+          packages:
+            - file
+            - grep
+      pipeline:
+        - if: ${{build.arch}} == 'aarch64'
+          runs: |
+            file /boot/efi/EFI/BOOT/BOOTAA64.EFI | grep "executable for EFI"
+        - if: ${{build.arch}} == 'x86_64'
+          runs: |
+            file /boot/efi/EFI/BOOT/BOOTX64.EFI | grep "executable for EFI"
 
   - name: "systemd-boot"
     description: "systemd bootloader"
@@ -273,6 +330,38 @@ subpackages:
             # # test if it works
             ls -la /var/lib/machines/test
 
+  - name: "udev"
+    description: "/dev hotplug management daemon"
+    dependencies:
+      runtime:
+        - libsystemd-shared
+    pipeline:
+      - runs: |
+          cd ${{targets.destdir}}/
+          find . -name '*udev*' -exec cp -v --parents -r '{}' ${{targets.subpkgdir}} \;
+          find . -name '*systemd-hwdb*' -exec cp -v --parents -r '{}' ${{targets.subpkgdir}} \;
+
+          find . -name '*udev*' -exec rm -f '{}' \;
+          find . -name '*systemd-hwdb*' -exec rm -f '{}' \;
+    test:
+      pipeline:
+        - runs: |
+            systemd-hwdb --version
+            systemd-hwdb --help
+            udevadm --help
+            udevadm --version
+        - name: Systemd-hwdb checks
+          runs: |
+            systemd-hwdb update -s
+
+            EXPECTED=$(cat <<EOF
+            ID_PCI_CLASS_FROM_DATABASE=Bridge
+            ID_PCI_SUBCLASS_FROM_DATABASE=ISA bridge
+            EOF
+            )
+
+            [ "$EXPECTED" = "$(systemd-hwdb query pci:v00001234d00007000sv00001AF4sd00001100bc06sc01i00)" ]
+
   - name: "systemd-init"
     description: "Configure systemd for use as an init system"
     dependencies:
@@ -282,9 +371,14 @@ subpackages:
         - mount
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/etc
-          ln -s /usr/lib/systemd/systemd ${{targets.subpkgdir}}/init
-          ln -sf /usr/share/zoneinfo/UTC ${{targets.subpkgdir}}/etc/localtime
+          mkdir -p ${{targets.subpkgdir}}/etc ${{targets.subpkgdir}}/sbin
+          ln -s ../usr/lib/systemd/systemd ${{targets.subpkgdir}}/sbin/init
+          ln -sf ../usr/share/zoneinfo/UTC ${{targets.subpkgdir}}/etc/localtime
+    test:
+      pipeline:
+        - runs: |
+            [ -f /sbin/init -a -x /sbin/init ]
+            [ -f /etc/localtime ]
 
   - name: "systemd-default-network"
     description: "Configure network to DHCP on default interfaces"
@@ -378,8 +472,6 @@ test:
         systemd-escape --help
         systemd-firstboot --version
         systemd-firstboot --help
-        systemd-hwdb --version
-        systemd-hwdb --help
         systemd-id128 --version
         systemd-id128 --help
         systemd-inhibit --version
@@ -416,7 +508,6 @@ test:
         systemd-vpick --help
         timedatectl --version
         timedatectl --help
-        udevadm --help
         userdbctl --version
         userdbctl --help
         varlinkctl --version
@@ -437,3 +528,7 @@ test:
         int main() { sd_bus *bus; return sd_bus_default_system(&bus); }' > test.c
         cc test.c -lsystemd -o test_systemd
         rm test.c test_systemd
+    - name: "Verify stanalone binaries removed"
+      runs: |
+        STANDALONE_BINARIES=$(find / -name '*.standalone')
+        test -z "${STANDALONE_BINARIES}"

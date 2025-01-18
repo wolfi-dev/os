@@ -2,22 +2,18 @@
 
 set -euo pipefail
 
-for p in $(make list); do
+# If arguments are passed to the command, only lint the files listed.
+if [ "$#" == 0 ]; then
+  list="*.yaml"
+else
+  list=$*
+fi
+
+for fn in $list; do
+  case $fn in *.yaml) ;; *) echo "--- $fn not a yaml file, skipping"; continue ;; esac
+
+  p=$(yq -r '.package.name' ${fn})
   echo "--- package" $p
-
-  if [ -f ${p}.yaml ]; then
-    if [ -f **/${p}/${p}.melange.yaml ]; then
-      echo "ERROR: ${p}.yaml and **/${p}/${p}.melange.yaml both exist"
-      exit 1
-    fi
-
-    fn=${p}.yaml
-  elif [ -f **/${p}/${p}.melange.yaml ]; then
-    fn=$(ls **/${p}/${p}.melange.yaml | head -n 1)
-  else
-    echo "ERROR: ${p}.yaml or **/${p}/${p}.melange.yaml does not exist, or multiple matches found"
-    exit 1
-  fi
 
   # Don't specify repositories or keyring for os packages
   if grep -q packages.wolfi.dev/os ${fn}; then
@@ -28,14 +24,14 @@ for p in $(make list); do
   # Don't specify wolfi-base or any of its packages, or the main package, for test pipelines.
   for pkg in wolfi-base busybox apk-tools wolfi-keys ${p}; do
     yq -i 'del(.test.environment.contents.packages[] | select(. == "'${pkg}'"))' ${fn}
-    yam ${fn}
   done
 
   # If .test.environment.contents.packages is empty, remove it all.
   if [ "$(yq -r '.test.environment.contents.packages | length' ${fn})" == "0" ]; then
-    yq -i 'del(.test.environment)' ${fn}
-    yam ${fn}
+    yq -i 'del(.test.environment.contents)' ${fn}
   fi
+
+  yam ${fn}
 done
 
 # New section to check for .sts.yaml files under ./.github/chainguard/

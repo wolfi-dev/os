@@ -1,44 +1,76 @@
+#nolint:forbidden-repository-used,forbidden-keyring-used
 package:
   name: openssl
-  version: 3.3.0
-  epoch: 6
+  version: 3.4.0
+  epoch: 5
   description: "the OpenSSL cryptography suite"
   copyright:
     - license: Apache-2.0
-  # For now, continue to install the legacy openssl provider if the parent openssl
-  # package is installed.  This is done because users may be installing the openssl
-  # package to gain that provider.
   dependencies:
-    runtime:
-      - openssl-provider-legacy
+    # For apk upgrades
+    replaces:
+      - openssl-config<3.4.0
+    replaces-priority: 5
+  resources:
+    cpu: 16
+    memory: 16Gi
 
 environment:
   contents:
+    # NB! accessing historic, but certified build of
+    # jitterentropy-library-dev=3.5.0-r0. In a fresh bootstrap build
+    # any version of jitternetropy-library and get an ESV certificate
+    # for it.
+    build_repositories:
+      - https://packages.wolfi.dev/os
     packages:
       - build-base
       - busybox
       - ca-certificates-bundle
+      # NB! pinned to version https://csrc.nist.gov/projects/cryptographic-module-validation-program/entropy-validations/certificate/191
+      - jitterentropy-library-dev=3.5.0-r0
+      - jitterentropy-library=3.5.0-r0
       - perl
+  environment:
+    # To support automatic discovery of source code in debug symbols
+    # packaged in openssl-dbg, build with debug symbols &
+    # file-prefix-map. Also see "Create dbg sourcecode" and
+    # split/debug.
+    CFLAGS: "-g -ffile-prefix-map=/home/build=/usr/src/${{package.name}}"
 
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      uri: https://www.openssl.org/source/openssl-${{package.version}}.tar.gz
-      expected-sha256: 53e66b043322a606abf0087e7699a0e033a37fa13feb9742df35c3a33b18fb02
+      repository: https://github.com/openssl/openssl
+      tag: openssl-${{package.version}}
+      expected-commit: 98acb6b02839c609ef5b837794e08d906d965335
+
+  - uses: patch
+    with:
+      patches: fix-jitter-old-providers.patch
+
+  - name: Create dbg sourcecode
+    runs: |
+      SRCDIR=$(mktemp -d)
+      cp -r . $SRCDIR/
+      mkdir -p ${{targets.destdir}}-dbg/usr/src/
+      mv $SRCDIR ${{targets.destdir}}-dbg/usr/src/${{package.name}}
+      # Note that mktemp -d created it as 700, whilst the contents
+      # inside is 644 for files and 755 for dirs, without this gdb
+      # doesn't work for non-root user, fix this up.
+      chmod 755 ${{targets.destdir}}-dbg/usr/src/${{package.name}}
 
   - name: Configure and build
     runs: |
-      export CC=${{host.triplet.gnu}}-gcc
-      export CXX=${{host.triplet.gnu}}-g++
-      export CPP=${{host.triplet.gnu}}-cpp
-
       perl ./Configure \
-         linux-$(uname -m) \
+         linux-${{build.arch}} \
          --prefix=/usr \
          --libdir=lib \
          --openssldir=/etc/ssl \
          enable-ktls \
+         enable-jitter \
          shared \
+         enable-pie \
          no-zlib \
          no-async \
          no-comp \
@@ -54,6 +86,7 @@ pipeline:
          -Wa,--noexecstack
       perl configdata.pm --dump
       make -j$(nproc)
+      make tests HARNESS_JOBS=10
 
   - uses: autoconf/make-install
 
@@ -64,6 +97,10 @@ pipeline:
       rm ${{targets.destdir}}/etc/ssl/openssl.cnf
       # Second identical copy of the above
       rm ${{targets.destdir}}/etc/ssl/openssl.cnf.dist
+      # Provide our hardened configuration for ca & req apps, note
+      # ca.cnf is shipped with libraries to be reusable without
+      # openssl tool
+      cp openssl.cnf ${{targets.destdir}}/etc/ssl/
       # Empty CT log
       rm ${{targets.destdir}}/etc/ssl/ct_log_list.cnf
       # Second copy of CT log
@@ -74,8 +111,6 @@ pipeline:
       # This also removes the need to have things coupled with
       # openssl-config-fipshardened going forward.
 
-  - uses: strip
-
 data:
   - name: engines
     items:
@@ -84,6 +119,11 @@ data:
       padlock: VIA Padlock engine
 
 subpackages:
+  - name: "openssl-dbg"
+    description: "OpenSSL debug symbols"
+    pipeline:
+      - uses: split/debug
+
   - name: "openssl-doc"
     description: "OpenSSL documentation"
     pipeline:
@@ -97,9 +137,10 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib
           mv "${{targets.destdir}}"/usr/lib/libcrypto.so.3 "${{targets.subpkgdir}}"/usr/lib
-
-          mkdir -p "${{targets.subpkgdir}}"/usr/lib/engines-3
-          mv "${{targets.destdir}}"/usr/lib/engines-3/loader_attic.so "${{targets.subpkgdir}}"/usr/lib/engines-3/
+          # Provide our hardened configuration for ca & req apps, note
+          # ca.cnf is shipped here to be reusable without the openssl tool
+          mkdir -p "${{targets.subpkgdir}}"/etc/ssl
+          cp ca.cnf ${{targets.subpkgdir}}/etc/ssl/
 
   - name: "libssl3"
     description: "OpenSSL libssl library"
@@ -110,8 +151,18 @@ subpackages:
 
   - name: "openssl-dev"
     description: "OpenSSL headers"
+    dependencies:
+      runtime:
+        # TODO: for static linking only, split into openssl-static, or
+        # fix upstream (note .so actually links 3.5.0-r0 but melange
+        # hates that here)
+        - jitterentropy-library-dev
+        - jitterentropy-library
     pipeline:
       - uses: split/dev
+    test:
+      pipeline:
+        - uses: test/pkgconf
 
   - range: engines
     name: "openssl-engine-${{range.key}}"
@@ -120,6 +171,13 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib/engines-3
           mv "${{targets.destdir}}"/usr/lib/engines-3/${{range.key}}.so "${{targets.subpkgdir}}"/usr/lib/engines-3/
+
+  - name: "openssl-engine-loader-attic"
+    description: "OpenSSL Loader Attic internal test engine"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/engines-3
+          mv "${{targets.destdir}}"/usr/lib/engines-3/loader_attic.so "${{targets.subpkgdir}}"/usr/lib/engines-3/
 
   - name: "openssl-provider-legacy"
     description: "OpenSSL legacy provider"
@@ -133,9 +191,22 @@ test:
     contents:
       packages:
         - curl
+        - gdb
         - git
+        - openssl-dbg
         - wget
   pipeline:
+    - uses: test/hardening-check
+      with:
+        package-match: "^openssl$\\|libssl3"
+    - uses: test/hardening-check
+      with:
+        # jitterentropy is without CF protection so far
+        args: "--nocfprotection"
+        package-match: "^libcrypto3$"
+    - runs: |
+        openssl --version
+        openssl --help
     - name: Verify curl still works
       runs: |
         curl -I https://github.com/openssl/openssl
@@ -147,8 +218,103 @@ test:
       runs: |
         wget -O /dev/null https://github.com/openssl/openssl
         ! wget https://expired.badssl.com/
+    - name: Verify jitter cherry-pick has no effect by default
+      runs: |
+        # Possibly python gdb would be easier to read
+        cat <<EOF >openssl.gdb
+        set pagination off
+        set logging file gdb.log
+        set logging on
+        set width 0
+        set height 0
+        set verbose off
+        set breakpoint pending on
+        break get_jitter_random_value
+        commands 1
+          continue
+        end
+        break syscall_random
+        commands 2
+          continue
+        end
+        run genrsa -out /dev/null
+        EOF
+        gdb --batch --command ./openssl.gdb openssl
+        # Assert that jitter entropy was not used
+        grep -q 'Breakpoint 1,' gdb.log && exit 1
+        # Assert that getrandom syscall wrapper was used
+        grep -q 'Breakpoint 2,' gdb.log || exit 1
+    - name: Verify jitter entropy source opt-in works
+      runs: |
+        cat <<EOF >openssl.cnf
+        openssl_conf = openssl_init
+        [openssl_init]
+        providers = provider_sect
+        random = random
+        [random]
+        seed = JITTER
+        [provider_sect]
+        default = default_sect
+        [default_sect]
+        activate = 1
+        EOF
+        export OPENSSL_CONF=openssl.cnf
+        # Possibly python gdb would be easier to read
+        cat <<EOF >openssl.gdb
+        set pagination off
+        set logging file jitter.log
+        set logging on
+        set width 0
+        set height 0
+        set verbose off
+        set breakpoint pending on
+        break get_jitter_random_value
+        commands 1
+          continue
+        end
+        break syscall_random
+        commands 2
+          continue
+        end
+        run genrsa -out /dev/null
+        EOF
+        gdb --batch --command ./openssl.gdb openssl
+        # Assert that jitter entropy was not used
+        grep -q 'Breakpoint 1,' jitter.log || exit 1
+        # Assert that getrandom syscall wrapper was used
+        grep -q 'Breakpoint 2,' jitter.log && exit 1
+    - name: docker-dind certificate generation
+      runs: |
+        # Distilled from dockerd-entrypoint.sh
+        set -x
+        tmpdir="$(mktemp -d)"
+        trap "rm -rf "$tmpdir"" EXIT
+        rm -rf "$tmpdir/certs/"
+        mkdir -p "$tmpdir/certs/ca"
+        openssl genrsa -out "$tmpdir/certs/ca/key.pem" 4096
+        openssl req -new -key "$tmpdir/certs/ca/key.pem" \
+          -out "$tmpdir/certs/ca/cert.pem" -subj '/CN=docker:dind CA' \
+          -x509 -days 825
+        mkdir -p "$tmpdir/certs/server"
+        openssl genrsa -out "$tmpdir/certs/server/key.pem" 4096
+        openssl req -new -key "$tmpdir/certs/server/key.pem" \
+          -out "$tmpdir/certs/server/csr.pem" -subj '/CN=docker:dind server'
+        cat << EOF >"$tmpdir/certs/server/openssl.cnf"
+        [ x509_exts ]
+        subjectAltName = DNS:b51ddd7b8dcd,DNS:docker,DNS:localhost,IP:127.0.0.1,IP:172.17.0.4,IP:::1
+        EOF
+        openssl x509 -req -in "$tmpdir/certs/server/csr.pem"\
+          -CA "$tmpdir/certs/ca/cert.pem" -CAkey "$tmpdir/certs/ca/key.pem" \
+          -CAcreateserial -out "$tmpdir/certs/server/cert.pem" \
+          -days 825 -extfile "$tmpdir/certs/server/openssl.cnf" \
+          -extensions x509_exts
+        cp "$tmpdir/certs/ca/cert.pem" "$tmpdir/certs/server/ca.pem"
+        openssl verify -CAfile "$tmpdir/certs/server/ca.pem" \
+          "$tmpdir/certs/server/cert.pem"
 
 update:
   enabled: true
-  release-monitor:
-    identifier: 2566
+  github:
+    identifier: openssl/openssl
+    strip-prefix: openssl-
+    tag-filter-prefix: openssl-

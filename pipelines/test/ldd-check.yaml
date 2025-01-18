@@ -1,0 +1,88 @@
+name: ldd-check
+
+needs:
+  packages:
+    - apk-tools
+    - busybox
+    - posix-libc-utils
+
+inputs:
+  files:
+    description: |
+      The files to run `ldd` on and check for missing deps.
+    required: false
+  packages:
+    description: |
+      Check all binaries in these installed packages
+    required: false
+  verbose:
+    description: |
+      Should the full ldd output be shown
+    required: false
+    default: false
+
+pipeline:
+  - name: "run ldd on provided files"
+    runs: |
+      set +x
+      set -f
+      error() { echo "ERROR[ldd-check]:" "$@"; exit 1; }
+      fail() { echo "FAIL[ldd-check]:" "$@"; fails=$((fails+1)); }
+      pass() { echo "PASS[ldd-check]:" "$@"; passes=$((passes+1)); }
+      cleanup() { [ -n "$tmpd" -o -z "$tmpd" ] && return 0; rm -Rf "$tmpd"; }
+
+      tmpd=$(mktemp -d) || fail "ERROR: failed to create tmpdir"
+      trap cleanup EXIT
+
+      fails=0
+      passes=0
+      files="${{inputs.files}}"
+      packages="${{inputs.packages}}"
+      verbose="${{inputs.verbose}}"
+      case "$verbose" in
+        true|false) :;;
+        *) error "verbose must be 'true' or 'false'. found '$verbose'";;
+      esac
+      [ -n "${files}${packages}" ] || error "No files or packages specified"
+
+      export LANG=C
+      test_file() {
+        outf="$tmpd/out"
+        [ -e "$f" ] || { fail "$f: does not exist"; continue; }
+        [ -f "$f" ] || { fail "$f: not a file"; continue; }
+        ldd "$f" > "$outf" || { fail "$f: ldd exited $?"; continue; }
+        missing=$(awk \
+          '$0 ~ /=> not found/ { miss = miss " " $1; }; END { printf("%s\n", miss); }' \
+          "$outf") || error "$f: parsing with awk failed $?";
+        if [ "$verbose" = "true" ]; then
+          echo "> $ ldd $f"
+          sed 's,^,> ,' "$outf"
+        fi
+        [ -z "$missing" ] && { pass "$f"; continue; }
+        fail "$f: missing ${missing# }"
+      }
+
+      test_files_in() {
+        echo "[ldd-check] Testing binaries in package $pkg"
+        apk info -eq "$pkg" > /dev/null || \
+          { fail "Package $pkg is not installed"; continue; }
+        apk info -Lq "$pkg" > "$tmpd/$pkg.list"
+        while read f; do
+          [ -n "$f" ] || continue
+          f="/$f"
+          [ -f "$f" ] || continue
+          ldd "$f" > /dev/null 2>&1 || continue
+          test_file "$f"
+        done < "$tmpd/$pkg.list"
+      }
+
+      set -- $files
+      for f in "$@"; do
+        test_file "$f"
+      done
+      set -- $packages
+      for pkg in "$@"; do
+        test_files_in "$pkg"
+      done
+      echo "tested $((passes+fails)) files with ldd. $passes passes. $fails fails."
+      exit $fails

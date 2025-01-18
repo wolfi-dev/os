@@ -1,0 +1,133 @@
+package:
+  name: kserve
+  version: 0.14.1
+  epoch: 0
+  description: "Standardized Serverless ML Inference Platform on Kubernetes"
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - go
+      - py3.11-pip
+      - py3.11-poetry
+      - py3.11-poetry-bin
+      - python-3.11-dev # Upstream https://github.com/kserve/kserve/blob/master/python/storage-initializer.Dockerfile uses python-3.11
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kserve/kserve
+      tag: v${{package.version}}
+      expected-commit: 564cc2d760b7f47e883a4001876cd98815cfc07d
+
+  - uses: go/bump
+    with:
+      deps: golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.33.0
+
+  - uses: go/bump
+    with:
+      deps: golang.org/x/net@v0.33.0
+      modroot: qpext
+
+data:
+  - name: go-components
+    items:
+      agent: "."
+      router: "."
+      manager: "."
+      qpext: "qpext"
+
+subpackages:
+  - range: go-components
+    name: kserve-${{range.key}}
+    pipeline:
+      - uses: go/build
+        working-directory: ${{range.value}}
+        with:
+          modroot: .
+          packages: ./cmd/${{range.key}}
+          output: ${{range.key}}
+
+  - range: go-components
+    name: kserve-${{range.key}}-compat
+    dependencies:
+      runtime:
+        - kserve-${{range.key}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/"
+          ln -s ../usr/bin/${{range.key}} "${{targets.contextdir}}/${{range.key}}"
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+      pipeline:
+        - name: "check paths"
+          runs: |
+            [ -x /${{range.key}} -a -f /${{range.key}} ]
+
+  - name: kserve-storage-controller
+    options:
+      no-commands: true
+    pipeline:
+      - name: poetry-build-storage-controller
+        working-directory: ./python/kserve
+        runs: |
+          # Install dependencies and build the package using poetry
+          poetry install --no-interaction --no-root --extras "storage ray"
+          # CVE-2024-47554 GHSA-78wr-2p64-hpwj
+          poetry add "ray=^2.24.0"
+          # CVE-2024-52304 GHSA-8495-4g3g-x7pr
+          poetry add "aiohttp=^3.10.11"
+          # CVE-2024-6345 GHSA-cx63-2mw6-8hw5
+          poetry add "setuptools=^70.0.0"
+          poetry add "certifi"
+          poetry add "idna"
+          # CVE-2024-35195: requests
+          poetry add "requests@^2.23.0"
+          poetry add "packaging"
+          poetry add "google.cloud"
+          poetry add "typing-extensions"
+          poetry add "starlette=^0.40.0"
+
+          # CVE-2024-56201 CVE-2024-56326
+          poetry add "jinja2=3.1.5"
+          poetry run pip freeze | grep -v kserve > requirements.txt
+
+          poetry build
+          # Install the wheel file with the root directory set to ${{targets.contextdir}}
+          pip install --root ${{targets.contextdir}} -I -r requirements.txt --no-compile
+          python3 -m pip install --verbose --prefix=/usr --root=${{targets.contextdir}} dist/*.whl
+      - name: install storage-initializer entrypoint
+        working-directory: ./python/storage-initializer
+        runs: |
+          mkdir -p ${{targets.contextdir}}/storage-initializer/scripts/
+
+          cp ./scripts/initializer-entrypoint ${{targets.contextdir}}/storage-initializer/scripts/
+          chmod 755 ${{targets.contextdir}}/storage-initializer/scripts/initializer-entrypoint
+
+          cd ${{targets.contextdir}}/storage-initializer/scripts/
+          # update shbang to point to the python used rather than '/usr/bin/env python'
+          sed -i.dist "1s,#!/usr/bin/env python[^ ]*,#!$(which python3.11)," initializer-entrypoint
+          # exit fail if it did not change anything
+          diff -u initializer-entrypoint.dist initializer-entrypoint && exit 1
+          rm initializer-entrypoint.dist
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+      pipeline:
+        - name: "test entrypoint usage"
+          runs: |
+            /storage-initializer/scripts/initializer-entrypoint --help
+
+update:
+  enabled: true
+  github:
+    identifier: kserve/kserve
+    strip-prefix: v

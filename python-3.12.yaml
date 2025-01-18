@@ -1,10 +1,13 @@
 package:
   name: python-3.12
-  version: 3.12.3
+  version: 3.12.8
   epoch: 2
   description: "the Python programming language"
   copyright:
     - license: PSF-2.0
+  resources:
+    cpu: 8
+    memory: 8Gi
   dependencies:
     provides:
       - python3=${{package.full-version}}
@@ -22,12 +25,15 @@ environment:
       - expat-dev
       - gdbm-dev
       - libffi-dev
+      - libx11-dev
       - linux-headers
       - mpdecimal-dev
       - ncurses-dev
       - openssl-dev
       - readline-dev
       - sqlite-dev
+      - tcl-dev
+      - tk-dev
       - xz-dev
       - zlib-dev
 
@@ -43,24 +49,19 @@ var-transforms:
     to: pyversion
 
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      uri: https://www.python.org/ftp/python/${{package.version}}/Python-${{package.version}}.tar.xz
-      expected-sha256: 56bfef1fdfc1221ce6720e43a661e3eb41785dd914ce99698d8c7896af4bdaa1
+      expected-commit: 2dc476bcb9142cd25d7e1d52392b73a3dcdf1756
+      repository: https://github.com/python/cpython.git
+      tag: v${{package.version}}
+      cherry-picks: |
+        3.12/9aa0deb2eef2655a1029ba228527b152353135b5: CVE-2024-12254 fix
 
   - name: Force use of system libraries
     runs: |
       rm -rf Modules/expat \
         Modules/_ctypes/darwin* \
         Modules/_ctypes/libffi*
-
-  - uses: patch
-    with:
-      patches: CVE-2023-27043.patch
-
-  - uses: patch
-    with:
-      patches: CVE-2023-27043-enable-disable.patch
 
   - uses: patch
     with:
@@ -81,11 +82,11 @@ pipeline:
          --with-computed-gotos \
          --with-dbmliborder=gdbm:ndbm \
          --with-system-expat \
-         --with-system-ffi \
          --with-system-libmpdec \
          --without-ensurepip \
          --with-builtin-hashlib-hashes=blake2 \
-         --with-lto
+         --with-lto \
+         --with-wheel-pkg-dir=/usr/share/python-wheels
 
   - uses: autoconf/make
 
@@ -109,6 +110,13 @@ pipeline:
       rm site-packages/README.txt
       rmdir site-packages
 
+  - name: "remove idle (python IDE)"
+    runs: |
+      rm -R "${{targets.destdir}}/usr/lib/${{vars.python}}/idlelib"
+
+  - runs: |
+      rm -R ${{targets.destdir}}/usr/lib/${{vars.python}}/ensurepip/_bundled/
+
   - runs: |
       find ${{targets.destdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
       find ${{targets.destdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
@@ -121,7 +129,10 @@ pipeline:
 
 subpackages:
   - name: "${{package.name}}-base"
-    description: "${{package.name}} as /usr/bin/python3"
+    description: "${{package.name}} without /usr/bin/python3"
+    dependencies:
+      runtime:
+        - py3-pip-wheel
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/bin ${{targets.subpkgdir}}/usr/lib
@@ -147,8 +158,67 @@ subpackages:
     test:
       pipeline:
         - runs: |
-            ${{vars.python}} CVE-2023-27043-unittest.py
             ${{vars.python}} version-check.py ${{package.version}}
+        - name: Verify venv installs expected packages
+          runs: |
+            set +x
+            d=$(mktemp -d)
+            echo "$ ${{vars.python}} -m venv $d"
+            ${{vars.python}} -m venv "$d"
+            echo "$ $d/bin/pip list"
+            $d/bin/pip list | tee "$d/list.txt"
+            wd=/usr/share/python-wheels
+            for pkg in pip ; do
+              set -- "$wd"/$pkg-*.whl
+              [ $# -eq 1 ] || {
+                echo "ERROR: found $# wheels in $wd matching $pkg-*.whl";
+                exit 1;
+              }
+              [ -f "$1" ] || {
+                echo "ERROR: $wd/$pkg-*.whl ('$1') was not a file"
+                exit 1
+              }
+              # name is like pip-24.2-py3-none-any.whl. second token is version.
+              wheel=${1}
+              tmp=${wheel##*/}
+              tmp=${tmp#*-}
+              ver=${tmp%%-*}
+              if ! grep -q "$pkg[ ]\+${ver}$" "$d/list.txt"; then
+                  echo "FAIL: did not find '$pkg==$ver' in venv"
+                  echo "pip list had:"
+                  sed 's,^,>,' "$d/list.txt"
+                  exit 1
+              fi
+              echo "PASS: venv installed '$pkg==$ver'"
+            done
+
+            rm -Rf "$d"
+
+  - name: "${{package.name}}-tk"
+    dependencies:
+      provides:
+        - py3-tkinter=${{package.full-version}}
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
+        # which is provided by tk.  melange SCA does not find this dependency.
+        - tk
+    pipeline:
+      - runs: |
+          # these got moved by python-3.xx-base from ${{targets.destdir}}
+          fromd="${{targets.destdir}}-base"
+          tod=${{targets.contextdir}}
+          d=usr/lib/${{vars.python}}
+
+          mkdir -p "$tod/$d/lib-dynload"
+          mv "$fromd/$d/lib-dynload"/_tkinter.*.so "$tod/$d/lib-dynload/"
+          mv "$fromd/$d/tkinter" "$tod/$d/"
+    test:
+      pipeline:
+        - uses: python/import
+          with:
+            python: python${{vars.pyversion}}
+            import: tkinter
 
   - name: "${{package.name}}-doc"
     description: "python3 documentation"
@@ -183,7 +253,7 @@ subpackages:
         - ${{package.name}}-base=${{package.full-version}}
     pipeline:
       - runs: |
-          # usr/lib/pytyon3.X/config-3.X-x86_64-linux-gnu
+          # usr/lib/python3.X/config-3.X-x86_64-linux-gnu
           # split/dev will only move 2 files from it, but we want all of it.
           d="usr/lib/${{vars.python}}"
           mkdir -p "${{targets.subpkgdir}}/$d"
@@ -197,6 +267,19 @@ test:
         # main package should provide 'python' and 'python3'.
         python version-check.py ${{package.version}}
         python3 version-check.py ${{package.version}}
+        pydoc3 --version
+        pydoc3 --help
+        python --version
+        python --help
+        python3 --version
+        python3 --help
+    - name: Verify working python3 -m venv
+      runs: |
+        d=$(mktemp -d)
+        python3 -m venv "$d"
+        $d/bin/pip list
+        $d/bin/pip check
+        rm -Rf "$d"
 
 update:
   enabled: true

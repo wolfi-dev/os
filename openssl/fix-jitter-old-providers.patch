@@ -1,0 +1,87 @@
+From https://github.com/openssl/openssl/pull/25929/commits/0c306cb74ae1de27abc873d5384d6d97be01353c.patch
+From 0c306cb74ae1de27abc873d5384d6d97be01353c Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@surgut.co.uk>
+Date: Sat, 9 Nov 2024 21:32:48 +0000
+Subject: [PATCH] Force use jitter entropy in the FIPS 3.0.9 provider callback
+
+FIPS 3.0.9 provider does not honor runtime seed configuration, thus if
+one desires to use JITTER entropy source with FIPS 3.0.9 provider
+something like this needs to be applied to the core (libcrypto) build.
+
+Not sure if this is at all suitable for upstream.
+---
+ crypto/provider_core.c                        | 26 +++++++++++++++++++
+ .../implementations/rands/seed_src_jitter.c   | 16 ++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index 266423dda9551..e5e40d5e82003 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -2111,6 +2111,7 @@ static void core_self_test_get_callback(OPENSSL_CORE_CTX *libctx,
+     OSSL_SELF_TEST_get_callback((OSSL_LIB_CTX *)libctx, cb, cbarg);
+ }
+ 
++# ifdef OPENSSL_NO_JITTER
+ static size_t rand_get_entropy(const OSSL_CORE_HANDLE *handle,
+                                unsigned char **pout, int entropy,
+                                size_t min_len, size_t max_len)
+@@ -2118,6 +2119,31 @@ static size_t rand_get_entropy(const OSSL_CORE_HANDLE *handle,
+     return ossl_rand_get_entropy((OSSL_LIB_CTX *)core_get_libctx(handle),
+                                  pout, entropy, min_len, max_len);
+ }
++# else
++/*
++ * OpenSSL FIPS providers prior to 3.2 call rand_get_entropy API from
++ * core, instead of the newer get_user_entropy. Newer API call honors
++ * runtime configuration of random seed source and can be configured
++ * to use os getranom() or another seed source, such as
++ * JITTER. However, 3.0.9 only calls this API. Note that no other
++ * providers known to use this, and it is core <-> provider only
++ * API. Public facing EVP and getrandom bytes already correctly honor
++ * runtime configuration for seed source. There are no other providers
++ * packaged in Wolfi, or even known to exist that use this api. Thus
++ * it is safe to say any caller of this API is in fact 3.0.9 FIPS
++ * provider. Also note that the passed in handle is invalid and cannot
++ * be safely dereferences in such cases. Due to a bug in FIPS
++ * providers 3.0.0, 3.0.8 and 3.0.9. See
++ * https://github.com/openssl/openssl/blob/master/doc/internal/man3/ossl_rand_get_entropy.pod#notes
++ */
++size_t ossl_rand_jitter_get_seed(unsigned char **, int, size_t, size_t);
++static size_t rand_get_entropy(const OSSL_CORE_HANDLE *handle,
++                               unsigned char **pout, int entropy,
++                               size_t min_len, size_t max_len)
++{
++    return ossl_rand_jitter_get_seed(pout, entropy, min_len, max_len);
++}
++# endif
+ 
+ static size_t rand_get_user_entropy(const OSSL_CORE_HANDLE *handle,
+                                     unsigned char **pout, int entropy,
+diff --git a/providers/implementations/rands/seed_src_jitter.c b/providers/implementations/rands/seed_src_jitter.c
+index 3dea0959d4004..7092114e92c96 100644
+--- a/providers/implementations/rands/seed_src_jitter.c
++++ b/providers/implementations/rands/seed_src_jitter.c
+@@ -290,6 +290,22 @@ static size_t jitter_get_seed(void *vseed, unsigned char **pout,
+     return ret;
+ }
+ 
++size_t ossl_rand_jitter_get_seed(unsigned char **pout, int entropy, size_t min_len, size_t max_len)
++{
++    size_t ret = 0;
++    OSSL_PARAM params[1] = { OSSL_PARAM_END };
++    PROV_JITTER *s = jitter_new(NULL, NULL, NULL);
++
++    if (s == NULL)
++        return ret;
++    if (!jitter_instantiate(s, 0, 0, NULL, 0, params))
++        goto end;
++    ret = jitter_get_seed(s, pout, entropy, min_len, max_len, 0, NULL, 0);
++ end:
++    jitter_free(s);
++    return ret;
++}
++
+ static void jitter_clear_seed(ossl_unused void *vdrbg,
+                               unsigned char *out, size_t outlen)
+ {

@@ -1,14 +1,36 @@
 package:
   name: docker
-  version: 26.1.3
-  epoch: 0
+  version: "27.5.0"
+  epoch: 1
   description: A meta package for Docker Engine and Docker CLI
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
+      - btrfs-progs
+      # Include busybox because dockerd-oci-entrypoint is a shell script that execs the input params given.
+      - busybox
+      - ca-certificates
       - docker-cli
+      - docker-cli-buildx
+      - docker-compose
       - dockerd
+      - e2fsprogs
+      - e2fsprogs-extra
+      - fuse-overlayfs
+      - git
+      - ip6tables
+      - iproute2
+      # docker dind also needs a couple of runtime dependencies mentioned here (https://github.com/moby/moby/blob/0eecd59153c03ced5f5ddd79cc98f29e4d86daec/project/PACKAGERS.md#runtime-dependencies) below are those dependencies.
+      - iptables
+      - openssh-client
+      - openssl
+      - pigz
+      - procps
+      - shadow-subids # equivalent of shadow-uidmap in wolfi
+      - xfsprogs
+      - xz
+      - zfs
   checks:
     disabled:
       # docker is a meta package pulling in several subpackages at runtime
@@ -35,7 +57,7 @@ pipeline:
     with:
       repository: https://github.com/moby/moby
       tag: v${{package.version}}
-      expected-commit: 8e96db1c328d0467b015768e42a62c0f834970bb
+      expected-commit: 38b84dce32c45732606fe09ffebef8b29a783644
 
   - runs: |
       # moby/moby uses a non-standard `vendor.mod` and helper scripts instead
@@ -44,7 +66,9 @@ pipeline:
       # pin to older dependencies when this package auto updates, we use sed with
       # the specific replacement version.
 
-      # CVE-2023-47108 GHSA-8pgv-569h-w5rw CVE-2023-45142 GHSA-rcjv-mgp8-qvmr
+      # CVE-2023-47108 GHSA-8pgv-569h-w5rw CVE-2023-45142 GHSA-rcjv-mgp8-qvmr CVE-2024-45337 GHSA-w32m-9786-jp63
+      sed -i 's|golang.org/x/crypto v0.27.0|golang.org/x/crypto v0.31.0|' vendor.mod
+      sed -i 's|golang.org/x/net v0.29.0|golang.org/x/net v0.33.0|' vendor.mod
       sed -i 's|go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.45.0|go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.46.0|' vendor.mod
       sed -i 's|go.opentelemetry.io/otel v1.19.0|go.opentelemetry.io/otel v1.21.0|' vendor.mod
       sed -i 's|go.opentelemetry.io/otel/sdk v1.19.0|go.opentelemetry.io/otel/sdk v1.21.0|' vendor.mod
@@ -52,6 +76,8 @@ pipeline:
       sed -i 's|go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.19.0|go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.21.0|' vendor.mod
       sed -i 's|google.golang.org/protobuf v1.31.0|google.golang.org/protobuf v1.33.0|' vendor.mod
       sed -i 's|github.com/golang/protobuf v1.5.3|github.com/golang/protobuf v1.5.4|' vendor.mod
+      sed -i 's|github.com/opencontainers/runc v1.1.13|github.com/opencontainers/runc v1.1.14|' vendor.mod
+      sed -i 's|github.com/golang-jwt/jwt/v4 v4.5.0|github.com/golang-jwt/jwt/v4 v4.5.1|' vendor.mod
 
       ./hack/vendor.sh
 
@@ -107,18 +133,18 @@ subpackages:
 
   - name: docker-oci-entrypoint
     description: "docker OCI entrypoint"
-    dependencies:
-      runtime:
-        - docker
     pipeline:
       - runs: |
           install -Dm755 /home/docker-library/docker-entrypoint.sh "${{targets.subpkgdir}}"/usr/bin/docker-entrypoint.sh
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/bin/docker-entrypoint.sh
 
   - name: dockerd-oci-entrypoint
     description: "dockerd OCI entrypoint"
     dependencies:
       runtime:
-        - docker
         # Used as a fallback in the dockerd-entrypoint.sh script
         - docker-oci-entrypoint
         # Used as a fallback in the dockerd-entrypoint.sh script
@@ -126,25 +152,45 @@ subpackages:
     pipeline:
       - runs: |
           install -Dm755 /home/docker-library/dockerd-entrypoint.sh "${{targets.subpkgdir}}"/usr/bin/dockerd-entrypoint.sh
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/bin/dockerd-entrypoint.sh
+
+  - name: docker-rootless
+    description: "dockerd rootless"
+    dependencies:
+      runtime:
+        - rootlesskit
+    pipeline:
+      - runs: |
+          install -Dm755 contrib/dockerd-rootless-setuptool.sh "${{targets.subpkgdir}}"/usr/bin/dockerd-rootless-setuptool.sh
+          install -Dm755 contrib/dockerd-rootless.sh "${{targets.subpkgdir}}"/usr/bin/dockerd-rootless
+    test:
+      pipeline:
+        - runs: |
+            dockerd-rootless-setuptool.sh --help
 
   # Ref: https://github.com/docker-library/docker/blob/master/Dockerfile-dind.template
   - name: docker-dind
     description: "Docker in Docker"
-    dependencies:
-      runtime:
-        - docker
     pipeline:
       - runs: |
           install -Dm755 /home/build/hack/dind "${{targets.subpkgdir}}"/usr/bin/dind
 
-  # I can't believe this is a real thing
-  - name: docker-modprobe-compat
+  - name: dockerd-service
+    description: "Systemd services for docker"
     dependencies:
       runtime:
-        - docker
+        - dockerd
+        - containerd-service
+        - systemd
     pipeline:
       - runs: |
-          install -Dm755 /home/docker-library/modprobe.sh "${{targets.subpkgdir}}"/usr/bin/modprobe
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/systemd/system/
+          install -Dm644 contrib/init/systemd/docker.socket "${{targets.subpkgdir}}"/usr/lib/systemd/system/
+          install -Dm644 contrib/init/systemd/docker.service "${{targets.subpkgdir}}"/usr/lib/systemd/system/
+          sed -i "s|\[Service\]|[Service]\nEnvironment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"|g" "${{targets.subpkgdir}}"/usr/lib/systemd/system/docker.service
 
 update:
   enabled: true
@@ -152,3 +198,15 @@ update:
     identifier: moby/moby
     strip-prefix: v
     tag-filter: v
+
+test:
+  pipeline:
+    - name: Smoke check
+      runs: |
+        docker -v
+        dockerd --version
+        docker-init --version
+        docker-init -h
+        docker-proxy --version
+        docker-proxy --help
+        dockerd --help

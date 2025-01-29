@@ -218,3 +218,5 @@ check-bootstrap:
 	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
+
+.PHONY: clean fetch-kernel dev-container local-wolfi dev-container-wolfi check-bootstrap

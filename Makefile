@@ -98,7 +98,7 @@ packages/$(ARCH)/%.apk: $(KEY)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
-debug/%:
+debug/%: $(KEY)
 	$(eval yamlfile := $*.yaml)
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
@@ -141,7 +141,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:0fc6a5a67cf35055e1aa7dc500153af54b3bcbed5445556aeac1fbe66d072cdb
+	    ghcr.io/wolfi-dev/sdk:latest@sha256:e7e7696357955970adbfad5b690e68043080b97ed6149c39732193a6ffbe80df
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -209,7 +209,7 @@ dev-container-wolfi:
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:0fc6a5a67cf35055e1aa7dc500153af54b3bcbed5445556aeac1fbe66d072cdb
+		ghcr.io/wolfi-dev/sdk:latest@sha256:e7e7696357955970adbfad5b690e68043080b97ed6149c39732193a6ffbe80df
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"
 
@@ -218,3 +218,5 @@ check-bootstrap:
 	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
+
+.PHONY: clean fetch-kernel dev-container local-wolfi dev-container-wolfi check-bootstrap

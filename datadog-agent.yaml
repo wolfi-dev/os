@@ -111,6 +111,7 @@ pipeline:
 
   - uses: go/bump
     with:
+      deps: github.com/anchore/archiver/v3@v3.5.2
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
 
@@ -156,12 +157,16 @@ pipeline:
       # HOW DOES THIS WORK: https://stackoverflow.com/a/60357720
       ln -s /usr/lib/libncursesw.so.6 /usr/lib/libtinfo.so.5
 
+      # 7.62.0 introduced a go version issue for some reason, so we have to fix it. Otherwise, build error:
+      # go: module . listed in go.work file requires go >= 1.23.5, but go.work lists go 1.23.0; to update it:
+      #      go work use
+      go work use
+
       # Build once to correctly setup links/generates. The system-probe we end
       # up using will be part of the multicall below.
       unshare --user --map-root-user \
         invoke -e system-probe.build \
         --strip-object-files \
-        --no-bundle \
         --bundle-ebpf
 
   - runs: |
@@ -191,19 +196,18 @@ pipeline:
         --exclude-rtloader \
         --no-development \
         --bundle-ebpf \
-        --embedded-path /usr/lib
+        --embedded-path /usr/lib \
+        --python-home-3=/usr
 
   - runs: |
-      mkdir -p \
-        ${{targets.contextdir}}${{vars.destd}}/bin/agent \
-        ${{targets.contextdir}}${{vars.destd}}/embedded/bin
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/bin/agent
 
       install -Dm755 bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent
       # *-agent is just a symlink to the "agent" multicall
-      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/process-agent
-      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/security-agent
-      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-agent
-      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/embedded/bin/system-probe
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent/process-agent
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent/security-agent
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent/trace-agent
+      ln -s ${{vars.destd}}/bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent/system-probe
 
       mkdir -p ${{targets.contextdir}}/etc/datadog-agent/
 
@@ -271,10 +275,7 @@ subpackages:
           mkdir -p \
             ${{targets.contextdir}}/conf.d \
             ${{targets.contextdir}}/checks.d \
-            ${{targets.contextdir}}${{vars.destd}}/embedded \
             ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist
-
-          cp -r ${{vars.destd}}/embedded/share ${{targets.contextdir}}${{vars.destd}}/embedded/share
 
           cp -r bin/agent/dist/checks ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist/
           install -Dm644 bin/agent/dist/config.py ${{targets.contextdir}}${{vars.destd}}/bin/agent/dist/config.py
@@ -290,53 +291,49 @@ subpackages:
         - busybox
         - coreutils
         - findutils
-        - python-${{vars.py-version}}-base
     pipeline:
       - working-directory: /home/integrations
         pipeline:
           - uses: git-checkout
             with:
               repository: https://github.com/DataDog/integrations-core
-              branch: ${{vars.datadog-major-minor-x}} # 7.59.x
-              expected-commit: 3189af0e0ae840c9a4bab3131662c7fd6b0de7fb # needs to be updated with each new release
+              branch: ${{vars.datadog-major-minor-x}} # 7.62.x
+              expected-commit: 3263b1cb567f6dc6ef72289a613d7856bcc680d7 # needs to be updated with each new release
           - uses: patch
             with:
-              patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch /home/build/int-core-snowflake-pyproject-toml.patch
+              patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch
           - runs: |
               # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
               SOURCE_DATE_EPOCH=315532800
 
-              # Create virtual environment
-              python${{vars.py-version}} -m venv .venv
-
               # Install locked dependencies
-              .venv/bin/pip${{vars.py-version}} install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
+              # The core/downloader/dependencies pip install command fails without this first pip one so we install it twice to make sure
+              # it's in the output as well as usable now.
+              pip${{vars.py-version}} install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
+              #pip${{vars.py-version}} install --prefix=/usr --root=${{targets.contextdir}} --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
+              pip3.12 install -vvv --prefix=/usr --root=/home/build/melange-out/datadog-agent-core-integrationssss --require-hashes --only-binary=:all: --no-deps --ignore-installed -r .deps/resolved/linux-x86_64_3.12.txt
+
 
               excludes="datadog_checks_base datadog_checks_dev datadog_checks_tests_helper docker_daemon esxi teleport"
               checks=$(invoke -r /home/build agent.collect-integrations /home/integrations/ 3 linux --excluded "$excludes")
 
               # Install core, downloader, and dependencies
-              .venv/bin/pip${{vars.py-version}} install \
+              pip${{vars.py-version}} install \
+                --prefix=/usr --root=${{targets.contextdir}} \
                 "./datadog_checks_base[deps, http]" \
                 "./datadog_checks_downloader" \
                 $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
 
-              find .venv -name "*.pyc" -delete
-              find .venv -name "__pycache__" -exec rm -rf {} +
+              find ${{targets.contextdir}}/usr/ -name "*.pyc" -delete
+              find ${{targets.contextdir}}/usr/ -name "__pycache__" -exec rm -rf {} +
+              find /usr/lib/python${{vars.py-version}} -name "*.pyc" -delete
+              find /usr/lib/python${{vars.py-version}} -name "__pycache__" -exec rm -rf {} +
 
               mkdir -p ${{targets.contextdir}}${{vars.destd}}
-              .venv/bin/pip${{vars.py-version}} freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
+              pip${{vars.py-version}} freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
 
               # Include the agent's requirements for the core integrations.
               cp requirements-agent-release.txt ${{targets.contextdir}}${{vars.destd}}/
-
-              # Use Python in virtual environment
-              sed -i "s|$(pwd)/.venv|${{vars.destd}}/embedded|g" .venv/pyvenv.cfg
-              sed -i "s|$(pwd)/.venv|${{vars.destd}}/embedded|g" .venv/bin/*
-
-              # Install virtual environment
-              mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded
-              cp -r .venv/* ${{targets.contextdir}}${{vars.destd}}/embedded/
 
               # this is intentionally referencing the main package, since we only "install" if a config doesn't already exist
               conf_dir="${{targets.destdir}}/etc/datadog-agent/conf.d"
@@ -365,6 +362,10 @@ subpackages:
                   fi
                 done
               done
+
+              #mkdir -p ${{targets.contextdir}}/usr/lib/python${{vars.py-version}}
+              #cp -r /usr/lib/python${{vars.py-version}}/site-packages ${{targets.contextdir}}/usr/lib/python${{vars.py-version}}/
+              halt
 
   - name: datadog-cluster-agent
     dependencies:
@@ -415,9 +416,6 @@ subpackages:
         # This needs CGO_ENABLED=1, which we just so happen to inherit from the
         # main package
         pipeline:
-          - uses: go/bump
-            with:
-              deps: google.golang.org/protobuf@v1.33.0 github.com/golang/protobuf@v1.5.4
           - uses: go/build
             with:
               packages: ./cmd/server
@@ -570,7 +568,7 @@ test:
     environment:
       # cannot use vars.destd here. https://github.com/chainguard-dev/melange/issues/1402
       # setting PATH here has no effect.
-      mypath: /opt/datadog-agent/bin/agent:/opt/datadog-agent/embedded/bin
+      mypath: /opt/datadog-agent/bin/agent
   pipeline:
     - name: Ensure the agent's requirements.txt for integrations is included
       runs: |
@@ -579,16 +577,18 @@ test:
     - name: Ensure the agent integration subcommand works
       runs: |
         PATH=$mypath:$PATH
+        # TODO: mkdir and ln shouldn't be required
+        mkdir -p /opt/datadog-agent/embedded/bin/
+        ln -s /usr/bin/python3.12 /opt/datadog-agent/embedded/bin/python3
         agent integration freeze >/dev/null
+        rm -rf /opt/datadog-agent/embedded
     - name: Ensure checks can be loaded (base)
       uses: python/import
       with:
-        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
         import: datadog_checks.base
     - name: Ensure checks can be loaded (downloader)
       uses: python/import
       with:
-        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
         import: datadog_checks.downloader
     - name: Execute bins
       runs: |

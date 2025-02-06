@@ -98,7 +98,7 @@ packages/$(ARCH)/%.apk: $(KEY)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
-debug/%:
+debug/%: $(KEY)
 	$(eval yamlfile := $*.yaml)
 	@if [ -z "$(yamlfile)" ]; then \
 		echo "Error: could not find yaml file for $*"; exit 1; \
@@ -137,11 +137,11 @@ test-debug/%:
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
 
 dev-container:
-	docker run --privileged --rm -it \
+	docker run --pull=always --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
-	    ghcr.io/wolfi-dev/sdk:latest@sha256:42fed66d23feba228f2575750647aa4a9c55d62c17f213d446ab0bdfa8ccb0fa
+	    ghcr.io/wolfi-dev/sdk:latest
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -202,14 +202,14 @@ dev-container-wolfi:
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
 	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --rm -it \
+	docker run --pull=always --rm -it \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest@sha256:42fed66d23feba228f2575750647aa4a9c55d62c17f213d446ab0bdfa8ccb0fa
+		ghcr.io/wolfi-dev/sdk:latest
 	@rm "$(TMP_REPOS_FILE)"
 	@rmdir "$(TMP_REPOS_DIR)"
 
@@ -218,3 +218,5 @@ check-bootstrap:
 	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
+
+.PHONY: clean fetch-kernel dev-container local-wolfi dev-container-wolfi check-bootstrap

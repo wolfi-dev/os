@@ -15,6 +15,8 @@ package:
       - grep
       - libpcap
       - libseccomp
+      - python-${{vars.py-version}}
+      - py${{vars.py-version}}-pip
       - shadow
 
 vars:
@@ -69,6 +71,7 @@ environment:
       - openssf-compiler-options
       - procps-dev
       - py${{vars.py-version}}-build-base-dev
+      - py${{vars.py-version}}-pip
       - py${{vars.py-version}}-semver
       - systemd-dev
       - util-linux-misc # unshare
@@ -100,8 +103,7 @@ pipeline:
       gccdir="$(GCC_SPEC_FILE=/dev/null gcc --print-search-dirs | grep ^install: | cut -d' ' -f2)"
       sed -r 's/,?-z,now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
 
-  # Install `invoke` (build) dependencies. We ultimately package with venv so
-  # these won't leak into the package.
+  # Install `invoke` (build) dependencies and gitlab 
   - runs: |
       # install `invoke` and its dependencies
       python${{vars.py-version}} -m pip install invoke requests toml pyyaml packaging
@@ -312,9 +314,6 @@ subpackages:
               # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
               SOURCE_DATE_EPOCH=315532800
 
-              # Install pip to the output folder to make sure we don't run into "/opt/datadog-agent/embedded/bin/python3: No module named pip"
-              pip${{vars.py-version}} install -vvv --prefix=/usr --root=${{targets.contextdir}} --ignore-installed pip
-
               # Install locked dependencies
               # The core/downloader/dependencies pip install command fails without pip installing deps to the current python interpreter, hence we install to both the system and the output folder.
               pip${{vars.py-version}} install --prefix=/usr --root=${{targets.contextdir}} --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
@@ -366,6 +365,12 @@ subpackages:
                   fi
                 done
               done
+
+              # Set up symlinks to make sure the agent integration commands work properly 
+              mkdir -p ${{targets.contextdir}}/opt/datadog-agent/embedded/bin/
+              mkdir -p ${{targets.contextdir}}/opt/datadog-agent/embedded/lib/python${{vars.py-version}}
+              ln -s /usr/bin/python${{vars.py-version}} ${{targets.contextdir}}/opt/datadog-agent/embedded/bin/python3
+              ln -s /usr/lib/python${{vars.py-version}}/site-packages ${{targets.contextdir}}/opt/datadog-agent/embedded/lib/python${{vars.py-version}}/site-packages
 
   - name: datadog-cluster-agent
     dependencies:
@@ -577,40 +582,21 @@ test:
     - name: Ensure the agent integration subcommand works using useSysPython
       runs: |
         PATH=$mypath:$PATH
-
-        ln -s /usr/bin/python3.12 /usr/bin/python
-
         agent integration freeze -p >/dev/null
-
-        rm /usr/bin/python
     - name: Ensure the agent integration subcommand works on a basic level
       runs: |
         PATH=$mypath:$PATH
-
-        # TODO: mkdir and ln shouldn't be required
-        mkdir -p /opt/datadog-agent/embedded/bin/
-        ln -s /usr/bin/python3.12 /opt/datadog-agent/embedded/bin/python3
-
         agent integration freeze >/dev/null
-
-        rm -rf /opt/datadog-agent/embedded
     - name: Ensure the agent integration subcommand works with removals and installations
       runs: |
         PATH=$mypath:$PATH
 
-        # TODO: mkdir and ln shouldn't be required
-        mkdir -p /opt/datadog-agent/embedded/bin/
-        mkdir -p /opt/datadog-agent/embedded/lib/python3.12
-        ln -s /usr/bin/python3.12 /opt/datadog-agent/embedded/bin/python3
-        ln -s /usr/lib/python3.12/site-packages /opt/datadog-agent/embedded/lib/python3.12/site-packages
-        ln -s /usr/bin/python3.12 /usr/bin/python
+        # Gather current version of datadog-zk
+        ZKVERSION=$(agent integration freeze -p | awk -F '==' '/datadog-zk/ {print $2}')
 
         # --allow-root required to solve "Error: operation is disabled for root user. Please run this tool with the agent-running user or add '--allow-root/-r' to force"
         agent integration remove --allow-root datadog-zk
-        agent integration install --allow-root datadog-zk==6.0.0 # This may need to be updated in future versions
-
-        rm -rf /opt/datadog-agent/embedded
-        rm /usr/bin/python
+        agent integration install --allow-root datadog-zk==$ZKVERSION
     - name: Ensure checks can be loaded (base)
       uses: python/import
       with:
@@ -642,6 +628,10 @@ test:
 
         export DD_LOG_LEVEL=debug
         export DD_HOSTNAME_FILE=/etc/hostname
+
+        # TODO: This shouldn't be required, but "agent integration freeze" doesn't work without the embedded folder and this doesn't work with it. :(
+        rm -rf /opt/datadog-agent/embedded
+
         agent check uptime
         agent check disk
     - name: Validate multicall components are correctly linked

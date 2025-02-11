@@ -112,7 +112,7 @@ debug/%: $(KEY)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
-test/%:
+test/%: $(KEY)
 	@mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	@if [ -z "$(yamlfile)" ]; then \
@@ -124,7 +124,7 @@ test/%:
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
 
-test-debug/%:
+test-debug/%: $(KEY)
 	@mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	@if [ -z "$(yamlfile)" ]; then \

@@ -1,0 +1,112 @@
+package:
+  name: jmx-exporter-bitnami
+  version: "1.1.0"
+  epoch: 0
+  description: "Bitnami for Prometheus JMX Exporter"
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates
+      - curl
+      - maven
+      - openjdk-${{vars.java-version}}-default-jdk
+      - procps
+      - zlib
+
+var-transforms:
+  # Extract the major version from the package version.
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+vars:
+  java-version: 17
+  debian-version: 12
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/prometheus/jmx_exporter
+      tag: ${{package.version}}
+      expected-commit: 00fd35dc2e0a03eefe49ef1182280fc9319bbe70
+
+  - name: build-intall-jars
+    # Build the project using Maven
+    runs: |
+      ./mvnw clean package -DskipTests
+
+  - name: create-required-dirs
+    # Create the required directories for a Bitnami-like layout
+    runs: |
+      mkdir -p ${{targets.contextdir}}/opt/bitnami
+      mkdir -p ${{targets.contextdir}}/opt/bitnami/jmx-exporter
+      mkdir -p ${{targets.contextdir}}/opt/bitnami/java
+      mkdir -p ${{targets.contextdir}}/opt/bitnami/jmx-exporter/licenses
+      mkdir -p ${{targets.contextdir}}/tmp/bitnami/pkg/cache/
+
+  - name: copy-files-to-dest
+    # Bitnami doesn't like symlinks
+    runs: |
+      cp -R ./examples ${{targets.destdir}}/opt/bitnami/jmx-exporter/
+
+      # Copy the Java 17 installation into /opt/bitnami/java
+      for item in bin conf include jre legal lib release; do
+        cp -R /usr/lib/jvm/java-${{vars.java-version}}-openjdk/$item ${{targets.destdir}}/opt/bitnami/java/
+      done
+
+      # Copy built JARs for agent and standalone server
+      cp ./jmx_prometheus_javaagent/target/jmx_prometheus_javaagent-${{package.version}}.jar \
+          ${{targets.destdir}}/opt/bitnami/jmx-exporter/jmx_prometheus_javaagent.jar
+      cp ./jmx_prometheus_standalone/target/jmx_prometheus_standalone-${{package.version}}.jar \
+          ${{targets.destdir}}/opt/bitnami/jmx-exporter/jmx_prometheus_standalone.jar
+
+  - uses: bitnami/compat
+    with:
+      image: jmx-exporter
+      version-path: ${{vars.major-version}}/debian-${{vars.debian-version}}
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - openjdk-${{vars.java-version}}-default-jvm
+  pipeline:
+    - name: run-minimal-jmx-test
+      runs: |
+        set -ex
+
+        # Create a minimal config for the JMX Exporter in standalone mode.
+        mkdir -p /tmp/jmx-exporter-test
+        cat <<EOF > /tmp/jmx-exporter-test/config.yaml
+        hostPort: localhost:9999
+        rules:
+          - pattern: ".*"
+        EOF
+
+        # Launch the standalone exporter on port 7071, referencing our config file.
+        java -jar /opt/bitnami/jmx-exporter/jmx_prometheus_standalone.jar \
+             7071 /tmp/jmx-exporter-test/config.yaml &
+        STANDALONE_PID=$!
+
+        # Allow the exporter time to start
+        sleep 5
+
+        # Verify the JMX Exporter is still running
+        kill -0 "$STANDALONE_PID" 2>/dev/null \
+          || (echo "Error: JMX Exporter (standalone) failed to start." >&2; exit 1)
+
+        # Check that /metrics is available and contains a known metric
+        curl -s http://127.0.0.1:7071/metrics | grep -q "jmx_exporter_build_info" \
+          || (echo "Error: Expected metric 'jmx_exporter_build_info' not found." >&2; exit 1)
+
+update:
+  enabled: true
+  github:
+    identifier: prometheus/jmx_exporter
+    tag-filter: 1.

@@ -129,25 +129,20 @@ environment:
       - xz
       - zlib-dev
       - zstd-dev
-  environment:
-    # Disable compiler warnings encountered when using system provided libraries
-    CFLAGS: "$(echo ${CFLAGS}) -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-shift-count-overflow -Wno-ignored-attributes"
-    CXXFLAGS: "$(echo ${CXXFLAGS}) -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-invalid-constexpr"
-    CPPFLAGS: "$(echo ${CPPFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS/}) -D__DATE__=  -D__TIME__=  -D__TIMESTAMP__="
 
 pipeline:
   - uses: git-checkout
     with:
-      # === INFO === Initial git clone: takes ~3 minutes, needs 6GB disk
+      # Initial git clone: takes ~3 minutes, needs 6GB disk
       repository: https://chromium.googlesource.com/chromium/src.git
       tag: ${{package.version}}
       depth: 1
       expected-commit: 2a5d6da0d6165d7b107502095a937fe7704fcef6
       destination: /home/src
 
-  - name: clone depot-tools and setup .gclient
+  - working-directory: /home
+    name: Clone depot-tools and setup .gclient
     runs: |
-      cd /home
       # depot_tools contains essential Chromium build tools
       # in consists of gclient, gn, autoninja, etc. that are used to build Chromium
       # We are cloning it to /home/depot_tools and have to add it to PATH
@@ -157,7 +152,7 @@ pipeline:
       # Important: File must be in /home (parent of src/)
       # Because: gclient searches for .gclient in parent directories
       # Reference: https://chromium.googlesource.com/chromium/tools/depot_tools/+/main/README.gclient.md
-      cat <<EOF >/home/.gclient
+      cat <<EOF > /home/.gclient
       # Setup a .gclient config (handled by 'fetch' in upstream instructions)
       solutions = [
         { "name"        : "src",
@@ -168,7 +163,6 @@ pipeline:
         },
       ]
       EOF
-      cat /home/.gclient
 
   - working-directory: /home/src
     name: sync-dependencies
@@ -176,11 +170,11 @@ pipeline:
       # Add depot_tools to PATH to use gclient
       export PATH="$PATH:/home/depot_tools"
 
-      # === INFO === Sync dependencies: takes about 11 minutes, requires 30 GB of disk
+      # Sync dependencies: takes about 11 minutes, requires 30 GB of disk
       time gclient sync --no-history
 
   - working-directory: /home/src
-    name: configure-system-libraries
+    name: Use system libraries
     runs: |
       # Use USB IDs already provided by hwdata-usb
       sed 's|//third_party/usb_ids/usb.ids|/usr/share/hwdata/usb.ids|g' \
@@ -232,7 +226,7 @@ pipeline:
       sed -i 's/OFFICIAL_BUILD/GOOGLE_CHROME_BUILD/' \
         tools/generate_shim_headers/generate_shim_headers.py
 
-      # === INFO === Make node executable: works around permission denial
+      # Make node executable: works around permission denial
       chmod +x /home/src/third_party/node/linux/node-linux-x64/bin/node
 
   - working-directory: /home/src
@@ -241,7 +235,7 @@ pipeline:
       # Add depot_tools to PATH to use gn
       export PATH="$PATH:/home/depot_tools"
 
-      # === INFO === Generate config: takes about 30 minutes
+      # Generate config: takes about 30 minutes
       time gn gen /home/src/out/Default --args="
         clang_use_chrome_plugins=false
         chrome_pgo_phase=0
@@ -272,37 +266,45 @@ pipeline:
       "
 
   - working-directory: /home/src
-    name: build
+    name: Build
     runs: |
       # Add depot_tools to PATH to use autoninja
       export PATH="$PATH:/home/depot_tools"
 
-      # === INFO === Compile: takes about 3 hours, 60 GB of disk (on a 32xXeon, 128GBxRAM, 2TBxNVME system)
+      # Disable compiler warnings encountered when using system provided libraries
+      export CFLAGS="$CFLAGS -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-shift-count-overflow -Wno-ignored-attributes"
+      export CXXFLAGS="$CXXFLAGS -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-invalid-constexpr"
+      export CPPFLAGS="${CPPFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS/} -D__DATE__=  -D__TIME__=  -D__TIMESTAMP__="
+
+      # Compile: takes about 3 hours, 60 GB of disk (on a 32xXeon, 128GBxRAM, 2TBxNVME system)
       time autoninja -C ./out/Default chrome chromedriver.unstripped chrome_crashpad_handler chrome_sandbox
 
   - working-directory: /home/src/out/Default
-    name: install the binaries and libraries
+    name: Install the binaries and libraries
     runs: |
-      mkdir -p ${{targets.destdir}}/usr/bin ${{targets.destdir}}/usr/lib/${{package.name}}
-      mkdir -p ${{targets.destdir}}/etc/chromium
+      mkdir -p \
+        ${{targets.contextdir}}/usr/bin \
+        ${{targets.contextdir}}/usr/lib/${{package.name}} \
+        ${{targets.contextdir}}/etc/chromium
+
+      # Install libraries
+      mv *.so* ${{targets.contextdir}}/usr/lib/${{package.name}}
 
       # Install binaries
-      mv *.so* ${{targets.destdir}}/usr/lib/${{package.name}}
-      mv chrome ${{targets.destdir}}/usr/lib/${{package.name}}
-      mv chrome_crashpad_handler ${{targets.destdir}}/usr/lib/${{package.name}}
-      mv chrome_sandbox ${{targets.destdir}}/usr/lib/${{package.name}}
+      mv chrome chrome_crashpad_handler chrome_sandbox \
+        ${{targets.contextdir}}/usr/lib/${{package.name}}
 
       # Install resources
       mv snapshot_blob.bin v8_context_snapshot.bin \
          xdg-mime xdg-settings vk_swiftshader_icd.json \
          *.pak locales \
-         ${{targets.destdir}}/usr/lib/${{package.name}}/
+         ${{targets.contextdir}}/usr/lib/${{package.name}}/
 
       # Setup wrapper and symlinks
       cd /home/build
       mv chromium-launcher.sh ${{targets.destdir}}/usr/bin/chromium-browser
-      ln -sf /usr/lib/${{package.name}}/chrome ${{targets.destdir}}/usr/bin/chromium
-      ln -sf /usr/lib/${{package.name}}/chromedriver ${{targets.destdir}}/usr/bin/chromedriver
+      ln -s /usr/lib/${{package.name}}/chrome ${{targets.contextdir}}/usr/bin/chromium
+      ln -s /usr/lib/${{package.name}}/chromedriver ${{targets.contextdir}}/usr/bin/chromedriver
 
   - uses: strip
     with:
@@ -317,8 +319,8 @@ subpackages:
   - name: ${{package.name}}-lang
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/lib/${{package.name}}/locales
-          mv ${{targets.destdir}}/usr/lib/${{package.name}}/locales/* ${{targets.subpkgdir}}/usr/lib/${{package.name}}/locales/
+          mkdir -p ${{targets.contextdir}}/usr/lib/${{package.name}}/locales
+          mv ${{targets.destdir}}/usr/lib/${{package.name}}/locales/* ${{targets.contextdir}}/usr/lib/${{package.name}}/locales/
 
           # Ensure we provide one locale in the base package
           mv ${{targets.subpkgdir}}/usr/lib/${{package.name}}/locales/en-US.pak ${{targets.destdir}}/usr/lib/${{package.name}}/locales/en-US.pak
@@ -329,11 +331,11 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/opt/selenium
 
-          ln -sf /usr/lib/chromium/chromedriver ${{targets.subpkgdir}}/opt/selenium/chromedriver-${{package.version}}
+          ln -s /usr/lib/chromium/chromedriver ${{targets.subpkgdir}}/opt/selenium/chromedriver-${{package.version}}
 
-          echo "chrome" > ${{targets.subpkgdir}}/opt/selenium/browser_name
-          echo ${{package.version}} > ${{targets.subpkgdir}}/opt/selenium/browser_version
-          echo "\"goog:chromeOptions\": {\"binary\": \"/usr/bin/chromium-browser\"}" > ${{targets.subpkgdir}}/opt/selenium/browser_binary_location
+          echo "chrome" > ${{targets.contextdir}}/opt/selenium/browser_name
+          echo ${{package.version}} > ${{targets.contextdir}}/opt/selenium/browser_version
+          echo "\"goog:chromeOptions\": {\"binary\": \"/usr/bin/chromium-browser\"}" > ${{targets.contextdir}}/opt/selenium/browser_binary_location
 
 update:
   enabled: true

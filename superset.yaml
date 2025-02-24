@@ -1,7 +1,7 @@
 package:
   name: superset
   version: 4.1.1
-  epoch: 2
+  epoch: 4
   description: Data Visualization and Data Exploration Platform
   copyright:
     - license: Apache-2.0
@@ -13,9 +13,11 @@ package:
     #  is provided in the virtual environment. Enabling no-depends
     #  works around this
     no-depends: true
+    no-provides: true
   dependencies:
     runtime:
       - openssl
+      - py${{vars.python-version}}-pip
       - python-${{vars.python-version}}
 
 environment:
@@ -45,17 +47,16 @@ pipeline:
       tag: ${{package.version}}
       expected-commit: 6264ff516532f0359d914bd72356f2007925109b
 
-  - runs: |
-      # Front-end build
-      cd superset-frontend
+  - name: Build frontend
+    working-directory: superset-frontend
+    runs: |
       npm ci
       npm run build
       mkdir -p ${{targets.destdir}}/app/superset/static/assets
-      cp -r  ../superset/static/assets/* ${{targets.destdir}}/app/superset/static/assets
+      cp -r ../superset/static/assets/* ${{targets.destdir}}/app/superset/static/assets
 
-  - runs: |
-      # Back-end build
-
+  - name: Build backend
+    runs: |
       python -m venv venv --system-site-packages
       source venv/bin/activate
 
@@ -66,10 +67,14 @@ pipeline:
 
       # To fix vulnerabilities
       pip install --upgrade dnspython==2.6.1 gunicorn==22.0.0 idna==3.7 setuptools==70.0.0 sqlparse==0.5.0 Jinja2==3.1.5 Werkzeug==3.0.6 requests==2.32.0 urllib3==1.26.19 certifi==2024.07.04 zipp==3.19.2
+
       # Dependencies required during runtime
       pip install pillow pyarrow
+
       # For running translations
       pip install flask flask-appbuilder==4.5.1
+
+      sed -i 's/"cryptography>=42.0.4.*"/"cryptography>=44.0.1"/' pyproject.toml
 
       # Build Apache Superset
       pip install .
@@ -77,36 +82,119 @@ pipeline:
       # translations for the web application, Is a non-blocking call, so errors may be ignored
       flask fab babel-compile --target superset/translations
 
-  - runs: |
+      # Remove malware-scan-triggering tests folder from built package
+      rm -rf venv/lib/python${{vars.python-version}}/site-packages/tests/
+
+      # Remove pip
+      pip uninstall --yes pip
+
+      # Install virtual environment
       mkdir -p ${{targets.destdir}}/usr/share/superset
       mv venv ${{targets.destdir}}/usr/share/superset
+
+      # Remove pycache
       rm -rf ${{targets.destdir}}/usr/share/superset/venv/bin/__pycache*
+
+      # Fix virtual environment's installed path
       sed -i "s|/home/build|/usr/share/superset|g" ${{targets.destdir}}/usr/share/superset/venv/bin/*
+      sed -i "s|/home/build|/usr/share/superset|g" ${{targets.destdir}}/usr/share/superset/venv/pyvenv.cfg
 
-  - runs: |
-      mkdir -p ${{targets.destdir}}/usr/bin/
-      cp  ./docker/run-server.sh ${{targets.destdir}}/usr/bin/
-      chmod 755 ${{targets.destdir}}/usr/bin/run-server.sh
-
+      # Install frontend
       mkdir -p ${{targets.destdir}}/app/superset-frontend
       cp -r ./superset ${{targets.destdir}}/app/
       cp setup.py MANIFEST.in README.md ${{targets.destdir}}/app/
       cp superset-frontend/package.json ${{targets.destdir}}/app/superset-frontend/
 
 subpackages:
-  # Upstream image runs ./docker/docker-ci.sh as entrypoint
-  # https://github.com/apache/superset/blob/4.1.1/Dockerfile#L179
-  - name: ${{package.name}}-entrypoint
-    description: "Compatibility package to copy entrypoint scripts"
+  - name: ${{package.name}}-ci
+    description: Superset with Postgres support
+    options:
+      no-depends: true
+      no-provides: true
+    dependencies:
+      runtime:
+        - openssl
+        - py${{vars.python-version}}-pip
+        - python-${{vars.python-version}}
     pipeline:
       - runs: |
-          mkdir -p ${{targets.destdir}}/app/docker
-          cp ./docker/docker-bootstrap.sh  ${{targets.destdir}}/app/docker/
-          cp ./docker/docker-frontend.sh  ${{targets.destdir}}/app/docker/
-          cp ./docker/docker-init.sh  ${{targets.destdir}}/app/docker/
-          mkdir -p ${{targets.destdir}}/app/docker/entrypoints
-          cp  ./docker/run-server.sh ${{targets.destdir}}/app/docker/entrypoints/
-          cp  ./docker/docker-ci.sh  ${{targets.destdir}}/app/docker/entrypoints/
+          # Copy Superset to subpackage
+          mkdir -p ${{targets.contextdir}}
+          cp -r ${{targets.destdir}}/* ${{targets.contextdir}}/
+
+          # Set path to virtual environment
+          sed -i "s|/usr/share/superset|${{targets.contextdir}}/usr/share/superset|g" ${{targets.contextdir}}/usr/share/superset/venv/bin/*
+          sed -i "s|/usr/share/superset|${{targets.contextdir}}/usr/share/superset|g" ${{targets.contextdir}}/usr/share/superset/venv/pyvenv.cfg
+
+          # Re-initialize and activate virtual env
+          python -m venv ${{targets.contextdir}}/usr/share/superset/venv --system-site-packages
+          source ${{targets.contextdir}}/usr/share/superset/venv/bin/activate
+
+          # Install Postgres pattern
+          pip install .[postgres]
+
+          # Remove pip
+          pip uninstall --yes pip
+
+          # Fix virtual environment's installed path
+          sed -i "s|${{targets.contextdir}}/usr/share/superset|/usr/share/superset|g" ${{targets.contextdir}}/usr/share/superset/venv/bin/*
+          sed -i "s|${{targets.contextdir}}/usr/share/superset|/usr/share/superset|g" ${{targets.contextdir}}/usr/share/superset/venv/pyvenv.cfg
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-entrypoint
+      pipeline:
+        - uses: test/daemon-check-output
+          with:
+            start: |
+              env \
+                PATH=/usr/share/superset/venv/bin:$PATH \
+                SUPERSET_ENV=production \
+                FLASK_APP="superset.app:create_app()" \
+                SUPERSET_PORT=8088 \
+                SUPERSET_SECRET_KEY="$(openssl rand -base64 42)" \
+              /app/docker/entrypoints/docker-ci.sh
+            timeout: 60
+            expected_output: |
+              Applying DB migrations
+              Setting up admin user
+              Setting up roles and perms
+              Starting gunicorn
+              Listening at: http://0.0.0.0:8088
+
+  - name: ${{package.name}}-entrypoint
+    description: "Docker configuration for Superset"
+    dependencies:
+      runtime:
+        - bash
+        - busybox
+        - coreutils
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/bin/
+          cp ./docker/run-server.sh ${{targets.contextdir}}/usr/bin/
+          chmod 755 ${{targets.contextdir}}/usr/bin/run-server.sh
+
+          # Docker bootstrap scripts
+          mkdir -p ${{targets.contextdir}}/app/docker
+          cp ./docker/docker-bootstrap.sh ${{targets.contextdir}}/app/docker/
+          cp ./docker/docker-frontend.sh ${{targets.contextdir}}/app/docker/
+          cp ./docker/docker-init.sh ${{targets.contextdir}}/app/docker/
+          cp ./docker/frontend-mem-nag.sh ${{targets.contextdir}}/app/docker/
+          chmod 755 ${{targets.contextdir}}/app/docker/*.sh
+
+          # Entrypoint scripts
+          mkdir -p ${{targets.contextdir}}/app/docker/entrypoints
+          cp ./docker/run-server.sh ${{targets.contextdir}}/app/docker/entrypoints/
+          cp ./docker/docker-ci.sh ${{targets.contextdir}}/app/docker/entrypoints/
+          chmod 755 ${{targets.contextdir}}/app/docker/entrypoints/*.sh
+    test:
+      pipeline:
+        - runs: |
+            if ! [ -x /app/docker/entrypoints/run-server.sh ]; then
+              echo "Entrypoint isn't executable" && exit 1
+            fi
 
 update:
   enabled: true
@@ -117,8 +205,22 @@ update:
     identifier: apache/superset
 
 test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-entrypoint
   pipeline:
-    - runs: |
-        export PATH=/usr/share/superset/venv/bin:$PATH
-        export SUPERSET_SECRET_KEY="$(openssl rand -base64 42)"
-        superset --help
+    - uses: test/daemon-check-output
+      with:
+        start: |
+          env \
+            PATH=/usr/share/superset/venv/bin:$PATH \
+            SUPERSET_ENV=production \
+            FLASK_APP="superset.app:create_app()" \
+            SUPERSET_PORT=8088 \
+            SUPERSET_SECRET_KEY="$(openssl rand -base64 42)" \
+          /app/docker/entrypoints/run-server.sh
+        timeout: 30
+        expected_output: |
+          Starting gunicorn
+          Listening at: http://0.0.0.0:8088

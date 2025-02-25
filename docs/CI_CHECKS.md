@@ -1,7 +1,7 @@
 # CI Checks for Wolfi Packages
 
 ## Overview
-This document explains the Continuous Integration (CI) check that verifies packages updates in Wolfi. 
+This document explains the Continuous Integration (CI) check that verifies packages updates in Wolfi.
 
 # CI Build Actions
 
@@ -9,7 +9,7 @@ The main build has two jobs that compile the package(s) for both x86 and arm arc
 
 ### When It Fails
 
-1. Consult the Logs: 
+1. Consult the Logs:
 
 The logs usually contain detailed information about why the build failed. The quality of logs can vary depending on the language ecosystem or the build tool being used.
 
@@ -104,7 +104,7 @@ Example PR: https://github.com/wolfi-dev/os/pull/20198
 
 In this example PR, we can see there is a new shared object version being introduced in the `gsl` package. The `gsl.yaml` file has four packages: `gsl`, `gsl-dev`, `gsl-doc`, and `gsl-static`.
 
-To find the dependent packages of `gsl`, we use [GitHub search](https://github.com/search?q=repo:wolfi-dev/os%20gsl&type=code). In this case, we can see that there are two packages that are dependent on the `gsl-dev` package: `dieharder` and `lsb-release-minimal`. 
+To find the dependent packages of `gsl`, we use [GitHub search](https://github.com/search?q=repo:wolfi-dev/os%20gsl&type=code). In this case, we can see that there are two packages that are dependent on the `gsl-dev` package: `dieharder` and `lsb-release-minimal`.
 
 Therefore, we need to increment the epoch of these two dependent packages. To do this, locate the epoch field in the YAML files of `dieharder` and `lsb-release-minimal`, and increment the value by one.
 
@@ -118,18 +118,10 @@ One of the core missions of the The Wolfi project is to produce packaged softwar
 
 You can run the same CI check locally to help iterate and patch failed scans.
 
-First build the Wolfi package locally using an extra melange option
+First build the Wolfi package locally, then using [wolfictl](https://github.com/wolfi-dev/wolfictl) you can run
 
 ```
-MELANGE_EXTRA_OPTS="--create-build-log"
-```
-
-This will create a `packages.log` file once the packages have been built.
-
-Next, using [wolfictl](https://github.com/wolfi-dev/wolfictl) you can run
-
-```
-wolfictl scan .  --build-log
+wolfictl scan packages/<arch>/<your-apk>
 ```
 
 Typically a vulnerability is reported against a dependency of the package you are building.  Depending on what type of package you have there are different approaches used to patch the software.

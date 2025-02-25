@@ -1,0 +1,118 @@
+diff --git a/nptl/pthread_cond_wait.c b/nptl/pthread_cond_wait.c
+index f915873f8c..d41f9f54e2 100644
+--- a/nptl/pthread_cond_wait.c
++++ b/nptl/pthread_cond_wait.c
+@@ -143,6 +143,23 @@ __condvar_cancel_waiting (pthread_cond_t *cond, uint64_t seq, unsigned int g,
+     }
+ }
+ 
++/* Wake up any signalers that might be waiting.  */
++static void
++__condvar_dec_grefs (pthread_cond_t *cond, unsigned int g, int private)
++{
++  /* Release MO to synchronize-with the acquire load in
++     __condvar_quiesce_and_switch_g1.  */
++  if (atomic_fetch_add_release (cond->__data.__g_refs + g, -2) == 3)
++    {
++      /* Clear the wake-up request flag before waking up.  We do not need more
++	 than relaxed MO and it doesn't matter if we apply this for an aliased
++	 group because we wake all futex waiters right after clearing the
++	 flag.  */
++      atomic_fetch_and_relaxed (cond->__data.__g_refs + g, ~(unsigned int) 1);
++      futex_wake (cond->__data.__g_refs + g, INT_MAX, private);
++    }
++}
++
+ /* Clean-up for cancellation of waiters waiting for normal signals.  We cancel
+    our registration as a waiter, confirm we have woken up, and re-acquire the
+    mutex.  */
+@@ -154,6 +171,8 @@ __condvar_cleanup_waiting (void *arg)
+   pthread_cond_t *cond = cbuffer->cond;
+   unsigned g = cbuffer->wseq & 1;
+ 
++  __condvar_dec_grefs (cond, g, cbuffer->private);
++
+   __condvar_cancel_waiting (cond, cbuffer->wseq >> 1, g, cbuffer->private);
+   /* FIXME With the current cancellation implementation, it is possible that
+      a thread is cancelled after it has returned from a syscall.  This could
+@@ -305,6 +324,15 @@ __condvar_cleanup_waiting (void *arg)
+    sufficient because if a waiter can see a sufficiently large value, it could
+    have also consume a signal in the waiters group.
+ 
++   It is essential that the last field in pthread_cond_t is __g_signals[1]:
++   The previous condvar used a pointer-sized field in pthread_cond_t, so a
++   PTHREAD_COND_INITIALIZER from that condvar implementation might only
++   initialize 4 bytes to zero instead of the 8 bytes we need (i.e., 44 bytes
++   in total instead of the 48 we need).  __g_signals[1] is not accessed before
++   the first group switch (G2 starts at index 0), which will set its value to
++   zero after a harmless fetch-or whose return value is ignored.  This
++   effectively completes initialization.
++
+ 
+    Limitations:
+    * This condvar isn't designed to allow for more than
+diff --git a/nptl/tst-cond22.c b/nptl/tst-cond22.c
+index bdcb45c536..1336e9c79d 100644
+--- a/nptl/tst-cond22.c
++++ b/nptl/tst-cond22.c
+@@ -106,13 +106,13 @@ do_test (void)
+       status = 1;
+     }
+ 
+-  printf ("cond = { 0x%x:%x, 0x%x:%x, %u/%u, %u/%u, %u, %u }\n",
++  printf ("cond = { 0x%x:%x, 0x%x:%x, %u/%u/%u, %u/%u/%u, %u, %u }\n",
+ 	  c.__data.__wseq.__value32.__high,
+ 	  c.__data.__wseq.__value32.__low,
+ 	  c.__data.__g1_start.__value32.__high,
+ 	  c.__data.__g1_start.__value32.__low,
+-	  c.__data.__g_signals[0], c.__data.__g_size[0],
+-	  c.__data.__g_signals[1], c.__data.__g_size[1],
++	  c.__data.__g_signals[0], c.__data.__g_refs[0], c.__data.__g_size[0],
++	  c.__data.__g_signals[1], c.__data.__g_refs[1], c.__data.__g_size[1],
+ 	  c.__data.__g1_orig_size, c.__data.__wrefs);
+ 
+   if (pthread_create (&th, NULL, tf, (void *) 1l) != 0)
+@@ -152,13 +152,13 @@ do_test (void)
+       status = 1;
+     }
+ 
+-  printf ("cond = { 0x%x:%x, 0x%x:%x, %u/%u, %u/%u, %u, %u }\n",
++  printf ("cond = { 0x%x:%x, 0x%x:%x, %u/%u/%u, %u/%u/%u, %u, %u }\n",
+ 	  c.__data.__wseq.__value32.__high,
+ 	  c.__data.__wseq.__value32.__low,
+ 	  c.__data.__g1_start.__value32.__high,
+ 	  c.__data.__g1_start.__value32.__low,
+-	  c.__data.__g_signals[0], c.__data.__g_size[0],
+-	  c.__data.__g_signals[1], c.__data.__g_size[1],
++	  c.__data.__g_signals[0], c.__data.__g_refs[0], c.__data.__g_size[0],
++	  c.__data.__g_signals[1], c.__data.__g_refs[1], c.__data.__g_size[1],
+ 	  c.__data.__g1_orig_size, c.__data.__wrefs);
+ 
+   return status;
+diff --git a/sysdeps/nptl/bits/thread-shared-types.h b/sysdeps/nptl/bits/thread-shared-types.h
+index 7c24c0a6be..13a08a8095 100644
+--- a/sysdeps/nptl/bits/thread-shared-types.h
++++ b/sysdeps/nptl/bits/thread-shared-types.h
+@@ -95,7 +95,8 @@ struct __pthread_cond_s
+ {
+   __atomic_wide_counter __wseq;
+   __atomic_wide_counter __g1_start;
+-  unsigned int __g_size[2] __LOCK_ALIGNMENT;
++  unsigned int __g_refs[2] __LOCK_ALIGNMENT;
++  unsigned int __g_size[2];
+   unsigned int __g1_orig_size;
+   unsigned int __wrefs;
+   unsigned int __g_signals[2];
+diff --git a/sysdeps/nptl/pthread.h b/sysdeps/nptl/pthread.h
+index 050b4ab8d1..b643546dc8 100644
+--- a/sysdeps/nptl/pthread.h
++++ b/sysdeps/nptl/pthread.h
+@@ -152,7 +152,7 @@ enum
+ 
+ 
+ /* Conditional variable handling.  */
+-#define PTHREAD_COND_INITIALIZER { { {0}, {0}, {0, 0}, 0, 0, {0, 0} } }
++#define PTHREAD_COND_INITIALIZER { { {0}, {0}, {0, 0}, {0, 0}, 0, 0, {0, 0} } }
+ 
+ 
+ /* Cleanup buffers */

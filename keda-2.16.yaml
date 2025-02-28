@@ -11,16 +11,6 @@ package:
     provides:
       - keda=${{package.full-version}}
 
-environment:
-  contents:
-    packages:
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go
-      - protobuf-dev
-      - protoc
-
 pipeline:
   - uses: git-checkout
     with:
@@ -33,12 +23,13 @@ pipeline:
       deps: |-
         github.com/go-jose/go-jose/v4@v4.0.5
 
-  - runs: |
-      ARCH=$(go env GOARCH) make build
-      mkdir -p "${{targets.destdir}}/usr/bin"
-      mv bin/keda "${{targets.destdir}}/usr/bin"
-
-  - uses: strip
+  - uses: go/build
+    with:
+      packages: ./cmd/operator/main.go
+      output: keda
+      ldflags: |
+        -X=github.com/kedacore/keda/v2/version.GitCommit=$(git rev-parse --short HEAD)
+        -X=github.com/kedacore/keda/v2/version.Version=${{package.version}}
 
 subpackages:
   - name: "${{package.name}}-metrics-apiserver"
@@ -50,10 +41,36 @@ subpackages:
         - keda-adapter=${{package.full-version}}
         - keda-metrics-apiserver=${{package.full-version}}
     pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}/usr/bin"
-          mv bin/keda-adapter "${{targets.subpkgdir}}/usr/bin"
-      - uses: strip
+      - uses: go/build
+        with:
+          packages: ./cmd/adapter/main.go
+          output: keda-adapter
+          ldflags: |
+            -X=github.com/kedacore/keda/v2/version.GitCommit=$(git rev-parse --short HEAD)
+            -X=github.com/kedacore/keda/v2/version.Version=${{package.version}}
+    test:
+      environment:
+        environment:
+          KUBERNETES_SERVICE_HOST: "127.0.0.1"
+          KUBERNETES_SERVICE_PORT: 32764
+          WATCH_NAMESPACE: default
+      pipeline:
+        - uses: test/kwok/cluster
+        - uses: test/daemon-check-output
+          with:
+            start: /usr/bin/keda-adapter
+            setup: |
+              mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+              CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+              cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              kubectl create serviceaccount default
+              kubectl create token default > /var/run/secrets/kubernetes.io/serviceaccount/token
+            timeout: 30
+            expected_output: |
+              Starting metrics server
+              KEDA Version
+              Running on Kubernetes
+              Connecting Metrics Service gRPC client to the server
 
   - name: "${{package.name}}-admission-webhooks"
     description: "Webhooks for Keda"
@@ -63,10 +80,24 @@ subpackages:
       provides:
         - keda-admission-webhooks=${{package.full-version}}
     pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}/usr/bin"
-          mv bin/keda-admission-webhooks "${{targets.subpkgdir}}/usr/bin"
-      - uses: strip
+      - uses: go/build
+        with:
+          packages: ./cmd/webhooks/main.go
+          output: keda-admission-webhooks
+          ldflags: |
+            -X=github.com/kedacore/keda/v2/version.GitCommit=$(git rev-parse --short HEAD)
+            -X=github.com/kedacore/keda/v2/version.Version=${{package.version}}
+    test:
+      pipeline:
+        - uses: test/kwok/cluster
+        - uses: test/daemon-check-output
+          with:
+            start: /usr/bin/keda-admission-webhooks
+            timeout: 30
+            expected_output: |
+              Starting admission webhooks
+              Running on Kubernetes
+              Registering a validating webhook
 
   - name: "${{package.name}}-compat"
     description: "Compatibility package to place binaries in the location expected by upstream helm charts"
@@ -80,7 +111,12 @@ subpackages:
           ln -sf /usr/bin/keda ${{targets.subpkgdir}}/keda
           ln -sf /usr/bin/keda-admission-webhooks ${{targets.subpkgdir}}/keda-admission-webhooks
           ln -sf /usr/bin/keda-adapter ${{targets.subpkgdir}}/keda-adapter
-      - uses: strip
+    test:
+      pipeline:
+        - runs: |
+            stat /keda
+            stat /keda-admission-webhooks
+            stat /keda-adapter
 
 update:
   enabled: true
@@ -88,3 +124,7 @@ update:
     identifier: kedacore/keda
     strip-prefix: v
     tag-filter: v2.16.
+
+test:
+  pipeline:
+    - runs: keda --help 2>&1 | grep -E 'eda|health-probe|kubeconfig'

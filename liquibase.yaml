@@ -9,6 +9,7 @@ package:
     runtime:
       - bash
       - openjdk-17-jre
+      - liquibase-package-manager
 
 environment:
   contents:
@@ -40,31 +41,24 @@ pipeline:
       # Setup destination dir
       mkdir -p ${{targets.destdir}}/usr/share/java/liquibase
       tar -zxvf liquibase-dist/target/${{package.name}}-0-SNAPSHOT.tar.gz -C ${{targets.destdir}}/usr/share/java/liquibase
+      cp docker-entrypoint.sh ${{targets.destdir}}/usr/share/java/liquibase
+      chmod +x ${{targets.destdir}}/usr/share/java/liquibase/docker-entrypoint.sh
+      cp liquibase.docker.properties ${{targets.destdir}}/usr/share/java/liquibase
 
   - uses: strip
 
 subpackages:
-  - name: ${{package.name}}-oci-entrypoint
-    description: Entrypoint for using Liquibase in OCI containers.
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/share/java/liquibase
-          cp docker-entrypoint.sh ${{targets.subpkgdir}}/usr/share/java/liquibase/docker-entrypoint.sh
-          chmod +x ${{targets.subpkgdir}}/usr/share/java/liquibase/docker-entrypoint.sh
-
-  - name: ${{package.name}}-config
-    description: Default liquibase configuration.
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/share/java/liquibase
-          cp  liquibase.docker.properties ${{targets.subpkgdir}}/usr/share/java/liquibase/liquibase.docker.properties
-
   - name: "${{package.name}}-compat"
+    description: "Compat package for Liquibase Symlinks"
     pipeline:
       - runs: |
           # Symlinks for liquibase
-          mkdir -p "${{targets.subpkgdir}}"/usr/share/java/liquibase
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
           ln -sf /usr/share/java/liquibase ${{targets.destdir}}/liquibase
+          ln -sf /usr/share/java/liquibase/liquibase ${{targets.subpkgdir}}/usr/local/bin/liquibase 
+          ln -sf /usr/share/java/liquibase/docker-entrypoint.sh ${{targets.subpkgdir}}/usr/local/bin/docker-entrypoint.sh
+          
+          # Symlinks for java
           mkdir -p ${{targets.subpkgdir}}/opt/java/openjdk
           for item in bin conf legal lib release; do
             ln -sf /usr/lib/jvm/java-17-openjdk/$item ${{targets.subpkgdir}}/opt/java/openjdk
@@ -75,3 +69,75 @@ update:
   github:
     identifier: liquibase/liquibase
     strip-prefix: v
+
+test:
+  environment:
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      SQLITE_URL: jdbc:sqlite:/tmp/test.db
+      LIQUIBASE_HOME: /usr/share/java/liquibase
+    contents:
+      packages:
+        - sqlite
+        - liquibase
+        - liquibase-package-manager
+  pipeline:
+    - name: Test CLI basics
+      runs: |
+        export PATH=$PATH:$JAVA_HOME/bin:$LIQUIBASE_HOME
+        liquibase --version
+    - name: Test Liquibase Changelogs
+      runs: |
+        export PATH=$PATH:$JAVA_HOME/bin:$LIQUIBASE_HOME
+        
+        # Setup sqlite database
+        sqlite3 /tmp/test.db "CREATE TABLE test (id INT, name TEXT); INSERT INTO test VALUES (1, 'hello');"
+
+        # Setup liquibase test project dir
+        mkdir -p $LIQUIBASE_HOME/test
+
+        # Create changlog file
+        cat <<'EOF' >> $LIQUIBASE_HOME/test/example-changelog.sql
+        --liquibase formatted sql
+
+        --changeset your.name:1 labels:example-label context:example-context
+        --comment: example comment
+        create table person (
+            id integer primary key autoincrement not null,
+            name varchar(50) not null,
+            address1 varchar(50),
+            address2 varchar(50),
+            city varchar(30)
+        )
+        --rollback DROP TABLE person;
+
+        --changeset your.name:2 labels:example-label context:example-context
+        --comment: example comment
+        create table company (
+            id integer primary key autoincrement not null,
+            name varchar(50) not null,
+            address1 varchar(50),
+            address2 varchar(50),
+            city varchar(30)
+        )
+        --rollback DROP TABLE company;
+
+        --changeset other.dev:3 labels:example-label context:example-context
+        --comment: example comment
+        alter table person add column country varchar(2)
+        --rollback ALTER TABLE person DROP COLUMN country;
+        EOF
+        
+        cd $LIQUIBASE_HOME
+
+        # Check status
+        liquibase status --url="$SQLITE_URL" --changelog-file=test/example-changelog.sql
+
+        # Inspect sql
+        liquibase update-sql --url="$SQLITE_URL" --changelog-file=test/example-changelog.sql
+
+        # Run changlog update
+        liquibase update --url="$SQLITE_URL" --changelog-file=test/example-changelog.sql
+
+        # Verify tables were created
+        sqlite3 /tmp/test.db ".tables" | grep -E "company|person"

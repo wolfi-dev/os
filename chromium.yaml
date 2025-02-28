@@ -103,9 +103,7 @@ environment:
       - libxtst
       - libxtst-dev
       - linux-headers
-      - mesa
       - mesa-dev
-      - mesa-gbm
       - minizip
       - nghttp2-dev
       - openh264-dev
@@ -124,6 +122,7 @@ environment:
       - rust
       - rust-bindgen
       - samurai
+      - scanelf
       - speex-dev
       - sqlite-dev
       - systemd-dev
@@ -137,50 +136,27 @@ environment:
     RUSTC_BOOTSTRAP: 1
 
 pipeline:
-  - uses: git-checkout
+  - name: Fetch Chromium tarball
+    uses: fetch
     with:
-      # Initial git clone: takes ~3 minutes, needs 6GB disk
-      repository: https://chromium.googlesource.com/chromium/src.git
-      tag: ${{package.version}}
-      depth: 1
-      expected-commit: 2a5d6da0d6165d7b107502095a937fe7704fcef6
-      destination: /home/src
+      # Fetch source and dependencies: takes about 11 minutes, requires 30 GB of disk
+      # Gentoo provides tarballs where they've already performed a client sync (which isn't possible on arm64)
+      uri: https://chromium-tarballs.distfiles.gentoo.org/chromium-${{package.version}}-linux.tar.xz
+      expected-sha512: 04ca888078ab3ce4775d0dff9c9d46b342be5bda2fe41493dcf8695fa9b52ed749455275cfc4bba234a10fbe6df0eeac3d8bb2f8d73ca1250a142c58944ff6d9
 
-  - working-directory: /home
-    name: Clone depot-tools and setup .gclient
+  - name: Remove binaries from source tree
     runs: |
-      # depot_tools contains essential Chromium build tools
-      # in consists of gclient, gn, autoninja, etc. that are used to build Chromium
-      # We are cloning it to /home/depot_tools and have to add it to PATH
-      time git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+      # These binaries are tools transient from the client sync Gentoo performs for us
+      # All we need is the Chromium source tree and its dependencies
+      #
+      # Tarballs are built using the instructions here:
+      # https://wiki.gentoo.org/wiki/Project:Chromium/How_to_make_a_Chromium_tarball
+      scanelf -RA -F "%F" "$HOME" 2>/dev/null | while read -r elf; do
+        echo "Removing $elf"
+        rm -f "$elf"
+      done
 
-      # Create .gclient configuration file
-      # Important: File must be in /home (parent of src/)
-      # Because: gclient searches for .gclient in parent directories
-      # Reference: https://chromium.googlesource.com/chromium/tools/depot_tools/+/main/README.gclient.md
-      cat <<EOF > /home/.gclient
-      # Setup a .gclient config (handled by 'fetch' in upstream instructions)
-      solutions = [
-        { "name"        : "src",
-          "url"         : "https://chromium.googlesource.com/chromium/src.git",
-          "managed": False,
-          "custom_deps": {},
-          "custom_vars": {},
-        },
-      ]
-      EOF
-
-  - working-directory: /home/src
-    name: sync-dependencies
-    runs: |
-      # Add depot_tools to PATH to use gclient
-      export PATH="$PATH:/home/depot_tools"
-
-      # Sync dependencies: takes about 11 minutes, requires 30 GB of disk
-      time gclient sync --no-history
-
-  - working-directory: /home/src
-    name: Use system libraries
+  - name: Use system libraries
     runs: |
       # Use USB IDs already provided by hwdata-usb
       sed 's|//third_party/usb_ids/usb.ids|/usr/share/hwdata/usb.ids|g' \
@@ -232,17 +208,15 @@ pipeline:
       sed -i 's/OFFICIAL_BUILD/GOOGLE_CHROME_BUILD/' \
         tools/generate_shim_headers/generate_shim_headers.py
 
-      # Make node executable: works around permission denial
-      chmod +x /home/src/third_party/node/linux/node-linux-x64/bin/node
+      # Use host node
+      mkdir -p third_party/node/linux/node-linux-x64/bin
+      ln -sv /usr/bin/node third_party/node/linux/node-linux-x64/bin/node
 
   - working-directory: /home/src
     name: prepare-build
     runs: |
-      # Add depot_tools to PATH to use gn
-      export PATH="$PATH:/home/depot_tools"
-
       # Generate config: takes about 30 minutes
-      time gn gen /home/src/out/Default --args="
+      time gn gen $HOME/out/Default --args="
         blink_symbol_level=0
         clang_use_chrome_plugins=false
         chrome_pgo_phase=0
@@ -276,12 +250,8 @@ pipeline:
         use_system_zlib=true
       "
 
-  - working-directory: /home/src
-    name: Build
+  - name: Build
     runs: |
-      # Add depot_tools to PATH to use autoninja
-      export PATH="$PATH:/home/depot_tools"
-
       # Disable compiler warnings encountered when using system provided libraries
       export CFLAGS="$CFLAGS -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-shift-count-overflow -Wno-ignored-attributes"
       export CXXFLAGS="$CXXFLAGS -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-invalid-constexpr"
@@ -290,7 +260,7 @@ pipeline:
       # Compile: takes about 3 hours, 60 GB of disk (on a 32xXeon, 128GBxRAM, 2TBxNVME system)
       time autoninja -C ./out/Default chrome chromedriver.unstripped chrome_crashpad_handler chrome_sandbox
 
-  - working-directory: /home/src/out/Default
+  - working-directory: /home/build/out/Default
     name: Install the binaries and libraries
     runs: |
       mkdir -p \
@@ -312,7 +282,7 @@ pipeline:
          ${{targets.contextdir}}/usr/lib/${{package.name}}/
 
       # Setup wrapper and symlinks
-      cd /home/build
+      cd $HOME
       mv chromium-launcher.sh ${{targets.destdir}}/usr/bin/chromium-browser
       ln -s /usr/lib/${{package.name}}/chrome ${{targets.contextdir}}/usr/bin/chromium
       ln -s /usr/lib/${{package.name}}/chromedriver ${{targets.contextdir}}/usr/bin/chromedriver
@@ -322,7 +292,7 @@ pipeline:
       opts: -s
 
   # Do not strip ChromeDriver
-  - working-directory: /home/src/out/Default
+  - working-directory: /home/build/out/Default
     runs: |
       mv chromedriver.unstripped ${{targets.destdir}}/usr/lib/${{package.name}}/chromedriver
 
@@ -340,9 +310,9 @@ subpackages:
   - name: chromium-docker-selenium-compat
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/opt/selenium
+          mkdir -p ${{targets.contextdir}}/opt/selenium
 
-          ln -s /usr/lib/chromium/chromedriver ${{targets.subpkgdir}}/opt/selenium/chromedriver-${{package.version}}
+          ln -s /usr/lib/chromium/chromedriver ${{targets.contextdir}}/opt/selenium/chromedriver-${{package.version}}
 
           echo "chrome" > ${{targets.contextdir}}/opt/selenium/browser_name
           echo ${{package.version}} > ${{targets.contextdir}}/opt/selenium/browser_version

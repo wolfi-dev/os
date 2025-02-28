@@ -41,6 +41,8 @@ environment:
       - bzip2-dev
       - ca-certificates-bundle
       - cairo-dev
+      - clang
+      - compiler-rt
       - crc32c-dev
       - cups-dev
       - curl
@@ -104,6 +106,7 @@ environment:
       - libxtst
       - libxtst-dev
       - linux-headers
+      - llvm-dev
       - mesa-dev
       - minizip
       - nghttp2-dev
@@ -133,7 +136,12 @@ environment:
       - zlib-dev
       - zstd-dev
   environment:
-    # Allow unstable rust features with stable rust
+    # Use host clang
+    AR: "llvm-ar"
+    CC: "clang"
+    CXX: "clang++"
+    NM: "llvm-nm"
+    # Allow unstable features with stable rust
     RUSTC_BOOTSTRAP: 1
 
 pipeline:
@@ -142,6 +150,9 @@ pipeline:
     with:
       # Fetch source and dependencies: takes about 11 minutes, requires 30 GB of disk
       # Gentoo provides tarballs where they've already performed a client sync (which isn't possible on arm64)
+      #
+      # Tarballs are built using the instructions here:
+      # https://wiki.gentoo.org/wiki/Project:Chromium/How_to_make_a_Chromium_tarball
       uri: https://chromium-tarballs.distfiles.gentoo.org/chromium-${{package.version}}-linux.tar.xz
       expected-sha512: 04ca888078ab3ce4775d0dff9c9d46b342be5bda2fe41493dcf8695fa9b52ed749455275cfc4bba234a10fbe6df0eeac3d8bb2f8d73ca1250a142c58944ff6d9
 
@@ -149,13 +160,16 @@ pipeline:
     runs: |
       # These binaries are tools transient from the client sync Gentoo performs for us
       # All we need is the Chromium source tree and its dependencies
-      #
-      # Tarballs are built using the instructions here:
-      # https://wiki.gentoo.org/wiki/Project:Chromium/How_to_make_a_Chromium_tarball
       scanelf -RA -F "%F" "$HOME" 2>/dev/null | while read -r elf; do
         echo "Removing $elf"
         rm -f "$elf"
       done
+
+  - uses: patch
+    with:
+      patches: |
+        bindgen.patch \
+        fortify_level.patch
 
   - name: Use system libraries
     runs: |
@@ -219,18 +233,28 @@ pipeline:
 
   - name: Generate gn config
     runs: |
+      # Fetch clang version
+      # We could parse clang --version with awk, but this is cleaner
+      clang_version=$(basename $(clang --print-resource-dir))
+
       # Generate config: takes about 30 minutes
       time gn gen $HOME/out/Default --args="
         blink_symbol_level=0
+        clang_base_path=\"/usr/lib/llvm-$clang_version\"
         clang_use_chrome_plugins=false
+        clang_version=\"$clang_version\"
         chrome_pgo_phase=0
+        custom_toolchain=\"//build/toolchain/linux/unbundle:default\"
         enable_freetype=true
         enable_nacl=false
-        enable_nocompile_tests_new=false
         enable_rust=true
         enable_widevine=true
         ffmpeg_branding=\"Chrome\"
         icu_use_data_file=false
+        is_cfi=false
+        is_clang=true
+        is_component_build=false
+        is_component_ffmpeg=true
         is_debug=false
         is_official_build=true
         link_pulseaudio=true
@@ -245,6 +269,7 @@ pipeline:
         use_lld=true
         use_pulseaudio=true
         use_qt6=true
+        use_safe_libstdcxx=false
         use_sysroot=false
         use_system_freetype=true
         use_system_harfbuzz=true
@@ -262,7 +287,7 @@ pipeline:
       export CPPFLAGS="${CPPFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS/} -D__DATE__=  -D__TIME__=  -D__TIMESTAMP__="
 
       # Compile: takes about 3 hours, 60 GB of disk (on a 32xXeon, 128GBxRAM, 2TBxNVME system)
-      time autoninja -C ./out/Default chrome chromedriver.unstripped chrome_crashpad_handler chrome_sandbox
+      time ninja -C ./out/Default chrome chromedriver.unstripped chrome_crashpad_handler chrome_sandbox
 
   - working-directory: /home/build/out/Default
     name: Install binaries & libraries

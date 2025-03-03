@@ -2,11 +2,14 @@
 package:
   name: ingress-nginx-controller-1.12
   version: 1.12.0
-  # There are manual changes to review between each package update. See 'vars:' section.
-  epoch: 5
+  # There are manual changes to review between each package update. See 'vars:' section
+  epoch: 11
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
+  resources:
+    cpu: 16
+    memory: 16Gi
   dependencies:
     provides:
       - ingress-nginx-controller=${{package.full-version}}
@@ -14,6 +17,7 @@ package:
       - ca-certificates-bundle
       - ca-certificates
       - curl
+      - dumb-init-privileged-netbindservice
       - openssh-client
       - openssl
       - openssl-dev
@@ -76,6 +80,7 @@ environment:
       - git
       - glibc-dev
       - go
+      - grpc-dev
       - icu-dev
       - libaio-dev
       - libcap
@@ -156,9 +161,12 @@ vars:
   NGX_BROTLI_SHA: 63ca02abdcf79c9e788d2eedcc388d2335902e52
   # TODO: ModSecurity-nginx needs a release beyond v1.0.3 to work properly
   # see https://github.com/owasp-modsecurity/ModSecurity-nginx/issues/324
-  MODSECURITY_NGINX_VERSION: "fb678c5b4456c733e011d4bd6ad0888baca8c124"
+  MODSECURITY_NGINX_VERSION: "0b4f0cf38502f34a30c8543039f345cfc075670d"
   # Instrumentation for nginx plugin: https://github.com/open-telemetry/opentelemetry-cpp-contrib
-  OTEL_SHA: "42e542d18d55662399c40117a0a1f542a9c102e7"
+  # NOTE: this is really really critical and the config can break in backwards compatible way!!
+  # We should always use the SHA available in release-x.y branch of upstream project (e.g. https://github.com/kubernetes/ingress-nginx/blob/release-1.12/images/nginx/rootfs/build.sh#L532)
+  # please check https://github.com/open-telemetry/opentelemetry-cpp-contrib/compare/8933841f0a7f8737f61404cf0a64acf6b079c8a5...main for regression
+  OTEL_SHA: "8933841f0a7f8737f61404cf0a64acf6b079c8a5"
 
 pipeline:
   - uses: git-checkout
@@ -294,9 +302,6 @@ pipeline:
       ARCH=$(uname -m)
 
       ls -lah ${BUILD_PATH}/lua-nginx-module-${{vars.LUA_NGX_VERSION}}
-      echo /usr/local/lib >> /etc/ld.so.conf
-      ldconfig
-      cat /etc/ld.so.conf
 
       mkdir -p ${{targets.destdir}}/etc/nginx/
 
@@ -470,6 +475,7 @@ pipeline:
       echo "Clean up owasp-modsecurity-crs"
       rm -rf ${{targets.destdir}}/etc/nginx/owasp-modsecurity-crs/.git
       rm -rf ${{targets.destdir}}/etc/nginx/owasp-modsecurity-crs/util/regression-tests
+      rm -rf ${{targets.destdir}}/etc/nginx/owasp-modsecurity-crs/tests
 
   - uses: strip
 
@@ -487,13 +493,6 @@ pipeline:
 
       setcap cap_net_bind_service=+ep ${{targets.destdir}}/usr/bin/nginx \
         && setcap -v cap_net_bind_service=+ep ${{targets.destdir}}/usr/bin/nginx
-
-      echo "::::::::::::::::::::::::::::::::::::::::::"
-      echo ":::: SETCAP DUMB INIT                  ::::"
-      echo "::::::::::::::::::::::::::::::::::::::::::"
-
-      setcap cap_net_bind_service=+ep ${{targets.destdir}}/usr/bin/dumb-init \
-        && setcap -v cap_net_bind_service=+ep ${{targets.destdir}}/usr/bin/dumb-init
 
 subpackages:
   - name: ingress-nginx-controller-compat-${{vars.nginx-ingress-major-minor}}
@@ -557,6 +556,7 @@ subpackages:
           repository: https://github.com/open-telemetry/opentelemetry-cpp-contrib
           branch: main
           expected-commit: ${{vars.OTEL_SHA}}
+          depth: -1
       - working-directory: instrumentation/nginx
         runs: |
           mkdir build
@@ -570,6 +570,89 @@ subpackages:
           mkdir -p ${{targets.contextdir}}/etc/nginx/modules
           cp -p otel_ngx_module.so ${{targets.contextdir}}/etc/nginx/modules/
       - uses: strip
+    test:
+      pipeline:
+        - uses: test/ldd-check
+          with:
+            packages: $(basename ${{targets.contextdir}})
+
+  - name: ingress-nginx-custom-error-pages-${{vars.nginx-ingress-major-minor}}
+    description: OTel plugin for ingress nginx controller ${{vars.nginx-ingress-major-minor}}
+    dependencies:
+      provides:
+        - ingress-nginx-custom-error-pages=${{package.full-version}}
+    pipeline:
+      - working-directory: images/custom-error-pages/rootfs/
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/usr/bin
+              mkdir -p /go/src/k8s.io/ingress-nginx/images/custom-error-pages
+              cp -r * /go/src/k8s.io/ingress-nginx/images/custom-error-pages/
+              cd /go/src/k8s.io/ingress-nginx/images/custom-error-pages
+              go get . && \
+              go build -o ${{targets.contextdir}}/usr/bin/nginx-errors .
+    test:
+      environment:
+        contents:
+          packages:
+            - wait-for-it
+            - curl
+            - ingress-nginx-custom-error-pages-compat-${{vars.nginx-ingress-major-minor}}
+      pipeline:
+        - runs: |
+            /usr/bin/nginx-errors &
+            wait-for-it -t 10 localhost:8080
+
+            # check healthz endpoint make sure it returns 200
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/healthz)
+
+            if [ "$http_code" != "200" ]; then
+              echo "Healthz endpoint returned $http_code"
+              exit 1
+            fi
+
+            # I already checked that the following error exists in the upstream custom error pages image
+            # unexpected error reading return code: strconv.Atoi: parsing "": invalid syntax. Using 404
+            # serving custom error response for code 404 and format text/html from file /www/404.html
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/)
+
+            if [ "$http_code" != "404" ]; then
+              echo "Custom error page did not return 404"
+              exit 1
+            fi
+
+            # also check the message
+            message=$(curl -s http://localhost:8080/)
+
+            # Trim message (removes leading/trailing spaces & newlines)
+            message=$(echo "$message" | tr -d '\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+
+            if [[ "$message" != "<span>The page you're looking for could not be found.</span>" ]]; then
+                echo "Custom error page did not return expected message"
+                exit 1
+            fi
+
+  - name: ingress-nginx-custom-error-pages-compat-${{vars.nginx-ingress-major-minor}}
+    description: OTel plugin for ingress nginx controller ${{vars.nginx-ingress-major-minor}}
+    dependencies:
+      provides:
+        - ingress-nginx-custom-error-pages-compat=${{package.full-version}}
+    pipeline:
+      - working-directory: images/custom-error-pages/rootfs/
+        pipeline:
+          - runs: |
+              mkdir -p ${{targets.contextdir}}/www
+              mkdir -p ${{targets.contextdir}}/etc/
+              cp -r www/* ${{targets.contextdir}}/www/
+              cp -r etc/* ${{targets.contextdir}}/etc/
+              ln -sf /usr/bin/nginx-errors ${{targets.contextdir}}/nginx-errors
+    test:
+      pipeline:
+        - runs: |
+            ls -lah /www/404.html
+            ls -lah /www/500.html
+            ls -lah /www/404.json
+            ls -lah /etc/mime.types
 
 update:
   enabled: true
@@ -584,6 +667,7 @@ test:
     contents:
       packages:
         - ingress-nginx-controller-compat-${{vars.nginx-ingress-major-minor}}
+        - libcap-utils
   pipeline:
     - runs: |
         /usr/bin/nginx -v
@@ -597,9 +681,8 @@ test:
         load_module /etc/nginx/modules/otel_ngx_module.so;
 
         http {
-          opentelemetry_service_name "nginx-proxy";
-          opentelemetry_otlp_traces_endpoint "http://collector:4318/v1/traces";
-
+          opentelemetry_operation_name otel_example;
+          opentelemetry_ignore_paths ignored.php;
           server {
             listen 80;
             server_name otel_example;
@@ -625,3 +708,7 @@ test:
     - uses: test/ldd-check
       with:
         packages: ${{package.name}}
+    - name: Test file capabilities
+      runs: |
+        getcap /usr/bin/nginx-ingress-controller | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=ep$'
+        getcap /usr/bin/nginx | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=ep$'

@@ -1,7 +1,7 @@
 package:
   name: glibc
   version: 2.40
-  epoch: 8
+  epoch: 20
   description: "the GNU C library"
   copyright:
     - license: LGPL-2.1-or-later
@@ -14,10 +14,12 @@ package:
       # that depend on glibc, if they happen to have configured both repositories.
       # Only apk-tools respects this constraint; apko-based tools don't respect
       # the ! constraint.
-      - '!musl'
+      - "!musl"
       - glibc-locale-posix
       # Needed for some pthread functionality
       - libgcc
+      - merged-sbin
+      - wolfi-baselayout
       - wolfi-baselayout
   scriptlets:
     trigger:
@@ -37,10 +39,12 @@ environment:
     keyring:
       - https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
     packages:
+      - bash # needed by `make check`
       - bison
       - build-base
       - busybox
       - ca-certificates-bundle
+      - coreutils # needed by `make check`
       - flex
       - gawk
       - grep
@@ -69,17 +73,18 @@ pipeline:
     with:
       patches: Disable-AVX512VL.patch
 
-  - name: 'Set up build directory'
+  - name: "Set up build directory"
     runs: |
       mkdir build
 
-  - name: 'Configure glibc'
+  - name: "Configure glibc"
     runs: |
       cd build
       echo "user-defined-trusted-dirs=/usr/local/lib:/usr/local/lib64:/usr/lib:/usr/lib64:/lib:/lib64" >> configparms.base
       echo "rtlddir=/lib" >> configparms.base
       echo "slibdir=/lib" >> configparms.base
       echo "libdir=/usr/lib" >> configparms.base
+      echo "rootsbindir=/usr/bin" >> configparms.base
 
       echo "build-programs=no" > configparms
       cat configparms.base >> configparms
@@ -113,15 +118,24 @@ pipeline:
   - runs: |
       make -C build -j$(nproc) install DESTDIR="${{targets.destdir}}"
 
+  - name: "Run the glibc testsuite, not blocking on failures for now"
+    runs: |
+      # For now we run the glibc testsuite for manual investigation.
+      # Later on we'll establish a baseline and make regressions fail the build.
+      make -C build -j$(nproc) check || true
+
   - name: "Set up ldconfig"
     runs: |
-      cp vendor/ld.so.conf "${{targets.destdir}}"/etc/ld.so.conf
+      mkdir -p "${{targets.destdir}}"/etc
+      cp vendor/ld.so.conf "${{targets.destdir}}"/etc
+      mkdir -p "${{targets.destdir}}"/etc/ld.so.conf.d
+      cp vendor/ld.so.conf.d/*.conf "${{targets.destdir}}"/etc/ld.so.conf.d
 
-  - name: 'Clean up documentation'
+  - name: "Clean up documentation"
     runs: |
       rm -rf ${{targets.destdir}}/usr/share/info
 
-  - name: 'Generate and install locale data'
+  - name: "Generate and install locale data"
     runs: |
       make -C build -j$(nproc) localedata/install-locale-files DESTDIR="${{targets.destdir}}"
 
@@ -341,6 +355,18 @@ data:
       zu: Zulu
 
 subpackages:
+  - name: "glibc-testresults"
+    description: "Test results and logs from the current GLIBC build - for Wolfi development only"
+    pipeline:
+      - runs: |
+          resultdir="${{targets.subpkgdir}}"/usr/share/glibc-testresults
+          mkdir -p $resultdir
+          cd build/
+          # Move all the test results and log files
+          find . \( -name "*.test-result" -o -name "*.out" \) \
+            -exec sh -c 'dir=$(dirname $1); mkdir -p $2/$dir; cp $1 $2/$dir' _ {} $resultdir \;
+          cp tests.sum $resultdir
+
   - name: "ld-linux"
     description: "the GLIBC ELF interpreter"
     pipeline:
@@ -362,7 +388,47 @@ subpackages:
     dependencies:
       provider-priority: 10
       runtime:
+        - merged-sbin
         - wolfi-baselayout
+        - wolfi-baselayout
+    test:
+      environment:
+        contents:
+          packages:
+            - gcc
+            - glibc-dev
+      pipeline:
+        - name: Test usage of /etc/ld.so.conf.d/ snippets
+          runs: |
+            tmpdir="$(mktemp -d)"
+            tmplibdir="$(mktemp -d)"
+            ldcfg="/etc/ld.so.conf.d/test-snippet.conf"
+            cleanup() {
+              rm -f "$ldcfg"
+              rm -rf "$tmpdir" "$tmplibdir"
+            }
+            trap cleanup EXIT
+            cat > "$tmpdir/ldsoconfdotd.c" << EOF
+            #include <stdio.h>
+
+            void ldsoconfdotd_test(void) {
+              printf("Calling %s\n", __func__);
+            }
+            EOF
+            cat > "$tmpdir/test.c" << EOF
+            void ldsoconfdotd_test(void);
+            int main(void) {
+              ldsoconfdotd_test();
+            }
+            EOF
+            gcc -c -fpic "$tmpdir/ldsoconfdotd.c" -o "$tmpdir/ldsoconfdotd.o"
+            gcc -shared -o "$tmplibdir/libldsoconfdotd.so" \
+              "$tmpdir/ldsoconfdotd.o"
+            echo "$tmplibdir" > "$ldcfg"
+            ldconfig
+            LIBRARY_PATH="$tmplibdir" \
+              gcc "$tmpdir/test.c" -o "$tmpdir/test" -lldsoconfdotd
+            "$tmpdir"/test
 
   - name: "glibc-dev"
     description: "GLIBC development headers"
@@ -374,8 +440,10 @@ subpackages:
           [ -f "${{targets.destdir}}"/usr/lib/libm.so ] && mv "${{targets.destdir}}"/usr/lib/libm.so "${{targets.subpkgdir}}"/usr/lib/
     dependencies:
       runtime:
-        - linux-headers
         - libxcrypt-dev
+        - linux-headers
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "glibc-iconv"
     description: "GLIBC iconv tables"
@@ -391,6 +459,10 @@ subpackages:
         - runs: |
             iconvconfig --version
             iconvconfig --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "glibc-locales"
     description: "GLIBC locale data"
@@ -399,6 +471,10 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/share
           mv "${{targets.destdir}}"/usr/share/i18n "${{targets.subpkgdir}}"/usr/share/i18n
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "tzutils"
     description: "Timezone utilities"
@@ -419,12 +495,18 @@ subpackages:
             zdump --help
             zic --version
             zic --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "posix-libc-utils"
     description: "POSIX XCU utilities included with the C library"
     dependencies:
       runtime:
         - bash
+        - merged-sbin
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/bin
@@ -465,6 +547,10 @@ subpackages:
         - runs: |
             localedef --version
             localedef --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "sotruss"
     description: "Shared object tracing tool"
@@ -483,6 +569,10 @@ subpackages:
         - uses: test/ldd-check
           with:
             packages: $(basename ${{targets.contextdir}})
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "nscd"
     description: "NSS caching daemon"
@@ -495,6 +585,10 @@ subpackages:
         - runs: |
             nscd --version
             nscd --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "nss-db"
     description: "NSS module for database lookups"
@@ -515,6 +609,10 @@ subpackages:
         - uses: test/ldd-check
           with:
             packages: nss-db
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "nss-hesiod"
     description: "NSS module for hesiod lookups"
@@ -527,6 +625,10 @@ subpackages:
         - uses: test/ldd-check
           with:
             packages: nss-hesiod
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "pcprofiledump"
     description: "PC profiling tool"
@@ -542,6 +644,10 @@ subpackages:
         - runs: |
             pcprofiledump --version
             pcprofiledump --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "glibc-tracing"
     description: "GLIBC tracing and profiling utilities"
@@ -558,18 +664,26 @@ subpackages:
             sprof --help
             xtrace --version
             xtrace --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "sln"
     description: "Staticly-linked symbolic link tool"
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/sbin
-          mv "${{targets.destdir}}"/sbin/sln "${{targets.subpkgdir}}"/sbin
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/sln "${{targets.subpkgdir}}"/usr/bin
     test:
       pipeline:
         - runs: |
             sln --version
             sln --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "libcrypt1"
     description: "Password hashing library included with glibc"
@@ -579,6 +693,8 @@ subpackages:
         - so:libcrypt.so.1=1
       runtime:
         - libxcrypt
+        - merged-sbin
+        - wolfi-baselayout
 
   - name: "glibc-locale-posix"
     description: "POSIX locale data for glibc"
@@ -586,6 +702,10 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib/locale
           mv "${{targets.destdir}}"/usr/lib/locale/C.utf8 "${{targets.subpkgdir}}"/usr/lib/locale/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   - range: locales
     name: "glibc-locale-${{range.key}}"
@@ -601,15 +721,21 @@ subpackages:
           # glibc-locale-en is ~18x as big as it should be due to duplicate files.
           # rdfind replaces redundant files with hardlinks.
           rdfind -makehardlinks true "${{targets.subpkgdir}}"/usr/lib/locale/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - wolfi-baselayout
 
   # Similar to https://packages.debian.org/bookworm/libc-bin
   - name: "libc-bin"
     description: "GNU C Library: Binaries"
     dependencies:
       runtime:
+        - localedef
+        - merged-sbin
         - posix-libc-utils
         - tzutils
-        - localedef
+        - wolfi-baselayout
     checks:
       disabled:
         - empty

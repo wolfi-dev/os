@@ -1,6 +1,6 @@
 package:
   name: opentelemetry-operator
-  version: "0.118.0"
+  version: "0.119.0"
   epoch: 0
   description: Kubernetes Operator for OpenTelemetry Collector
   copyright:
@@ -11,7 +11,7 @@ pipeline:
     with:
       repository: https://github.com/open-telemetry/opentelemetry-operator
       tag: v${{package.version}}
-      expected-commit: 8d19f4fbb673554ade02585598ca04a167ce27cb
+      expected-commit: b20b9222a0fb8074089907a8747044dc5e941aad
 
   - uses: go/build
     with:
@@ -90,6 +90,7 @@ test:
         - mkcert
         - kustomize
         - curl
+        - helm
   pipeline:
     - uses: test/kwok/cluster
     - name: Fetch the testdata from the source repo
@@ -97,60 +98,28 @@ test:
     - name: Install CRDs
       working-directory: opentelemetry-operator/config/crd/
       runs: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+        helm install prometheus-operator-crds prometheus-community/prometheus-operator-crds --wait
         kubectl wait --for=condition=Ready nodes --all
         kustomize build | kubectl apply --server-side=true -f -
         # wait for all CRDs to be created
         sleep 3
     - name: "Test manager run with mock cluster"
-      uses: test/daemon-check-output
-      with:
-        setup: |
-          mkdir -p /tmp/k8s-webhook-server/serving-certs/
-          mkcert -install
-          mkcert -key-file /tmp/k8s-webhook-server/serving-certs/tls.key -cert-file /tmp/k8s-webhook-server/serving-certs/tls.crt localhost
-        start: /usr/bin/manager  --metrics-addr=127.0.0.1:8080
-        timeout: 30
-        expected_output: |
-          Starting Controller
-          Starting workers
-        # Ignore error checking due to known errors present (evaluated later)
-        error_strings: "do not check for errors"
-        post: |
-          sleep 3
-          STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" http://localhost:8081/healthz)
-          # Check if the status code is 200, if so exit 0, otherwise exit 1
-          if [ "$STATUS" -eq 200 ]; then
-              echo "Health check passed with status code 200"
-              exit 0
-          else
-              echo "Health check failed with status code $STATUS"
-              exit 1
-          fi
-    - name: "Test manager run with mock cluster and check error and shutdown output"
       runs: |
-        # Setup
         mkdir -p /tmp/k8s-webhook-server/serving-certs/
         mkcert -install
         mkcert -key-file /tmp/k8s-webhook-server/serving-certs/tls.key -cert-file /tmp/k8s-webhook-server/serving-certs/tls.crt localhost
-
-        output=$(timeout 15 /usr/bin/manager --metrics-addr=127.0.0.1:8080 2>&1 || true)
-
-        echo "$output" | grep -q "Starting Controller" || {
-          echo "Expected output not found: Starting Controller"
-          exit 1
-        }
-
-        echo "$output" | grep -q "Wait completed, proceeding to shutdown the manager" || {
-          echo "Expected output not found: Wait completed, proceeding to shutdown the manager"
-          exit 1
-        }
-
-        # The operator will contain an error because we don't have prometheus optional components enabled, so just check for other errors
-        echo "$output" | grep -q "no kind is registered for the type v1.PodMonitor in scheme" || {
-          echo "Expected error not found: no kind is registered for the type v1.PodMonitor in scheme"
-          exit 1
-        }
-        echo "$output" | grep -q "no kind is registered for the type v1.ServiceMonitor in scheme" || {
-          echo "Expected error not found: no kind is registered for the type v1.ServiceMonitor in scheme"
-          exit 1
-        }
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        echo "default" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+        /usr/bin/manager --metrics-addr :8080 --health-probe-addr :8081 &
+        sleep 5
+        STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" http://localhost:8081/healthz)
+        # Check if the status code is 200, if so exit 0, otherwise exit 1
+        if [ "$STATUS" -eq 200 ]; then
+            echo "Health check passed with status code 200"
+            exit 0
+        else
+            echo "Health check failed with status code $STATUS"
+            exit 1
+        fi

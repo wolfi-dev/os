@@ -2,8 +2,8 @@ package:
   name: datadog-agent
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: 7.60.1
-  epoch: 4
+  version: "7.63.3"
+  epoch: 0
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -94,8 +94,17 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: 646618687e4f9351b5fe19cce678c9cd4b011e74
+      expected-commit: eab078f2e713852de8e4f4c168ea009065841903
 
+  # Recent commit to the init.go code changed some of the logic of Python path resolving
+  # for the embedded Python, causing issues. Let's revert the commit to return to the previous
+  # behavior. This change was introduced for MacOS use-cases, so not relevant to Linux.
+  # https://github.com/DataDog/datadog-agent/pull/31426
+  - uses: patch
+    with:
+      patches: revert-import-python-relatively-instead-of-using-the-patch.patch remove-removed-godebug.patch
+
+  # Ensure that we don't run into nvidia GPU issues at runtime.
   - runs: |
       gccdir="$(GCC_SPEC_FILE=/dev/null gcc --print-search-dirs | grep ^install: | cut -d' ' -f2)"
       sed -r 's/,?-z,now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
@@ -111,8 +120,15 @@ pipeline:
 
   - uses: go/bump
     with:
-      deps: github.com/moby/buildkit@v0.13.1 golang.org/x/net@v0.33.0 github.com/go-git/go-git/v5@v5.13.0
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
+      show-diff: true
+
+  - uses: go/bump
+    with:
+      modroot: pkg/trace
+      # Requires +incompatible or it'll throw an error
+      deps: |-
+        github.com/docker/distribution@v2.8.3+incompatible
       show-diff: true
 
   - if: ${{build.arch}} == 'aarch64'
@@ -157,12 +173,15 @@ pipeline:
       # HOW DOES THIS WORK: https://stackoverflow.com/a/60357720
       ln -s /usr/lib/libncursesw.so.6 /usr/lib/libtinfo.so.5
 
+      # There's a go version issue for some reason (possibly related to the use of gobumps), so we have to fix it. Otherwise, we get this build error:
+      # go: module . listed in go.work file requires go >= 1.24.0, but go.work lists go 1.23.1; to update it:
+      #      go work use
+      go work use
+
       # Build once to correctly setup links/generates. The system-probe we end
       # up using will be part of the multicall below.
       unshare --user --map-root-user \
         invoke -e system-probe.build \
-        --strip-object-files \
-        --no-bundle \
         --bundle-ebpf
 
   - runs: |
@@ -177,6 +196,7 @@ pipeline:
       invoke -e rtloader.make \
         --install-prefix="${{targets.destdir}}/usr" \
         --cmake-options="\
+          -DCMAKE_INSTALL_BINDIR=/usr/bin \
           -DCMAKE_INSTALL_LIBDIR=lib \
           -DCMAKE_CXX_FLAGS=-Os \
           -DCMAKE_C_FLAGS=-Os"
@@ -217,15 +237,17 @@ pipeline:
       install -Dm644 bin/agent/dist/system-probe.yaml ${{targets.contextdir}}/etc/datadog-agent/system-probe.yaml.example
       install -Dm644 bin/agent/dist/security-agent.yaml ${{targets.contextdir}}/etc/datadog-agent/security-agent.yaml.example
 
-      install -Dm755 Dockerfiles/agent/entrypoint.sh ${{targets.contextdir}}/bin/entrypoint.sh
+      install -Dm755 Dockerfiles/agent/entrypoint.sh ${{targets.contextdir}}/usr/bin/entrypoint.sh
       install -Dm755 Dockerfiles/agent/probe.sh ${{targets.contextdir}}/probe.sh
       install -Dm755 Dockerfiles/agent/initlog.sh ${{targets.contextdir}}/initlog.sh
       install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.py ${{targets.contextdir}}/readsecret.py
       install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.sh ${{targets.contextdir}}/readsecret.sh
       install -Dm755 Dockerfiles/agent/secrets-helper/readsecret_multiple_providers.sh ${{targets.contextdir}}/readsecret_multiple_providers.sh
 
+      # confd used for easy reuse below
       confd=${{targets.contextdir}}/etc/datadog-agent/conf.d
       cp -r bin/agent/dist/conf.d "$confd"
+
       # https://github.com/NixOS/nixpkgs/pull/189795
       # the agent apparently loads .yaml.default files, which then cause noise in logs.
       rm -rf \
@@ -298,11 +320,11 @@ subpackages:
           - uses: git-checkout
             with:
               repository: https://github.com/DataDog/integrations-core
-              branch: ${{vars.datadog-major-minor-x}} # 7.59.x
-              expected-commit: 3189af0e0ae840c9a4bab3131662c7fd6b0de7fb # needs to be updated with each new release
+              branch: ${{vars.datadog-major-minor-x}} # 7.x.y
+              expected-commit: eb1cc6cf7b6d521bda3a8d1529cfe952e5355e89 # needs to be updated with each new release
           - uses: patch
             with:
-              patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch /home/build/int-core-snowflake-pyproject-toml.patch
+              patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-datadog_checks_base-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch
           - runs: |
               # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
               SOURCE_DATE_EPOCH=315532800
@@ -416,9 +438,6 @@ subpackages:
         # This needs CGO_ENABLED=1, which we just so happen to inherit from the
         # main package
         pipeline:
-          - uses: go/bump
-            with:
-              deps: google.golang.org/protobuf@v1.33.0 github.com/golang/protobuf@v1.5.4
           - uses: go/build
             with:
               packages: ./cmd/server
@@ -463,6 +482,10 @@ subpackages:
 
           mkdir -p ${{targets.subpkgdir}}/
           tar -xvzf s6-overlay.tgz -C ${{targets.subpkgdir}}/
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.subpkgdir}}"/bin/* "${{targets.subpkgdir}}"/usr/bin
+          rmdir "${{targets.subpkgdir}}"/bin
 
           # Since this is essentially a hard fork only for datadog, we can do this without issue
           # https://github.com/DataDog/datadog-agent/blob/f20521b4b0b05ad83314e3fc353ecbbe7e3e69a0/Dockerfiles/agent/Dockerfile#L200

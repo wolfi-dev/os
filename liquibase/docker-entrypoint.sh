@@ -1,4 +1,6 @@
 #!/bin/bash
+# REF: https://github.com/liquibase/docker/blob/main/docker-entrypoint.sh
+
 set -e
 
 if [[ "$INSTALL_MYSQL" ]]; then

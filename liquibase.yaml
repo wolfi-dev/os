@@ -8,8 +8,12 @@ package:
   dependencies:
     runtime:
       - bash
+      - liquibase-docker
       - liquibase-package-manager
-      - openjdk-17-jre
+      - openjdk-${{vars.java-version}}-default-jvm
+
+vars:
+  java-version: '17'
 
 environment:
   contents:
@@ -18,11 +22,10 @@ environment:
       - build-base
       - busybox
       - maven
-      - openjdk-17
+      - openjdk-${{vars.java-version}}-default-jdk
       - wolfi-base
   environment:
     LANG: en_US.UTF-8
-    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
 
 pipeline:
   - uses: git-checkout
@@ -34,6 +37,7 @@ pipeline:
   - name: Setup
     runs: |
       # Reversion liquibase.build.properties
+      # REF: https://github.com/liquibase/liquibase/blob/master/.github/util/re-version.sh#L87
       sed -i -e "s/build.version=.*/build.version=${{package.version}}/" liquibase-standard/src/main/resources/liquibase.build.properties
 
   - name: Build
@@ -44,11 +48,10 @@ pipeline:
   - name: Install
     runs: |
       # Setup destination dir
+      mkdir -p ${{targets.destdir}}/opt/java
       mkdir -p ${{targets.destdir}}/usr/share/java/liquibase
       tar -zxvf liquibase-dist/target/${{package.name}}-0-SNAPSHOT.tar.gz -C ${{targets.destdir}}/usr/share/java/liquibase
-      cp docker-entrypoint.sh ${{targets.destdir}}/usr/share/java/liquibase
-      chmod +x ${{targets.destdir}}/usr/share/java/liquibase/docker-entrypoint.sh
-      cp liquibase.docker.properties ${{targets.destdir}}/usr/share/java/liquibase
+      ln -sf /usr/lib/jvm/default-jvm ${{targets.destdir}}/opt/java/openjdk
 
   - uses: strip
 
@@ -58,16 +61,10 @@ subpackages:
     pipeline:
       - runs: |
           # Symlinks for liquibase
-          mkdir -p ${{targets.destdir}}/usr/local/bin
-          ln -sf /usr/share/java/liquibase ${{targets.destdir}}/liquibase
-          ln -sf /usr/share/java/liquibase/liquibase ${{targets.destdir}}/usr/local/bin/liquibase
-          ln -sf /usr/share/java/liquibase/docker-entrypoint.sh ${{targets.destdir}}/usr/local/bin/docker-entrypoint.sh
-
-          # Symlinks for java
-          mkdir -p ${{targets.destdir}}/opt/java/openjdk
-          for item in bin conf legal lib release; do
-            ln -sf /usr/lib/jvm/java-17-openjdk/$item ${{targets.destdir}}/opt/java/openjdk
-          done
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+          ln -sf /usr/share/java/liquibase ${{targets.contextdir}}/liquibase
+          ln -sf /usr/share/java/liquibase/liquibase ${{targets.contextdir}}/usr/local/bin/liquibase
+          ln -sf /usr/share/java/liquibase/docker-entrypoint.sh ${{targets.contextdir}}/usr/local/bin/docker-entrypoint.sh
 
 update:
   enabled: true
@@ -78,22 +75,19 @@ update:
 test:
   environment:
     environment:
-      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
       SQLITE_URL: jdbc:sqlite:/tmp/test.db
       LIQUIBASE_HOME: /usr/share/java/liquibase
     contents:
       packages:
         - sqlite
         - liquibase-package-manager
+        - ${{package.name}}-compat
   pipeline:
     - name: Test CLI basics
       runs: |
-        export PATH=$PATH:$JAVA_HOME/bin:$LIQUIBASE_HOME
         liquibase --version
     - name: Test Liquibase Changelogs
       runs: |
-        export PATH=$PATH:$JAVA_HOME/bin:$LIQUIBASE_HOME
-
         # Setup sqlite database
         sqlite3 /tmp/test.db "CREATE TABLE test (id INT, name TEXT); INSERT INTO test VALUES (1, 'hello');"
 
@@ -144,7 +138,32 @@ test:
         liquibase update --url="$SQLITE_URL" --changelog-file=test/example-changelog.sql
 
         # Verify tables were created
-        sqlite3 /tmp/test.db ".tables" | grep -E "company|person"
+        sqlite3 /tmp/test.db ".tables" | grep -q "company"
+        sqlite3 /tmp/test.db ".tables" | grep -q "person"
+    - name: Test rollback
+      runs: |
+        cd $LIQUIBASE_HOME
+
+        # Tag the initial revision.
+        liquibase --url="$SQLITE_URL" tag firsttag
+        liquibase --url="$SQLITE_URL" history 2>/dev/null | grep -q firsttag
+
+        # Rollout a new revision.
+        cat <<"EOF" >$LIQUIBASE_HOME/test/update-changelog.sql
+        --liquibase formatted sql
+        -- ChangeSet your.name:add-column
+        alter table company add column employees int;
+        EOF
+        liquibase --url="$SQLITE_URL" update --changelog-file=test/update-changelog.sql
+        sqlite3 /tmp/test.db '.schema company' | grep -q employees
+
+        # Tag the new revision.
+        liquibase --url="$SQLITE_URL" tag secondtag
+        liquibase --url="$SQLITE_URL" history 2>/dev/null | grep -q firsttag
+        liquibase --url="$SQLITE_URL" history 2>/dev/null | grep -q secondtag
+
+        # Rollback to the initial revision.
+        liquibase --url="$SQLITE_URL" rollback --tag=firsttag --changelog-file=test/example-changelog.sql
     - name: Test LPM CLI basics
       runs: |
         lpm --version
@@ -162,7 +181,7 @@ test:
 
         # Verify packages
         for pkg in firebird-3.5.0.jar snowflake-jdbc-3.22.0.jar sqlite-jdbc-3.49.1.0.jar sybase-3.5.0.jar mariadb-java-client-3.5.2.jar; do
-          find $(pwd)/liquibase_libs/ -name "$pkg"
+          find $(pwd)/liquibase_libs/ -name "$pkg" -type f
         done
     - name: Test LPM install
       runs: |
@@ -174,7 +193,7 @@ test:
 
         # Verify packages
         for pkg in liquibase-postgresql-4.5.0.jar firebird-3.5.0.jar snowflake-jdbc-3.22.0.jar sqlite-jdbc-3.49.1.0.jar sybase-3.5.0.jar mariadb-java-client-3.5.2.jar; do
-          find $(pwd)/liquibase_libs/ -name "$pkg"
+          find $(pwd)/liquibase_libs/ -name "$pkg" -type f
         done
     - name: Test LPM remove
       runs: |

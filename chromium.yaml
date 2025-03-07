@@ -1,12 +1,13 @@
 #nolint:git-checkout-must-use-github-updates
 # Note: To produce a debug build of Chromium, pass these options to gn:
+#  blink_symbol_level=2
 #  is_debug=true
 #  is_official_build=false
 #  symbol_level=2
 # And remove the use of the strip pipeline below
 package:
   name: chromium
-  version: "133.0.6943.141"
+  version: "134.0.6998.35"
   epoch: 0
   description: "Open souce version of Google's chrome web browser"
   copyright:
@@ -14,8 +15,6 @@ package:
   resources:
     cpu: 65
     memory: 128Gi
-  target-architecture:
-    - x86_64
   dependencies:
     runtime:
       - font-opensans
@@ -24,6 +23,7 @@ package:
       - icu-data-full
       - libnss
       - mesa
+      - mesa-glx
       - nss
       - systemd
       - xdg-utils
@@ -41,6 +41,8 @@ environment:
       - bzip2-dev
       - ca-certificates-bundle
       - cairo-dev
+      - clang
+      - compiler-rt
       - crc32c-dev
       - cups-dev
       - curl
@@ -48,6 +50,7 @@ environment:
       - dav1d-dev
       - dbus-dev
       - dbus-glib-dev
+      - default-jdk
       - double-conversion-dev
       - elfutils
       - elfutils-dev
@@ -103,11 +106,12 @@ environment:
       - libxtst
       - libxtst-dev
       - linux-headers
-      - mesa
+      - lld
+      - llvm-dev
       - mesa-dev
-      - mesa-gbm
       - minizip
       - nghttp2-dev
+      - nodejs
       - openh264-dev
       - opus-dev
       - pango
@@ -122,7 +126,9 @@ environment:
       - qt5-qtbase-dev
       - qt6-qtbase-dev
       - rust
+      - rust-bindgen
       - samurai
+      - scanelf
       - speex-dev
       - sqlite-dev
       - systemd-dev
@@ -132,57 +138,42 @@ environment:
       - zlib-dev
       - zstd-dev
   environment:
-    # Disable compiler warnings encountered when using system provided libraries
-    CFLAGS: "$(echo ${CFLAGS}) -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-shift-count-overflow -Wno-ignored-attributes"
-    CXXFLAGS: "$(echo ${CXXFLAGS}) -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-invalid-constexpr"
-    CPPFLAGS: "$(echo ${CPPFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS/}) -D__DATE__=  -D__TIME__=  -D__TIMESTAMP__="
+    # Use host clang
+    AR: "llvm-ar"
+    CC: "clang"
+    CXX: "clang++"
+    NM: "llvm-nm"
+    # Allow unstable features with stable rust
+    RUSTC_BOOTSTRAP: 1
 
 pipeline:
-  - uses: git-checkout
+  - name: Fetch Chromium tarball
+    uses: fetch
     with:
-      # === INFO === Initial git clone: takes ~3 minutes, needs 6GB disk
-      repository: https://chromium.googlesource.com/chromium/src.git
-      tag: ${{package.version}}
-      depth: 1
-      expected-commit: 2a5d6da0d6165d7b107502095a937fe7704fcef6
-      destination: /home/src
+      # Fetch source and dependencies: takes about 11 minutes, requires 30 GB of disk
+      # Gentoo provides tarballs where they've already performed a client sync (which isn't possible on arm64)
+      #
+      # Tarballs are built using the instructions here:
+      # https://wiki.gentoo.org/wiki/Project:Chromium/How_to_make_a_Chromium_tarball
+      uri: https://chromium-tarballs.distfiles.gentoo.org/chromium-${{package.version}}-linux.tar.xz
+      expected-sha512: f9da9256ef4518e53c139c6c074b6b4fe10f028e37ebee488a95ed84d6ed47acf802a9316eb215d9f2b3ebb8f1bc70ef837334256272e9f13fc3674ec36f1336
 
-  - name: clone depot-tools and setup .gclient
+  - name: Remove binaries from source tree
     runs: |
-      cd /home
-      # depot_tools contains essential Chromium build tools
-      # in consists of gclient, gn, autoninja, etc. that are used to build Chromium
-      # We are cloning it to /home/depot_tools and have to add it to PATH
-      time git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+      # These binaries are tools transient from the client sync Gentoo performs for us
+      # All we need is the Chromium source tree and its dependencies
+      scanelf -RA -F "%F" "$HOME" 2>/dev/null | while read -r elf; do
+        echo "Removing $elf"
+        rm -f "$elf"
+      done
 
-      # Create .gclient configuration file
-      # Important: File must be in /home (parent of src/)
-      # Because: gclient searches for .gclient in parent directories
-      # Reference: https://chromium.googlesource.com/chromium/tools/depot_tools/+/main/README.gclient.md
-      cat <<EOF >/home/.gclient
-      # Setup a .gclient config (handled by 'fetch' in upstream instructions)
-      solutions = [
-        { "name"        : "src",
-          "url"         : "https://chromium.googlesource.com/chromium/src.git",
-          "managed": False,
-          "custom_deps": {},
-          "custom_vars": {},
-        },
-      ]
-      EOF
-      cat /home/.gclient
+  - uses: patch
+    with:
+      patches: |
+        bindgen.patch \
+        fortify_level.patch
 
-  - working-directory: /home/src
-    name: sync-dependencies
-    runs: |
-      # Add depot_tools to PATH to use gclient
-      export PATH="$PATH:/home/depot_tools"
-
-      # === INFO === Sync dependencies: takes about 11 minutes, requires 30 GB of disk
-      time gclient sync --no-history
-
-  - working-directory: /home/src
-    name: configure-system-libraries
+  - name: Use system libraries
     runs: |
       # Use USB IDs already provided by hwdata-usb
       sed 's|//third_party/usb_ids/usb.ids|/usr/share/hwdata/usb.ids|g' \
@@ -226,7 +217,7 @@ pipeline:
           -delete
       done
 
-      # Update GN configuration to use system libraries
+      # Update gn configuration to use system libraries
       python3 build/linux/unbundle/replace_gn_files.py --system-libraries $system_libs
       python3 third_party/libaddressinput/chromium/tools/update-strings.py
 
@@ -234,36 +225,65 @@ pipeline:
       sed -i 's/OFFICIAL_BUILD/GOOGLE_CHROME_BUILD/' \
         tools/generate_shim_headers/generate_shim_headers.py
 
-      # === INFO === Make node executable: works around permission denial
-      chmod +x /home/src/third_party/node/linux/node-linux-x64/bin/node
+      # Use host node
+      mkdir -p third_party/node/linux/node-linux-x64/bin
+      ln -s /usr/bin/node third_party/node/linux/node-linux-x64/bin/node
 
-  - working-directory: /home/src
-    name: prepare-build
+      # Use host java
+      mkdir -p third_party/jdk/current/bin
+      ln -s /usr/bin/java third_party/jdk/current/bin/java
+
+      # Upstream Rust moved from adler to adler2 in 1.86, and upstream Chromium
+      # have already followed that move: if we're building with 1.85.x (the
+      # current wolfi Rust version as of authoring), then instruct GN to use
+      # the older lib.  (I figured this out based on the resolution of this
+      # build failure in Gentoo: https://bugs.gentoo.org/950040)
+      rust_version="$(rustc --version | awk '{ print $2;}')"
+      case $rust_version in
+        1.85.*)
+          sed -i 's/adler2/adler/' build/rust/std/BUILD.gn
+          ;;
+      esac
+
+  - name: Generate gn config
     runs: |
-      # Add depot_tools to PATH to use gn
-      export PATH="$PATH:/home/depot_tools"
+      # Fetch clang version
+      # We could parse clang --version with awk, but this is cleaner
+      clang_version=$(basename $(clang --print-resource-dir))
 
-      # === INFO === Generate config: takes about 30 minutes
-      time gn gen /home/src/out/Default --args="
+      # Generate config: takes about 30 minutes
+      time gn gen $HOME/out/Default --args="
+        blink_symbol_level=0
+        clang_base_path=\"/usr/lib/llvm-$clang_version\"
         clang_use_chrome_plugins=false
+        clang_version=\"$clang_version\"
         chrome_pgo_phase=0
-        enable_nacl=false
-        enable_nocompile_tests_new=false
-        enable_widevine=true
+        custom_toolchain=\"//build/toolchain/linux/unbundle:default\"
         enable_freetype=true
+        enable_nacl=false
+        enable_rust=true
+        enable_widevine=true
         ffmpeg_branding=\"Chrome\"
         icu_use_data_file=false
+        is_cfi=false
+        is_clang=true
+        is_component_build=false
+        is_component_ffmpeg=true
         is_debug=false
         is_official_build=true
         link_pulseaudio=true
         moc_qt6_path=\"/usr/lib/qt6/libexec\"
         proprietary_codecs=true
+        rustc_version=\"$(rustc --version)\"
+        rust_bindgen_root=\"/usr\"
+        rust_sysroot_absolute=\"/usr\"
         safe_browsing_use_unrar=false
         symbol_level=0
         treat_warnings_as_errors=false
         use_lld=true
         use_pulseaudio=true
         use_qt6=true
+        use_safe_libstdcxx=false
         use_sysroot=false
         use_system_freetype=true
         use_system_harfbuzz=true
@@ -273,45 +293,49 @@ pipeline:
         use_system_zlib=true
       "
 
-  - working-directory: /home/src
-    name: build
+  - name: Build
     runs: |
-      # Add depot_tools to PATH to use autoninja
-      export PATH="$PATH:/home/depot_tools"
+      # Disable compiler warnings encountered when using system provided libraries
+      export CFLAGS="$CFLAGS -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-shift-count-overflow -Wno-ignored-attributes"
+      export CXXFLAGS="$CXXFLAGS -Wno-unknown-warning-option -Wno-builtin-macro-redefined -Wno-deprecated-declarations -Wno-invalid-constexpr"
+      export CPPFLAGS="${CPPFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS/} -D__DATE__=  -D__TIME__=  -D__TIMESTAMP__="
 
-      # === INFO === Compile: takes about 3 hours, 60 GB of disk (on a 32xXeon, 128GBxRAM, 2TBxNVME system)
-      time autoninja -C ./out/Default chrome chromedriver.unstripped chrome_crashpad_handler chrome_sandbox
+      # Compile: takes about 3 hours, 60 GB of disk (on a 32xXeon, 128GBxRAM, 2TBxNVME system)
+      time ninja -C ./out/Default chrome chromedriver.unstripped chrome_crashpad_handler chrome_sandbox
 
-  - working-directory: /home/src/out/Default
-    name: install the binaries and libraries
+  - working-directory: /home/build/out/Default
+    name: Install binaries & libraries
     runs: |
-      mkdir -p ${{targets.destdir}}/usr/bin ${{targets.destdir}}/usr/lib/${{package.name}}
-      mkdir -p ${{targets.destdir}}/etc/chromium
+      mkdir -p \
+        ${{targets.contextdir}}/usr/bin \
+        ${{targets.contextdir}}/usr/lib/${{package.name}} \
+        ${{targets.contextdir}}/etc/chromium
+
+      # Install libraries
+      mv *.so* ${{targets.contextdir}}/usr/lib/${{package.name}}
 
       # Install binaries
-      mv *.so* ${{targets.destdir}}/usr/lib/${{package.name}}
-      mv chrome ${{targets.destdir}}/usr/lib/${{package.name}}
-      mv chrome_crashpad_handler ${{targets.destdir}}/usr/lib/${{package.name}}
-      mv chrome_sandbox ${{targets.destdir}}/usr/lib/${{package.name}}
+      mv chrome chrome_crashpad_handler chrome_sandbox \
+        ${{targets.contextdir}}/usr/lib/${{package.name}}
 
       # Install resources
       mv snapshot_blob.bin v8_context_snapshot.bin \
          xdg-mime xdg-settings vk_swiftshader_icd.json \
          *.pak locales \
-         ${{targets.destdir}}/usr/lib/${{package.name}}/
+         ${{targets.contextdir}}/usr/lib/${{package.name}}/
 
       # Setup wrapper and symlinks
-      cd /home/build
+      cd $HOME
       mv chromium-launcher.sh ${{targets.destdir}}/usr/bin/chromium-browser
-      ln -sf /usr/lib/${{package.name}}/chrome ${{targets.destdir}}/usr/bin/chromium
-      ln -sf /usr/lib/${{package.name}}/chromedriver ${{targets.destdir}}/usr/bin/chromedriver
+      ln -s /usr/lib/${{package.name}}/chrome ${{targets.contextdir}}/usr/bin/chromium
+      ln -s /usr/lib/${{package.name}}/chromedriver ${{targets.contextdir}}/usr/bin/chromedriver
 
   - uses: strip
     with:
       opts: -s
 
   # Do not strip ChromeDriver
-  - working-directory: /home/src/out/Default
+  - working-directory: /home/build/out/Default
     runs: |
       mv chromedriver.unstripped ${{targets.destdir}}/usr/lib/${{package.name}}/chromedriver
 
@@ -319,8 +343,8 @@ subpackages:
   - name: ${{package.name}}-lang
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/lib/${{package.name}}/locales
-          mv ${{targets.destdir}}/usr/lib/${{package.name}}/locales/* ${{targets.subpkgdir}}/usr/lib/${{package.name}}/locales/
+          mkdir -p ${{targets.contextdir}}/usr/lib/${{package.name}}/locales
+          mv ${{targets.destdir}}/usr/lib/${{package.name}}/locales/* ${{targets.contextdir}}/usr/lib/${{package.name}}/locales/
 
           # Ensure we provide one locale in the base package
           mv ${{targets.subpkgdir}}/usr/lib/${{package.name}}/locales/en-US.pak ${{targets.destdir}}/usr/lib/${{package.name}}/locales/en-US.pak
@@ -329,13 +353,13 @@ subpackages:
   - name: chromium-docker-selenium-compat
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/opt/selenium
+          mkdir -p ${{targets.contextdir}}/opt/selenium
 
-          ln -sf /usr/lib/chromium/chromedriver ${{targets.subpkgdir}}/opt/selenium/chromedriver-${{package.version}}
+          ln -s /usr/lib/chromium/chromedriver ${{targets.contextdir}}/opt/selenium/chromedriver-${{package.version}}
 
-          echo "chrome" > ${{targets.subpkgdir}}/opt/selenium/browser_name
-          echo ${{package.version}} > ${{targets.subpkgdir}}/opt/selenium/browser_version
-          echo "\"goog:chromeOptions\": {\"binary\": \"/usr/bin/chromium-browser\"}" > ${{targets.subpkgdir}}/opt/selenium/browser_binary_location
+          echo "chrome" > ${{targets.contextdir}}/opt/selenium/browser_name
+          echo ${{package.version}} > ${{targets.contextdir}}/opt/selenium/browser_version
+          echo "\"goog:chromeOptions\": {\"binary\": \"/usr/bin/chromium-browser\"}" > ${{targets.contextdir}}/opt/selenium/browser_binary_location
 
 update:
   enabled: true
@@ -347,27 +371,27 @@ test:
     contents:
       packages:
         - grep
-        - posix-libc-utils
-        - libnss
-        #- py3-pip
-        #- python3
+        - py3-pip
+        - python3
+    environment:
+      LD_LIBRARY_PATH: "/usr/lib/chromium"
   pipeline:
-    - runs: |
-        # Make sure Chrome and ChromeDriver are at the correct path
-        test -x /usr/lib/chromium/chrome
-        test -x /usr/lib/chromium/chromedriver
+    - name: Check for lang pack
+      runs: |
         test -f /usr/lib/chromium/locales/en-US.pak
-
+    - name: Check status page
+      runs: |
         # Check status with new headless mode
         chromium --no-sandbox --headless --disable-gpu --dump-dom https://www.chromestatus.com
 
         # Test wrapper
         CHROMIUM_USER_FLAGS="--no-sandbox --headless --disable-gpu --dump-dom" chromium-browser https://www.chromestatus.com
-
-        # Test ChromeDriver functionality
-        # Disable ChromeDriver test until py3-selenium has been packaged
-        #pip3 install selenium
-        #python3 ./test-chromedriver.py
+    #- name: Test ChromeDriver with Selenium
+    #  runs: |
+    #    pip3 install selenium
+    #    python3 ./test-chromedriver.py
+    - name: Version/help check
+      runs: |
         chromedriver --version
         chromedriver --help
         chromium --version

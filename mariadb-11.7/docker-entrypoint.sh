@@ -233,7 +233,7 @@ _mariadb_version() {
 # initializes the database directory
 docker_init_database_dir() {
 	mysql_note "Initializing database files"
-	installArgs=( --datadir="$DATADIR" --rpm --auth-root-authentication-method=normal )
+	installArgs=( --datadir="$DATADIR" --rpm --auth-root-authentication-method=normal --basedir=/usr )
 	# "Other options are passed to mariadbd." (so we pass all "mariadbd" arguments directly here)
 
 	local mariadbdArgs=()

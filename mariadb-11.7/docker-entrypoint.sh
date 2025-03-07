@@ -245,7 +245,9 @@ docker_init_database_dir() {
 			mariadbdArgs+=("$arg")
 		fi
 	done
-	mariadb-install-db "${installArgs[@]}" "${mariadbdArgs[@]}" \
+	# Set basedir before user specified args to allow others to override
+	mariadb-install-db --basedir=/usr \
+	        "${installArgs[@]}" "${mariadbdArgs[@]}" \
 		--cross-bootstrap \
 		--skip-test-db \
 		--old-mode='UTF8_IS_UTF8MB3' \

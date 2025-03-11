@@ -8,7 +8,6 @@ package:
   dependencies:
     runtime:
       - curl
-      - postgresql-client
 
 pipeline:
   - uses: git-checkout
@@ -34,16 +33,13 @@ pipeline:
 subpackages:
   - name: ${{package.name}}-compat
     description: "Compatibility package to place binaries in the location expected by pg_timetable"
-    dependencies:
-      runtime:
-        - ${{package.name}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}
           ln -sf /usr/bin/pg_timetable ${{targets.contextdir}}/pg_timetable
     test:
       pipeline:
-        - runs: "[ \"$(stat -c '%N' /pg_timetable 2>/dev/null)\" = \"'/pg_timetable' -> '/usr/bin/pg_timetable'\" ]"
+        - runs: test "$(readlink -fv /pg_timetable)" = "/usr/bin/pg_timetable"
 
 update:
   enabled: true
@@ -56,6 +52,7 @@ test:
     contents:
       packages:
         - postgresql
+        - postgresql-client
         - build-base
         - shadow
         - sudo-rs
@@ -65,6 +62,10 @@ test:
       PGUSER: wolfi
       PGHOST: /tmp
   pipeline:
+    - name: "Verify pg_timetable Version"
+      runs: |
+        echo "Checking pg_timetable version..."
+        pg_timetable --version | grep ${{package.version}}
     - name: "Initialize and Start PostgreSQL"
       runs: |
         echo "Creating PostgreSQL user..."
@@ -98,6 +99,7 @@ test:
         psql -U wolfi -d testdb -c "GRANT ALL PRIVILEGES ON DATABASE testdb TO scheduler;"
     - name: "Initialize pg_timetable Schema"
       runs: |
+        echo "check for pg_timetable version"
         echo "Initializing pg_timetable schema in timetable database..."
         pg_timetable --init -c "dbname=timetable user=scheduler password=scheduler host=/tmp sslmode=disable"
 
@@ -139,35 +141,37 @@ test:
           VALUES ($CHAIN_ID, 1, 'SQL', 'SELECT now();');"
 
         echo "Task scheduled successfully."
-    - name: "Start pg_timetable"
-      runs: |
-        echo "Starting pg_timetable..."
-        nohup pg_timetable -c "dbname=timetable user=scheduler password=scheduler host=/tmp sslmode=disable" > /tmp/pg_timetable.log 2>&1 &
-        sleep 5  # Give it time to start
-        echo "pg_timetable started."
-    - name: "Verify Task Execution"
-      runs: |
-        echo "Checking if task executed..."
-        sleep 5
+    - name: "Start and Test pg_timetable"
+      uses: test/daemon-check-output
+      with:
+        start: pg_timetable -c "dbname=timetable user=scheduler password=scheduler host=/tmp sslmode=disable"
+        timeout: 30
+        expected_output: |
+          Accepting asynchronous chains execution requests
+          Retrieve scheduled chains to run
+          Starting chain
+          Starting task
+          Task executed successfully
+          Chain executed successfully
+        post: |
+          echo "Checking if task executed..."
 
-        cat /tmp/pg_timetable.log
+          # Print pg_timetable logs for debugging
+          cat /tmp/pg_timetable.log
 
-        # Ensure we check the timetable database
-        RESULT=$(psql -U scheduler -d timetable -t -A -c "SELECT count(*) FROM timetable.execution_log;" | tr -d '[:space:]')
+          # Check execution log count
+          RESULT=$(psql -U scheduler -d timetable -t -A -c "SELECT count(*) FROM timetable.execution_log;" | tr -d '[:space:]')
 
-        echo "Checking if task executed..."
-        psql -U scheduler -d timetable -c 'SELECT * FROM timetable.execution_log ORDER BY finished DESC LIMIT 10;'
+          # Retrieve and print execution logs
+          echo "Execution Log Entries:"
+          psql -U scheduler -d timetable -c "SELECT * FROM timetable.execution_log ORDER BY finished DESC LIMIT 10;"
 
-        # Retrieve and print execution logs
-        echo "Execution Log Entries:"
-        psql -U scheduler -d timetable -c '\d timetable.execution_log'
-
-        if [ -z "$RESULT" ]; then
-          echo "ERROR: timetable.execution_log does not exist in timetable database!"
-          exit 1
-        elif [ "$RESULT" -eq 0 ]; then
-          echo "ERROR: No execution logs found, task may not have run!"
-          exit 1
-        else
-          echo "SUCCESS: Task executed correctly!"
-        fi
+          if [ -z "$RESULT" ]; then
+            echo "ERROR: timetable.execution_log does not exist in timetable database!"
+            exit 1
+          elif [ "$RESULT" -eq 0 ]; then
+            echo "ERROR: No execution logs found, task may not have run!"
+            exit 1
+          else
+            echo "SUCCESS: Task executed correctly!"
+          fi

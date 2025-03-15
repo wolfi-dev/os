@@ -1,36 +1,22 @@
 package:
   name: fluent-operator
-  version: 3.2.0
-  epoch: 7
+  version: 3.3.0
+  epoch: 0
   description: Operate Fluent Bit and Fluentd in the Kubernetes way - Previously known as FluentBit Operator
   copyright:
     - license: Apache-2.0
-
-environment:
-  contents:
-    packages:
-      - go
-
-var-transforms:
-  - from: ${{package.version}}
-    match: ^(\d)\.(\d)\.(\d)$
-    replace: $1
-    to: fluent-major-version
-  - from: ${{package.version}}
-    match: ^(\d)\.(\d)\.(\d)$
-    replace: $2
-    to: fluent-minor-version
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/fluent/fluent-operator
-      expected-commit: aabb8198c080f55f3e1e575ef8951c5900cb2a6a
+      expected-commit: ef3ec94308a8586c7609aea48ceb23f17ab7b86b
       tag: v${{package.version}}
 
   - uses: go/bump
     with:
-      deps: golang.org/x/net@v0.33.0
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
 
   - uses: go/build
     with:
@@ -50,20 +36,18 @@ subpackages:
           packages:
             - fluent-bit
             - fluent-bit-compat
-            - fluent-watcher-compat
       pipeline:
         - runs: |
-            echo "Testing fluent-watcher"
-            # Run fluent-watcher in the background and redirect its output to a temporary file
-            tempfile=$(mktemp)
-            fluent-watcher > "$tempfile" 2>&1 &
-
-            sleep 5
-
-            # Use grep to filter the output
-            cat "$tempfile" | grep -i "fluent-bit started"
-
             fluent-watcher --help
+        - name: "Test fluent-watcher"
+          uses: test/daemon-check-output
+          with:
+            start: "fluent-watcher -watch-path /fluent-bit/etc/fluent-bit.conf"
+            timeout: 60
+            expected_output: |
+              fluent-bit started
+              [fluent bit]
+              worker #0 started
 
   - name: fluent-watcher-config
     dependencies:
@@ -80,7 +64,11 @@ subpackages:
         # When this test fails, that likely means fluent-bit rolled forward to
         # a new version stream anad must be updated in the "replaces" block
         # below
-        - fluent-bit-${{vars.fluent-major-version}}.${{vars.fluent-minor-version}}
+        #
+        # Both fluent-bit and fluent-operator doesn't follow same versioning
+        # and resulting inconsistency for the replaces block, so we have to
+        # use always latest version of fluent-bit here.
+        - fluent-bit
     pipeline:
       - runs: |
           mkdir -p "${{targets.contextdir}}"/fluent-bit/etc
@@ -100,6 +88,10 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.contextdir}}"/fluent-bit/bin/
           ln -s /usr/bin/fluent-watcher "${{targets.contextdir}}"/fluent-bit/bin/fluent-watcher
+    test:
+      pipeline:
+        - runs: |
+            test "$(readlink /fluent-bit/bin/fluent-watcher)" = /usr/bin/fluent-watcher
 
 update:
   enabled: true
@@ -122,8 +114,17 @@ test:
     - runs: |
         manager --help
     - name: "Test operator"
-      runs: |
-        kubectl create ns fluent
-        kubectl apply --server-side=true -f https://github.com/fluent/fluent-operator/releases/download/v${{package.version}}/setup.yaml
-        manager -metrics-bind-address 0.0.0.0:8082&
-        sleep 5; curl localhost:8082/metrics |grep workqueue_retries_total
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl create ns fluent
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/fluent/fluent-operator/refs/tags/v${{package.version}}/manifests/setup/setup.yaml
+        start: "manager -metrics-bind-address 0.0.0.0:8082"
+        timeout: 60
+        expected_output: |
+          starting server
+          Starting EventSource
+          Starting Controller
+          Starting workers
+        post: |
+          curl -fsS --retry 3 localhost:8082/metrics | grep workqueue_retries_total

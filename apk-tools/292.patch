@@ -1,0 +1,106 @@
+From https://gitlab.alpinelinux.org/alpine/apk-tools/-/merge_requests/292.patch
+From 716fe84f69137b59dd12b3b4fa90710e5f4ed911 Mon Sep 17 00:00:00 2001
+From: Justin Vreeland <vreeland.justin@gmail.com>
+Date: Tue, 18 Mar 2025 10:25:33 -0700
+Subject: [PATCH] db: Explicitly clean st on fstatat failure to workaround
+ rosetta2
+
+We've discovered an issue with in apk when using Rosetta2 with wolfi that was surfaced
+by f3f239a: apk, db: rework dbopts cache_max_age default handling.  With the new
+settings apk now hits an fstatat conditional where it didn't before.  As far as I can tell
+this failure is expected and shouldn't be a problem. It only is because the code
+continues to rely out the buffer that was passed in to contain clean
+values. On Rosetta2 with wolfi the st buffer is no longer clean out after the call to fstatat.
+
+This issue only occurs if cache_max_age is positive, and `/var/cache/apk`
+is empty.  This issue can be seen below:
+
+```
+a549fa77b74f:/apk-tools# apk --help | head -1
+apk-tools 2.14.10, compiled for x86_64.
+a549fa77b74f:/apk-tools# apk update
+fetch https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz
+WARNING: opening from cache https://packages.wolfi.dev/os: No such file or directory
+2 unavailable, 0 stale; 83 distinct packages available
+
+a549fa77b74f:/apk-tools# apk update --cache-max-age 0
+fetch https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz
+ [https://packages.wolfi.dev/os]
+OK: 144415 distinct packages available
+
+a549fa77b74f:/apk-tools# apk update
+ [https://packages.wolfi.dev/os]
+OK: 144415 distinct packages available
+
+a549fa77b74f:/apk-tools# apk update --cache-max-age 1
+ [https://packages.wolfi.dev/os]
+OK: 144415 distinct packages available
+
+a549fa77b74f:/apk-tools# rm /var/cache/apk/*
+
+a549fa77b74f:/apk-tools# apk update
+fetch https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz
+WARNING: opening from cache https://packages.wolfi.dev/os: No such file or directory
+2 unavailable, 0 stale; 83 distinct packages available
+```
+
+Some debug output with Rosetta2
+
+```
+a549fa77b74f:/apk-tools# LD_PRELOAD=`pwd`/src/libapk.so ./src/apk update --cache-max-age 1
+st_mtime pre fstat: 0
+cache_max_age=60
+ferr: -1, tmperr: 2
+st_mtime post fstat: 140737472955232
+fetch https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz
+WARNING: opening from cache https://packages.wolfi.dev/os: No such file or directory
+2 unavailable, 0 stale; 83 distinct packages available
+a549fa77b74f:/apk-tools# git diff > /test.patch
+a549fa77b74f:/apk-tools# ps aux | grep rosetta
+    1 root      0:02 {sh} /run/rosetta/rosetta /bin/sh /bin/sh -l
+15816 root      0:00 {grep} /run/rosetta/rosetta /usr/bin/grep grep rosetta
+```
+
+Some debug output without Rosetta2
+
+```
+/apk-tools # LD_PRELOAD=`pwd`/src/libapk.so ./src/apk update --cache-max-age 1
+st_mtime pre fstat: 0
+cache_max_age=60
+ferr: -1, tmperr: 2
+st_mtime post fstat: 0
+fetch https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz
+ [https://packages.wolfi.dev/os]
+OK: 144391 distinct packages available
+/apk-tools # ps aux | grep rosetta
+ 2438 root      0:00 grep rosetta
+```
+
+I cannot reproduce this with Alpine. In fact the st buffer remains clean
+with Alpine. I believe the real issue is with rosetta2 & glibc not
+actually apk but it seems reasonable not to rely on the buffer from
+a failed system call as a solution for now.
+---
+ src/database.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/database.c b/src/database.c
+index dc5e4fd4..b7353221 100644
+--- a/src/database.c
++++ b/src/database.c
+@@ -654,7 +654,11 @@ int apk_cache_download(struct apk_database *db, struct apk_repository *repo,
+ 	if (r < 0) return r;
+ 
+ 	if (autoupdate && db->cache_max_age > 0 && !(apk_force & APK_FORCE_REFRESH)) {
+-		if (fstatat(db->cache_fd, cacheitem, &st, 0) == 0 &&
++		int ferr = fstatat(db->cache_fd, cacheitem, &st, 0);
++		if (ferr == -1) {
++			memset(&st, 0, sizeof(struct stat));
++		}
++		if (ferr == 0 &&
+ 		    now - st.st_mtime <= db->cache_max_age)
+ 			return -EALREADY;
+ 	}
+-- 
+GitLab
+

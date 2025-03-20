@@ -1,7 +1,7 @@
 package:
   name: flannel
   version: "0.26.5"
-  epoch: 4
+  epoch: 12
   description: flannel is a network fabric for containers, designed for Kubernetes
   copyright:
     - license: Apache-2.0
@@ -34,9 +34,8 @@ pipeline:
       if [ "$(go env GOARCH)" = "amd64" ]; then
         CGO_ENABLED=1
       fi
-      CGO_ENABLED=$(CGO_ENABLED) go build -o "${{targets.destdir}}"/usr/bin/flanneld \
-        -ldflags '-extldflags "-static" -X github.com/flannel-io/flannel/pkg/version.version=${{package.version}}'
-
+      CGO_ENABLED=$CGO_ENABLED go build -o "${{targets.destdir}}"/usr/bin/flanneld \
+        -ldflags "-extldflags \"-static\" -X github.com/flannel-io/flannel/pkg/version.Version=${{package.version}}"
 update:
   enabled: true
   github:
@@ -47,39 +46,53 @@ test:
   environment:
     contents:
       packages:
-        - ${{package.name}}
+        - ${{ package.name }}
         - etcd
   pipeline:
     - runs: |
+        #!/bin/bash
+        set -euxo pipefail
+
         # Check flanneld version
         flanneld --version
 
-        # Start etcd (default v3)
-        mkdir -p /var/lib/etcd
-        etcd --data-dir=/var/lib/etcd --listen-client-urls=http://127.0.0.1:2379 --advertise-client-urls=http://127.0.0.1:2379 > /tmp/etcd.log 2>&1 &
+        # Start etcd with a dedicated temporary data directory
+        mkdir -p /tmp/etcd-data
+        etcd --data-dir=/tmp/etcd-data \
+          --listen-client-urls=http://127.0.0.1:2379 \
+          --advertise-client-urls=http://127.0.0.1:2379 > /tmp/etcd.log 2>&1 &
         ETCD_PID=$!
+        # Ensure etcd is always killed even if an error occurs
+        trap 'kill $ETCD_PID || true' EXIT
 
-        # Wait for etcd readiness (max 5 attempts)
+        # Wait for etcd readiness (try up to 5 times)
         for i in {1..5}; do
-          if curl -s http://127.0.0.1:2379/version; then
+          if etcdctl --endpoints=http://127.0.0.1:2379 endpoint status --write-out=table; then
             break
           fi
           sleep 1
         done
 
-        # Set flannel config in etcd using etcdctl v3 command
-        etcdctl --endpoints=http://127.0.0.1:2379 put /coreos.com/network/config '{"Network": "10.244.0.0/16", "Backend": {"Type": "host-gw"}}'
+        # Set flannel configuration in etcd using etcdctl v3 command
+        etcdctl --endpoints=http://127.0.0.1:2379 put /coreos.com/network/config \
+          '{"Network": "10.244.0.0/16", "Backend": {"Type": "host-gw"}}'
 
         # Run flanneld with a timeout, specifying a valid interface (e.g. eth0)
-        timeout 3s flanneld --etcd-endpoints=http://127.0.0.1:2379 --iface=eth0 > /tmp/flannel-output.log 2>&1 || true
+        timeout 5s flanneld --etcd-endpoints=http://127.0.0.1:2379 --iface=eth0 > /tmp/flannel-output.log 2>&1 || true
 
+        # Output flannel logs for debugging purposes
         cat /tmp/flannel-output.log
 
-        # Verify subnet manager creation
+        # Verify that flanneld successfully created the subnet manager
         if ! grep -q "Created subnet manager" /tmp/flannel-output.log; then
+          echo "Subnet manager not created. Logs:"
           cat /tmp/flannel-output.log
           exit 1
         fi
 
-        # Clean up: Stop etcd
-        kill $ETCD_PID
+        # Optionally, check that the subnet file was created and contains expected values
+        if [ ! -f /run/flannel/subnet.env ]; then
+          echo "Subnet file not found"
+          exit 1
+        fi
+        grep -q "FLANNEL_SUBNET=" /run/flannel/subnet.env

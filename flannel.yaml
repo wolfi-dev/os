@@ -46,53 +46,64 @@ test:
   environment:
     contents:
       packages:
-        - ${{ package.name }}
+        - flannel
         - etcd
   pipeline:
-    - runs: |
-        #!/bin/bash
-        set -euxo pipefail
+    - name: "Test flanneld daemon output"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          #!/bin/sh -ex
+          # Start etcd in background with proper networking configuration
+          mkdir -p /tmp/etcd-data
+          etcd --data-dir=/tmp/etcd-data \
+            --listen-client-urls=http://127.0.0.1:2379 \
+            --advertise-client-urls=http://127.0.0.1:2379 > /tmp/etcd.log 2>&1 &
+          ETCD_PID=$!
+          
+          # Ensure etcd is ready before proceeding
+          for i in 1 2 3 4 5; do
+            if etcdctl --endpoints=http://127.0.0.1:2379 endpoint status --write-out=table; then
+              break
+            fi
+            sleep 1
+          done
+          
+          # Store flannel network config in etcd 
+          printf "{\"Network\": \"10.244.0.0/16\", \"Backend\": {\"Type\": \"host-gw\"}}" > /tmp/flannel-config.json
+          etcdctl --endpoints=http://127.0.0.1:2379 put /coreos.com/network/config "$(cat /tmp/flannel-config.json)"
+          
+          # Save PID for cleanup
+          echo "export ETCD_PID=$ETCD_PID" > /tmp/etcd_pid.sh
 
-        # Check flanneld version
-        flanneld --version
+        # Disable iptables to avoid permission issues in unprivileged test environments and focus testing on core networking capabilities
+        start: flanneld --etcd-endpoints=http://127.0.0.1:2379 --iface=eth0 --iptables-forward-rules=false
+        
+        timeout: 10
 
-        # Start etcd with a dedicated temporary data directory
-        mkdir -p /tmp/etcd-data
-        etcd --data-dir=/tmp/etcd-data \
-          --listen-client-urls=http://127.0.0.1:2379 \
-          --advertise-client-urls=http://127.0.0.1:2379 > /tmp/etcd.log 2>&1 &
-        ETCD_PID=$!
-        # Ensure etcd is always killed even if an error occurs
-        trap 'kill $ETCD_PID || true' EXIT
-
-        # Wait for etcd readiness (try up to 5 times)
-        for i in {1..5}; do
-          if etcdctl --endpoints=http://127.0.0.1:2379 endpoint status --write-out=table; then
-            break
+        expected_output: |
+          Created subnet manager
+          
+        error_strings: |
+          "msg":"error connecting to etcd"
+          "level":"error" .* "could not create subnet manager"
+          "panic"
+          "fatal"
+          "Failed"
+          "Error: could not access etcd"
+          "error: could not allocate lease"
+          
+        post: |
+          #!/bin/sh -ex
+          # Load etcd PID from setup phase
+          . /tmp/etcd_pid.sh
+          
+          # Verify flannel created the proper subnet configuration
+          if [ ! -f /run/flannel/subnet.env ]; then
+            echo "Subnet file not found"
+            exit 1
           fi
-          sleep 1
-        done
-
-        # Set flannel configuration in etcd using etcdctl v3 command
-        etcdctl --endpoints=http://127.0.0.1:2379 put /coreos.com/network/config \
-          '{"Network": "10.244.0.0/16", "Backend": {"Type": "host-gw"}}'
-
-        # Run flanneld with a timeout, specifying a valid interface (e.g. eth0)
-        timeout 5s flanneld --etcd-endpoints=http://127.0.0.1:2379 --iface=eth0 > /tmp/flannel-output.log 2>&1 || true
-
-        # Output flannel logs for debugging purposes
-        cat /tmp/flannel-output.log
-
-        # Verify that flanneld successfully created the subnet manager
-        if ! grep -q "Created subnet manager" /tmp/flannel-output.log; then
-          echo "Subnet manager not created. Logs:"
-          cat /tmp/flannel-output.log
-          exit 1
-        fi
-
-        # Optionally, check that the subnet file was created and contains expected values
-        if [ ! -f /run/flannel/subnet.env ]; then
-          echo "Subnet file not found"
-          exit 1
-        fi
-        grep -q "FLANNEL_SUBNET=" /run/flannel/subnet.env
+          grep -q "FLANNEL_SUBNET=" /run/flannel/subnet.env
+          
+          # Cleanup etcd process
+          kill $ETCD_PID || true

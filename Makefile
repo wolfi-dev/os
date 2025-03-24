@@ -140,7 +140,7 @@ local-wolfi:
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --rm -it \
+	docker run --pull=always --rm -it \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \

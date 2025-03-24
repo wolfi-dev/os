@@ -9,7 +9,8 @@ shopt -s nullglob
 # logging functions
 mysql_log() {
 	local type="$1"; shift
-	printf '%s [%s] [Entrypoint]: %s\n' "$(date)" "$type" "$*"
+	local text="$*"; if [ "$#" -eq 0 ]; then text="$(cat)"; fi
+	printf '%s [%s] [Entrypoint]: %s\n' "$(date)" "$type" "$text"
 }
 mysql_note() {
 	mysql_log Note "$@"

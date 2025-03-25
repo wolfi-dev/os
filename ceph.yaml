@@ -13,12 +13,27 @@ package:
       - libstdc++
       - libudev
       - openssl
-      - py3.11-packaging
-      - py3.11-prettytable
-      - py3.11-pyyaml
-      - python-3.11
+      - py${{vars.py-version}}-bcrypt-3.2
+      - py${{vars.py-version}}-cherrypy
+      - py${{vars.py-version}}-cryptography
+      - py${{vars.py-version}}-jinja2
+      - py${{vars.py-version}}-jsonpatch
+      - py${{vars.py-version}}-packaging
+      - py${{vars.py-version}}-pecan
+      - py${{vars.py-version}}-prettytable
+      - py${{vars.py-version}}-pyopenssl
+      - py${{vars.py-version}}-python-dateutil
+      - py${{vars.py-version}}-pyyaml
+      - py${{vars.py-version}}-requests
+      - py${{vars.py-version}}-scipy
+      - py${{vars.py-version}}-urllib3
+      - py${{vars.py-version}}-werkzeug
+      - python-${{vars.py-version}}
       - yaml
       - zlib
+
+vars:
+  py-version: 3.11
 
 environment:
   contents:
@@ -67,12 +82,12 @@ environment:
       - openssl-dev
       - pkgconf
       - posix-libc-utils
-      - py3.11-cython
-      - py3.11-prettytable
-      - py3.11-pyyaml
-      - py3.11-setuptools
-      - py3.11-sphinx-bin
-      - python-3.11-dev
+      - py${{vars.py-version}}-cython
+      - py${{vars.py-version}}-prettytable
+      - py${{vars.py-version}}-pyyaml
+      - py${{vars.py-version}}-setuptools
+      - py${{vars.py-version}}-sphinx-bin
+      - python-${{vars.py-version}}-dev
       - re2-dev
       - snappy-dev
       - swagger
@@ -96,7 +111,7 @@ pipeline:
 
   - uses: patch
     with:
-      patches: fix-submodule.patch
+      patches: fix-submodule.patch fix-osd-class-dir.patch
 
   - uses: cmake/configure
     with:
@@ -111,7 +126,7 @@ pipeline:
         -DNINJA_MAX_COMPILE_JOBS=$JOBS \
         -DALLOCATOR=libc \
         -DWITH_GTEST_PARALLEL=ON \
-        -DWITH_PYTHON3=3.11 \
+        -DWITH_PYTHON3=${{vars.py-version}} \
         -DENABLE_GIT_VERSION=ON \
         -DLUA_LIBRARIES=/usr/lib/lua5.4/liblua.so \
         -DWITH_BABELTRACE=OFF \
@@ -155,14 +170,28 @@ subpackages:
         - ${{package.name}}
     pipeline:
       - uses: split/dev
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 
-  - name: ${{package.name}}-test-doc
+  - name: ${{package.name}}-libs
+    description: "libraries for ${{package.name}}"
+    dependencies:
+      provides:
+        - so:libceph-common.so.2=2
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/ceph
+          mv "${{targets.destdir}}"/usr/lib/lib*.so.* "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/ceph/lib*.so.* "${{targets.subpkgdir}}"/usr/lib/ceph
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-doc
     pipeline:
       - uses: split/manpages
     description: ceph manpages
-    dependencies:
-      provides:
-        - ceph-doc=${{package.full-version}}
     test:
       pipeline:
         - uses: test/docs
@@ -172,11 +201,10 @@ test:
     contents:
       packages:
         - sudo-rs
-        - py3.11-packaging
-        - py3.11-pyyaml
         - systemd
         - docker
         - lvm2-dev
+        - uuidgen
   pipeline:
     - name: Ensure version build
       runs: |
@@ -191,18 +219,120 @@ test:
         radosgw --version | grep ${{package.version}}
         radosgw-admin --version | grep ${{package.version}}
         rbd --version | grep ${{package.version}}
-    - uses: test/kwok/cluster
-    - name: Fetch the testdata from the source repo
-      runs: git clone --depth=1 https://github.com/rook/rook.git
-    - name: Install CRDs
-      working-directory: rook/deploy/examples
+    - name: Bootstrap and validate Ceph cluster
       runs: |
-        kubectl wait --for=condition=Ready nodes --all
-        kubectl apply --server-side=true -f crds.yaml -f common.yaml -f operator.yaml
-        kubectl apply --server-side=true -f cluster.yaml
+        UUID=$(uuidgen)
+        HOSTNAME=$(hostname)
 
-        # wait for all CRDs to be created
-        sleep 3
+        mkdir -p /etc/ceph
+        mkdir -p /var/run/ceph
+        mkdir -p /var/log/ceph
+
+        cat <<EOF > /etc/ceph/ceph.conf
+        [global]
+        fsid = ${UUID}
+        mon_initial_members = ${HOSTNAME}
+        mon_host = 127.0.0.1
+        public network = 127.0.0.0/8
+        auth_cluster required = cephx
+        auth_service required = cephx
+        auth_client required = cephx
+        osd_pool_default_size = 1
+        osd_pool_default_min_size = 1
+        mon warn on insecure global id reclaim allowed = false
+        mon warn on insecure global id reclaim = false
+        mon warn on pool no redundancy = false
+        EOF
+
+        mkdir -p /var/lib/ceph/bootstrap-osd
+        mkdir -p /var/lib/ceph/mon/ceph-${HOSTNAME}
+
+        # Create required keyrings
+        # Ceph MON keyring
+        ceph-authtool --create-keyring /tmp/ceph.mon.keyring \
+          --gen-key -n mon. --cap mon 'allow *'
+
+        # Ceph Admin keyring
+        ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring \
+          --gen-key -n client.admin \
+          --cap mon 'allow *' \
+          --cap osd 'allow *' \
+          --cap mds 'allow *' \
+          --cap mgr 'allow *'
+
+        # Ceph OSD bootstrap keyring
+        ceph-authtool --create-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring \
+          --gen-key -n client.bootstrap-osd \
+          --cap mon 'profile bootstrap-osd' \
+          --cap mgr 'allow r'
+
+        # Import admin and OSD bootstrap keyrings to mon keyring
+        ceph-authtool /tmp/ceph.mon.keyring --import-keyring /etc/ceph/ceph.client.admin.keyring
+        ceph-authtool /tmp/ceph.mon.keyring --import-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring
+
+        # Create initial monitor map
+        monmaptool --create --add ${HOSTNAME} 127.0.0.1 --fsid ${UUID} /tmp/monmap
+
+        # Setup the monitor daemon
+        ceph-mon --mkfs -i ${HOSTNAME} --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
+
+        # Startup ceph-mon daemon - defaults to run in the background
+        ceph-mon --id ${HOSTNAME}
+        ceph mon enable-msgr2
+
+        # ceph-mgr setup
+        mkdir -p /var/lib/ceph/mgr/ceph-${HOSTNAME}
+
+        # Generate cephx key with mgr permissions
+        ceph auth get-or-create mgr.${HOSTNAME} \
+          mon 'allow profile mgr' \
+          osd 'allow *' \
+          mds 'allow *' > /var/lib/ceph/mgr/ceph-${HOSTNAME}/keyring
+
+        # Startup ceph-mgr daemon
+        ceph-mgr --id ${HOSTNAME}
+        ceph health
+
+        # Bootstrap three OSD daemons
+        for osd in `seq 0 2`; do
+          OSD_UUID=$(uuidgen)
+          OSD_SECRET=$(ceph-authtool --gen-print-key)
+          # Generate new OSD ID
+          OSD_ID=$(echo "{\"cephx_secret\": \"$OSD_SECRET\"}" | ceph osd new ${OSD_UUID} -i - -n client.bootstrap-osd -k /var/lib/ceph/bootstrap-osd/ceph.keyring)
+          mkdir -p /var/lib/ceph/osd/ceph-${OSD_ID}
+          # Generate keyring
+          ceph-authtool --create-keyring /var/lib/ceph/osd/ceph-${OSD_ID}/keyring \
+            --name osd.${OSD_ID} --add-key $OSD_SECRET
+          # Create block 'device'
+          dd if=/dev/zero of=/var/lib/ceph/osd/ceph-${OSD_ID}/block bs=4M count=512
+          # Create the OSD
+          ceph-osd --mkfs --id ${OSD_ID} --osd-uuid ${OSD_UUID}
+          # Startup the ceph-osd daemon
+          ceph-osd --id ${OSD_ID}
+        done
+
+        # Check status
+        ceph health | grep -q HEALTH_OK || {
+          cat /var/log/ceph/*.log
+          ceph -s
+          ceph osd tree
+          exit 1
+        }
+
+        ceph osd pool create wolfi-test
+        ceph osd pool application enable wolfi-test rbd
+
+        rbd create --size 20 wolfi-test/small-disk
+        rbd info wolfi-test/small-disk
+        rbd resize --size 50 wolfi-test/small-disk
+        rbd info wolfi-test/small-disk
+        rbd resize --size 30 --allow-shrink wolfi-test/small-disk
+        rbd info wolfi-test/small-disk
+        rbd rm wolfi-test/small-disk
+
+        ceph osd pool autoscale-status
+
+        ceph -s
 
 update:
   enabled: true

@@ -2,7 +2,7 @@ package:
   name: dapr-1.15
   version: "1.15.3"
   epoch: 0
-  description: Cluster API meta package
+  description: Portable, event-driven, runtime for building distributed applications across cloud and edge.
   dependencies:
     provides:
       - dapr=${{package.full-version}}
@@ -46,7 +46,6 @@ pipeline:
       # Generate proto code
       sed -i '/check-proto-version:/,/^$/d' Makefile
       make gen-proto
-      export LD_FLAGS="-X github.com/dapr/dapr/pkg/buildinfo.gitversion=$(git describe --always --abbrev=7 --dirty) -X github.com/dapr/dapr/pkg/buildinfo.gitcommit=$(git rev-list -1 HEAD) -X github.com/dapr/dapr/pkg/buildinfo.version=v${{package.version}} -X github.com/dapr/kit/logger.DaprVersion=v${{package.version}}"
 
 subpackages:
   - name: dapr-daprd-${{vars.major-minor-version}}
@@ -89,7 +88,7 @@ subpackages:
           tags: $GO_TAGS
 
   - name: dapr-injector-${{vars.major-minor-version}}
-    description: cluster-api core controller
+    description: Looks for pods initialized with the Dapr annotations, and then creates another container in that pod for the daprd service
     dependencies:
       provides:
         - dapr-injector=${{package.full-version}}
@@ -131,13 +130,9 @@ test:
   environment:
     contents:
       packages:
-        - kustomize
         - kubectl
         - git
-        - mkcert
-        - nss
         - curl
-        - socat
         - jq
         - python3
         - dapr
@@ -147,9 +142,25 @@ test:
         - dapr-operator
         - dapr-scheduler
         - dapr-sentry
-        - netcat-openbsd
+    environment:
+      NAMESPACE: "default"
   pipeline:
     - uses: test/kwok/cluster
+    - name: Install stub daprsystem config
+      runs: |
+        kubectl create configmap daprsystem -n default || true
+    - name: Install Dapr CRDs
+      runs: |
+        kubectl wait --for=condition=Ready nodes --all
+        curl -fsSL https://raw.githubusercontent.com/dapr/dapr/v${{package.version}}/charts/dapr/crds/components.yaml | kubectl apply -f -
+        # Give it a sec to settle
+        sleep 2
+    - name: Launch Dapr Operator and verify component processing
+      uses: test/daemon-check-output
+      with:
+        start: operator
+        expected_output: "Starting Dapr Operator"
+        post: "echo \"Deploying test Component...\"\ncat <<EOF | kubectl apply --validate=false -f -\napiVersion: dapr.io/v1alpha1\nkind: Component\nmetadata:\n  name: test-comp\n  namespace: default\nspec:\n  type: bindings.cron\n  version: v1\n  metadata:\n    - name: schedule\n      value: \"@every 5s\"\n    - name: direction\n      value: input\nEOF\n\necho \"⏳ Waiting for component to be processed...\"\nsleep 5\n\necho \"\U0001F50D Verifying component...\"\nkubectl get component test-comp -o yaml | grep -q \"bindings.cron\" \\\n  && echo \"✅ Operator processed component\" \\\n  || (echo \"❌ Component not processed\" && exit 1)\n"
     - name: Prepare Dapr configs
       runs: |
         mkdir -p /etc/dapr
@@ -188,15 +199,6 @@ test:
       with:
         start: injector
         expected_output: "Error getting config"
-        timeout: 10
-    - name: Start operator with fake env
-      uses: test/daemon-check-output
-      with:
-        setup: |
-          export NAMESPACE=default
-          export CONFIG=/etc/dapr/daprsystem
-        start: operator
-        expected_output: "Starting Dapr Operator"
         timeout: 10
     - name: Start daprd and publish + receive message
       uses: test/daemon-check-output

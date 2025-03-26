@@ -1,9 +1,9 @@
 #nolint:valid-pipeline-fetch-digest,valid-pipeline-git-checkout-commit,valid-pipeline-git-checkout-tag
 package:
   name: ingress-nginx-controller-1.12
-  version: 1.12.0
+  version: 1.12.1
   # There are manual changes to review between each package update. See 'vars:' section
-  epoch: 11
+  epoch: 14
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -54,6 +54,10 @@ var-transforms:
     match: ^(\d+\.\d+)\.\d+$
     replace: "$1"
     to: nginx-ingress-major-minor
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: nginx-ingress-major
 
 environment:
   contents:
@@ -161,19 +165,19 @@ vars:
   NGX_BROTLI_SHA: 63ca02abdcf79c9e788d2eedcc388d2335902e52
   # TODO: ModSecurity-nginx needs a release beyond v1.0.3 to work properly
   # see https://github.com/owasp-modsecurity/ModSecurity-nginx/issues/324
-  MODSECURITY_NGINX_VERSION: "0b4f0cf38502f34a30c8543039f345cfc075670d"
+  MODSECURITY_NGINX_VERSION: "17405e09fa123eaa24186dd1be0cfaf9fbdf4c5b"
   # Instrumentation for nginx plugin: https://github.com/open-telemetry/opentelemetry-cpp-contrib
   # NOTE: this is really really critical and the config can break in backwards compatible way!!
   # We should always use the SHA available in release-x.y branch of upstream project (e.g. https://github.com/kubernetes/ingress-nginx/blob/release-1.12/images/nginx/rootfs/build.sh#L532)
-  # please check https://github.com/open-telemetry/opentelemetry-cpp-contrib/compare/8933841f0a7f8737f61404cf0a64acf6b079c8a5...main for regression
-  OTEL_SHA: "8933841f0a7f8737f61404cf0a64acf6b079c8a5"
+  # please check https://github.com/open-telemetry/opentelemetry-cpp-contrib/compare/62cbae68035af2102e5fdd68c9f34ba12430fa26...main for regression
+  OTEL_SHA: "62cbae68035af2102e5fdd68c9f34ba12430fa26"
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/kubernetes/ingress-nginx
       tag: controller-v${{package.version}}
-      expected-commit: 8ee4384271e081578bb8f08eccf2f3b5a78ada25
+      expected-commit: 64780b1fed3af99f4eccbc3fdad7ad785e8a83b6
 
   - uses: git-checkout
     with:
@@ -495,6 +499,73 @@ pipeline:
         && setcap -v cap_net_bind_service=+ep ${{targets.destdir}}/usr/bin/nginx
 
 subpackages:
+  - name: ingress-nginx-controller-bitnami-compat-${{vars.nginx-ingress-major-minor}}
+    description: Compatibility package with bitnami/nginx-ingress-controller image
+    dependencies:
+      provides:
+        - ingress-nginx-controller-bitnami-compat=${{package.full-version}}
+      runtime:
+        - bash # https://github.com/bitnami/charts/blob/db53e622ecf1be5a78d1ce683cec8baa41110fa3/bitnami/nginx-ingress-controller/templates/controller-deployment.yaml#L89
+        - coreutils
+        - curl
+        - findutils
+        - gmp
+        - gnutls
+        - grep
+        - ingress-nginx-controller-compat-${{vars.nginx-ingress-major-minor}} # We depend on generic compat because it ships some symlinks that also Bitnami needs, like symlinks to /nginx-ingress-controller, /dev/stdout and /dev/stderr.
+        - libffi
+        #- libhogweed6 missing pkg/so # https://github.com/bitnami/containers/blob/942861e0cea74a6a07bceafb299180a2733c0bfe/bitnami/nginx-ingress-controller/1/debian-12/Dockerfile#L29
+        - libmaxminddb-dev
+        - librtmp
+        - libssh
+        - libtasn1
+        - nettle
+        - p11-kit
+        - procps
+        - sed
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: nginx-ingress-controller
+          version-path: ${{vars.nginx-ingress-major}}/debian-12
+      - name: Ensure symlinks
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/common/bin
+          ln -s /usr/bin/mmdblookup ${{targets.subpkgdir}}/opt/bitnami/common/bin/mmdblookup
+          ln -s /usr/lib ${{targets.subpkgdir}}/opt/bitnami/common/lib
+          ln -s /usr/include ${{targets.subpkgdir}}/opt/bitnami/common/include
+    test:
+      environment:
+        contents:
+          packages:
+            - libmaxminddb
+            - ${{package.name}}
+        environment:
+          BITNAMI_APP_NAME: nginx-ingress-controller
+      pipeline:
+        - uses: test/tw/ldd-check
+          with:
+            packages: ${{subpkg.name}}
+        - name: Test symlinks
+          runs: |
+            set -e
+            test -f $(readlink -f /opt/bitnami/common/bin/mmdblookup)
+            test -d $(readlink -f /opt/bitnami/common/lib)
+            test -d $(readlink -f /opt/bitnami/common/include)
+        - name: Run KwoK
+          uses: test/kwok/cluster
+        - name: Test entrypoint and controller logs
+          uses: test/daemon-check-output
+          with:
+            start: |
+              /nginx-ingress-controller --kubeconfig ~/.kube/config
+            timeout: 30
+            expected_output: |
+              NGINX Ingress controller
+              Release:       controller-v${{package.version}}
+              nginx version: nginx/${{vars.NGINX_VERSION}}
+              Running in Kubernetes cluster
+
   - name: ingress-nginx-controller-compat-${{vars.nginx-ingress-major-minor}}
     description: Compatibility package for ingress-nginx-controller
     dependencies:
@@ -712,3 +783,16 @@ test:
       runs: |
         getcap /usr/bin/nginx-ingress-controller | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=ep$'
         getcap /usr/bin/nginx | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=ep$'
+    - name: Run KwoK
+      uses: test/kwok/cluster
+    - name: Check controller logs
+      uses: test/daemon-check-output
+      with:
+        start: |
+          nginx-ingress-controller --kubeconfig ~/.kube/config
+        timeout: 30
+        expected_output: |
+          NGINX Ingress controller
+          Release:       controller-v${{package.version}}
+          nginx version: nginx/${{vars.NGINX_VERSION}}
+          Running in Kubernetes cluster

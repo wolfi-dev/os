@@ -1,0 +1,240 @@
+## Pypy typically support two versions of Python at a time. This is the latest version of PyPy that supports Python 3.11.
+## Each version of python that pypy supports is a different tag, so version streaming this is not possible.
+## If a new version of pypy is released, it would require a new package to be created.
+package:
+  name: pypy-3.10
+  description: PyPy is a very fast and compliant implementation of the Python language v 3.10
+  epoch: 9
+  version: "7.3.19"
+  copyright:
+    - license: Apache-2.0
+  options:
+    #  There is a dependency on cmd:pypy because of the pip install step
+    no-depends: true
+  dependencies:
+    runtime:
+      - bzip2-dev
+      - gcc
+      - glibc-dev
+      - ncurses
+      - openssl
+      - py3-pip-wheel
+      - py3-setuptools-wheel
+      - zlib
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - bzip2-dev
+      - expat-dev
+      - gdbm-dev
+      - libffi
+      - libffi-pic-dev
+      - linux-headers
+      - ncurses-dev
+      - openssl-dev
+      - perl
+      - readline-dev
+      - rpcgen
+      - rsync
+      - sqlite-dev
+      - tcl-dev
+      - tk-dev
+      - xz-dev
+      - zlib-dev
+  environment:
+    PY_BUILD: /home/build/python-build
+    PY_INSTALL: /home/build/python-install
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^pypy-(\d+\.\d+).*
+    replace: $1
+    to: extracted-version
+
+pipeline:
+  - runs: mkdir -p "$PY_BUILD"
+
+  - working-directory: "$PY_BUILD"
+    uses: git-checkout
+    with:
+      repository: https://github.com/python/cpython.git
+      tag: v2.7.18
+      expected-commit: 8d21aa21f2cbc6d50aab3f420bb23be1d081dac4
+
+  ## Force the build to use system provided modules
+  - working-directory: "$PY_BUILD"
+    runs: rm -r Modules/expat Modules/_ctypes/libffi* Modules/zlib
+
+  - working-directory: "$PY_BUILD"
+    uses: autoconf/configure
+    with:
+      opts: |
+        --enable-ipv6 \
+        --enable-unicode=ucs4 \
+        --with-system-expat \
+        --with-system-ffi \
+        --with-system-zlib \
+        --with-threads
+
+  - working-directory: "$PY_BUILD"
+    uses: autoconf/make
+
+  - working-directory: "$PY_BUILD"
+    runs: DESTDIR="$PY_INSTALL" make -j$(nproc) install
+
+  - working-directory: pycparser
+    uses: git-checkout
+    with:
+      repository: https://github.com/eliben/pycparser.git
+      ## v2.21 is the last version of pycparser with python2.7 compatibility. v2.22 expects python3
+      tag: release_v2.21
+      expected-commit: 3cf6bf5eb16f5eadd4a058e41596145c407a79ad
+
+  - working-directory: pycparser
+    runs: |
+      PATH="$PY_INSTALL/usr/bin:$PATH" LD_LIBRARY_PATH="$PY_INSTALL/usr/lib" \
+        python setup.py install
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/pypy/pypy.git
+      tag: release-pypy${{vars.extracted-version}}-v${{package.version}}
+      expected-commit: 64367dfeb2639a9eabdcf1659f804efc47a783ce
+
+  - uses: patch
+    with:
+      patches: pypy-3.10-set-sysconfigdata-wheel-pkg-dir.patch
+
+  - working-directory: pypy/goal
+    runs: |
+      PATH="$PY_INSTALL/usr/bin:$PATH" LD_LIBRARY_PATH="$PY_INSTALL/usr/lib" \
+        python ../../rpython/bin/rpython --opt=jit --shared targetpypystandalone
+
+  - runs: |
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      install -Dm755 pypy/goal/pypy${{vars.extracted-version}}-c "${{targets.contextdir}}"/usr/bin/pypy${{vars.extracted-version}}-c
+      install -Dm755 pypy/goal/libpypy${{vars.extracted-version}}-c.so "${{targets.contextdir}}"/usr/bin/libpypy${{vars.extracted-version}}-c.so
+
+      rsync -r --exclude='__pycache__' --exclude='test' --exclude='tests' lib-python/ "${{targets.contextdir}}"/usr/lib-python/
+      rsync -r --exclude='__pycache__' --exclude='*.c' --exclude '*.o' lib_pypy/ "${{targets.contextdir}}"/usr/lib_pypy/
+      rsync -r --include='*.h' -f 'hide,! */' include/ "${{targets.contextdir}}"/usr/include/
+
+      ln -s /usr/bin/pypy${{vars.extracted-version}}-c ${{targets.contextdir}}/usr/bin/pypy
+
+  - uses: fetch
+    with:
+      uri: https://bootstrap.pypa.io/get-pip.py
+      expected-sha512: 4e04911474edb9df9dd2c40538fd7b164381c576d65a48c4555de240abc8a9a53f4e381eba6a93a07bc2339181b7530276a1a2648d7cc979dde759718ab20c37
+      extract: false
+      strip-components: 0
+
+  - runs: |
+      "${{targets.contextdir}}"/usr/bin/pypy${{vars.extracted-version}}-c get-pip.py setuptools wheel
+      sed -i '1s|.*|#!/usr/bin/env pypy|' ${{targets.contextdir}}/usr/bin/pip*
+
+  - runs: |
+      rm -rf ${{targets.destdir}}/usr/lib-python/3/ensurepip/_bundled
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: PyPy 3.10 compatibility layer
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin/
+          mkdir -p ${{targets.contextdir}}/opt/pypy/bin
+          ln -s /usr/bin/pypy${{vars.extracted-version}}-c ${{targets.contextdir}}/opt/pypy/bin/pypy3
+          ln -s /usr/bin/pypy${{vars.extracted-version}}-c ${{targets.contextdir}}/usr/local/bin/pypy3
+          ln -s /usr/bin/pypy${{vars.extracted-version}}-c ${{targets.contextdir}}/opt/pypy/bin/pypy
+          ln -s /usr/bin/pypy${{vars.extracted-version}}-c ${{targets.contextdir}}/opt/pypy/bin/python
+          ln -s /usr/bin/pypy${{vars.extracted-version}}-c ${{targets.contextdir}}/opt/pypy/bin/python3
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - runs: stat /opt/pypy/bin/pypy3
+        - runs: stat /opt/pypy/bin/pypy
+        - runs: |
+            pypy3 --version
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+  pipeline:
+    - name: "check version"
+      uses: test/daemon-check-output
+      with:
+        start: "pypy3 --version"
+        timeout: 120
+        expected_output: |
+          PyPy ${{package.version}}
+    - runs: pypy3 -c "import os, sys, math, random, datetime; print('Modules OK')"
+    - runs: |
+        export PATH=$PATH:/opt/pypy/bin
+        cat <<EOF >test.py
+        import time
+
+        def test_pypy_jit():
+            def expensive_loop():
+                x = 0
+                for i in range(10**6):
+                    x += i % 3
+                return x
+
+            start = time.time()
+            expensive_loop()
+            end = time.time()
+            print("Execution time:", end - start)
+
+        test_pypy_jit()
+        EOF
+        pypy test.py
+    - runs: |
+        pip --version
+        pip --help
+        pip wheel --help
+        pip3 --version
+        pip3 --help
+        pip3 wheel --help
+    - name: "Check pip installation of a simple package"
+      runs: |
+        pip install requests
+        pypy -c "import requests; print('requests imported successfully')"
+    - name: "Verify pip list and show"
+      runs: |
+        pip list | grep requests
+        pip show requests
+    - name: "Uninstall the test package"
+      runs: |
+        pip uninstall -y requests
+        pypy -c "import requests" && echo "ERROR: requests not uninstalled" && exit 1 || echo "requests successfully uninstalled"
+    - name: Verify working pypy -m venv
+      runs: |
+        d=$(mktemp -d)
+        pypy -m venv "$d"
+        $d/bin/pip list
+        # pip check fails on pypy replicated upstream
+        # # ./.venv/bin/pip check
+        # cffi 1.18.0.dev0 requires pycparser, which is not installed.
+        rm -Rf "$d"
+    - name: "Check pip cache functionality"
+      runs: |
+        pip cache list | head -n 10
+        pip cache remove '*'
+        pip cache dir | xargs ls -al
+
+update:
+  enabled: false
+  github:
+    identifier: pypy/pypy
+    tag-filter-prefix: release-pypy3.10-v
+    strip-prefix: release-pypy3.10-v
+    use-tag: true

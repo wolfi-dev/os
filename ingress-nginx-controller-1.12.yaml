@@ -3,7 +3,7 @@ package:
   name: ingress-nginx-controller-1.12
   version: 1.12.1
   # There are manual changes to review between each package update. See 'vars:' section
-  epoch: 14
+  epoch: 18
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -84,14 +84,15 @@ environment:
       - git
       - glibc-dev
       - go
-      - grpc-dev
+      - grpc-dev~1.70.1-r2 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
+      - grpc~1.70.1-r2 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
       - icu-dev
       - libaio-dev
       - libcap
       - libcap-utils
       - libedit-dev
       - libmaxminddb-dev
-      - libprotobuf
+      - libprotobuf~3.29.3 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
       - libsrt
       - libtool
       - libxml2
@@ -129,10 +130,12 @@ environment:
       - pcre-dev
       - perl-dev
       - pkgconf
-      - protobuf-dev
+      - protobuf-dev~3.29.3 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
+      - protoc~3.29.3 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
       - python3
       - re2-dev
       - scanelf
+      - so:libprotobuf.so.29.3.0 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
       - ssdeep
       - systemd-dev
       - util-linux
@@ -167,10 +170,9 @@ vars:
   # see https://github.com/owasp-modsecurity/ModSecurity-nginx/issues/324
   MODSECURITY_NGINX_VERSION: "17405e09fa123eaa24186dd1be0cfaf9fbdf4c5b"
   # Instrumentation for nginx plugin: https://github.com/open-telemetry/opentelemetry-cpp-contrib
-  # NOTE: this is really really critical and the config can break in backwards compatible way!!
-  # We should always use the SHA available in release-x.y branch of upstream project (e.g. https://github.com/kubernetes/ingress-nginx/blob/release-1.12/images/nginx/rootfs/build.sh#L532)
-  # please check https://github.com/open-telemetry/opentelemetry-cpp-contrib/compare/62cbae68035af2102e5fdd68c9f34ba12430fa26...main for regression
-  OTEL_SHA: "62cbae68035af2102e5fdd68c9f34ba12430fa26"
+  # NOTE: THIS IS REALLY REALLY REALLY CRITICAL AND THE CONFIG CAN BREAK IN BACKWARDS COMPATIBLE WAY!!
+  # WE SHOULD ALWAYS USE THE SHA AVAILABLE IN RELEASE-X.Y BRANCH OF UPSTREAM PROJECT (e.g. https://github.com/kubernetes/ingress-nginx/blob/controller-v1.12.1/images/nginx/rootfs/build.sh#L528)
+  OTEL_SHA: "8933841f0a7f8737f61404cf0a64acf6b079c8a5"
 
 pipeline:
   - uses: git-checkout
@@ -185,12 +187,16 @@ pipeline:
       branch: master
       expected-commit: ${{vars.MODSECURITY_NGINX_VERSION}}
       destination: ModSecurity-nginx-${{vars.MODSECURITY_NGINX_VERSION}}
+      depth: -1
 
   - name: Build ingress-nginx controller from source
     runs: |
+      # need to retag the repo because we've made changes and the module builds based on the git tags
+      git tag v${{package.version}}
+
       export PKG="k8s.io/ingress-nginx"
       export COMMIT_SHA=$(git rev-parse --short HEAD)
-      export REPO_INFO=$(git config --get remote.origin.url)$
+      export REPO_INFO=$(git config --get remote.origin.url)
 
       mkdir -p ${{targets.destdir}}
 
@@ -544,8 +550,6 @@ subpackages:
           BITNAMI_APP_NAME: nginx-ingress-controller
       pipeline:
         - uses: test/tw/ldd-check
-          with:
-            packages: ${{subpkg.name}}
         - name: Test symlinks
           runs: |
             set -e
@@ -619,9 +623,18 @@ subpackages:
   - name: ingress-nginx-opentelemetry-plugin-${{vars.nginx-ingress-major-minor}}
     description: OTel plugin for ingress nginx controller ${{vars.nginx-ingress-major-minor}}
     dependencies:
+      runtime:
+        - grpc~1.70.1-r2 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
+        - libprotobuf~3.29.3 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
+        - so:libprotobuf.so.29.3.0 # This is temporary, due to Otel proto files incompatibility with our 3.29.4 version of protobuf
       provides:
         - ingress-nginx-opentelemetry-plugin=${{package.full-version}}
     pipeline:
+      - name: Validate Open Telemetry version
+        runs: |
+          expected_sha=$(grep -E "^export OPENTELEMETRY_CONTRIB_COMMIT" images/nginx/rootfs/build.sh | awk -F '=' '{print $2}')
+          [[ "${{vars.OTEL_SHA}}" == "${expected_sha}" ]] || \
+            { echo "OTel version does not match."; exit 1; }
       - uses: git-checkout
         with:
           repository: https://github.com/open-telemetry/opentelemetry-cpp-contrib
@@ -643,9 +656,7 @@ subpackages:
       - uses: strip
     test:
       pipeline:
-        - uses: test/ldd-check
-          with:
-            packages: $(basename ${{targets.contextdir}})
+        - uses: test/tw/ldd-check
 
   - name: ingress-nginx-custom-error-pages-${{vars.nginx-ingress-major-minor}}
     description: OTel plugin for ingress nginx controller ${{vars.nginx-ingress-major-minor}}
@@ -776,9 +787,21 @@ test:
     # -T: test the configuration file: nginx checks the configuration for correct syntax, and then tries to open files referred in the configuration.
     # additionally dump configuration files to standard output (1.9.2).
     - runs: nginx -T
-    - uses: test/ldd-check
-      with:
-        packages: ${{package.name}}
+    - name: Test opentelemetry_config directive
+      runs: |
+        touch empty
+        cat <<"EOF" >/etc/nginx/nginx.conf
+        pid /tmp/nginx/nginx.pid;
+        load_module /etc/nginx/modules/otel_ngx_module.so;
+        error_log stderr;
+        events {}
+        http {
+        opentelemetry_config empty;
+        }
+        daemon off;
+        EOF
+        nginx -T 2>&1 | grep "Missing required exporter field"
+    - uses: test/tw/ldd-check
     - name: Test file capabilities
       runs: |
         getcap /usr/bin/nginx-ingress-controller | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=ep$'

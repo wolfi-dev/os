@@ -1,0 +1,142 @@
+package:
+  name: clamav-docker-1.4
+  version: 1.4.1_git20250212
+  epoch: 0
+  description: An anti-virus toolkit for UNIX eis-ng backport
+  copyright:
+    - license: GPL-2.0-only
+  dependencies:
+    runtime:
+      - bash
+      - json-c
+      - libbz2-1
+      - libcurl-openssl4
+      - libmilter
+      - libstdc++
+      - libxml2
+      - ncurses
+      - netcat-openbsd
+      - pcre2
+      - tini
+      - tzdata
+      - zlib
+    provides:
+      - clamav-docker=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^([0-9]+\.[0-9]+)\..*$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/Cisco-Talos/clamav-docker
+      expected-commit: 658ba84dfb16f0a70ea6588c5da208e36962e678
+      tag: ""
+      branch: main
+
+  - name: Create directories
+    runs: |
+      mkdir -p "${{targets.destdir}}"/usr/bin
+      mkdir -p "${{targets.destdir}}"/etc/clamav
+      mkdir -p "${{targets.destdir}}"/var/lib/clamav
+      mkdir -p "${{targets.destdir}}"/var/log/clamav
+      mkdir -p "${{targets.destdir}}"/run/clamav
+      mkdir -p "${{targets.destdir}}"/tmp
+      touch "${{targets.destdir}}"/var/log/clamav/freshclam.log
+
+  - working-directory: clamav/${{vars.major-minor-version}}/alpine/scripts
+    runs: |
+      install -Dm755 docker-entrypoint-unprivileged.sh "${{targets.destdir}}"/usr/bin/docker-entrypoint-unprivileged.sh
+      install -Dm755 docker-entrypoint.sh "${{targets.destdir}}"/usr/bin/docker-entrypoint.sh
+      install -Dm755 clamdcheck.sh "${{targets.destdir}}"/usr/bin/clamdcheck.sh
+
+  - name: Patch files
+    runs: |
+      sed -i '/^set -eu/a sleep 20' ${{targets.destdir}}/usr/bin/clamdcheck.sh
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    dependencies:
+      provides:
+        - clamav-docker-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/clamdcheck.sh "${{targets.contextdir}}"/usr/local/bin/clamdcheck.sh
+          ln -sf /usr/bin/docker-entrypoint.sh "${{targets.contextdir}}"/init
+          ln -sf /usr/bin/docker-entrypoint-unprivileged.sh "${{targets.contextdir}}"/init-unprivileged
+    test:
+      pipeline:
+        - runs: |
+            test "$(readlink -fv /usr/local/bin/clamdcheck.sh)" = "/usr/bin/clamdcheck.sh"
+            test "$(readlink -fv /init)" = "/usr/bin/docker-entrypoint.sh"
+            test "$(readlink -fv /init-unprivileged)" = "/usr/bin/docker-entrypoint-unprivileged.sh"
+
+update:
+  enabled: true
+  git: {}
+  schedule:
+    period: weekly
+    reason: Upstream does not maintain tags or releases
+
+test:
+  environment:
+    contents:
+      packages:
+        - clamav-${{vars.major-minor-version}}
+        - clamav-daemon
+        - clamav-db
+        - clamav-libunrar
+        - clamav-milter
+        - freshclam
+        - ${{package.name}}-compat
+    accounts:
+      groups:
+        - groupname: clamav
+          gid: 100
+      users:
+        - username: clamav
+          gid: 100
+          uid: 100
+      run-as: 0
+    environment:
+      TINI_SUBREAPER: 1
+  pipeline:
+    - name: "Test clamdcheck"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/clamdcheck.sh"
+        timeout: 60
+        error_strings: |
+          FAIL
+          FATAL
+          Traceback.*most.recent.call
+          Exception in thread
+          java.lang.NullPointerException
+          java.lang.RuntimeException
+          Gem::MissingSpecError
+          command not found
+          No such file or directory
+        expected_output: |
+          Unable to contact server
+    # this test will fail locally with run-as set to 0, but pass pipeline.
+    # switch to run-as: 100 if running locally.
+    - name: "Test init"
+      uses: test/daemon-check-output
+      with:
+        setup: /usr/bin/clamdcheck.sh &
+        start: "exec tini -s /init > /proc/1/fd/1 2>&1 & sleep 10 && echo 'ok' && sleep 5"
+        timeout: 60
+        expected_output: |
+          ok

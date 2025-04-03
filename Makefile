@@ -96,6 +96,11 @@ packages/$(ARCH)/%.apk: $(KEY)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
+docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
+$(docker_pkg_targets): docker-package/%:
+	@echo "Building using docker runner"
+	MELANGE_EXTRA_OPTS="--runner docker" make package/$*
+
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: $(KEY)
 	$(eval yamlfile := $*.yaml)
@@ -113,6 +118,11 @@ $(test_targets): test/%: $(KEY)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
+
+docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
+$(docker_test_targets): docker-test/%:
+	@echo "Testing using docker runner"
+	MELANGE_EXTRA_OPTS="--runner docker" make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
 $(testdbg_targets): test-debug/%: $(KEY)

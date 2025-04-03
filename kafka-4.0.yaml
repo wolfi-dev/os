@@ -1,0 +1,156 @@
+package:
+  name: kafka-4.0
+  version: "4.0.0"
+  epoch: 40
+  description: Apache Kafka is a distributed event streaming platform
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - kafka=${{package.full-version}}
+    runtime:
+      - bash # some helper scripts use bash
+      - merged-usrsbin
+      - openjdk-17-default-jvm
+      - wolfi-baselayout
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - gradle
+      - openjdk-17-default-jdk
+  environment:
+    LANG: en_US.UTF-8
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/kafka
+      tag: ${{package.version}}
+      expected-commit: 985bc99521dd22bbf620591b8db8613c54f596b2
+
+  - runs: |
+      gradle clean releaseTarGz
+
+      tar -xf core/build/distributions/kafka_2.13-${{package.version}}.tgz
+
+      mkdir -p ${{targets.destdir}}/usr/lib/kafka/logs
+
+      mv kafka_2.13-${{package.version}}/bin ${{targets.destdir}}/usr/lib/kafka
+      mv kafka_2.13-${{package.version}}/libs ${{targets.destdir}}/usr/lib/kafka
+      mv kafka_2.13-${{package.version}}/config ${{targets.destdir}}/usr/lib/kafka
+
+      mv ${{targets.destdir}}/usr/lib/kafka/config/server.properties ${{targets.destdir}}/usr/lib/kafka/config/server.properties.original
+      mkdir -p ${{targets.destdir}}/docker-entrypoint-initdb.d/
+
+      # Clean up Windows scripts
+      rm -rf ${{targets.destdir}}/usr/lib/kafka/bin/*.bat
+      rm -rf ${{targets.destdir}}/usr/lib/kafka/windows
+
+subpackages:
+  - name: kafka-bitnami-compat-${{vars.major-minor-version}}
+    description: "compat package with bitnami/kafka image"
+    dependencies:
+      provides:
+        - kafka-bitnami-compat=${{package.full-version}}
+      runtime:
+        - merged-usrsbin
+        - wait-for-port
+        - wolfi-baselayout
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: kafka
+          version-path: ${{vars.major-minor-version}}/debian-12
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/kafka/
+          ln -s /usr/lib/kafka/bin ${{targets.subpkgdir}}/opt/bitnami/kafka/bin
+          ln -s /usr/lib/kafka/libs ${{targets.subpkgdir}}/opt/bitnami/kafka/libs
+          ln -s /usr/lib/kafka/config ${{targets.subpkgdir}}/opt/bitnami/kafka/config
+          ln -s /usr/lib/kafka/logs ${{targets.subpkgdir}}/opt/bitnami/kafka/logs
+          ln -sf /opt/bitnami/scripts/kafka/entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
+          ln -sf /opt/bitnami/scripts/kafka/run.sh ${{targets.subpkgdir}}/run.sh
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - name: "Test compatibility with bitnami/kafka image"
+          runs: |
+            test -L /entrypoint.sh
+            test -L /run.sh
+            test "$(readlink /entrypoint.sh)" = "/opt/bitnami/scripts/kafka/entrypoint.sh"
+            test "$(readlink /run.sh)" = "/opt/bitnami/scripts/kafka/run.sh"
+        - uses: bitnami/validate-welcome-message
+          with:
+            app-name: kafka
+
+test:
+  environment:
+    contents:
+      packages:
+        - uuidgen
+    environment:
+      LANG: en_US.UTF-8
+      JAVA_HOME: "/usr/lib/jvm/default-jvm"
+  pipeline:
+    - name: "Initialize Kafka storage"
+      runs: |
+        export PATH="/usr/lib/kafka/bin:$PATH"
+
+        CLUSTER_ID="$(kafka-storage.sh random-uuid)"
+        echo "Using cluster ID: $CLUSTER_ID"
+
+        kafka-storage.sh format -t "$CLUSTER_ID" -c /usr/lib/kafka/config/server.properties.original --standalone
+    - runs: |
+        export PATH="/usr/lib/kafka/bin:$PATH"
+
+        # Start Kafka
+        kafka-server-start.sh /usr/lib/kafka/config/server.properties.original &
+        KAFKA_PID=$!
+        sleep 5
+
+        TOPIC_NAME="test-topic-$(uuidgen)"
+        PARTITIONS=1
+        REPLICATION_FACTOR=1
+
+        # Create and verify test topic
+        kafka-topics.sh --create --topic "${TOPIC_NAME}" --partitions "${PARTITIONS}" --replication-factor "${REPLICATION_FACTOR}" --if-not-exists --bootstrap-server localhost:9092
+        kafka-topics.sh --describe --topic "${TOPIC_NAME}" --bootstrap-server localhost:9092 | grep "${TOPIC_NAME}"
+
+        # Produce a test message
+        echo "Hello Kafka" | kafka-console-producer.sh --bootstrap-server localhost:9092 --topic "${TOPIC_NAME}"
+
+        # Consume the message
+        consumed_message=$(timeout 10 kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic "${TOPIC_NAME}" --from-beginning --max-messages 1)
+
+        # Verify the message
+        if [[ "${consumed_message}" == "Hello Kafka" ]]; then
+          echo "Successfully produced and consumed a test message."
+        else
+          echo "Failed to verify the consumed message."
+        fi
+
+        # Clean up the test topic
+        kafka-topics.sh --delete --topic "${TOPIC_NAME}" --bootstrap-server localhost:9092
+
+        # Kill Kafka
+        kill "${KAFKA_PID}"
+
+update:
+  enabled: true
+  github:
+    identifier: apache/kafka
+    tag-filter: 4.0.
+    use-tag: true

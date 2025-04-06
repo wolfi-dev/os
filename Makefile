@@ -96,6 +96,11 @@ packages/$(ARCH)/%.apk: $(KEY)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
+docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
+$(docker_pkg_targets): docker-package/%:
+	@echo "Building using docker runner"
+	MELANGE_EXTRA_OPTS="--runner docker" make package/$*
+
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: $(KEY)
 	$(eval yamlfile := $*.yaml)
@@ -113,6 +118,11 @@ $(test_targets): test/%: $(KEY)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
+
+docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
+$(docker_test_targets): docker-test/%:
+	@echo "Testing using docker runner"
+	MELANGE_EXTRA_OPTS="--runner docker" make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
 $(testdbg_targets): test-debug/%: $(KEY)
@@ -140,7 +150,7 @@ local-wolfi:
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --rm -it \
+	docker run --pull=always --rm -it \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \

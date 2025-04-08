@@ -42,3 +42,15 @@ for file in $(find .github/chainguard -type f); do
     exit 1
   fi
 done
+
+err=0
+for f in $(find . -type f -name "*.patch" -depth 2 ); do
+  if ! grep -q $(basename $f) $(dirname $f).yaml; then
+   echo "Found unused patch file: $f"
+   err=1
+  fi ;
+done
+if [ $err -ne 0 ]; then
+  echo "Some patch files are not used in any yaml file."
+  exit 1
+fi

@@ -7,7 +7,7 @@ set -o pipefail
 repo=$1
 
 get_prs() {
-    gh pr list --app "octo-sts" --label "auto-approver-bot/approve" --limit=50 --json number --jq '.[].number'
+  gh search prs --repo wolfi-dev/os --app "octo-sts" --label "auto-approver-bot/approve" --limit=50 --review none --state open --json number --jq '.[].number'
 }
 
 readarray -t PRS < <(get_prs)

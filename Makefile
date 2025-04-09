@@ -11,6 +11,9 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
+ifneq (${MELANGE_RUNNER},)
+	MELANGE_OPTS += --runner ${MELANGE_RUNNER}
+endif
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}

@@ -1,0 +1,463 @@
+# originated from https://git.alpinelinux.org/aports/plain/main/openldap/0003-Add-mqtt-overlay.patch
+
+From b2251604bdf2ed66471c9be546a8aab9f973ede2 Mon Sep 17 00:00:00 2001
+From: Lars Kellogg-Stedman <lars@oddbit.com>
+Date: Fri, 19 Aug 2022 22:53:36 -0400
+Subject: [PATCH 3/8] Add mqtt overlay
+
+---
+ contrib/slapd-modules/mqtt/Makefile |  45 ++++
+ contrib/slapd-modules/mqtt/mqtt.c   | 389 ++++++++++++++++++++++++++++
+ 2 files changed, 434 insertions(+)
+ create mode 100644 contrib/slapd-modules/mqtt/Makefile
+ create mode 100644 contrib/slapd-modules/mqtt/mqtt.c
+
+diff --git a/contrib/slapd-modules/mqtt/Makefile b/contrib/slapd-modules/mqtt/Makefile
+new file mode 100644
+index 0000000..5f62aab
+--- /dev/null
++++ b/contrib/slapd-modules/mqtt/Makefile
+@@ -0,0 +1,45 @@
++# $OpenLDAP$
++
++LDAP_SRC = ../../..
++LDAP_BUILD = ../../..
++LDAP_INC = -I$(LDAP_BUILD)/include -I$(LDAP_SRC)/include -I$(LDAP_SRC)/servers/slapd
++LDAP_LIB = $(LDAP_BUILD)/libraries/libldap/libldap.la \
++	$(LDAP_BUILD)/libraries/liblber/liblber.la
++
++LIBTOOL = $(LDAP_BUILD)/libtool
++CC = gcc
++OPT = -g -O2 -Wall
++DEFS = 
++INCS = $(LDAP_INC)
++LIBS = $(LDAP_LIB) -lmosquitto
++
++PROGRAMS = mqtt.la
++LTVER = 0:0:0
++
++prefix=/usr/local
++exec_prefix=$(prefix)
++ldap_subdir=/openldap
++
++libdir=$(exec_prefix)/lib
++libexecdir=$(exec_prefix)/libexec
++moduledir = $(libdir)$(ldap_subdir)
++
++.SUFFIXES: .c .o .lo
++
++.c.lo:
++	$(LIBTOOL) --mode=compile $(CC) $(OPT) $(DEFS) $(INCS) -c $<
++
++all: $(PROGRAMS)
++
++mqtt.la: mqtt.lo
++	$(LIBTOOL) --mode=link $(CC) $(OPT) -version-info $(LTVER) \
++	-rpath $(moduledir) -module -o $@ $? $(LIBS)
++
++clean:
++	rm -rf *.o *.lo *.la .libs
++
++install: $(PROGRAMS)
++	mkdir -p $(DESTDIR)$(moduledir)
++	for p in $(PROGRAMS) ; do \
++		$(LIBTOOL) --mode=install cp $$p $(DESTDIR)$(moduledir) ; \
++	done
+diff --git a/contrib/slapd-modules/mqtt/mqtt.c b/contrib/slapd-modules/mqtt/mqtt.c
+new file mode 100644
+index 0000000..143d776
+--- /dev/null
++++ b/contrib/slapd-modules/mqtt/mqtt.c
+@@ -0,0 +1,389 @@
++/* $OpenLDAP$ */
++/* This work is part of OpenLDAP Software <http://www.openldap.org/>.
++ *
++ * Copyright 2014 Timo Teräs <timo.teras@iki.fi>.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted only as authorized by the OpenLDAP
++ * Public License.
++ *
++ * A copy of this license is available in file LICENSE in the
++ * top-level directory of the distribution or, alternatively, at
++ * http://www.OpenLDAP.org/license.html.
++ */
++/* mqtt-overlay
++ *
++ * This is an OpenLDAP overlay that... */
++
++#include <mosquitto.h>
++#include <unistd.h>
++
++#include "portable.h" 
++#include "slap.h"
++#include "slap-config.h"
++
++typedef struct mqtt_notify_t {
++	struct mqtt_notify_t	*next;
++	char			*topic;
++	char			*dn_group_str;
++	char			*oc_group_str;
++	char			*str_member;
++
++	struct berval		ndn_group;
++	ObjectClass		*oc_group;
++	AttributeDescription	*ad_member;
++	int			notify_pending;
++} mqtt_notify_t;
++
++typedef struct mqtt_t {
++	struct mosquitto *mq;
++	int port;
++	char *hostname, *username, *password;
++	mqtt_notify_t *notify_map;
++} mqtt_t;
++
++static ConfigDriver mqtt_config_notify;
++
++static ConfigTable mqttcfg[] = {
++	{ "mqtt-hostname", "hostname", 2, 2, 0,
++		ARG_STRING|ARG_OFFSET, (void *)offsetof(mqtt_t, hostname),
++		"( OLcfgCtAt:5.1 NAME 'olcMqttHostname' "
++		"DESC 'Hostname of MQTT broker' "
++		"SYNTAX OMsDirectoryString SINGLE-VALUE )",
++		NULL, NULL },
++	{ "mqtt-port", "port", 2, 2, 0,
++		ARG_INT|ARG_OFFSET, (void *)offsetof(mqtt_t, port),
++		"( OLcfgCtAt:5.2 NAME 'olcMqttPort' "
++		"DESC 'Port of MQTT broker' "
++		"SYNTAX OMsInteger SINGLE-VALUE )",
++		NULL, NULL },
++	{ "mqtt-username", "username", 2, 2, 0,
++		ARG_STRING|ARG_OFFSET, (void *)offsetof(mqtt_t, username),
++		"( OLcfgCtAt:5.3 NAME 'olcMqttUsername' "
++		"DESC 'Username for MQTT broker' "
++		"SYNTAX OMsDirectoryString SINGLE-VALUE )",
++		NULL, NULL },
++	{ "mqtt-password", "password", 2, 2, 0,
++		ARG_STRING|ARG_OFFSET, (void *)offsetof(mqtt_t, password),
++		"( OLcfgCtAt:5.4 NAME 'olcMqttPassword' "
++		"DESC 'Password for MQTT broker' "
++		"SYNTAX OMsDirectoryString SINGLE-VALUE )",
++		NULL, NULL },
++	{ "mqtt-notify-password", "topic> <group-dn> <group-oc> <member-ad", 2, 5, 0,
++		ARG_MAGIC, mqtt_config_notify,
++		"( OLcfgCtAt:5.5 NAME 'olcMqttNotifyPassword' "
++		"DESC 'Notify password change on <topic>, optionally checking that the object is in the specified group.'"
++		"SYNTAX OMsDirectoryString X-ORDERED 'VALUES' )",
++		NULL, NULL },
++	{ NULL, NULL, 0, 0, 0, ARG_IGNORED }
++};
++
++static ConfigOCs mqttocs[] = {
++	{ "( OLcfgCtOc:5.1 "
++	  "NAME 'olcMqttConfig' "
++	  "DESC 'MQTT configuration' "
++	  "SUP olcOverlayConfig "
++	  "MAY ( "
++		"olcMqttHostname "
++		"$ olcMqttPort"
++		"$ olcMqttUsername"
++		"$ olcMqttPassword"
++		"$ olcMqttNotifyPassword"
++	  " ) )",
++	  Cft_Overlay, mqttcfg },
++
++	{ NULL, 0, NULL }
++};
++
++static int mqtt_init(BackendInfo *bi)
++{
++	return mosquitto_lib_init();
++}
++
++static int mqtt_destroy(BackendInfo *bi)
++{
++	return mosquitto_lib_cleanup();
++}
++
++static const char *ca_arg(ConfigArgs *c, int n)
++{
++	return (c->argc <= n) ? NULL : c->argv[n];
++}
++
++static void free_notify(mqtt_notify_t *n)
++{
++	ch_free(n->topic);
++	ch_free(n->oc_group_str);
++	ch_free(n->str_member);
++	ch_free(n->dn_group_str);
++	if (!BER_BVISNULL(&n->ndn_group))
++		ber_memfree(n->ndn_group.bv_val);
++	ch_free(n);
++}
++
++static void free_all_notifies(mqtt_t *mqtt)
++{
++	mqtt_notify_t *n, *next;
++
++	for (n = mqtt->notify_map; n; n = next) {
++		next = n->next;
++		free_notify(n);
++	}
++	mqtt->notify_map = NULL;
++}
++
++static int mqtt_config_notify(ConfigArgs *c)
++{
++	slap_overinst *on = (slap_overinst *)c->bi;
++	mqtt_t *mqtt = (mqtt_t *) on->on_bi.bi_private;
++	mqtt_notify_t *n, **pprev;
++	const char *text = NULL;
++	struct berval bv = BER_BVNULL, ndn = BER_BVNULL;
++	int rc, i;
++
++	switch (c->op) {
++	case SLAP_CONFIG_EMIT:
++		for (i = 0, n = mqtt->notify_map; n; n = n->next, i++) {
++			char *ptr = c->cr_msg, *end = &c->cr_msg[sizeof(c->cr_msg)-1];
++
++			ptr += snprintf(ptr, end-ptr, SLAP_X_ORDERED_FMT "%s", i, n->topic);
++			if (n->dn_group_str)
++				ptr += snprintf(ptr, end-ptr, " \"%s\"", n->dn_group_str);
++			if (n->oc_group_str)
++				ptr += snprintf(ptr, end-ptr, " \"%s\"", n->oc_group_str);
++			if (n->str_member)
++				ptr += snprintf(ptr, end-ptr, " \"%s\"", n->str_member);
++
++			bv.bv_val = c->cr_msg;
++			bv.bv_len = ptr - bv.bv_val;
++			value_add_one(&c->rvalue_vals, &bv);
++		}
++		return 0;
++	case LDAP_MOD_DELETE:
++		if (c->valx < 0) {
++			free_all_notifies(mqtt);
++		} else {
++			pprev = &mqtt->notify_map;
++			n = mqtt->notify_map;
++			for (i = 0; i < c->valx; i++) {
++				pprev = &n->next;
++				n = n->next;
++			}
++			*pprev = n->next;
++			free_notify(n);
++		}
++		return 0;
++	}
++
++	const char *groupdn = ca_arg(c, 2);
++	const char *oc_name = ca_arg(c, 3);
++	const char *ad_name = ca_arg(c, 4);
++	ObjectClass *oc = NULL;
++	AttributeDescription *ad = NULL;
++
++	if (groupdn) {
++		oc = oc_find(oc_name ?: SLAPD_GROUP_CLASS);
++		if (oc == NULL) {
++			Debug(LDAP_DEBUG_ANY, "mqtt_db_open: unable to find objectClass=\"%s\"\n",
++				oc_name, 0, 0);
++			return 1;
++		}
++
++		rc = slap_str2ad(ad_name ?: SLAPD_GROUP_ATTR, &ad, &text);
++		if (rc != LDAP_SUCCESS) {
++			Debug(LDAP_DEBUG_ANY, "mqtt_db_config_notify: unable to find attribute=\"%s\": %s (%d)\n",
++				ad_name, text, rc);
++			return rc;
++		}
++
++		ber_str2bv(groupdn, 0, 0, &bv);
++		rc = dnNormalize(0, NULL, NULL, &bv, &ndn, NULL);
++		if (rc != LDAP_SUCCESS) {
++			Debug(LDAP_DEBUG_ANY, "mqtt_db_config_notify: DN normalization failed for \"%s\": %d\n",
++				groupdn, rc, 0);
++			return rc;
++		}
++	}
++
++	n = ch_calloc(1, sizeof(*n));
++	n->topic = ch_strdup(c->argv[1]);
++	n->dn_group_str = groupdn ? ch_strdup(groupdn) : NULL;
++	n->oc_group_str = oc_name ? ch_strdup(oc_name) : NULL;
++	n->str_member   = ad_name ? ch_strdup(ad_name) : NULL;
++	n->ndn_group = ndn;
++	n->oc_group = oc;
++	n->ad_member = ad;
++
++	for (pprev = &mqtt->notify_map; *pprev; pprev = &(*pprev)->next);
++	*pprev = n;
++
++	return 0;
++}
++
++static void mqtt_send_notify(mqtt_t *mqtt, mqtt_notify_t *n)
++{
++	Debug(LDAP_DEBUG_TRACE, "mqtt_send_notify: pub on topic '%s'\n", n->topic, 0, 0);
++	n->notify_pending = mosquitto_publish(mqtt->mq, NULL, n->topic, 0, NULL, 1, true) == MOSQ_ERR_NO_CONN;
++}
++
++static void mqtt_on_connect(struct mosquitto *mq, void *obj, int rc)
++{
++	slap_overinst *on = (slap_overinst *) obj;
++	mqtt_t *mqtt = (mqtt_t *) on->on_bi.bi_private;
++	mqtt_notify_t *n;
++
++	Debug(LDAP_DEBUG_TRACE, "mqtt_on_connect: connected with status %d\n", rc, 0, 0);
++	if (rc != 0)
++		return;
++	
++	for (n = mqtt->notify_map; n; n = n->next)
++		if (n->notify_pending)
++			mqtt_send_notify(mqtt, n);
++}
++
++static int mqtt_db_init(BackendDB *be, ConfigReply *cr)
++{
++	slap_overinst *on = (slap_overinst *) be->bd_info;
++
++	Debug(LDAP_DEBUG_TRACE, "mqtt_db_init: initialize overlay\n", 0, 0, 0);
++	on->on_bi.bi_private = ch_calloc(1, sizeof(mqtt_t));
++
++	return 0;
++}
++
++static int mqtt_db_destroy(BackendDB *be, ConfigReply *cr)
++{
++	slap_overinst *on = (slap_overinst *) be->bd_info;
++	mqtt_t *mqtt = on->on_bi.bi_private;
++
++	Debug(LDAP_DEBUG_TRACE, "mqtt_db_destroy: destroy overlay\n", 0, 0, 0);
++	free_all_notifies(mqtt);
++	ch_free(mqtt);
++
++	return 0;
++}
++
++static int mqtt_db_open(BackendDB *be, ConfigReply *cr)
++{
++	slap_overinst *on = (slap_overinst *) be->bd_info;
++	mqtt_t *mqtt = (mqtt_t *) on->on_bi.bi_private;
++	struct mosquitto *mq;
++	char id[256];
++	int n;
++
++	n = snprintf(id, sizeof(id), "openldap-mqtt/%d/", getpid());
++	gethostname(&id[n], sizeof(id) - n);
++
++	Debug(LDAP_DEBUG_TRACE, "mqtt_db_open, id='%s'\n", id, 0, 0);
++	mqtt->mq = mq = mosquitto_new(id, true, on);
++	if (!mq) return 1;
++
++	if (mqtt->username && mqtt->password)
++		mosquitto_username_pw_set(mq, mqtt->username, mqtt->password);
++
++	mosquitto_connect_callback_set(mq, mqtt_on_connect);
++	mosquitto_connect_async(mq, mqtt->hostname ?: "127.0.0.1", mqtt->port ?: 1883, 60);
++	mosquitto_loop_start(mq);
++
++	return 0;
++}
++
++static int mqtt_db_close(BackendDB *be, ConfigReply *cr)
++{
++	slap_overinst *on = (slap_overinst *) be->bd_info;
++	mqtt_t *mqtt = (mqtt_t *) on->on_bi.bi_private;
++
++	Debug(LDAP_DEBUG_TRACE, "mqtt_db_close\n", 0, 0, 0);
++	mosquitto_disconnect(mqtt->mq);
++	mosquitto_loop_stop(mqtt->mq, false);
++	mosquitto_destroy(mqtt->mq);
++
++	free(mqtt->hostname); mqtt->hostname = NULL;
++	free(mqtt->username); mqtt->username = NULL;
++	free(mqtt->password); mqtt->password = NULL;
++
++	return 0;
++}
++
++static int mqtt_response(Operation *op, SlapReply *rs)
++{
++	slap_overinst *on = (slap_overinst *) op->o_bd->bd_info;
++	mqtt_t *mqtt = (mqtt_t *) on->on_bi.bi_private;
++	Attribute *a;
++	Modifications *m;
++	bool change = false;
++
++	switch (op->o_tag) {
++	case LDAP_REQ_ADD:
++		for (a = op->ora_e->e_attrs; a; a = a->a_next) {
++			if (a->a_desc == slap_schema.si_ad_userPassword) {
++				change = true;
++				break;
++			}
++		}
++		break;
++	case LDAP_REQ_MODIFY:
++		for (m = op->orm_modlist; m; m = m->sml_next) {
++			if (m->sml_desc == slap_schema.si_ad_userPassword) {
++				change = true;
++				break;
++			}
++		}
++		break;
++	case LDAP_REQ_EXTENDED:
++		if (ber_bvcmp(&slap_EXOP_MODIFY_PASSWD, &op->ore_reqoid) == 0)
++			change = true;
++		break;
++	}
++
++	if (change) {
++		mqtt_notify_t *n;
++		int r, cache;
++
++		for (n = mqtt->notify_map; n; n = n->next) {
++			if (n->oc_group) {
++				cache = op->o_do_not_cache;
++				op->o_do_not_cache = 1;
++				r = backend_group(op, NULL, &n->ndn_group, &op->o_req_ndn, n->oc_group, n->ad_member);
++				op->o_do_not_cache = cache;
++			} else {
++				r = 0;
++			}
++
++			Debug(LDAP_DEBUG_TRACE, "tested o_req_ndn='%s' in ndn_group='%s' r=%d\n",
++				op->o_req_ndn.bv_val, n->ndn_group.bv_val, r);
++
++			if (r == 0)
++				mqtt_send_notify(mqtt, n);
++		}
++	}
++
++	return SLAP_CB_CONTINUE;
++}
++
++static int mqtt_init_overlay() 
++{
++	static slap_overinst ov;
++	int rc;
++
++	ov.on_bi.bi_type = "mqtt";
++	ov.on_bi.bi_init = mqtt_init;
++	ov.on_bi.bi_destroy = mqtt_destroy;
++	ov.on_bi.bi_db_init = mqtt_db_init;
++	ov.on_bi.bi_db_destroy = mqtt_db_destroy;
++	ov.on_bi.bi_db_open = mqtt_db_open;
++	ov.on_bi.bi_db_close = mqtt_db_close;
++	ov.on_bi.bi_cf_ocs = mqttocs;
++	ov.on_response = mqtt_response;
++
++	rc = config_register_schema(mqttcfg, mqttocs);
++	if (rc) return rc;
++
++	return overlay_register(&ov);
++}
++
++int init_module(int argc, char *argv[]) 
++{
++	return mqtt_init_overlay();
++}
+-- 
+2.37.1
+

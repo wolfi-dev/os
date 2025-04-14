@@ -3,13 +3,18 @@ ARCH ?= $(shell uname -m)
 ifeq (${ARCH}, arm64)
 	ARCH = aarch64
 endif
+ifeq (${TMPDIR}, )
+        CACHEDIR = /tmp/melange-cache
+else
+        CACHEDIR = ${TMPDIR}/melange-cache
+endif
 TARGETDIR = packages/${ARCH}
 
 MELANGE ?= $(shell which melange)
 WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
-CACHE_DIR ?= gs://wolfi-sources/
+SOURCES ?= gs://wolfi-sources/
 
 ifneq (${MELANGE_RUNNER},)
 	MELANGE_OPTS += --runner ${MELANGE_RUNNER}
@@ -23,6 +28,7 @@ MELANGE_OPTS += --namespace wolfi
 MELANGE_OPTS += --license 'Apache-2.0'
 MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
 MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
+MELANGE_OPTS += --cache-dir ${CACHEDIR}
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
@@ -48,7 +54,7 @@ MELANGE_TEST_OPTS += --debug
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
 
 ifeq (${USE_CACHE}, yes)
-	MELANGE_OPTS += --cache-source ${CACHE_DIR}
+	MELANGE_OPTS += --cache-source ${SOURCES}
 endif
 
 ifeq (${LINT}, yes)
@@ -72,8 +78,22 @@ endif
 ${KEY}:
 	${MELANGE} keygen ${KEY}
 
+cache:
+	@mkdir -p ${CACHEDIR}
+
 clean:
-	rm -rf packages/${ARCH}
+	@rm -rf packages/${ARCH}
+
+clean-cache:
+	@rm -rf ${CACHEDIR}
+
+${CACHEDIR}/.libraries_token.txt: cache
+	@tmpf=$(shell mktemp); \
+	chainctl auth login --audience libraries.cgr.dev; \
+	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
+	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
+
+lib-token: ${CACHEDIR}/.libraries_token.txt
 
 fetch-kernel:
 	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
@@ -87,7 +107,7 @@ fetch-kernel:
 yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
-$(pkg_targets): package/%:
+$(pkg_targets): package/%: cache $(KEY)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
@@ -105,7 +125,7 @@ $(docker_pkg_targets): docker-package/%:
 	MELANGE_EXTRA_OPTS="--runner docker" make package/$*
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
-$(dbg_targets): debug/%: $(KEY)
+$(dbg_targets): debug/%: cache $(KEY)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
@@ -115,7 +135,7 @@ $(dbg_targets): debug/%: $(KEY)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
-$(test_targets): test/%: $(KEY)
+$(test_targets): test/%: cache $(KEY)
 	@mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
@@ -128,7 +148,7 @@ $(docker_test_targets): docker-test/%:
 	MELANGE_EXTRA_OPTS="--runner docker" make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
-$(testdbg_targets): test-debug/%: $(KEY)
+$(testdbg_targets): test-debug/%: cache $(KEY)
 	@mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))

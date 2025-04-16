@@ -1,0 +1,133 @@
+package:
+  name: knative-operator-1.17
+  version: "1.17.6"
+  epoch: 0
+  description: Automatically provision and manage TLS certificates in Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - knative-operator=${{package.full-version}}
+    runtime:
+      - tzdata
+  checks:
+    disabled:
+      # knative stores kodata inside /var/run/ko so this checks needs to be disabled.
+      - tempdir
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/knative/operator
+      tag: knative-v${{package.version}}
+      expected-commit: c3b4f83848cddff0c0d6fdb635184efd31c54b7f
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/net@v0.36.0
+
+  - name: build the operator
+    uses: go/build
+    with:
+      packages: ./cmd/operator/main.go
+      output: operator
+
+  - name: populate kodata
+    runs: ./hack/update-codegen.sh
+
+  - name: package operator kodata
+    runs: |
+      mkdir -p ${{targets.contextdir}}/var/run/ko
+      # it's strange that upstream project have suid bit set :(
+      # unset them first before moving
+      find -perm /u=s,g=s -exec chmod u-s,g-s {} \;
+      cp -r ./cmd/operator/kodata/* ${{targets.contextdir}}/var/run/ko/
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    dependencies:
+      provides:
+        - knative-operator-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/ko-app
+          ln -sf /usr/bin/operator "${{targets.contextdir}}"/ko-app/operator
+    test:
+      pipeline:
+        - runs: stat /ko-app/operator
+
+  - name: ${{package.name}}-webhook-compat
+    description: Compat package for ${{package.name}}-webhook
+    dependencies:
+      provides:
+        - knative-operator-webhook-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/ko-app
+          ln -sf /usr/bin/webhook "${{targets.contextdir}}"/ko-app/webhook
+    test:
+      pipeline:
+        - runs: stat /ko-app/webhook
+
+  - name: ${{package.name}}-webhook
+    dependencies:
+      provides:
+        - knative-operator-webhook=${{package.full-version}}
+    pipeline:
+      - name: build the webhook binary
+        uses: go/build
+        with:
+          packages: ./cmd/webhook/main.go
+          output: webhook
+    test:
+      environment:
+        environment:
+          SYSTEM_NAMESPACE: default
+          WEBHOOK_NAME: pikachu
+      pipeline:
+        - uses: test/kwok/cluster
+        - uses: test/daemon-check-output
+          with:
+            start: /usr/bin/webhook
+            timeout: 30
+            # the binary logs ERROR which makes test/daemon-check-output unhappy, setting this so "" so that we don't error on ERROR log messages.
+            error_strings: |
+              FATAL
+            expected_output: |
+              Registering
+              informers
+              factories
+              controllers
+
+test:
+  environment:
+    contents:
+      packages:
+        - fd
+    environment:
+      SYSTEM_NAMESPACE: default
+  pipeline:
+    - name: check KODATA
+      runs: |
+        fd eventing /var/run/ko
+        fd serving /var/run/ko
+    - uses: test/kwok/cluster
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/operator
+        timeout: 30
+        expected_output: |
+          Registering
+          informers
+          factories
+          controllers
+
+update:
+  enabled: true
+  github:
+    identifier: knative/operator
+    strip-prefix: knative-v
+    tag-filter: knative-v1.17.

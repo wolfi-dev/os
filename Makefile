@@ -11,6 +11,9 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 CACHE_DIR ?= gs://wolfi-sources/
 
+ifneq (${MELANGE_RUNNER},)
+	MELANGE_OPTS += --runner ${MELANGE_RUNNER}
+endif
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
@@ -96,6 +99,11 @@ packages/$(ARCH)/%.apk: $(KEY)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
+docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
+$(docker_pkg_targets): docker-package/%:
+	@echo "Building using docker runner"
+	MELANGE_EXTRA_OPTS="--runner docker" make package/$*
+
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: $(KEY)
 	$(eval yamlfile := $*.yaml)
@@ -113,6 +121,11 @@ $(test_targets): test/%: $(KEY)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
+
+docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
+$(docker_test_targets): docker-test/%:
+	@echo "Testing using docker runner"
+	MELANGE_EXTRA_OPTS="--runner docker" make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
 $(testdbg_targets): test-debug/%: $(KEY)
@@ -134,15 +147,15 @@ PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # changes to the packages. It mounts the local packages folder as a read-only,
 # and sets up the necessary keys for you to run `apk add` commands, and then
 # test the packages however you see fit.
-local-wolfi:
+local-wolfi: $(KEY)
 	@mkdir -p "${PWD}/packages"
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --rm -it \
+	docker run --pull=always --rm -it \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
-		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
+		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
 		cgr.dev/chainguard/wolfi-base:latest
@@ -182,7 +195,7 @@ local-wolfi:
 OUT_LOCAL_DIR ?= /work/out
 OS_LOCAL_DIR ?= /work/os
 OS_DIR ?= ${PWD}
-dev-container-wolfi:
+dev-container-wolfi: $(KEY)
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
@@ -192,7 +205,7 @@ dev-container-wolfi:
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
-		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
+		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
 		ghcr.io/wolfi-dev/sdk:latest

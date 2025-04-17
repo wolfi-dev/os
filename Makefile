@@ -78,12 +78,15 @@ endif
 ${KEY}:
 	${MELANGE} keygen ${KEY}
 
+.PHONY: cache
 cache:
 	@mkdir -p ${CACHEDIR}
 
+.PHONY: clean
 clean:
 	@rm -rf packages/${ARCH}
 
+.PHONY: clean-cache
 clean-cache:
 	@rm -rf ${CACHEDIR}
 
@@ -93,8 +96,10 @@ ${CACHEDIR}/.libraries_token.txt: cache
 	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
 	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
 
+.PHONY: lib-token
 lib-token: ${CACHEDIR}/.libraries_token.txt
 
+.PHONY: fetch-kernel
 fetch-kernel:
 	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
 	@curl -s -LSo linux-virt.apk "https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/$(KERNEL_PKG)"
@@ -107,13 +112,13 @@ fetch-kernel:
 yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
-$(pkg_targets): package/%: cache $(KEY)
+$(pkg_targets): package/%:
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
-packages/$(ARCH)/%.apk: $(KEY)
+packages/$(ARCH)/%.apk: cache $(KEY)
 	@mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
@@ -155,6 +160,7 @@ $(testdbg_targets): test-debug/%: cache $(KEY)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
 
+.PHONY: dev-container
 dev-container:
 	docker run --pull=always --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
@@ -167,6 +173,7 @@ PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # changes to the packages. It mounts the local packages folder as a read-only,
 # and sets up the necessary keys for you to run `apk add` commands, and then
 # test the packages however you see fit.
+.PHONY: local-wolfi
 local-wolfi: $(KEY)
 	@mkdir -p "${PWD}/packages"
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
@@ -215,6 +222,8 @@ local-wolfi: $(KEY)
 OUT_LOCAL_DIR ?= /work/out
 OS_LOCAL_DIR ?= /work/os
 OS_DIR ?= ${PWD}
+
+.PHONY: dev-container-wolfi
 dev-container-wolfi: $(KEY)
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
@@ -233,9 +242,8 @@ dev-container-wolfi: $(KEY)
 	@rmdir "$(TMP_REPOS_DIR)"
 
 # Checks that the repo can be built in order from bootstrap packages.
+.PHONY: check-bootstrap
 check-bootstrap:
 	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
-
-.PHONY: clean fetch-kernel dev-container local-wolfi dev-container-wolfi check-bootstrap

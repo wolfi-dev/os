@@ -51,7 +51,8 @@
 	package!: #Package
 
 	// The specification for the packages build environment
-	environment!: #ImageConfiguration
+	// Optional: environment variables to override apko
+	environment?: #ImageConfiguration
 
 	// Optional: Linux capabilities configuration to apply to the
 	// melange runner.
@@ -336,15 +337,15 @@
 	// not provide
 	// any files, executables, libraries, etc... and is otherwise
 	// empty
-	"no-provides"!: bool
+	"no-provides"?: bool
 
 	// Optional: Mark this package as a self contained package that
 	// does not
 	// depend on any other package
-	"no-depends"!: bool
+	"no-depends"?: bool
 
 	// Optional: Mark this package as not providing any executables
-	"no-commands"!: bool
+	"no-commands"?: bool
 })
 
 #PathMutation: close({
@@ -414,8 +415,7 @@
 	// This defaults to the guests' build workspace (/home/build)
 	"working-directory"?: string
 
-	// Optional: environment variables to override the apko
-	// environment
+	// Optional: environment variables to override apko
 	environment?: close({
 		[string]: string
 	})
@@ -547,8 +547,7 @@
 	// package.dependencies.runtime added to it. So, if your test
 	// needs
 	// no additional packages, you can leave it blank.
-	// Optional: Linux capabilities configuration to apply to the
-	// melange runner.
+	// Optional: Additional Environment the test needs to run
 	environment?: #ImageConfiguration
 
 	// Required: The list of pipelines that test the produced package.

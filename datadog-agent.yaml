@@ -2,7 +2,7 @@ package:
   name: datadog-agent
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: 7.60.1
+  version: "7.64.3"
   epoch: 1
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
@@ -16,6 +16,10 @@ package:
       - libpcap
       - libseccomp
       - shadow
+
+capabilities:
+  add:
+    - CAP_SYS_ADMIN # This is needed to run unshare(1).
 
 vars:
   py-version: "3.12"
@@ -37,6 +41,7 @@ var-transforms:
 environment:
   contents:
     packages:
+      - binutils
       - bison
       - build-base
       - busybox
@@ -58,7 +63,7 @@ environment:
       # - gstatus # TODO: Required by gluster
       - gcc-12
       - gnutar
-      - go
+      - go-1.23
       - krb5-dev
       - libbpf-dev
       - libedit-dev
@@ -94,11 +99,20 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: 646618687e4f9351b5fe19cce678c9cd4b011e74
+      expected-commit: 0d44e61fa623ef2572ba8d7fbe30e2632540d8aa
 
+  # Recent commit to the init.go code changed some of the logic of Python path resolving
+  # for the embedded Python, causing issues. Let's revert the commit to return to the previous
+  # behavior. This change was introduced for MacOS use-cases, so not relevant to Linux.
+  # https://github.com/DataDog/datadog-agent/pull/31426
+  - uses: patch
+    with:
+      patches: revert-import-python-relatively-instead-of-using-the-patch.patch
+
+  # Ensure that we don't run into nvidia GPU issues at runtime.
   - runs: |
       gccdir="$(GCC_SPEC_FILE=/dev/null gcc --print-search-dirs | grep ^install: | cut -d' ' -f2)"
-      sed -r 's/,?-z,now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
+      sed -r 's/-z now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
 
   # Install `invoke` (build) dependencies. We ultimately package with venv so
   # these won't leak into the package.
@@ -111,11 +125,14 @@ pipeline:
 
   - uses: go/bump
     with:
-      deps: github.com/moby/buildkit@v0.13.1 golang.org/x/net@v0.33.0 github.com/go-git/go-git/v5@v5.13.0
+      deps: |-
+        golang.org/x/net@v0.36.0
+        github.com/containerd/containerd@v1.7.27
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
 
   - if: ${{build.arch}} == 'aarch64'
+    name: Install clang-12
     runs: |
       mkdir -p /usr/src
       wget -O arch.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-arm64_${LINUX_KERNEL_VERSION}_arm64.deb
@@ -128,6 +145,7 @@ pipeline:
       echo "3d4ad804b7c85007686548cbc917ab067bf17eaedeab43d9eb83d3a683d8e9d4  /tmp/clang.tar.xz" | sha256sum --check
 
   - if: ${{build.arch}} == 'x86_64'
+    name: Install clang-12
     runs: |
       mkdir -p /usr/src
       wget -O arch.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-amd64_${LINUX_KERNEL_VERSION}_amd64.deb
@@ -141,11 +159,13 @@ pipeline:
       echo "6b3cc55d3ef413be79785c4dc02828ab3bd6b887872b143e3091692fc6acefe7  /tmp/clang.tar.xz" | sha256sum --check
 
   # need to link libpcap.a to /home/build/dev/lib/libpcap.a else the build will attempt to download libpcap
-  - runs: |
+  - name: Create libpcap.a symlink expected by the build
+    runs: |
       mkdir -p /home/build/dev/lib
       ln -s /usr/lib/libpcap.a /home/build/dev/lib/libpcap.a
 
-  - runs: |
+  - name: Build the System Probe
+    runs: |
       wget -O common.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-common_${LINUX_KERNEL_VERSION}_all.deb
       dpkg -x common.deb /tmp/common
       ln -s /tmp/common/usr/src/linux-headers-${LINUX_HEADERS_VERSION}-common /usr/src/linux-headers-${LINUX_HEADERS_VERSION}-common
@@ -157,15 +177,29 @@ pipeline:
       # HOW DOES THIS WORK: https://stackoverflow.com/a/60357720
       ln -s /usr/lib/libncursesw.so.6 /usr/lib/libtinfo.so.5
 
+      # There's a go version issue for some reason (possibly related to the use of gobumps), so we have to fix it. Otherwise, we get this build error:
+      # go: module . listed in go.work file requires go >= 1.24.0, but go.work lists go 1.23.1; to update it:
+      #      go work use
+      go work use
+
       # Build once to correctly setup links/generates. The system-probe we end
       # up using will be part of the multicall below.
       unshare --user --map-root-user \
-        invoke -e system-probe.build \
-        --strip-object-files \
-        --no-bundle \
-        --bundle-ebpf
+        invoke -e system-probe.build
+        #--bundle-ebpf # This makes oom-kill.o to fail because it expects it to be embedded in the Go binary at /build, because
+        # of this: https://github.com/DataDog/datadog-agent/blob/eab078f2e713852de8e4f4c168ea009065841903/pkg/ebpf/co_re.go#L71
+        # where c.coreDir is by default: /opt/datadog-agent/embedded/share/system-probe/ebpf/co-re
+        # but is then overwritten to /build when the Go build tag ebpf_bindata, here:
+        # https://github.com/DataDog/datadog-agent/blob/eab078f2e713852de8e4f4c168ea009065841903/pkg/ebpf/bytecode/asset_reader_bindata.go#L29
+        # and the build tag is set when the inboke task flag --bundle-ebpf is set, ehre:
+        # https://github.com/DataDog/datadog-agent/blob/17329b350f3e31ef8bb7906e842e1989486ec097/tasks/system_probe.py#L830
+        # Instead, when the Go build tag ebpf_bindata / --bundle-ebpf Invoke task flag are not set, the directory is not overwriten and remains
+        # /opt/datadog-agent/embedded/share/system-probe/ebpf/co-re, here:
+        # https://github.com/DataDog/datadog-agent/blob/eab078f2e713852de8e4f4c168ea009065841903/pkg/ebpf/bytecode/asset_reader_nobindata.go#L18.
+        # which is where object files like the oom-kill.o BPF CO-RE programs live, hence can be loaded correctly.
 
-  - runs: |
+  - name: Ensure Go dependencies
+    runs: |
       export PATH=$PATH:$GOPATH/bin
       mkdir -p "$GOPATH/src/github.com/DataDog/"
       ln -sf /home/build/ "$GOPATH"/src/github.com/DataDog/datadog-agent
@@ -173,15 +207,20 @@ pipeline:
 
       invoke -e deps
 
-  - runs: |
+  # RtLoader: https://github.com/DataDog/datadog-agent/tree/main/rtloader
+  - name: Build the RtLoader wrapper
+    runs: |
       invoke -e rtloader.make \
         --install-prefix="${{targets.destdir}}/usr" \
         --cmake-options="\
+          -DCMAKE_INSTALL_BINDIR=/usr/bin \
           -DCMAKE_INSTALL_LIBDIR=lib \
           -DCMAKE_CXX_FLAGS=-Os \
           -DCMAKE_C_FLAGS=-Os"
       invoke -e rtloader.install
 
+  - name: Build the agent
+    runs: |
       # Default includes [process-agent, security-agent, trace-agent]. Add in
       # the `system-probe` as well, which saves us ~140Mb.
       invoke -e agent.build \
@@ -191,10 +230,11 @@ pipeline:
         --bundle security-agent \
         --exclude-rtloader \
         --no-development \
-        --bundle-ebpf \
         --embedded-path /usr/lib
+        #--bundle-ebpf \ # Same as above for the system-probe.build Invoke task.
 
-  - runs: |
+  - name: Install the agent and its components
+    runs: |
       mkdir -p \
         ${{targets.contextdir}}${{vars.destd}}/bin/agent \
         ${{targets.contextdir}}${{vars.destd}}/embedded/bin
@@ -217,15 +257,17 @@ pipeline:
       install -Dm644 bin/agent/dist/system-probe.yaml ${{targets.contextdir}}/etc/datadog-agent/system-probe.yaml.example
       install -Dm644 bin/agent/dist/security-agent.yaml ${{targets.contextdir}}/etc/datadog-agent/security-agent.yaml.example
 
-      install -Dm755 Dockerfiles/agent/entrypoint.sh ${{targets.contextdir}}/bin/entrypoint.sh
+      install -Dm755 Dockerfiles/agent/entrypoint.sh ${{targets.contextdir}}/usr/bin/entrypoint.sh
       install -Dm755 Dockerfiles/agent/probe.sh ${{targets.contextdir}}/probe.sh
       install -Dm755 Dockerfiles/agent/initlog.sh ${{targets.contextdir}}/initlog.sh
       install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.py ${{targets.contextdir}}/readsecret.py
       install -Dm755 Dockerfiles/agent/secrets-helper/readsecret.sh ${{targets.contextdir}}/readsecret.sh
       install -Dm755 Dockerfiles/agent/secrets-helper/readsecret_multiple_providers.sh ${{targets.contextdir}}/readsecret_multiple_providers.sh
 
+      # confd used for easy reuse below
       confd=${{targets.contextdir}}/etc/datadog-agent/conf.d
       cp -r bin/agent/dist/conf.d "$confd"
+
       # https://github.com/NixOS/nixpkgs/pull/189795
       # the agent apparently loads .yaml.default files, which then cause noise in logs.
       rm -rf \
@@ -262,7 +304,9 @@ subpackages:
     dependencies:
       runtime:
         - bash
+        - busybox
         - coreutils
+        - findutils
         - datadog-agent-s6-overlay
         - datadog-security-agent-policies
     pipeline:
@@ -286,7 +330,9 @@ subpackages:
     dependencies:
       runtime:
         - bash
+        - busybox
         - coreutils
+        - findutils
         - python-${{vars.py-version}}-base
     pipeline:
       - working-directory: /home/integrations
@@ -294,11 +340,11 @@ subpackages:
           - uses: git-checkout
             with:
               repository: https://github.com/DataDog/integrations-core
-              branch: ${{vars.datadog-major-minor-x}} # 7.59.x
-              expected-commit: 3189af0e0ae840c9a4bab3131662c7fd6b0de7fb # needs to be updated with each new release
+              branch: ${{vars.datadog-major-minor-x}} # 7.x.y
+              expected-commit: 3040577a9e2f266b8202294db17da354dcb41c47 # needs to be updated with each new release
           - uses: patch
             with:
-              patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch /home/build/int-core-snowflake-pyproject-toml.patch
+              patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-datadog_checks_base-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch
           - runs: |
               # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
               SOURCE_DATE_EPOCH=315532800
@@ -391,7 +437,9 @@ subpackages:
     dependencies:
       runtime:
         - bash
+        - busybox
         - coreutils
+        - findutils
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}${{vars.destd}}/bin/
@@ -410,9 +458,6 @@ subpackages:
         # This needs CGO_ENABLED=1, which we just so happen to inherit from the
         # main package
         pipeline:
-          - uses: go/bump
-            with:
-              deps: google.golang.org/protobuf@v1.33.0 github.com/golang/protobuf@v1.5.4
           - uses: go/build
             with:
               packages: ./cmd/server
@@ -457,6 +502,10 @@ subpackages:
 
           mkdir -p ${{targets.subpkgdir}}/
           tar -xvzf s6-overlay.tgz -C ${{targets.subpkgdir}}/
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.subpkgdir}}"/bin/* "${{targets.subpkgdir}}"/usr/bin
+          rmdir "${{targets.subpkgdir}}"/bin
 
           # Since this is essentially a hard fork only for datadog, we can do this without issue
           # https://github.com/DataDog/datadog-agent/blob/f20521b4b0b05ad83314e3fc353ecbbe7e3e69a0/Dockerfiles/agent/Dockerfile#L200
@@ -548,6 +597,30 @@ subpackages:
             withstdinas version
             withstdinas help
 
+  - name: dogstatsd
+    dependencies:
+      runtime:
+        - busybox
+        - netcat-openbsd
+    pipeline:
+      - runs: |
+          invoke -e dogstatsd.build
+          strip bin/dogstatsd/dogstatsd
+          install -Dm755 bin/dogstatsd/dogstatsd "${{targets.subpkgdir}}/dogstatsd"
+          mkdir -p ${{targets.subpkgdir}}/etc/conf.d
+          mkdir -p ${{targets.subpkgdir}}/etc/init.d
+      - working-directory: Dockerfiles/dogstatsd/alpine
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp ./install_info ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp ./dogstatsd.yaml ${{targets.subpkgdir}}/etc/datadog-agent/
+          install -Dm755 entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
+          install -Dm755 probe.sh ${{targets.subpkgdir}}/probe.sh
+    test:
+      pipeline:
+        - runs: |
+            /dogstatsd start --help
+
 update:
   enabled: true
   github:
@@ -617,6 +690,4 @@ test:
         security-agent version | grep "Security agent"
         process-agent version | grep Agent
         system-probe version | grep "System Probe"
-    - uses: test/ldd-check
-      with:
-        packages: ${{package.name}}
+    - uses: test/tw/ldd-check

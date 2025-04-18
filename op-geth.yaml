@@ -1,0 +1,213 @@
+package:
+  name: op-geth
+  version: "1.101503.3"
+  epoch: 0
+  description: The go-ethereum command line interface
+  copyright:
+    - license: LGPL-3.0-or-later
+    - license: GPL-3.0-or-later
+
+environment:
+  contents:
+    packages:
+      - ca-certificates
+      - linux-headers
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: e666543dc5500428ee7c940e54263fe4968c5efd
+      repository: https://github.com/ethereum-optimism/op-geth
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/net@v0.36.0
+        github.com/golang-jwt/jwt/v4@v4.5.2
+
+  - uses: go/build
+    with:
+      packages: ./cmd/geth
+      # TODO: The following ldflags set the gitTag for the main package and all subpackages.
+      # verify if params.gitTag is needed or can be removed in future builds and change the ldflags to new path when the next stable version is released and if auto-bump fails
+      ldflags: |
+        -X github.com/ethereum/go-ethereum/version.gitTag=v${{package.version}}
+        -X github.com/ethereum/go-ethereum/params.gitTag=v${{package.version}}
+      output: geth
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the same location used by the upstream image"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/local/bin
+          ln -sf /usr/bin/geth ${{targets.subpkgdir}}/usr/local/bin/geth
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - runs: |
+            /usr/local/bin/geth version
+            /usr/local/bin/geth --help
+
+  - name: ${{package.name}}-clef
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/clef
+          ldflags: |
+            -X github.com/ethereum/go-ethereum/version.gitTag=v${{package.version}}
+            -X github.com/ethereum/go-ethereum/params.gitTag=v${{package.version}}
+          output: clef
+    test:
+      environment:
+        contents:
+          packages:
+            - util-linux-misc
+      pipeline:
+        - runs: |
+            clef --version
+            clef --help
+        - runs: |
+            script -q -c "clef init" /dev/null <<EOF
+            ok
+            1234567890
+            1234567890
+            EOF
+            test -f /root/.clef/masterseed.json && echo "Clef init successful" || { echo "Clef init failed"; exit 1; }
+
+  - name: ${{package.name}}-abigen
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/abigen
+          output: abigen
+          ldflags: |
+            -X github.com/ethereum/go-ethereum/version.gitTag=v${{package.version}}
+            -X github.com/ethereum/go-ethereum/params.gitTag=v${{package.version}}
+    test:
+      pipeline:
+        - runs: |
+            abigen --version
+            abigen --help
+            echo 'Testing abigen with a sample ABI...'
+
+            echo '[{"inputs":[],"name":"retrieve","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]' > test.abi
+
+            abigen --abi test.abi --pkg main --type TestContract --out test.go
+
+            if [ ! -s test.go ]; then
+              echo "Error: test.go was not generated correctly!"
+              exit 1
+            fi
+
+            echo "abigen test passed successfully!"
+
+  - name: ${{package.name}}-devp2p
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/devp2p
+          ldflags: |
+            -X github.com/ethereum/go-ethereum/version.gitTag=v${{package.version}}
+            -X github.com/ethereum/go-ethereum/params.gitTag=v${{package.version}}
+          output: devp2p
+    test:
+      pipeline:
+        - runs: |
+            devp2p --version
+            devp2p --help
+        - runs: |
+            devp2p key generate mynode.key
+
+            # Verify that the key was created and contains a valid hex string
+            if [ ! -f "mynode.key" ]; then
+              echo "Error: mynode.key was not created!" >&2
+              exit 1
+            fi
+
+            KEY_CONTENT=$(cat mynode.key)
+            if ! echo "$KEY_CONTENT" | grep -qE '^[a-f0-9]{64}$'; then
+              echo "Error: Invalid key format in mynode.key" >&2
+              exit 1
+            fi
+
+            echo "Successfully generated and validated mynode.key"
+
+  - name: ${{package.name}}-evm
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/evm
+          ldflags: |
+            -X github.com/ethereum/go-ethereum/version.gitTag=v${{package.version}}
+            -X github.com/ethereum/go-ethereum/params.gitTag=v${{package.version}}
+          output: evm
+    test:
+      pipeline:
+        - runs: |
+            evm --version
+            evm --help
+            evm run --code 0x 2>/dev/null && echo "Success" || echo "Failed"
+
+  - name: ${{package.name}}-rlpdump
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/rlpdump
+          output: rlpdump
+    test:
+      pipeline:
+        - runs: |
+            rlpdump --help
+            echo "c0" | rlpdump | grep -q '"c"' && echo "rlpdump stdin test passed" || { echo "rlpdump stdin test failed"; exit 1; } # Test: Decode hex "c0" using stdin and validate output
+            rlpdump -hex c0 | grep -q '\[\]' && echo "rlpdump hex test passed" || { echo "rlpdump hex test failed"; exit 1; }
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - jq
+  pipeline:
+    - name: version and help tests for geth
+      runs: |
+        geth version | grep -qi "${{package.version}}-stable"
+        geth --help
+    - name: "Testing geth process"
+      uses: test/daemon-check-output
+      with:
+        start: geth --dev --nodiscover --maxpeers 0 --http --http.addr "127.0.0.1" --http.port "8545" --http.api "eth,net,web3" --allow-insecure-unlock
+        expected_output: |
+          Maximum peer count
+          HTTP server started
+          Writing custom genesis block
+          Using developer account
+        error_strings: |
+          "panic"
+          "fatal"
+          failed
+          denied
+        post: |
+          sleep 5
+          BLOCK_NUMBER=$(curl -s -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' http://127.0.0.1:8545/ | jq -r '.result')
+
+          BLOCK_NUMBER_DECIMAL=$((BLOCK_NUMBER))
+
+          if [[ "$BLOCK_NUMBER" == "0x0" ]]; then
+            echo "Error: Block number is still 0x0, indicating no blocks have been mined."
+            exit 1  # Fail the pipeline
+          else
+            echo "Success: Ethereum node is responding with block number $BLOCK_NUMBER (decimal: $BLOCK_NUMBER_DECIMAL)."
+          fi
+
+update:
+  enabled: true
+  github:
+    identifier: ethereum-optimism/op-geth
+    strip-prefix: v
+    tag-filter: v

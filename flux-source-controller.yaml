@@ -1,10 +1,14 @@
 package:
   name: flux-source-controller
-  version: 1.4.1
-  epoch: 7
+  version: "1.5.0"
+  epoch: 42
   description: The GitOps Toolkit source management component
   copyright:
     - license: Apache-2.0
+  dependencies:
+    runtime:
+      - merged-usrsbin
+      - wolfi-baselayout
 
 environment:
   contents:
@@ -19,7 +23,7 @@ environment:
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 50035c6e85a52e73dc264b4414661b691fcd5663
+      expected-commit: 301fc7271458e79a2331fc70c2ba5dc97c13d39c
       repository: https://github.com/fluxcd/source-controller
       tag: v${{package.version}}
 
@@ -27,11 +31,15 @@ pipeline:
     with:
       deps: |-
         oras.land/oras-go@v1.2.6
-        github.com/golang-jwt/jwt/v4@v4.5.1
-        golang.org/x/crypto@v0.31.0
-        golang.org/x/net@v0.33.0
-        github.com/go-git/go-git/v5@v5.13.0
-        github.com/notaryproject/notation-go@v1.3.0-rc.2
+        github.com/go-jose/go-jose/v4@v4.0.5
+        github.com/go-jose/go-jose/v3@v3.0.4
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/net@v0.36.0
+        github.com/containerd/containerd@v1.7.27
+        github.com/golang-jwt/jwt/v4@v4.5.2
+        github.com/golang-jwt/jwt/v5@v5.2.2
+        helm.sh/helm/v3@v3.17.3
 
   - runs: |
       mkdir -p "${{targets.destdir}}"/usr/bin
@@ -41,6 +49,27 @@ pipeline:
         -trimpath -o "${{targets.destdir}}"/usr/bin/source-controller .
 
   - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-bitnami-compat
+    description: "Compatibility package for usage with the Bitnami helm chart."
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/flux/bin/
+          ln -sf /usr/bin/source-controller ${{targets.contextdir}}/opt/bitnami/flux/bin/source-controller
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        # the test is extensive in the main package and this is the same binary invoked via a symlink.
+        - runs: |
+            /opt/bitnami/flux/bin/source-controller --help 2>&1 | grep -i "Usage of /opt/bitnami/flux/bin/source-controller"
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
 
 update:
   enabled: true
@@ -53,9 +82,13 @@ update:
 
 test:
   environment:
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
     contents:
       packages:
         - ${{package.name}}
+        - curl
   pipeline:
     # the source-controller when passing the -h flag exit with error code 2
     - runs: |
@@ -65,3 +98,24 @@ test:
           echo "expected 2, got $?"
           exit 1
         fi
+    # only passes with docker runner: `MELANGE_EXTRA_OPTS="--runner docker" make test/flux-notification-controller`
+    - uses: test/kwok/cluster
+    - name: "start ${{package.name}} and test"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
+          kubectl wait --for=condition=Ready nodes --all
+        start: source-controller --storage-adv-addr=source-controller.default.svc.cluster.local --storage-path=/ --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1
+        timeout: 30
+        expected_output: |
+          starting file server
+          starting manager
+          source.toolkit.fluxcd.io
+          Starting Controller
+          Starting workers
+        post: |
+          #!/bin/sh -e
+          set -o pipefail
+          curl -s localhost:8081/metrics  | grep rest_client_requests_total
+          curl -v localhost:9441/healthz 2>&1 | grep -i "200 OK"

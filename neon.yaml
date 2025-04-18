@@ -1,6 +1,6 @@
 package:
   name: neon
-  version: "7496"
+  version: "8355"
   epoch: 0
   description: "Serverless Postgres. We separated storage and compute to offer autoscaling, branching, and bottomless storage."
   copyright:
@@ -29,6 +29,7 @@ environment:
       - libseccomp-dev
       - libtool
       - openssl-dev
+      - patchelf
       - perl
       - pkgconf
       - poetry
@@ -46,13 +47,13 @@ pipeline:
     with:
       repository: https://github.com/neondatabase/neon
       tag: release-${{package.version}}
-      expected-commit: 32f58f822816e0bb81cf4b69e11d31e501380f38
+      expected-commit: cd07b120b55badf05327da3e798389a696260cef
       recurse-submodules: true
 
   - runs: |
-      rustup install nightly
+      rustup install stable
       ARCH=$(uname -m)
-      export PATH="$HOME/.rustup/toolchains/nightly-${ARCH}-unknown-linux-gnu/bin:$PATH"
+      export PATH="$HOME/.rustup/toolchains/stable-${ARCH}-unknown-linux-gnu/bin:$PATH"
 
       BUILD_TYPE=release make -j$(nproc) -s
 
@@ -65,9 +66,29 @@ pipeline:
       # neon where to find the postgres binaries.
       # POSTGRES_DISTRIB_DIR=/usr/libexec
       mkdir -p "${{targets.destdir}}"/usr/libexec/neon
-      mv pg_install/v14 "${{targets.destdir}}"/usr/libexec/neon/v14
-      mv pg_install/v15 "${{targets.destdir}}"/usr/libexec/neon/v15
-      mv pg_install/v16 "${{targets.destdir}}"/usr/libexec/neon/v16
+
+      # The postgresql libraries/binaries need RPATH adjustment
+      # because they're installed under non-standard paths.
+      #
+      # Unfortunately we cannot use /etc/ld.so.conf.d/ snippets here
+      # because each psql binary should load their corresponding
+      # versioned libpq.so.  If we rely on the /etc/ld.so.conf.d/
+      # mechanism, ld will always load the first libpq.so it finds,
+      # which e.g. ends up being v14.
+      find pg_install/ -mindepth 1 -maxdepth 1 -type d -name "v*" | while read -r dir; do
+        verdir=$(basename "${dir}")
+        mv "${dir}" "${{targets.destdir}}"/usr/libexec/neon/"${verdir}"
+        find "${{targets.destdir}}"/usr/libexec/neon/"${verdir}" -type f | while read -r obj; do
+          # Are we looking at an ELF file?
+          if head -c 4 "${obj}" | grep -qF $'\x7FELF'; then
+            # Unfortunately we need to use the full path here (instead
+            # of '$ORIGIN/../lib', for example) because the
+            # libraries/binaries are installed under several nested
+            # directories.
+            patchelf --set-rpath /usr/libexec/neon/"${verdir}"/lib "${obj}"
+          fi
+        done
+      done
 
   - uses: strip
 
@@ -82,6 +103,11 @@ update:
 
 test:
   pipeline:
+    # Will fail see https://github.com/wolfi-dev/os/issues/34360
+    # - uses: test/pkgconf
+    - uses: test/tw/ldd-check
+      with:
+        extra-library-paths: "/usr/libexec/neon/v14/lib:/usr/libexec/neon/v15/lib:/usr/libexec/neon/v16/lib:/usr/libexec/neon/v17/lib"
     - name: Test neon_local command
       runs: |
         neon_local --version

@@ -1,0 +1,239 @@
+package:
+  name: grafana-oncall
+  version: "1.15.5"
+  epoch: 0
+  description: "Developer-friendly incident response with brilliant Slack integration"
+  copyright:
+    - license: AGPL-3.0-or-later
+  dependencies:
+    runtime:
+      - bash
+      - git
+      - libffi
+      - libpq
+      - mariadb-connector-c
+      - netcat-openbsd
+      - pcre
+      - python-${{vars.py-version}}
+
+vars:
+  py-version: 3.12
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - libffi-dev
+      - linux-headers
+      - mariadb-connector-c-dev
+      - openssl-dev
+      - pcre-dev
+      - postgresql-dev
+      - python-${{vars.py-version}}
+      - python-${{vars.py-version}}-dev
+      - sed
+      - tzdata
+      - uv
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/grafana/oncall
+      tag: v${{package.version}}
+      expected-commit: 2099f03db12c0037555dc52964cb8598cee21654
+
+  - runs: |
+      sed 's/hashlib.md5/hashlib.sha256/g' -i engine/apps/alerts/models/alert.py
+      sed 's/hashlib.md5/hashlib.sha256/g' -i engine/apps/alerts/models/alert_manager_models.py
+
+  - working-directory: engine
+    pipeline:
+      - name: Create venv
+        runs: |
+          # We use uv here as pip backtracks in resolution
+          uv venv -p python${{vars.py-version}} --seed
+      - name: Install grpcio
+        runs: |
+          uv pip install grpcio
+          rm -rf grpcio-*.whl # It's LFS and not installable since it's musl
+      - name: Install requirements
+        runs: |
+          uv pip install --no-cache -r requirements.txt --no-compile
+      - name: Mitigate CVEs
+        runs: |
+          # Mitigates CVE-2024-56374, CVE-2024-56201 and CVE-2024-56326
+          # bump cryptography to 44.0.1 to address CVE-2024-12797 and GHSA-79v4-65xg-pq4g
+          uv pip install --no-cache --no-compile --upgrade django==4.2.20 jinja2==3.1.6 cryptography==44.0.1
+      - name: Move venv
+        runs: |
+          mkdir -p ${{targets.destdir}}/usr/share/grafana-oncall/
+          mv .venv ${{targets.destdir}}/usr/share/grafana-oncall/
+      - name: Copy source
+        runs: |
+          cp -aR . ${{targets.destdir}}/usr/share/grafana-oncall/
+      - name: Create database
+        runs: |
+          mkdir -p ${{targets.destdir}}/var/lib/oncall
+          DJANGO_SETTINGS_MODULE=settings.prod_without_db DATABASE_TYPE=sqlite3 DATABASE_NAME=${{targets.destdir}}/var/lib/oncall/oncall.db SECRET_KEY="ThEmUsTSecretKEYforBUILDstage123" SILK_PROFILER_ENABLED="True" ${{targets.destdir}}/usr/share/grafana-oncall/.venv/bin/python manage.py collectstatic --no-input
+          mv ./collected_static ${{targets.destdir}}/usr/share/grafana-oncall/
+          DATABASE_TYPE=sqlite3 DATABASE_NAME=${{targets.destdir}}/var/lib/oncall/oncall.db ${{targets.destdir}}/usr/share/grafana-oncall/.venv/bin/python manage.py create_sqlite_db
+      - name: Create required directories
+        runs: |
+          mkdir -p ${{targets.destdir}}/tmp/silk_profiles
+          mkdir -p ${{targets.destdir}}/tmp/prometheus_django_metrics
+      - name: Update venv paths
+        runs: |
+          # Replace full build path with target path
+          find ${{targets.destdir}}/usr/share/grafana-oncall/.venv/bin/ -type f | xargs sed -i "s|/home/build/engine|/usr/share/grafana-oncall|g"
+          # Existing configuration updates
+          sed -i "s|include-system-site-packages = false|include-system-site-packages = true|g" ${{targets.destdir}}/usr/share/grafana-oncall/.venv/pyvenv.cfg
+          sed -i "s|/home/build.*python${{vars.py-version}}|/usr/bin/python${{vars.py-version}}|" ${{targets.destdir}}/usr/share/grafana-oncall/.venv/pyvenv.cfg
+      - name: Cleanup
+        runs: |
+          find ${{targets.contextdir}} -type d -name '__pycache__' -exec rm -rf {} +
+          find ${{targets.contextdir}} -type f -name '*.pyc' -exec rm -rf {} +
+          find ${{targets.contextdir}} -type d -name "tests" -exec rm -rf {} +
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/etc
+          ln -sf /usr/share/grafana-oncall "${{targets.contextdir}}"/etc/app
+    test:
+      pipeline:
+        - runs: test "$(readlink -fv /etc/app)" = "/usr/share/grafana-oncall"
+
+update:
+  enabled: true
+  github:
+    identifier: grafana/oncall
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - mysql
+        - redis
+        - redis-cli
+        - wait-for-it
+        - shadow
+        - sudo-rs
+        - curl
+    environment:
+      PYTHONPATH: /usr/share/grafana-oncall/.venv/lib/python${{vars.py-version}}/site-packages:/usr/share/grafana-oncall
+      DATABASE_TYPE: sqlite3
+      BROKER_TYPE: redis
+      REDIS_URI: redis://localhost:6379/0
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: 3306
+      DATABASE_USER: root
+      DATABASE_PASSWORD: oncall
+      CELERY_WORKER_QUEUE: "default,critical,long,slack,telegram,webhook,retry,celery,grafana"
+      CELERY_WORKER_CONCURRENCY: "1"
+      CELERY_WORKER_MAX_TASKS_PER_CHILD: "100"
+      CELERY_WORKER_SHUTDOWN_INTERVAL: "65m"
+      CELERY_WORKER_BEAT_ENABLED: "True"
+      DJANGO_SETTINGS_MODULE: settings.hobby
+      SECRET_KEY: ThEmUsTSecretKEYforBUILDstage123
+      DATABASE_NAME: /var/lib/oncall.db
+      GRAFANA_API_URL: http://localhost:3000
+      UWSGIUSER: uwsgi
+  pipeline:
+    # The following test cases from: https://github.com/grafana/oncall/blob/0419ce516ea304535628d30333b81df0505ae461/docker-compose.yml#L1-L54
+    - name: Check db file
+      runs: |
+        stat /var/lib/oncall/oncall.db
+    - uses: test/tw/ldd-check
+      with:
+        packages: grafana-oncall
+    - name: Ensure manage.py works
+      runs: |
+        # Confirm manage.py loads Django etc. from the venv
+        /usr/share/grafana-oncall/.venv/bin/python /usr/share/grafana-oncall/manage.py help
+    - name: Ensure settings loaded
+      runs: |
+        for s in settings.helm settings.prod_without_db settings.celery_task_routes settings.hobby; do
+          /usr/share/grafana-oncall/.venv/bin/python -c "from $s import *; print('Settings loaded')"
+        done
+    - name: Ensure core binaries are available
+      runs: |
+        /usr/share/grafana-oncall/.venv/bin/celery --help
+        /usr/share/grafana-oncall/.venv/bin/uwsgi --help
+    - name: Run mysql
+      runs: |
+        mkdir -p /var/tmp /var/log/mysql
+        mysqld --initialize-insecure
+        mysqld --user=root &
+        mysqladmin --user=root ping --wait=5
+        # *** Remove the 'mysql_native_password' clause ***
+        mysql --user=root --host=127.0.0.1 -e "
+            ALTER USER 'root'@'localhost'
+            IDENTIFIED BY 'oncall';
+            FLUSH PRIVILEGES;
+        "
+        mysql --user=root --host=127.0.0.1 --password=oncall -e "CREATE DATABASE oncall;"
+    - name: Run manage.py
+      runs: |
+        cd /etc/app
+        /etc/app/manage.py migrate --noinput
+        /etc/app/manage.py runserver -h
+    - working-directory: /etc/app
+      name: "start engine"
+      uses: test/daemon-check-output
+      with:
+        start: env "HOME=/etc/app" /etc/app/manage.py runserver
+        timeout: 30
+        expected_output: |
+          Watching for file changes
+    - name: Run AQMP broker
+      runs: |
+        cat <<EOF >> /tmp/redis.conf
+        dbfilename dump.rdb
+        pidfile /tmp/redis_6379.pid
+        dir /tmp/
+        EOF
+        redis-server /tmp/redis.conf &
+        wait-for-it localhost:6379 --timeout=60
+        redis-cli -p 6379 ping
+    - name: "start celery"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          env "HOME=/etc/app" \
+            "PATH=/usr/share/grafana-oncall/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            /etc/app/celery_with_exporter.sh
+        timeout: 30
+        expected_output: |
+          Connected to redis://localhost:6379/0
+          ready
+          task started
+          succeeded
+          task finished
+    - name: "start engine"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          env "HOME=/etc/app" \
+            "PATH=/usr/share/grafana-oncall/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            uwsgi --ini /etc/app/uwsgi.ini
+        timeout: 30
+        expected_output: |
+          uWSGI http bound
+          spawned uWSGI master
+          spawned uWSGI worker
+          spawned uWSGI http
+    - name: start engine with user should fail
+      runs: |
+        useradd $UWSGIUSER
+        sudo -u $UWSGIUSER env "HOME=/etc/app" \
+            "PATH=/usr/share/grafana-oncall/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            uwsgi --ini /etc/app/uwsgi.ini | grep "No module named 'settings.prod'" # Expect fail same as upstream: "docker container run --rm -it grafana/oncall:latest"

@@ -1,13 +1,19 @@
 package:
   name: contour-1.30
-  version: "1.30.2"
-  epoch: 0
+  version: "1.30.3"
+  epoch: 41
   description: Contour is a Kubernetes ingress controller using Envoy proxy.
   copyright:
     - license: Apache-2.0
   dependencies:
     provides:
       - contour=${{package.full-version}}
+      # REMOVE_POST_USRMERGE - https://github.com/orgs/wolfi-dev/discussions/40270
+      - ${{package.name}}-compat=${{package.full-version}}
+    runtime:
+      - merged-bin
+      - merged-usrsbin
+      - wolfi-baselayout
 
 var-transforms:
   - from: ${{package.version}}
@@ -30,7 +36,13 @@ pipeline:
     with:
       repository: https://github.com/projectcontour/contour
       tag: v${{package.version}}
-      expected-commit: 6a5021dd96f7e1fe1b5859ee7632e8794328c396
+      expected-commit: 32741bb7c4cc0b0ca7f760c574b388164e86e9c5
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/net@v0.36.0
 
   - uses: go/build
     with:
@@ -42,21 +54,15 @@ pipeline:
         -X github.com/projectcontour/contour/internal/build.Branch=$(git rev-parse --abbrev-ref HEAD)
 
 subpackages:
-  - name: ${{package.name}}-compat
-    description: "compat package for contour as expected by envoy"
-    pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/bin
-          ln -s /usr/bin/contour "${{targets.subpkgdir}}"/bin/contour
-    dependencies:
-      provides:
-        - contour-compat=${{package.full-version}}
-
   - name: ${{package.name}}-bitnami-compat
     description: "compat package with bitnami/contour image"
     dependencies:
       provides:
         - contour-bitnami-compat=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - uses: bitnami/compat
         with:
@@ -75,7 +81,45 @@ update:
     tag-filter: v1.30.
 
 test:
+  environment:
+    contents:
+      packages:
+        - kubectl
   pipeline:
-    - runs: |
+    - name: "Basic checks"
+      runs: |
         contour version
         contour --help
+        contour serve --help
+    - name: "Setup KWOK cluster"
+      uses: test/kwok/cluster
+    - name: "Install CRDs"
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/projectcontour/contour/v${{package.version}}/examples/contour/01-crds.yaml
+        kubectl wait --for=condition=Established crd --all --timeout=60s
+    - name: "Launch Contour"
+      runs: |
+        # Dump the KWOK cluster config
+        kubectl config view --minify --raw > /tmp/kwok-kubeconfig.yaml
+
+        contour serve \
+          --kubeconfig /tmp/kwok-kubeconfig.yaml \
+          --disable-leader-election \
+          --insecure \
+          > /tmp/contour.log 2>&1 &
+
+        CONTOUR_PID=$!
+        sleep 5
+
+        if ! kill -0 "$CONTOUR_PID" 2>/dev/null; then
+          echo "ERROR: contour serve exited early. Logs:"
+          cat /tmp/contour.log
+          exit 1
+        fi
+
+        # Check contour is running via log validation.
+        if ! grep -qi "started HTTP server" /tmp/contour.log; then
+          echo "ERROR: 'started HTTP server' not found in logs"
+          cat /tmp/contour.log
+          exit 1
+        fi

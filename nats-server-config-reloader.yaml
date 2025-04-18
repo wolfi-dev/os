@@ -1,0 +1,113 @@
+package:
+  name: nats-server-config-reloader
+  version: "0.17.1"
+  epoch: 2
+  description: "NATS server configuration reloader utility"
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/nats-io/nack.git
+      tag: v${{package.version}}
+      expected-commit: 03e5e930036a5baacc12ef604cd57ad6ff6ada96
+
+  - uses: go/build
+    with:
+      packages: ./cmd/nats-server-config-reloader
+      output: nats-server-config-reloader
+      ldflags: |
+        -X main.BuildTime=$(date -d@${SOURCE_DATE_EPOCH} -u +%Y-%m-%dT%H:%M:%S%z)
+        -X main.GitInfo=$(git rev-parse --abbrev-ref HEAD)-$(git rev-parse --short HEAD)$(git diff --quiet || echo "-dirty")
+        -X main.Version=v${{package.version}}
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compat package for ${{package.name}}"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+          ln -sf /usr/bin/nats-server-config-reloader ${{targets.contextdir}}/usr/local/bin/nats-server-config-reloader
+          ln -sf /usr/local/bin/nats-server-config-reloader ${{targets.contextdir}}/nats-server-config-reloader
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - runs: |
+            /usr/bin/nats-server-config-reloader --help
+            /usr/local/bin/nats-server-config-reloader --help
+            /nats-server-config-reloader --help
+
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint for ${{package.name}}
+    dependencies:
+      runtime:
+        - dash-binsh
+    pipeline:
+      - runs: |
+          install -m755 cicd/assets/entrypoint.sh ${{targets.contextdir}}/entrypoint.sh
+      - uses: strip
+    test:
+      pipeline:
+        - name: "Check expected scripts exist"
+          runs: |
+            stat /entrypoint.sh
+
+update:
+  enabled: true
+  github:
+    identifier: nats-io/nack
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - nats-server
+        - curl
+        - jq
+        - wait-for-it
+  pipeline:
+    - name: "Verify basic installation"
+      runs: |
+        nats-server-config-reloader --version 2>&1 | grep "${{package.version}}"
+        nats-server-config-reloader --help
+    - name: "Test nats-server-config-reloader with nats-server"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          cat <<EOF > /tmp/nats-server.conf
+          pid_file: "/tmp/nats-server.pid"
+          http: 8222
+          EOF
+          nats-server -c /tmp/nats-server.conf -l /tmp/nats-server.log &
+          wait-for-it localhost:8222 --timeout=10
+        start: nats-server-config-reloader -config /tmp/nats-server.conf -pid /tmp/nats-server.pid
+        timeout: 30
+        expected_output: |
+          Watching file: /tmp/nats-server.conf
+        post: |
+          #!/bin/sh -e
+          echo "Modifying config to reload..."
+          cat <<EOF > /tmp/nats-server.conf
+          pid_file: "/tmp/nats-server.pid"
+          http: 8222
+          debug: true
+          EOF
+
+          wait-for-it localhost:8222 --timeout=5
+
+          echo "Checking NATS server logs for reload confirmation..."
+          cat /tmp/nats-server.log
+
+          if ! grep -q "Reloaded: debug = true" /tmp/nats-server.log; then
+            echo "Error: Config reload for debug=true not detected in logs!"
+            exit 1
+          fi
+          echo "Config reload test passed successfully!"

@@ -1,0 +1,172 @@
+package:
+  name: pg_timetable
+  version: "5.12.0"
+  epoch: 0
+  description: Advanced scheduling for PostgreSQL
+  copyright:
+    - license: PostgreSQL
+  dependencies:
+    runtime:
+      - curl
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 63b696d7aa381a1a6428c9e3e31f50a2caad801c
+      repository: https://github.com/cybertec-postgresql/pg_timetable.git
+      tag: v${{package.version}}
+
+  - uses: go/build
+    with:
+      packages: .
+      ldflags: |
+        -X main.version=$(git describe --tags --abbrev=0)
+        -X main.commit=$(git show -s --format=%H HEAD)
+        -X main.date=$(git show -s --format=%cI HEAD)
+      output: pg_timetable
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to place binaries in the location expected by pg_timetable"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -sf /usr/bin/pg_timetable ${{targets.contextdir}}/pg_timetable
+    test:
+      pipeline:
+        - runs: test "$(readlink -fv /pg_timetable)" = "/usr/bin/pg_timetable"
+
+update:
+  enabled: true
+  github:
+    identifier: cybertec-postgresql/pg_timetable
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql
+        - postgresql-client
+        - build-base
+        - shadow
+        - sudo-rs
+        - glibc-locales
+    environment:
+      PGDATA: /tmp/test_db
+      PGUSER: wolfi
+      PGHOST: /tmp
+  pipeline:
+    - name: "Verify pg_timetable Version"
+      runs: |
+        echo "Checking pg_timetable version..."
+        pg_timetable --version | grep ${{package.version}}
+    - name: "Initialize and Start PostgreSQL"
+      runs: |
+        echo "Creating PostgreSQL user..."
+        useradd wolfi
+        echo "Initializing PostgreSQL..."
+        sudo -u wolfi initdb -D /tmp/test_db
+        echo "Starting PostgreSQL..."
+        sudo -u wolfi pg_ctl -D /tmp/test_db -l /tmp/logfile start
+        sleep 5  # Ensure PostgreSQL has time to start
+    - name: "Ensure PostgreSQL is running"
+      runs: |
+        echo "Checking PostgreSQL status..."
+        until pg_isready -h /tmp -U wolfi; do
+          echo "Waiting for PostgreSQL..."
+          sleep 2
+        done
+        echo "PostgreSQL is ready."
+    - name: "Create test database and scheduler user"
+      runs: |
+        echo "Creating test database as user wolfi..."
+        createdb -U wolfi testdb
+
+        echo "Creating timetable database..."
+        createdb -U wolfi timetable
+
+        echo "Creating scheduler user..."
+        psql -U wolfi -d testdb -c "CREATE ROLE scheduler WITH LOGIN SUPERUSER PASSWORD 'scheduler';"
+
+        echo "Granting privileges to scheduler..."
+        psql -U wolfi -d timetable -c "GRANT ALL PRIVILEGES ON DATABASE timetable TO scheduler;"
+        psql -U wolfi -d testdb -c "GRANT ALL PRIVILEGES ON DATABASE testdb TO scheduler;"
+    - name: "Initialize pg_timetable Schema"
+      runs: |
+        echo "check for pg_timetable version"
+        echo "Initializing pg_timetable schema in timetable database..."
+        pg_timetable --init -c "dbname=timetable user=scheduler password=scheduler host=/tmp sslmode=disable"
+
+        echo "Ensuring timetable schema exists..."
+        SCHEMA_EXISTS=$(psql -U scheduler -d timetable -t -A -c \
+          "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'timetable';")
+
+        if [ -z "$SCHEMA_EXISTS" ]; then
+          echo "ERROR: timetable schema is missing in timetable database!"
+          exit 1
+        fi
+    - name: "Create a Simple SQL Task"
+      runs: |
+        echo "Scheduling a simple task in pg_timetable..."
+
+        # Ensure timetable schema exists in the correct database
+        SCHEMA_EXISTS=$(psql -U scheduler -d timetable -t -A -c \
+          "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'timetable';")
+
+        if [ -z "$SCHEMA_EXISTS" ]; then
+          echo "ERROR: timetable schema is missing in timetable database!"
+          exit 1
+        fi
+
+        # Create a test chain and extract only the chain_id
+        CHAIN_ID=$(psql -U scheduler -d timetable -t -A -c \
+          "INSERT INTO timetable.chain (chain_name, live) VALUES ('Test Task', TRUE) RETURNING chain_id;" | head -n 1)
+
+        if [ -z "$CHAIN_ID" ]; then
+          echo "ERROR: Failed to create chain!"
+          exit 1
+        fi
+
+        echo "CHAIN_ID is $CHAIN_ID"
+
+        # Create a simple task in the chain
+        psql -U scheduler -d timetable -c \
+          "INSERT INTO timetable.task (chain_id, task_order, kind, command)
+          VALUES ($CHAIN_ID, 1, 'SQL', 'SELECT now();');"
+
+        echo "Task scheduled successfully."
+    - name: "Start and Test pg_timetable"
+      uses: test/daemon-check-output
+      with:
+        start: pg_timetable -c "dbname=timetable user=scheduler password=scheduler host=/tmp sslmode=disable"
+        timeout: 30
+        expected_output: |
+          Accepting asynchronous chains execution requests
+          Retrieve scheduled chains to run
+          Starting chain
+          Starting task
+          Task executed successfully
+          Chain executed successfully
+        post: |
+          echo "Checking if task executed..."
+
+          # Print pg_timetable logs for debugging
+          cat /tmp/pg_timetable.log
+
+          # Check execution log count
+          RESULT=$(psql -U scheduler -d timetable -t -A -c "SELECT count(*) FROM timetable.execution_log;" | tr -d '[:space:]')
+
+          # Retrieve and print execution logs
+          echo "Execution Log Entries:"
+          psql -U scheduler -d timetable -c "SELECT * FROM timetable.execution_log ORDER BY finished DESC LIMIT 10;"
+
+          if [ -z "$RESULT" ]; then
+            echo "ERROR: timetable.execution_log does not exist in timetable database!"
+            exit 1
+          elif [ "$RESULT" -eq 0 ]; then
+            echo "ERROR: No execution logs found, task may not have run!"
+            exit 1
+          else
+            echo "SUCCESS: Task executed correctly!"
+          fi

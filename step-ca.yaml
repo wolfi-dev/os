@@ -1,6 +1,6 @@
 package:
   name: step-ca
-  version: 0.28.1
+  version: "0.28.3"
   epoch: 2
   description: A private certificate authority (X.509 & SSH) & ACME server for secure automated certificate management, so you can use TLS everywhere & SSO for SSH.
   copyright:
@@ -9,27 +9,30 @@ package:
 environment:
   contents:
     packages:
-      - busybox
-      - ca-certificates-bundle
-      - go
+      - pcsc-lite-dev
+      - step
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/smallstep/certificates
       tag: v${{package.version}}
-      expected-commit: d327203c1c2a1900bd019a0d9b38bd280fbd5c24
+      expected-commit: 0cf1c5688708ec4a910c007d7f151c617b722268
 
   - uses: go/bump
     with:
-      deps: golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.33.0
+      deps: |-
+        github.com/golang-jwt/jwt/v5@v5.2.2
+      modroot: .
 
-  - runs: |
-      CGO_ENABLED=0 go build -v \
-        -ldflags='-w -X "main.Version=${{package.version}}"' \
-        -o "${{targets.destdir}}/usr/bin/step-ca" ./cmd/step-ca
-
-  - uses: strip
+  - uses: go/build
+    with:
+      modroot: .
+      packages: ./cmd/step-ca
+      output: step-ca
+      ldflags: |
+        -X main.Version=${{package.version}}
+        -X main.BuildTime=$(date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
 
 update:
   enabled: true
@@ -42,35 +45,30 @@ test:
     contents:
       packages:
         - step
+        - wait-for-it
   pipeline:
     - name: Verify step-ca installation
       runs: |
-        step-ca --version
+        step-ca --version | grep -q "${{package.version}}"
         step-ca --help
-    - name: Start step-ca server
-      runs: |
-        echo $RANDOM > password.txt
-        step ca init --name "Example Inc." \
-          --dns localhost \
-          --address 127.0.0.1:8443 \
-          --provisioner=bob@example.com \
-          --password-file=password.txt 2>&1 | grep -vi root
-        step-ca $(step path)/config/ca.json --password-file password.txt &
-        sleep 2
-    - name: Test step-ca server
-      runs: |
-        step ca health
-
-        # Create a certificate
-        step ca certificate svc.example.com svc.crt svc.key --password-file password.txt
-        [ -f svc.crt ]
-        [ -f svc.key ]
-
-        # Verify the provisioner
-        step certificate inspect svc.crt --short | grep "bob@example.com"
-
-        step ca revoke --cert svc.crt --key svc.key
-    - name: Cleanup
-      runs: |
-        rm -f password.txt svc.crt svc.key
-        pkill step-ca
+    - name: "Start step-ca server"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          echo $RANDOM > password.txt
+          step ca init --name "Example Inc." \
+            --dns localhost \
+            --address 127.0.0.1:8443 \
+            --provisioner=bob@example.com \
+            --password-file=password.txt 2>&1 | grep -vi root
+        start: "step-ca $(step path)/config/ca.json --password-file password.txt"
+        timeout: 30
+        expected_output: |
+          Serving HTTPS
+        post: |
+          wait-for-it -t 10 --strict localhost:8443 -- echo "Server is up"
+          step ca health | grep -qi "ok"
+          step ca certificate svc.example.com svc.crt svc.key --password-file password.txt
+          stat svc.crt svc.key
+          step certificate inspect svc.crt --short | grep "bob@example.com"
+          step ca revoke --cert svc.crt --key svc.key 2>&1 | grep -qi "has been revoked"

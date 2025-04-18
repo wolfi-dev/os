@@ -1,0 +1,193 @@
+package:
+  name: liquibase
+  version: "4.31.1"
+  epoch: 0
+  description: "Liquibase is a database schema change management solution that enables you to revise and release database changes faster and safer from development to production."
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - liquibase-package-manager
+      - openjdk-${{vars.java-version}}-default-jvm
+
+vars:
+  java-version: '17'
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - maven
+      - openjdk-${{vars.java-version}}-default-jdk
+      - wolfi-base
+  environment:
+    LANG: en_US.UTF-8
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/liquibase/liquibase
+      tag: v${{package.version}}
+      expected-commit: 12ab20b176e5659622c240b4ba4f056ccf17c27d
+
+  - uses: maven/pombump
+    with:
+      pom: liquibase-dist/pom.xml
+
+  - name: Setup
+    runs: |
+      # Reversion liquibase.build.properties
+      # REF: https://github.com/liquibase/liquibase/blob/master/.github/util/re-version.sh#L87
+      sed -i -e "s/build.version=.*/build.version=${{package.version}}/" liquibase-standard/src/main/resources/liquibase.build.properties
+
+  - name: Build
+    runs: |
+      # Build liquibase
+      ./mvnw -B clean package -DskipTests=true -P !liquibase-commercial
+
+  - name: Install
+    runs: |
+      # Setup destination dir
+      mkdir -p ${{targets.destdir}}/opt/java
+      mkdir -p ${{targets.destdir}}/usr/share/java/liquibase
+      tar -zxvf liquibase-dist/target/${{package.name}}-0-SNAPSHOT.tar.gz -C ${{targets.destdir}}/usr/share/java/liquibase
+      ln -sf /usr/lib/jvm/default-jvm ${{targets.destdir}}/opt/java/openjdk
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: liquibase/liquibase
+    strip-prefix: v
+
+test:
+  environment:
+    environment:
+      SQLITE_URL: jdbc:sqlite:/tmp/test.db
+      LIQUIBASE_HOME: /usr/share/java/liquibase
+    contents:
+      packages:
+        - sqlite
+        - bash
+        - liquibase-package-manager
+        - liquibase-docker
+  pipeline:
+    - name: Test CLI basics
+      runs: |
+        liquibase --version
+    - name: Test Liquibase Changelogs
+      runs: |
+        # Setup sqlite database
+        sqlite3 /tmp/test.db "CREATE TABLE test (id INT, name TEXT); INSERT INTO test VALUES (1, 'hello');"
+
+        # Setup liquibase test project dir
+        mkdir -p $LIQUIBASE_HOME/test
+
+        # Create changlog file
+        cat <<'EOF' >> $LIQUIBASE_HOME/test/example-changelog.sql
+        --liquibase formatted sql
+
+        --changeset your.name:1 labels:example-label context:example-context
+        --comment: example comment
+        create table person (
+            id integer primary key autoincrement not null,
+            name varchar(50) not null,
+            address1 varchar(50),
+            address2 varchar(50),
+            city varchar(30)
+        )
+        --rollback DROP TABLE person;
+
+        --changeset your.name:2 labels:example-label context:example-context
+        --comment: example comment
+        create table company (
+            id integer primary key autoincrement not null,
+            name varchar(50) not null,
+            address1 varchar(50),
+            address2 varchar(50),
+            city varchar(30)
+        )
+        --rollback DROP TABLE company;
+
+        --changeset other.dev:3 labels:example-label context:example-context
+        --comment: example comment
+        alter table person add column country varchar(2)
+        --rollback ALTER TABLE person DROP COLUMN country;
+        EOF
+
+        cd $LIQUIBASE_HOME
+
+        # Check status
+        liquibase status --url="$SQLITE_URL" --changelog-file=test/example-changelog.sql
+
+        # Inspect sql
+        liquibase update-sql --url="$SQLITE_URL" --changelog-file=test/example-changelog.sql
+
+        # Run changlog update
+        liquibase update --url="$SQLITE_URL" --changelog-file=test/example-changelog.sql
+
+        # Verify tables were created
+        sqlite3 /tmp/test.db ".tables" | grep -q "company"
+        sqlite3 /tmp/test.db ".tables" | grep -q "person"
+    - name: Test rollback
+      runs: |
+        cd $LIQUIBASE_HOME
+
+        # Tag the initial revision.
+        liquibase --url="$SQLITE_URL" tag firsttag
+        liquibase --url="$SQLITE_URL" history 2>/dev/null | grep -q firsttag
+
+        # Rollout a new revision.
+        cat <<"EOF" >$LIQUIBASE_HOME/test/update-changelog.sql
+        --liquibase formatted sql
+        -- ChangeSet your.name:add-column
+        alter table company add column employees int;
+        EOF
+        liquibase --url="$SQLITE_URL" update --changelog-file=test/update-changelog.sql
+        sqlite3 /tmp/test.db '.schema company' | grep -q employees
+
+        # Tag the new revision.
+        liquibase --url="$SQLITE_URL" tag secondtag
+        liquibase --url="$SQLITE_URL" history 2>/dev/null | grep -q firsttag
+        liquibase --url="$SQLITE_URL" history 2>/dev/null | grep -q secondtag
+
+        # Rollback to the initial revision.
+        liquibase --url="$SQLITE_URL" rollback --tag=firsttag --changelog-file=test/example-changelog.sql
+    - name: Test LPM CLI basics
+      runs: |
+        lpm --version
+        lpm --help
+    - name: Test LPM add operation
+      runs: |
+        # Add one package
+        lpm add liquibase-postgresql@4.5.0
+
+        # Verify package
+        stat $(pwd)/liquibase_libs/liquibase-postgresql-4.5.0.jar
+
+        # Add multiple packages
+        lpm add mariadb snowflake sybase firebird sqlite
+
+        # Verify packages
+        for pkg in firebird-3.5.0.jar snowflake-jdbc-3.22.0.jar sqlite-jdbc-3.49.1.0.jar sybase-3.5.0.jar mariadb-java-client-3.5.2.jar; do
+          find $(pwd)/liquibase_libs/ -name "$pkg" -type f
+        done
+    - name: Test LPM install
+      runs: |
+        # Remove liquibase_libs dir
+        rm -rf $(pwd)/liquibase_libs
+
+        # Test install from liquibase.json
+        lpm install
+
+        # Verify packages
+        for pkg in liquibase-postgresql-4.5.0.jar firebird-3.5.0.jar snowflake-jdbc-3.22.0.jar sqlite-jdbc-3.49.1.0.jar sybase-3.5.0.jar mariadb-java-client-3.5.2.jar; do
+          find $(pwd)/liquibase_libs/ -name "$pkg" -type f
+        done
+    - name: Test LPM remove
+      runs: |
+        # Remove installed packages
+        lpm rm liquibase-postgresql mariadb snowflake sybase firebird sqlite

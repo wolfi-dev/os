@@ -1,7 +1,7 @@
 package:
   name: ksops
-  version: 4.3.2
-  epoch: 5
+  version: "4.3.3"
+  epoch: 8
   description: Flexible Kustomize Plugin for SOPS Encrypted Resources
   copyright:
     - license: Apache-2.0
@@ -21,11 +21,16 @@ pipeline:
     with:
       repository: https://github.com/viaduct-ai/kustomize-sops.git
       tag: v${{package.version}}
-      expected-commit: 7f6baaa40b4e419bc3c8523e341090de04f3aa73
+      expected-commit: 294de9d6ac8c47a61d5ee14a79b6f216de65f872
 
   - uses: go/bump
     with:
-      deps: google.golang.org/grpc@v1.64.1 golang.org/x/crypto@v0.31.0 filippo.io/age@v1.2.1 golang.org/x/net@v0.33.0
+      deps: |-
+        github.com/go-jose/go-jose/v4@v4.0.5
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/net@v0.36.0
+        github.com/golang-jwt/jwt/v5@v5.2.2
 
   - uses: go/build
     with:
@@ -34,7 +39,30 @@ pipeline:
 
   - uses: strip
 
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/ksops "${{targets.contextdir}}"/usr/local/bin/ksops
+          ln -sf /usr/bin/ksops "${{targets.contextdir}}"/usr/local/bin/kustomize-sops
+          ln -sf /usr/bin/kustomize "${{targets.contextdir}}"/usr/local/bin/kustomize
+    test:
+      pipeline:
+        - name: Check symlink
+          runs: |
+            stat /usr/local/bin/ksops
+            stat /usr/local/bin/kustomize-sops
+            stat /usr/local/bin/kustomize
+
 test:
+  environment:
+    contents:
+      packages:
+        - sops
+        - age
+        - yq
   pipeline:
     - name: Verify binary presence and permissions
       runs: |
@@ -66,6 +94,55 @@ test:
 
         # Test if kustomize can find and recognize the plugin
         kustomize build . | grep -q "test-config" || { echo "Failed to find test resource in output"; exit 1; }
+    - name: Standalone decryption test
+      runs: |
+        # Generate an AGE key pair and store it in a file
+        age-keygen -o age-key.txt
+
+        # Extract the public key from the generated key file
+        AGE_PUBLIC_KEY=$(grep -oE 'age1[0-9a-z]+' age-key.txt)
+
+        # Create a sample Kubernetes Secret
+        cat <<EOF > secret.yaml
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: test-secret
+        type: Opaque
+        data:
+          username: YWRtaW4=
+          password: MWYyZDFlMmU2N2Rm
+        EOF
+
+        # Encrypt the Secret using SOPS with the extracted AGE public key
+        cat <<EOF > .sops.yaml
+        creation_rules:
+          - unencrypted_regex: "^(apiVersion|metadata|kind|type)$"
+            age: "$AGE_PUBLIC_KEY"
+        EOF
+
+        sops -e secret.yaml > secret.enc.yaml
+
+        # Define KSOPS Manifest
+        cat <<EOF > secret-generator.yaml
+        apiVersion: viaduct.ai/v1
+        kind: ksops
+        metadata:
+          name: test-secret-generator
+        files:
+          - ./secret.enc.yaml
+        EOF
+
+        # Use KSOPS standalone to decrypt the secret (by passing the private key file)
+        SOPS_AGE_KEY_FILE=age-key.txt ksops secret-generator.yaml > decrypted-secret.yaml
+
+        # Verify that the decrypted secret matches the original secret
+        diff <(yq eval 'del(.metadata)' secret.yaml) <(yq eval 'del(.metadata)' decrypted-secret.yaml)
+
+        echo "KSOPS standalone decryption test PASSED."
+
+        # Cleanup: Remove test files
+        rm -f age-key.txt secret.yaml secret.enc.yaml decrypted-secret.yaml .sops.yaml secret-generator.yaml
 
 update:
   enabled: true

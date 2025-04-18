@@ -1,36 +1,54 @@
 package:
   name: flux-notification-controller
-  version: 1.4.0
-  epoch: 3
+  version: "1.5.0"
+  epoch: 7
   description: The GitOps Toolkit event forwarded and notification dispatcher
   copyright:
     - license: Apache-2.0
 
-environment:
-  contents:
-    packages:
-      - busybox
-      - ca-certificates-bundle
-      - go
-
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 2525f2ce4eea91adbfb609c3c6588a765e517bd7
+      expected-commit: 85d897c59d451ae0e37ddc9cb8c05d410ff6dca2
       repository: https://github.com/fluxcd/notification-controller
       tag: v${{package.version}}
 
   - uses: go/bump
     with:
-      deps: github.com/golang-jwt/jwt/v4@v4.5.1 golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.33.0
+      deps: |-
+        golang.org/x/net@v0.38.0
+      modroot: api
 
-  - runs: |
-      mkdir -p "${{targets.destdir}}"/usr/bin
-      CGO_ENABLED=0 go build \
-        -ldflags="-X main.Version=${{package.version}}" \
-        -trimpath -a -o "${{targets.destdir}}"/usr/bin/notification-controller .
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
+        github.com/golang-jwt/jwt/v4@v4.5.2
+        github.com/golang-jwt/jwt/v5@v5.2.2
+        golang.org/x/net@v0.38.0
 
-  - uses: strip
+  - uses: go/build
+    with:
+      packages: .
+      output: notification-controller
+      ldflags: -X main.Version=${{package.version}}
+
+subpackages:
+  - name: ${{package.name}}-bitnami-compat
+    description: "Compatibility package for usage with the Bitnami helm chart."
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/fluxcd-notification-controller/bin/
+          ln -sf /usr/bin/notification-controller ${{targets.contextdir}}/opt/bitnami/fluxcd-notification-controller/bin/notification-controller
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        # the test is extensive in the main package and this is the same binary invoked via a symlink.
+        - runs: |
+            /opt/bitnami/fluxcd-notification-controller/bin/notification-controller --help 2>&1 | grep -i "Usage of /opt/bitnami/fluxcd-notification-controller/bin/notification-controller"
 
 update:
   enabled: true
@@ -39,6 +57,7 @@ update:
     strip-prefix: v
     tag-filter: v
 
+# only passes with docker runner: `MELANGE_EXTRA_OPTS="--runner docker" make test/flux-notification-controller`
 test:
   environment:
     contents:
@@ -46,9 +65,23 @@ test:
         - curl
   pipeline:
     - uses: test/kwok/cluster
-    - name: Verify notification-controller installation
-      runs: |
-        kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
-        kubectl wait --for=condition=Ready nodes --all
-        notification-controller --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1 & \
-        sleep 5; curl -s localhost:8081/metrics  | grep rest_client_requests_total
+    - name: "start ${{package.name}} and test"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
+          kubectl wait --for=condition=Ready nodes --all
+        start: notification-controller --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1
+        timeout: 30
+        expected_output: |
+          starting event server
+          starting webhook receiver server
+          starting manager
+          notification.toolkit.fluxcd.io
+          Starting Controller
+          Starting workers
+        post: |
+          #!/bin/sh -e
+          set -o pipefail
+          curl -s localhost:8081/metrics  | grep rest_client_requests_total
+          curl -v localhost:9441/healthz 2>&1 | grep -i "200 OK"

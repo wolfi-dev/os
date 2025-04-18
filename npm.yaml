@@ -1,7 +1,8 @@
+# downgraded to 11.2.0 until https://github.com/npm/cli/issues/8216 is resolved
 package:
   name: npm
-  version: 11.0.0
-  epoch: 0
+  version: "11.2.0"
+  epoch: 2
   description: "the npm package manager for javascript, mainline"
   copyright:
     - license: Artistic-2.0
@@ -17,7 +18,7 @@ pipeline:
   - uses: fetch
     with:
       uri: https://registry.npmjs.org/npm/-/npm-${{package.version}}.tgz
-      expected-sha512: 11dff29565d2297c74e7c594a9762581bde969f0aa5cbe6f5b3644bf008a16c065ece61094d9ffbb81125be38df8e1ba43eb8244b3d30c61eb797e9a2440e3ec
+      expected-sha512: 3dc9c50ba813a3d54393155a435fe66404b72685ab0e3008f9ae9ed8d81f6104860f07ed2656dd5748c1322d95f3140fa9b19c59a6bba7750fd12285f81866da
       delete: true
 
   - runs: |
@@ -82,6 +83,9 @@ subpackages:
     description: "npm documentation"
     pipeline:
       - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/docs
 
 update:
   enabled: true
@@ -98,6 +102,7 @@ test:
     contents:
       packages:
         - nodejs
+        - python3
     environment:
       HOME: /home/build
   pipeline:
@@ -108,3 +113,59 @@ test:
         npm help
         npx --version
         npx --help
+    - runs: |
+        # Reproduce https://github.com/npm/cli/issues/8216: create a
+        # package-lock.json and then attempt to use a registry at a non-/
+        # prefix with `npm install`
+
+        cat << EOF > proxy.py
+        import http.server
+        import socketserver
+        import urllib.request
+
+        class MyProxy(http.server.SimpleHTTPRequestHandler):
+
+            def do_GET(self):
+                if not self.path.startswith("/prefix"):
+                  self.send_response(404)
+                  self.end_headers()
+                  self.wfile.write(b"Unprefixed!\n")
+                  return
+                path = self.path.replace("/prefix", "")
+                url = f"https://registry.npmjs.org/{path}"
+                self.send_response(200)
+                self.end_headers()
+                self.copyfile(urllib.request.urlopen(url), self.wfile)
+
+        PORT = 7777
+
+        httpd = None
+
+        try:
+            httpd = socketserver.TCPServer(('', PORT), MyProxy)
+            print(f"Proxy at: http://localhost:{PORT}")
+            httpd.serve_forever()
+        finally:
+            if httpd:
+                httpd.shutdown()
+        EOF
+
+        # Run a proxy which strips "prefix/" from URLs, which should work as an
+        # NPM registry rooted at /prefix
+        python3 proxy.py &
+        sleep 1
+
+        # Create a package-lock.json
+        npm install rightpad
+        # Ensure npm will find something to do
+        rm -rf node_modules .npm
+
+        # Set our registry
+        npm config set registry http://localhost:7777/prefix/
+
+        # npm will use the scheme of `resolved` regardless of registry setting,
+        # so avoid the need to terminate SSL in our proxy
+        sed -i 's/https/http/' package-lock.json
+
+        # Attempt an install
+        npm install --loglevel silly

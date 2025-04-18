@@ -1,13 +1,17 @@
 package:
   name: calico-3.29
-  version: 3.29.1
-  epoch: 3
+  version: "3.29.3"
+  epoch: 42
   description: "Cloud native networking and network security"
   copyright:
     - license: Apache-2.0
   dependencies:
     provides:
       - calico=${{package.full-version}}
+    runtime:
+      - merged-bin
+      - merged-usrsbin
+      - wolfi-baselayout
   resources:
     cpu: 4
     memory: 12Gi
@@ -64,11 +68,30 @@ pipeline:
     with:
       repository: https://github.com/projectcalico/calico
       tag: v${{package.version}}
-      expected-commit: ddfc3b1ea724e2580c68d34950f0ccd318ae3ebf
+      expected-commit: b5d7d74c111d943251b61827ea88d9e5518f823b
+  - runs: |
+      # apiserver/cmd/apiserver
+      sed -i '/_ "k8s.io\/code-generator\/cmd\/import-boss"/s/^/\/\//g' apiserver/cmd/apiserver/tools.go
+      sed -i '/_ "k8s.io\/code-generator\/cmd\/openapi-gen"/s/^/\/\//g' apiserver/cmd/apiserver/tools.go
+      sed -i '/_ "k8s.io\/code-generator\/cmd\/set-gen"/s/^/\/\//g' apiserver/cmd/apiserver/tools.go
+      # libcaliico-go
+      sed -i '/_ "k8s.io\/code-generator\/cmd\/import-boss"/s/^/\/\//g' libcalico-go/tools.go
+      sed -i '/_ "k8s.io\/code-generator\/cmd\/set-gen"/s/^/\/\//g' libcalico-go/tools.go
+      # updates all x.30.9 to x.30.11
+      sed -i 's/\.30\.9/\.30\.11/g' go.mod
   - uses: go/bump
     with:
-      deps: golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.33.0
-      replaces: golang.org/x/crypto=golang.org/x/crypto@v0.31.0
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
+  # Because we are using tigera-operator during image test we are reliant on tigera-operator setting
+  # up all the required rbac rules that are needed for calico-apiserver to run. Currently it does not and
+  # this is a temporary solution until https://github.com/tigera/operator/issues/3780 is resolved upstream with a new
+  # release of tigera-operator. This issue was highlighed in calico-apiserver 3.29.2 when Validating Admission Policy
+  # became enabled by default. This patch disables the Validating Admission Policy in calico-apiserver until
+  # the issue is resolved.
+  - uses: patch
+    with:
+      patches: calico-apiserver-disable-validating-admission-policy.patch
   - working-directory: felix
     pipeline:
       # Equivalent to target: "build-bpf"
@@ -137,26 +160,29 @@ subpackages:
       provides:
         - calico-node=${{package.full-version}}
       runtime:
-        - runit
         - bash # required for logging functionality to work since `start_runit` logging script uses #!/bin/bash
-        - iptables
+        - conntrack-tools
+        - glibc
         - ip6tables
+        - iproute2
         - ipset
-        - libpcap
-        - libelf
-        - zlib
+        - iptables
         - libbpf
         # listed in Dockerfile, but not sure if they're build dependencies (for iptables) or runtime
+        - libelf
         - libmnl
-        - libnfnetlink
         - libnetfilter_conntrack
-        - iproute2
-        - procps
-        - conntrack-tools
         - libnetfilter_cthelper
         - libnetfilter_cttimeout
         - libnetfilter_queue
-        - glibc
+        - libnfnetlink
+        - libpcap
+        - merged-bin
+        - merged-usrsbin
+        - procps
+        - runit
+        - wolfi-baselayout
+        - zlib
     pipeline:
       - assertions:
           required-steps: 2
@@ -183,7 +209,7 @@ subpackages:
                 CGO_CFLAGS="$CGO_CFLAGS" \
                 go build -v -tags cgo -v -buildvcs=false \
                 -ldflags "$LDFLAGS" \
-                -o "${{targets.subpkgdir}}"/bin/calico-node \
+                -o "${{targets.subpkgdir}}"/usr/bin/calico-node \
                 ./node/cmd/calico-node
           # Equivalent to target: "$(TOOLS_MOUNTNS_BINARY)"
           - runs: |
@@ -198,7 +224,7 @@ subpackages:
                 CGO_LDFLAGS="$CGO_LDFLAGS" \
                 CGO_CFLAGS="$CGO_CFLAGS" \
                 go build -v -tags cgo -v -buildvcs=false \
-                -o "${{targets.subpkgdir}}"/bin/mountns \
+                -o "${{targets.subpkgdir}}"/usr/bin/mountns \
                 ./node/cmd/mountns
       # Equivalent to target: "$(FELIX_GPL_SOURCE)"
       - working-directory: node
@@ -212,19 +238,18 @@ subpackages:
           touch $_target
       # Filesystem prep
       - runs: |
-          # BIRD needs to run with root permissions, so put them in /bin/ to remember
-          mkdir -p "${{targets.subpkgdir}}"/bin
-          find bird/dist -type f -name 'bird*' -exec cp {} "${{targets.subpkgdir}}"/bin \;
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          find bird/dist -type f -name 'bird*' -exec cp {} "${{targets.subpkgdir}}"/usr/bin \;
 
           mkdir -p "${{targets.subpkgdir}}"/etc \
                    "${{targets.subpkgdir}}"/included-source \
                    "${{targets.subpkgdir}}"/licenses \
-                   "${{targets.subpkgdir}}"/usr/sbin
+                   "${{targets.subpkgdir}}"/usr/bin
 
           cp -avR ./node/filesystem/etc "${{targets.subpkgdir}}"/
           cp -avR ./node/filesystem/included-source "${{targets.subpkgdir}}"/
           cp -avR ./node/filesystem/usr "${{targets.subpkgdir}}"/
-          cp -avR ./node/filesystem/sbin/* "${{targets.subpkgdir}}"/usr/sbin/
+          cp -avR ./node/filesystem/sbin/* "${{targets.subpkgdir}}"/usr/bin/
           cp ./node/LICENSE "${{targets.subpkgdir}}"/licenses/
 
           # TODO: Proper fix for this
@@ -236,11 +261,14 @@ subpackages:
       provides:
         - calico-felix=${{package.full-version}}
       runtime:
-        - iproute2
-        - libelf
-        - zlib
-        - libbpf
         - glibc
+        - iproute2
+        - libbpf
+        - libelf
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+        - zlib
     pipeline:
       - working-directory: felix
       - runs: |
@@ -311,12 +339,15 @@ subpackages:
       provides:
         - calico-cni=${{package.full-version}}
       runtime:
-        - flannel-cni-plugin
-        - cni-plugins-loopback
+        - cni-plugins-bandwidth
         - cni-plugins-host-local
+        - cni-plugins-loopback
         - cni-plugins-portmap
         - cni-plugins-tuning
-        - cni-plugins-bandwidth
+        - flannel-cni-plugin
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       # NOTE: cni is a multicall binary: https://github.com/projectcalico/calico/blob/master/cni-plugin/cmd/calico/calico.go
       # install is not a part of that multicall binary anymore (as of calico 3.27.1)
@@ -352,12 +383,15 @@ subpackages:
         - calico-cni-compat=${{package.full-version}}
       runtime:
         - calico-cni
-        - flannel-cni-plugin-compat
-        - cni-plugins-loopback-compat
+        - cni-plugins-bandwidth-compat
         - cni-plugins-host-local-compat
+        - cni-plugins-loopback-compat
         - cni-plugins-portmap-compat
         - cni-plugins-tuning-compat
-        - cni-plugins-bandwidth-compat
+        - flannel-cni-plugin-compat
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/opt/cni/bin
@@ -371,6 +405,9 @@ subpackages:
         - calico-apiserver=${{package.full-version}}
       runtime:
         - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - uses: go/build
         with:
@@ -384,6 +421,10 @@ subpackages:
     dependencies:
       provides:
         - calico-apiserver-compat=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/code
@@ -395,6 +436,9 @@ subpackages:
         - calico-key-cert-provisioner=${{package.full-version}}
       runtime:
         - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - uses: go/build
         with:
@@ -408,6 +452,9 @@ subpackages:
         - calico-app-policy=${{package.full-version}}
       runtime:
         - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - uses: go/build
         with:
@@ -427,6 +474,9 @@ subpackages:
         - calico-kube-controllers=${{package.full-version}}
       runtime:
         - glibc-dev
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - uses: go/build
         with:
@@ -448,6 +498,9 @@ subpackages:
         - calico-pod2daemon=${{package.full-version}}
       runtime:
         - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - uses: go/build
         with:
@@ -472,6 +525,10 @@ subpackages:
     dependencies:
       provides:
         - calico-pod2daemon-flexvol-compat=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/local/bin
@@ -482,6 +539,10 @@ subpackages:
     dependencies:
       provides:
         - calicoctl=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - uses: go/build
         with:
@@ -497,6 +558,9 @@ subpackages:
         - calico-typhad=${{package.full-version}}
       runtime:
         - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       # TODO: I'm not sure yet if this actually needs CGO, or is just enabled upstream because of go-fips
       - runs: |
@@ -525,6 +589,9 @@ subpackages:
         - calico-typha-client=${{package.full-version}}
       runtime:
         - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       # TODO: I'm not sure yet if this actually needs CGO, or is just enabled upstream because of go-fips
       - runs: |
@@ -568,7 +635,7 @@ test:
         /usr/bin/calico-pod2daemon-csidriver --help
         /usr/bin/calico-pod2daemon-flexvol  --help
         /usr/bin/calico-kube-controllers --help
-        /usr/sbin/start_runit 2>&1 | grep -q 'no configuration has been provided'
+        /usr/bin/start_runit 2>&1 | grep -q 'no configuration has been provided'
         /usr/bin/calico-typha --help
         /usr/bin/typha-client --help
     - name: Test compat package paths

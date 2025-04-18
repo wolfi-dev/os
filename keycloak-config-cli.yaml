@@ -1,0 +1,213 @@
+package:
+  name: keycloak-config-cli
+  version: 6.4.0
+  epoch: 40
+  description: Import YAML/JSON-formatted configuration files into Keycloak - Configuration as Code for Keycloak.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - merged-usrsbin
+      - openjdk-21-jre
+      - wolfi-baselayout
+
+# Create a new major-version variable that contains only the major version
+# to use in the bitnami/compat pipeline to find out the correct folder for the image.
+# e.g. 25.0.2 will create a new var major-version=25
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - bash-binsh
+      - busybox
+      - gnutar
+      - openjdk-21-default-jdk
+  environment:
+    LANG: en_US.UTF-8
+    JAVA_HOME: /usr/lib/jvm/java-21-openjdk
+    KEYCLOAK_VERSION: "26.1.0"
+    KEYCLOAK_CLIENT_VERSION: "26.0.4"
+    MAVEN_CLI_OPTS: '-ntp --batch-mode --errors --fail-at-end --show-version -Dmaven.wagon.httpconnectionManager.ttlSeconds=60 -Dmaven.wagon.http.retryHandler.count=3 -Dstyle.color=always'
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/adorsys/${{package.name}}
+      tag: v${{package.version}}
+      expected-commit: 373ce996d332508be6e375d7bdf221307bddb330
+
+  - uses: patch
+    with:
+      patches: springboot-parent.patch
+
+  - uses: maven/pombump
+
+  - runs: |
+      ./mvnw ${MAVEN_CLI_OPTS} clean package \
+        -Dcheckstyle.skip \
+        -Dkeycloak.client.version=${KEYCLOAK_CLIENT_VERSION} \
+        -Dkeycloak.version=${KEYCLOAK_VERSION} \
+        -Dlicense.skipCheckLicense \
+        -Dmaven.gitcommitid.skip=true \
+        -Dmaven.javadoc.skip=true \
+        -Dmaven.site.skip=true \
+        -Dmaven.test.skip=true \
+        -DskipTests
+
+      mkdir -p ${{targets.contextdir}}/usr/share/java/${{package.name}}
+      cp ./target/${{package.name}}.jar ${{targets.contextdir}}/usr/share/java/${{package.name}}/
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package to align with counterpart non-Bitnami image
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/app
+          mkdir -p ${{targets.contextdir}}/opt/java
+
+          ln -sf ${JAVA_HOME} ${{targets.contextdir}}/opt/java/openjdk
+          ln -sf /usr/share/java/${{package.name}}/${{package.name}}.jar ${{targets.contextdir}}/app/${{package.name}}.jar
+    test:
+      pipeline:
+        - runs: stat /app/${{package.name}}.jar | grep "/usr/share/java/${{package.name}}/${{package.name}}.jar"
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: ${{package.name}}-bitnami-compat
+    description: Compat package with bitnami/keycloak-config-cli image
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: ${{package.name}}
+          version-path: ${{vars.major-version}}/debian-12
+      - runs: |
+          # Build packages for earlier versions of Keycloak
+          mkdir -p ${{targets.contextdir}}/usr/share/java/${{package.name}}
+
+          for versions in 26.0.5,26.0.2 25.0.1,25.0.1 24.0.5,24.0.5
+          do
+            IFS=, read -ra keycloak_versions <<< "${versions}"
+            IFS=. read -ra keycloak_semver <<< "${keycloak_versions[0]}"
+
+            if [ "${keycloak_semver[0]}" -lt 26 ]
+            then
+              compatibility='-Ppre-keycloak26'
+            else
+              unset compatibility
+            fi
+
+            ./mvnw ${MAVEN_CLI_OPTS} clean package \
+              -Dcheckstyle.skip \
+              -Dkeycloak.client.version="${keycloak_versions[1]}" \
+              -Dkeycloak.version="${keycloak_versions[0]}" \
+              -Dlicense.skipCheckLicense \
+              -Dmaven.gitcommitid.skip=true \
+              -Dmaven.javadoc.skip=true \
+              -Dmaven.site.skip=true \
+              -Dmaven.test.skip=true \
+              -DskipTests \
+              $compatibility
+
+            cp ./target/${{package.name}}.jar ${{targets.contextdir}}/usr/share/java/${{package.name}}/${{package.name}}-${keycloak_versions[0]}.jar
+          done
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/bitnami
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/${{package.name}}
+
+          for version in ${KEYCLOAK_VERSION} 26.0.5 25.0.1 24.0.5
+          do
+            ln -sf /usr/share/java/${{package.name}}/${{package.name}}-$version.jar ${{targets.contextdir}}/opt/bitnami/${{package.name}}/${{package.name}}-$version.jar
+          done
+
+          ln -sf ${JAVA_HOME} ${{targets.contextdir}}/opt/bitnami/java
+          ln -sf /usr/share/java/${{package.name}}/${{package.name}}.jar ${{targets.contextdir}}/opt/bitnami/${{package.name}}/${{package.name}}-${KEYCLOAK_VERSION}.jar
+          ln -sf /opt/bitnami/${{package.name}}/${{package.name}}-${KEYCLOAK_VERSION}.jar ${{targets.contextdir}}/opt/bitnami/${{package.name}}/${{package.name}}.jar
+    test:
+      environment:
+        accounts:
+          users:
+            - username: bitnami
+              gid: 1001
+              uid: 1001
+          run-as: 0
+        contents:
+          packages:
+            - ${{package.name}}
+            - keycloak
+            - openjdk-21-jre
+            - wait-for-it
+            - sudo
+        environment:
+          KC_BOOTSTRAP_ADMIN_USERNAME: admin
+          KC_BOOTSTRAP_ADMIN_PASSWORD: hunter2
+          KEYCLOAK_SSL_VERIFY: true
+          KEYCLOAK_VERSION: "26.1.0"
+          PATH: "/opt/bitnami/java/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      pipeline:
+        - runs: stat /opt/bitnami/${{package.name}}/${{package.name}}.jar | grep "${{package.name}}-${KEYCLOAK_VERSION}.jar"
+        - working-directory: /opt/bitnami/${{package.name}}
+          runs: |
+            # Start dev Keycloak to interact with
+            kc.sh start-dev --features=admin-fine-grained-authz &
+
+            # Wait for keycloak to start
+            wait-for-it localhost:8080 --timeout=60
+
+            # Entrypoint from Bitnami image
+            sudo su - bitnami
+            java -jar ./${{package.name}}.jar \
+              --keycloak.url=http://localhost:8080 \
+              --keycloak.user=${KC_BOOTSTRAP_ADMIN_USERNAME} \
+              --keycloak.password=${KC_BOOTSTRAP_ADMIN_PASSWORD} \
+              --import.files.locations=/home/build/moped.json
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - keycloak
+        - openjdk-21-jre
+        - wait-for-it
+    environment:
+      JAVA_HOME: /opt/java/openjdk
+      JAVA_OPTS: ""
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: hunter2
+      KEYCLOAK_SSL_VERIFY: true
+      PATH: "/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  pipeline:
+    - name: Startup ${{package.name}}
+      runs: |
+        # Start dev Keycloak to interact with
+        kc.sh start-dev --features=admin-fine-grained-authz &
+
+        # Wait for keycloak to start
+        wait-for-it localhost:8080 --timeout=60
+
+        exec java ${JAVA_OPTS} -jar /app/${{package.name}}.jar \
+          --keycloak.url=http://localhost:8080 \
+          --keycloak.user=${KC_BOOTSTRAP_ADMIN_USERNAME} \
+          --keycloak.password=${KC_BOOTSTRAP_ADMIN_PASSWORD} \
+          --import.files.locations=./moped.json
+
+update:
+  enabled: true
+  github:
+    identifier: adorsys/keycloak-config-cli
+    strip-prefix: v
+    tag-filter: v
+    use-tag: true
+  ignore-regex-patterns:
+    - ".*-rc[0-9]*$"

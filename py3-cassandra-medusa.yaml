@@ -1,7 +1,7 @@
 # Generated from https://pypi.org/project/cassandra-medusa/
 package:
   name: py3-cassandra-medusa
-  version: "0.23.0"
+  version: "0.24.0"
   epoch: 0
   description: Apache Cassandra backup and restore tool
   copyright:
@@ -11,7 +11,9 @@ package:
     no-depends: true
   dependencies:
     runtime:
-      - py${{vars.py-version}}-poetry
+      - merged-bin
+      - python-${{vars.py-version}}
+      - wolfi-baselayout
 
 vars:
   py-version: 3.11
@@ -19,17 +21,14 @@ vars:
 environment:
   contents:
     packages:
-      - build-base
-      - ca-certificates-bundle
       - py${{vars.py-version}}-build-base-dev
-      - wolfi-base
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/thelastpickle/cassandra-medusa
       tag: v${{package.version}}
-      expected-commit: 2320fc2ee1ee03df663f90384facad5b892a63e8
+      expected-commit: 90c91f1e361c3d24892994496601b2f8200d42f7
 
   - name: Python Build
     runs: |
@@ -37,42 +36,41 @@ pipeline:
       # See: https://github.com/thelastpickle/cassandra-medusa/commit/fd044f92d9a5ea245c61d1df9c58462de51496e4
       pip${{vars.py-version}} install 'poetry>=1.0.0,<2.0.0'
       poetry add "pyOpenSSL@^24.0.0"
-      poetry add "cryptography@^43.0.1"
+      poetry add "cryptography@^44.0.1"
       # GHSA-34jh-p97f-mpxf: urllib3
       poetry add "urllib3@^1.26.19"
       poetry run pip freeze | grep -v cassandra-medusa > requirements.txt
       POETRY_VIRTUALENVS_IN_PROJECT=true poetry install
       poetry build
 
-  - runs: |
       # Setup the virtualenv
-      python${{vars.py-version}} -m venv .venv --system-site-packages
+      python${{vars.py-version}} -m venv .venv
 
-  - runs: |
       .venv/bin/pip${{vars.py-version}} install -I -r requirements.txt --no-compile
       .venv/bin/pip${{vars.py-version}} install -I --no-compile dist/*.whl
 
-  - runs: |
       # python-snappy is required to run medusa using $MEDUSA_MODE=GRPC.
       .venv/bin/pip${{vars.py-version}} install -I python-snappy --no-compile
 
-  - runs: |
+      # Install poetry
+      .venv/bin/pip${{vars.py-version}} install 'poetry>=1.0.0,<2.0.0'
+      mkdir -p ${{targets.destdir}}/usr/bin
+      ln -s /home/cassandra/.venv/bin/poetry ${{targets.destdir}}/usr/bin/poetry
+
       mkdir -p ${{targets.destdir}}/home/cassandra
       mv .venv ${{targets.destdir}}/home/cassandra/
 
       # edit the venv paths
       find '${{targets.destdir}}/home/cassandra/.venv/bin/' -type f | \
-        xargs sed -i "s|/home/build|${{targets.destdir}}/home/cassandra|g"
+        xargs sed -i "s|/home/build|/home/cassandra|g"
 
       # allow site-packages
       sed -i "s|include-system-site-packages = false|include-system-site-packages = true|g" ${{targets.destdir}}/home/cassandra/.venv/pyvenv.cfg
 
-  - runs: |
       mkdir -p ${{targets.destdir}}/usr/bin
       cp k8s/medusa.sh ${{targets.destdir}}/usr/bin/medusa
       chmod +x ${{targets.destdir}}/usr/bin/medusa
 
-  - runs: |
       cp pyproject.toml ${{targets.destdir}}/home/cassandra
       cp k8s/docker-entrypoint.sh ${{targets.destdir}}/home/cassandra
       chmod +x ${{targets.destdir}}/home/cassandra/docker-entrypoint.sh
@@ -85,13 +83,12 @@ subpackages:
         # The entrypoint script fails to start without bash and sleep (which comes from busybox)
         - bash
         - busybox
+        - merged-bin
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}/home/cassandra/"
           ln -sf /usr/bin/medusa ${{targets.subpkgdir}}/home/cassandra/medusa
-          # Symlink the binary from usr/bin to /bin
-          mkdir -p "${{targets.subpkgdir}}"/bin
-          ln -sf /usr/bin/grpc-health-probe ${{targets.subpkgdir}}/bin/grpc_health_probe
 
 update:
   enabled: true
@@ -105,8 +102,12 @@ test:
       packages:
         - grpc-health-probe
   pipeline:
-    - runs: medusa --version
-    - runs: |
+    - name: Test poetry binary is in PATH
+      runs: poetry --version
+    - name: Test medusa version
+      runs: medusa --version
+    - name: Test medusa server run
+      runs: |
         set +e
         fail() { echo "$@" 1>&2; exit 1; }
         out=$(/home/cassandra/.venv/bin/python${{vars.py-version}} -m medusa.service.grpc.server 2>&1)

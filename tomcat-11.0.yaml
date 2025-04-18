@@ -1,6 +1,6 @@
 package:
   name: tomcat-11.0
-  version: 11.0.2
+  version: "11.0.6"
   epoch: 0
   description: Apache Tomcat Web Server
   copyright:
@@ -35,7 +35,7 @@ pipeline:
     with:
       repository: https://github.com/apache/tomcat
       tag: ${{package.version}}
-      expected-commit: d428a82c122c86e64aa4ffc4a515aee31ba7a51e
+      expected-commit: 872451298e20bb77ea95c499e6866b1e32b337e0
 
   - runs: |
       cat <<EOF > build.properties
@@ -81,46 +81,95 @@ subpackages:
           mkdir -p ${{targets.contextdir}}/usr/share/tomcat/webapps.dist
           rm -rf output/build/webapps/examples
           cp -r output/build/webapps/* ${{targets.contextdir}}/usr/share/tomcat/webapps.dist/
-      - name: Test tomcat with OpenJDK ${{range.key}}
-        uses: test/daemon-check-output
-        with:
-          setup: |
-            #!/bin/sh -ex
-            rm -rf /usr/share/tomcat/*
-            mkdir -p /usr/share/tomcat
-            cp -rf ${{targets.contextdir}}/usr/share/tomcat/* /usr/share/tomcat
-            cp /usr/share/tomcat/webapps.dist/docs/appdev/sample/sample.war /usr/share/tomcat/webapps/
-          start: |
-            sh -c "
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+      pipeline:
+        - name: Verify Tomcat installation
+          runs: |
+            if [[ ! -d "/usr/share/tomcat" ]]; then
+              echo "Tomcat directory not found!"
+              exit 1
+            fi
+            echo "Tomcat installation verified."
+        - name: Check Tomcat version
+          runs: |
+            sh -c "/usr/share/tomcat/bin/version.sh" | grep "Server version: Apache Tomcat/${{package.version}}" || {
+              echo "Tomcat version mismatch!"
+              exit 1
+            }
+            echo "Tomcat version verified."
+        - name: Test Tomcat catalina.sh with OpenJDK ${{range.key}}
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              #!/bin/sh -ex
+              cp /usr/share/tomcat/webapps.dist/docs/appdev/sample/sample.war /usr/share/tomcat/webapps/
+            start: |
+              sh -c "
+                if [[ "${{range.key}}" == "8" ]]; then
+                  export JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk
+                else
+                  export JAVA_HOME=/usr/lib/jvm/java-${{range.key}}-openjdk
+                fi
+                export LD_LIBRARY_PATH=/usr/lib/tomcat-native
+                /usr/share/tomcat/bin/catalina.sh run
+              "
+            timeout: 30
+            expected_output: |
+              Tomcat/${{package.version}}
+              JVM.Version
+              Deploying.*sample.war
+              Server startup in
+            post: |
+              #!/bin/sh -e
+              url=http://localhost:8080/sample/
+              echo "testing $url"
+              response=$(curl -s "$url") || {
+                echo "curl $url failed $?"
+                exit 1
+              }
+              expected="Sample.*Hello.*World.*Application"
+              echo "$response" | grep -q "$expected" || {
+                echo "response from $url did not contain \"$expected\""
+                echo "response: $response"
+                exit 1
+              }
+              echo "found \"$expected\" in output of curl $url"
+        - name: Test Tomcat startup.sh with OpenJDK ${{range.key}}
+          runs: |
             if [[ "${{range.key}}" == "8" ]]; then
               export JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk
             else
               export JAVA_HOME=/usr/lib/jvm/java-${{range.key}}-openjdk
             fi
-            export LD_LIBRARY_PATH=/usr/lib/tomcat-native
-            /usr/share/tomcat/bin/catalina.sh run
-            "
-          timeout: 30
-          expected_output: |
-            Tomcat/${{package.version}}
-            JVM.Version
-            Deploying.*sample.war
-            Server startup in
-          post: |
-            #!/bin/sh -e
-            url=http://localhost:8080/sample/
-            echo "testing $url"
-            response=$(curl -s "$url") || {
-              echo "curl $url failed $?"
+
+            export CATALINA_HOME="/usr/share/tomcat"
+            export CATALINA_BASE="/usr/share/tomcat"
+            export LD_LIBRARY_PATH="/usr/lib/tomcat-native"
+
+            /usr/share/tomcat/bin/startup.sh
+            sleep 5
+
+            curl --silent --retry 3 --retry-connrefused http://localhost:8080/ | grep "Apache Tomcat" || {
+              echo "Tomcat did not start correctly on JDK ${{range.key}}"
               exit 1
             }
-            expected="Sample.*Hello.*World.*Application"
-            echo "$response" | grep -q "$expected" || {
-              echo "response from $url did not contain \"$expected\""
-              echo "response: $response"
+
+            /usr/share/tomcat/bin/shutdown.sh
+            sleep 3
+        - name: Deploy test application
+          runs: |
+            cp /usr/share/tomcat/webapps.dist/docs/appdev/sample/sample.war /usr/share/tomcat/webapps/
+            /usr/share/tomcat/bin/startup.sh
+            sleep 5
+            curl --silent --retry 3 --retry-connrefused http://localhost:8080/sample/ | grep "This is the home page for a sample application" || {
+              echo "Test application deployment failed!"
               exit 1
             }
-            echo "found \"$expected\" in output of curl $url"
+            /usr/share/tomcat/bin/shutdown.sh
 
 update:
   enabled: true

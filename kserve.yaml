@@ -1,35 +1,49 @@
 package:
   name: kserve
-  version: 0.14.1
-  epoch: 0
+  version: "0.15.0"
+  epoch: 1
   description: "Standardized Serverless ML Inference Platform on Kubernetes"
   copyright:
     - license: Apache-2.0
+
+vars:
+  py-version: 3.11 # Upstream https://github.com/kserve/kserve/blob/release-0.15/python/storage-initializer.Dockerfile uses python-3.11
 
 environment:
   contents:
     packages:
       - go
-      - py3.11-pip
-      - py3.11-poetry
-      - py3.11-poetry-bin
-      - python-3.11-dev # Upstream https://github.com/kserve/kserve/blob/master/python/storage-initializer.Dockerfile uses python-3.11
+      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-poetry
+      - py${{vars.py-version}}-poetry-bin
+      - python-${{vars.py-version}}-dev
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/kserve/kserve
       tag: v${{package.version}}
-      expected-commit: 564cc2d760b7f47e883a4001876cd98815cfc07d
+      expected-commit: d20d4228a8b2956b800ad5a3e62c0578b5a5b97f
+
+  # kserve project puts this at the bottom of the go.mod so updating it with go/bump isn't possible
+  - runs: |
+      sed -i 's|replace golang.org/x/net => golang.org/x/net v0.33.0|replace golang.org/x/net => golang.org/x/net v0.36.0|g' go.mod
 
   - uses: go/bump
     with:
-      deps: golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.33.0
+      deps: |
+        github.com/expr-lang/expr@v1.17.0
 
   - uses: go/bump
     with:
-      deps: golang.org/x/net@v0.33.0
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/net@v0.36.0
       modroot: qpext
+
+  - uses: patch
+    with:
+      patches: bump-python-version.patch
 
 data:
   - name: go-components
@@ -76,30 +90,22 @@ subpackages:
       - name: poetry-build-storage-controller
         working-directory: ./python/kserve
         runs: |
+          # Due to bump-python-version.patch, we need to re-lock dependencies
+          poetry lock
+
           # Install dependencies and build the package using poetry
-          poetry install --no-interaction --no-root --extras "storage ray"
-          # CVE-2024-47554 GHSA-78wr-2p64-hpwj
-          poetry add "ray=^2.24.0"
-          # CVE-2024-52304 GHSA-8495-4g3g-x7pr
-          poetry add "aiohttp=^3.10.11"
-          # CVE-2024-6345 GHSA-cx63-2mw6-8hw5
-          poetry add "setuptools=^70.0.0"
-          poetry add "certifi"
-          poetry add "idna"
-          # CVE-2024-35195: requests
-          poetry add "requests@^2.23.0"
-          poetry add "packaging"
-          poetry add "google.cloud"
-          poetry add "typing-extensions"
-          poetry add "starlette=^0.40.0"
+          # NB: exclude 'ray' extras since that brings unwanted cuda/nv deps
+          poetry install --no-interaction --no-root --extras "storage"
 
-          # CVE-2024-56201 CVE-2024-56326
-          poetry add "jinja2=3.1.5"
+          # cryptography: CVE-2024-12797 GHSA-79v4-65xg-pq4g
+          poetry add \
+            "cryptography=^44.0.1"
+
           poetry run pip freeze | grep -v kserve > requirements.txt
-
           poetry build
-          # Install the wheel file with the root directory set to ${{targets.contextdir}}
-          pip install --root ${{targets.contextdir}} -I -r requirements.txt --no-compile
+
+          # Install runtime deps and wheel with the root directory set to ${{targets.contextdir}}
+          python3 -m pip install --root ${{targets.contextdir}} -I -r requirements.txt --no-compile
           python3 -m pip install --verbose --prefix=/usr --root=${{targets.contextdir}} dist/*.whl
       - name: install storage-initializer entrypoint
         working-directory: ./python/storage-initializer
@@ -111,7 +117,7 @@ subpackages:
 
           cd ${{targets.contextdir}}/storage-initializer/scripts/
           # update shbang to point to the python used rather than '/usr/bin/env python'
-          sed -i.dist "1s,#!/usr/bin/env python[^ ]*,#!$(which python3.11)," initializer-entrypoint
+          sed -i.dist "1s,#!/usr/bin/env python[^ ]*,#!$(which python${{vars.py-version}})," initializer-entrypoint
           # exit fail if it did not change anything
           diff -u initializer-entrypoint.dist initializer-entrypoint && exit 1
           rm initializer-entrypoint.dist
@@ -125,6 +131,11 @@ subpackages:
         - name: "test entrypoint usage"
           runs: |
             /storage-initializer/scripts/initializer-entrypoint --help
+        - uses: test/tw/ldd-check
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
 
 update:
   enabled: true

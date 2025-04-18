@@ -1,21 +1,31 @@
 package:
   name: descheduler
-  version: 0.32.1
-  epoch: 0
+  version: "0.32.2"
+  epoch: 34
   description: Descheduler for Kubernetes
   copyright:
     - license: Apache-2.0
+  dependencies:
+    # REMOVE_POST_USRMERGE - https://github.com/orgs/wolfi-dev/discussions/40270
+    provides:
+      - ${{package.name}}-compat=${{package.full-version}}
+    runtime:
+      - merged-bin
+      - wolfi-baselayout
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/kubernetes-sigs/descheduler
       tag: v${{package.version}}
-      expected-commit: f68d06ad4ab2a4d1a10ece2c3f227365bc777c57
+      expected-commit: a6e0ebff10692013f230f57cd122ac088d69619b
 
   - uses: go/bump
     with:
-      deps: golang.org/x/net@v0.33.0
+      deps: |-
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/net@v0.36.0
 
   - uses: go/build
     with:
@@ -23,17 +33,9 @@ pipeline:
       ldflags: |
         -X sigs.k8s.io/descheduler/pkg/version.version=${{package.version}}
         -X sigs.k8s.io/descheduler/pkg/version.gitsha1=$(git rev-parse HEAD)
-        -X sigs.k8s.io/descheduler/pkg/version.buildDate=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        -X sigs.k8s.io/descheduler/pkg/version.buildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
         -X sigs.k8s.io/descheduler/pkg/version.gitbranch=$(git rev-parse --abbrev-ref HEAD)
       output: descheduler
-
-subpackages:
-  - name: ${{package.name}}-compat
-    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.contextdir}}/bin/
-          ln -sf /usr/bin/descheduler ${{targets.contextdir}}/bin/descheduler
 
 update:
   enabled: true
@@ -48,10 +50,24 @@ test:
         - curl
   pipeline:
     - uses: test/kwok/cluster
-    - runs: |
+    - name: "Binary checks"
+      runs: |
         descheduler version
         descheduler --help
+    - name: "Functional test"
+      runs: |
         # Scale the cluster further
         kwokctl scale node --replicas 3
-        curl -fL -o policy.yaml https://raw.githubusercontent.com/kubernetes-sigs/descheduler/master/examples/policy.yaml
+
+        # Upstream repo contains examples, so lets use one of the example policies here to test with.
+        curl -fL -o policy.yaml https://raw.githubusercontent.com/kubernetes-sigs/descheduler/v${{package.version}}/examples/policy.yaml
         descheduler --kubeconfig ~/.kube/config --policy-config-file policy.yaml
+
+        # Deploy the policy.
+        descheduler --kubeconfig ~/.kube/config --policy-config-file policy.yaml --v=4 2>&1 | tee /tmp/descheduler-output.log
+
+        # Verify that the anti-affinity plugin is processing nodes (functional check)
+        grep "Processing node" /tmp/descheduler-output.log || { echo "No node processing found, plugin may not be running"; exit 1; }
+
+        # Verify successful run metrics
+        grep "Number of evictions/requests" /tmp/descheduler-output.log || { echo "Eviction metrics not found"; exit 1; }

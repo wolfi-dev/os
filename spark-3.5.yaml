@@ -1,0 +1,289 @@
+package:
+  name: spark-3.5
+  version: "3.5.5"
+  epoch: 40
+  description: Unified engine for large-scale data analytics
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provider-priority: 0
+    runtime:
+      - merged-usrsbin
+      - wolfi-baselayout
+
+vars:
+  debian-version: "12"
+  java-version: "8"
+  test-java-version: "11"
+  py-version: "3.11"
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - R
+      - R-dev
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - glibc-iconv
+      - glibc-locale-en
+      - grep
+      - maven
+      - openjdk-${{vars.java-version}}-default-jdk
+      - perl-utils
+      - procps
+      - protobuf-dev
+      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-setuptools
+      - python-${{vars.py-version}}
+      - yaml-dev
+  environment:
+    APACHE_MIRROR: "https://repo.maven.apache.org/maven2/org"
+    MAVEN_OPTS: "-Dmaven.wagon.httpconnectionManager.ttlSeconds=25 -Daether.connector.http.connectionMaxTtl=25"
+    JAVA_OPTS: "-Xms4g -Xmx4g"
+    JAVA_HOME: /usr/lib/jvm/default-jvm
+    LANG: en_US.UTF-8
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/spark
+      expected-commit: 7c29c664cdc9321205a98a14858aaf8daaa19db2
+      tag: v${{package.version}}
+
+  - uses: maven/pombump
+
+subpackages:
+  - name: ${{package.name}}-scala-2.12
+    dependencies:
+      # Both `python` and `openjdk-{11,17}-default-jvm` are required for running Spark,
+      # but will be added in the image, since upstream supports different Python versions
+      # and Java versions. So we don't need to specify them here to avoid conflicts.
+      runtime:
+        - bash
+        - busybox
+        - libnss
+        - linux-pam
+        - logrotate
+        - merged-usrsbin
+        - net-tools
+        - openssl
+        # OpenJDK virt provides are temporary and will be removed when the image is updated
+        - posix-libc-utils
+        - procps
+        - tini
+        - wolfi-baselayout
+      provides:
+        - spark=${{package.full-version}}
+        - ${{package.name}}=${{package.full-version}}
+      provider-priority: 2120
+    pipeline:
+      - uses: patch
+        with:
+          patches: guava.patch mvn.patch
+      - runs: |
+          ./dev/make-distribution.sh --name custom-spark --pip \
+            -Psparkr -Phive -Phive-thriftserver -Pmesos -Pyarn -Pkubernetes \
+            -T$(grep -c processor /proc/cpuinfo)
+
+          mkdir -p ${{targets.contextdir}}/usr/lib/spark/work-dir
+          mv dist/kubernetes/dockerfiles/spark/entrypoint.sh ${{targets.contextdir}}/usr/lib/spark
+          mv dist/* ${{targets.contextdir}}/usr/lib/spark/
+          mv ${{targets.contextdir}}/usr/lib/spark/examples/jars/spark-examples_2.12-${{package.version}}.jar ${{targets.contextdir}}/usr/lib/spark/examples/jars/spark-examples.jar
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-scala-2.12-compat
+            - R
+            - openjdk-${{vars.test-java-version}}-default-jvm
+            - python3
+            - wait-for-it
+        environment:
+          SPARK_CONF: "--conf spark.ssl.enabled=true --conf spark.ssl.protocol=TLSv1.3 --conf spark.network.crypto.enabled=true --conf spark.authenticate=true --conf spark.authenticate.secret=AbCdEfG0%12345678NotReal --conf spark.io.encryption.enabled=true"
+          SPARK_HOME: "/usr/lib/spark"
+          JAVA_HOME: "/usr/lib/jvm/default-jvm"
+      pipeline:
+        - name: Spark utils version check
+          runs: |
+            spark-shell --version
+            spark-submit --version
+            pyspark --version
+            spark-sql --version
+        - name: Start and wait for Spark
+          runs: |
+            /opt/entrypoint.sh spark-shell ${SPARK_CONF} &> spark_output.txt &
+            if ! wait-for-it localhost:4440; then
+              cat ./spark_output.txt
+              exit 1
+            fi
+        - name: Calculate sum
+          runs: spark-submit ./sum.py --master spark://localhost:4440 ${SPARK_CONF}
+        - name: Perform basic SQL query
+          runs: spark-submit ./SQLQuery.R --master spark://localhost:4440 ${SPARK_CONF}
+        - name: Calculate avg salary
+          runs: spark-submit ./salaries.py --master spark://localhost:4440 ${SPARK_CONF}
+
+  - name: ${{package.name}}-scala-2.12-compat
+    description: "Compatibility package to place binaries in the location expected by upstream image"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt
+          ln -s /usr/lib/spark/entrypoint.sh ${{targets.contextdir}}/opt/entrypoint.sh
+          ln -s /usr/lib/spark/kubernetes/dockerfiles/spark/decom.sh ${{targets.contextdir}}/opt/decom.sh
+          ln -s /usr/lib/spark ${{targets.contextdir}}/opt/spark
+
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          for path in ${{targets.outdir}}/${{package.name}}-scala-2.12/usr/lib/spark/bin/*; do
+            name=${path##*/}
+            ln -s ../lib/spark/bin/$name ${{targets.contextdir}}/usr/bin/$name
+          done
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: ${{package.name}}-scala-2.12-bitnami-compat
+    description: Bitnami compat for Spark 3.5 with Scala 2.12
+    dependencies:
+      runtime:
+        - coreutils # needed for cp -nr command
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: spark
+          version-path: ${{vars.major-minor-version}}/debian-${{vars.debian-version}}
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/spark/
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/spark/logs
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/spark/tmp
+
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/spark/conf.default/
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/spark/conf/
+
+          cp -r ${{targets.outdir}}/${{package.name}}-scala-2.12/usr/lib/spark/conf/* ${{targets.contextdir}}/opt/bitnami/spark/conf.default/
+          # We copy conf instead of symlinking to avoid issues with the bitnami volume mount.
+          cp -r ${{targets.outdir}}/${{package.name}}-scala-2.12/usr/lib/spark/conf/* ${{targets.contextdir}}/opt/bitnami/spark/conf/
+
+          ln -s /usr/lib/spark/jars ${{targets.contextdir}}/opt/bitnami/spark/jars
+          ln -s /usr/lib/spark/bin ${{targets.contextdir}}/opt/bitnami/spark/bin
+          ln -s /usr/lib/spark/data ${{targets.contextdir}}/opt/bitnami/spark/data
+          ln -s /usr/lib/spark/python ${{targets.contextdir}}/opt/bitnami/spark/python
+          ln -s /usr/lib/spark/licenses ${{targets.contextdir}}/opt/bitnami/spark/licenses
+          ln -s /usr/lib/spark/kubernetes ${{targets.contextdir}}/opt/bitnami/spark/kubernetes
+          ln -s /usr/lib/spark/sbin ${{targets.contextdir}}/opt/bitnami/spark/sbin
+          ln -s /usr/lib/spark/yarn ${{targets.contextdir}}/opt/bitnami/spark/yarn
+
+  - name: ${{package.name}}-scala-2.13
+    dependencies:
+      runtime:
+        - bash
+        - busybox
+        - libnss
+        - linux-pam
+        - logrotate
+        - merged-usrsbin
+        - net-tools
+        - openssl
+        # OpenJDK and PySpark virt provides are temporary and will be removed when the image is updated
+        - posix-libc-utils
+        - procps
+        - tini
+        - wolfi-baselayout
+      provides:
+        - spark=${{package.full-version}}
+        - ${{package.name}}=${{package.full-version}}
+      provider-priority: 2130
+    pipeline:
+      - runs: |
+          git stash
+          mvn clean
+      - uses: patch
+        with:
+          patches: guava.patch mvn.patch
+      - runs: |
+          ./dev/change-scala-version.sh 2.13
+      - uses: maven/pombump
+        with:
+          properties-file: pombump-properties-2.13.yaml
+      - uses: maven/pombump
+        with:
+          patch-file: pombump-deps.yaml
+      - runs: |
+          ./dev/make-distribution.sh --name pyspark-2.13 \
+            --pip --tgz -Pscala-2.13 -Phive -Phive-thriftserver -Pkubernetes -Pyarn \
+            -T$(grep -c processor /proc/cpuinfo)
+
+          mkdir -p ${{targets.contextdir}}/usr/lib/spark
+          mv dist/kubernetes/dockerfiles/spark/entrypoint.sh ${{targets.contextdir}}/usr/lib/spark
+          mv dist/* ${{targets.contextdir}}/usr/lib/spark/
+          mv ${{targets.contextdir}}/usr/lib/spark/examples/jars/spark-examples_2.13-${{package.version}}.jar ${{targets.contextdir}}/usr/lib/spark/examples/jars/spark-examples.jar
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-scala-2.13-compat
+            - R
+            - openjdk-${{vars.test-java-version}}-default-jvm
+            - python3
+            - wait-for-it
+        environment:
+          SPARK_CONF: "--conf spark.ssl.enabled=true --conf spark.ssl.protocol=TLSv1.3 --conf spark.network.crypto.enabled=true --conf spark.authenticate=true --conf spark.authenticate.secret=AbCdEfG0%12345678NotReal --conf spark.io.encryption.enabled=true"
+          SPARK_HOME: "/usr/lib/spark"
+          JAVA_HOME: "/usr/lib/jvm/default-jvm"
+      pipeline:
+        - name: Spark utils version check
+          runs: |
+            spark-shell --version
+            spark-submit --version
+            pyspark --version
+            spark-sql --version
+        - name: Start and wait for Spark
+          runs: |
+            /opt/entrypoint.sh spark-shell ${SPARK_CONF} &> spark_output.txt &
+            if ! wait-for-it localhost:4440; then
+              cat ./spark_output.txt
+              exit 1
+            fi
+        - name: Calculate sum
+          runs: spark-submit ./sum.py --master spark://localhost:4440 ${SPARK_CONF}
+        - name: Perform basic SQL query
+          runs: spark-submit ./SQLQuery.R --master spark://localhost:4440 ${SPARK_CONF}
+        - name: Calculate avg salary
+          runs: spark-submit ./salaries.py --master spark://localhost:4440 ${SPARK_CONF}
+
+  - name: ${{package.name}}-scala-2.13-compat
+    description: "Compatibility package to place binaries in the location expected by upstream image"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt
+          ln -s /usr/lib/spark ${{targets.contextdir}}/opt/spark
+          ln -s /usr/lib/spark/kubernetes/dockerfiles/spark/decom.sh ${{targets.contextdir}}/opt/decom.sh
+          ln -s /usr/lib/spark/entrypoint.sh ${{targets.contextdir}}/opt/entrypoint.sh
+
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          for path in ${{targets.outdir}}/${{package.name}}-scala-2.13/usr/lib/spark/bin/*; do
+            name=${path##*/}
+            ln -s ../lib/spark/bin/$name ${{targets.contextdir}}/usr/bin/$name
+          done
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
+
+update:
+  enabled: true
+  github:
+    identifier: apache/spark
+    use-tag: true
+    strip-prefix: v
+    tag-filter: v3.5

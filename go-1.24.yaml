@@ -1,0 +1,212 @@
+package:
+  name: go-1.24
+  version: "1.24.2"
+  epoch: 0
+  description: "the Go programming language"
+  copyright:
+    - license: BSD-3-Clause
+  dependencies:
+    provides:
+      - go=${{package.full-version}}
+    runtime:
+      - bash
+      - binutils-gold # Needed for cgo linking due to upstream issue #15696 which forces use of the gold linker.
+      - build-base
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - go-1.22 # https://go.dev/doc/go1.24#bootstrap
+
+# transform melange version to contain "+" rather than third "." so we can use a var in the fetch URL
+var-transforms:
+  - from: ${{package.version}}
+    match: \_
+    replace: ""
+    to: mangled-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/golang/go
+      tag: go${{package.version}}
+      expected-commit: 49860cf92a9a3ba434d2bc393faaefabe48d181e
+
+  - uses: patch
+    with:
+      patches: |
+        cmd-go-always-emit-ldflags-version-information.patch
+        change-default-telemetry-from-local-to-off.patch
+
+  - runs: |
+      cd src
+      ./make.bash -v
+
+  - runs: |
+      mkdir -p "${{targets.destdir}}"/usr/bin "${{targets.destdir}}"/usr/lib/go/bin "${{targets.destdir}}"/usr/share/doc/go
+
+      for bin in go gofmt; do
+        install -Dm755 bin/$bin "${{targets.destdir}}"/usr/lib/go/bin/$bin
+        ln -s /usr/lib/go/bin/$bin "${{targets.destdir}}"/usr/bin/
+      done
+
+      cp -a pkg lib "${{targets.destdir}}"/usr/lib/go/
+      cp -r doc misc "${{targets.destdir}}"/usr/share/doc/go
+      cp -a src "${{targets.destdir}}"/usr/lib/go/
+      cp -p go.env "${{targets.destdir}}"/usr/lib/go/go.env
+
+      rm -rf "${{targets.destdir}}"/usr/lib/go/pkg/obj
+      rm -rf "${{targets.destdir}}"/usr/lib/go/pkg/bootstrap
+      rm -rf "${{targets.destdir}}"/usr/lib/go/pkg/tool/*/api
+      rm -rf "${{targets.destdir}}"/usr/lib/go/pkg/*/cmd
+      rm -rf "${{targets.destdir}}"/usr/lib/go/pkg/tool/*/api
+      rm -rf "${{targets.destdir}}"/usr/lib/go/pkg/tool/*/go_bootstrap
+      rm -rf "${{targets.destdir}}"/usr/lib/go/src/cmd/dist/dist
+
+      # Remove tests from /usr/lib/go/src, not needed at runtime
+      find "${{targets.destdir}}"/usr/lib/go/src \( -type f -a -name "*_test.go" \) \
+        -exec rm -rf \{\} \+
+      find "${{targets.destdir}}"/usr/lib/go/src \( -type d -a -name "testdata" \) \
+        -exec rm -rf \{\} \+
+      find "${{targets.destdir}}"/usr/lib/go/src \( -type f -a -name "*.rc" \) \
+        -exec rm -rf \{\} \+
+      find "${{targets.destdir}}"/usr/lib/go/src \( -type f -a -name "*.bat" \) \
+        -exec rm -rf \{\} \+
+      find "${{targets.destdir}}"/usr/lib/go/src \( -type f -a -name "*.pem" \) \
+        -exec rm -rf \{\} \+
+
+  - uses: strip
+
+data:
+  - name: tools
+    items:
+      asm: ""
+      covdata: ""
+      cover: ""
+      test2json: ""
+      nm: ""
+      objdump: ""
+
+subpackages:
+  - name: "${{package.name}}-doc"
+    description: "go documentation"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/share
+          mv "${{targets.destdir}}"/usr/share/doc "${{targets.subpkgdir}}"/usr/share/
+    test:
+      pipeline:
+        - uses: test/docs
+
+  - range: tools
+    name: "${{package.name}}-${{range.key}}"
+    description: "standalone go tool ${{range.key}}"
+    dependencies:
+      provides:
+        - go-${{range.key}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          find "${{targets.destdir}}/usr/lib/go/pkg/tool" -type f -name "${{range.key}}" \
+            -exec install -Dm755 \{\} "${{targets.contextdir}}/usr/bin/${{range.key}}" \;
+
+update:
+  enabled: true
+  shared: true
+  github:
+    identifier: golang/go
+    strip-prefix: go
+    tag-filter: go1.24
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+  pipeline:
+    - name: Test Go installation
+      runs: |
+        # Write a simple "Hello World" Go program
+        cat <<EOF > hello.go
+        package main
+        import "fmt"
+        func main() {
+            fmt.Println("Hello World")
+        }
+        EOF
+
+        # Format the Go program
+        go fmt hello.go
+
+        # Run the Go program and check the output
+        go run hello.go | grep "Hello World"
+        go version
+        go help
+        gofmt --help
+    - name: Test Go cross-compilation
+      runs: |
+        # Build the Go program for a different OS/architecture
+        GOOS=freebsd GOARCH=amd64 go build hello.go
+    - name: Test Go with cgo
+      runs: |
+        # Write a Go program that uses cgo
+        cat <<EOF > hello_cgo.go
+        package main
+        /*
+        #include <stdlib.h>
+        #include <stdio.h>
+        void hello() {
+            printf("%s\\n", "Hello from cgo!");
+            fflush(stdout);
+        }
+        */
+        import "C"
+        func main() {
+            C.hello()
+        }
+        EOF
+
+        # Run the Go program with cgo and check the output
+        go run hello_cgo.go | grep "Hello from cgo!"
+    - name: Test telemetry settings
+      runs: |
+        fail() { echo "FAIL:" "$@" 1>&2; exit 1; }
+
+        tmpd=$(mktemp -d)
+        trap "rm -R '$tmpd'" EXIT
+        export HOME="$tmpd/home"
+        mkdir "$HOME"
+
+        out=$(go telemetry) || fail "'go telemetry' exited $?"
+        [ "$out" = "off" ] ||
+          fail "go telemetry output '$out'. expected 'off'"
+
+        cfgdir="$HOME/.config/go/telemetry"
+        if [ -d "$cfgdir" ]; then
+          fail "$cfgdir was created by running 'go telemetry'"
+        fi
+
+        go telemetry on ||
+          fail "'go telemetry on' exited $?"
+        out=$(go telemetry) || fail "'go telemetry' after 'on' exited $?"
+        [ "$out" = "on" ] ||
+          fail "go telemetry after 'on' output '$out'. expected 'on'"
+
+        [ -f "$cfgdir/mode" ] ||
+          fail "ERROR: 'go telemetry on' did not write ~/${cfgdir#$HOME/}"
+
+        go telemetry local ||
+          fail "'go telemetry local' exited $?"
+        out=$(go telemetry) || fail "'go telemetry' after 'local' exited $?"
+        [ "$out" = "local" ] ||
+          fail "go telemetry after 'local' output '$out'. expected 'on'"
+
+        go telemetry off ||
+          fail "explicit 'go telemetry off' exited $?"
+        out=$(go telemetry) || fail "'go telemetry' after explicit off exited $?"
+        [ "$out" = "off" ] ||
+          fail "go telemetry after explicit off output '$out'. expected 'off'"

@@ -1,7 +1,7 @@
 package:
   name: glibc
-  version: 2.40
-  epoch: 4
+  version: "2.41"
+  epoch: 2
   description: "the GNU C library"
   copyright:
     - license: LGPL-2.1-or-later
@@ -14,21 +14,13 @@ package:
       # that depend on glibc, if they happen to have configured both repositories.
       # Only apk-tools respects this constraint; apko-based tools don't respect
       # the ! constraint.
-      - '!musl'
+      - "!musl"
       - glibc-locale-posix
       # Needed for some pthread functionality
       - libgcc
+      - merged-sbin
+      - merged-usrsbin
       - wolfi-baselayout
-  scriptlets:
-    trigger:
-      paths:
-        - /lib
-        - /lib64
-        - /usr/lib
-        - /usr/lib64
-      script: |
-        #!/bin/busybox sh
-        /sbin/ldconfig
 
 environment:
   contents:
@@ -37,10 +29,12 @@ environment:
     keyring:
       - https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
     packages:
+      - bash # needed by `make check`
       - bison
       - build-base
       - busybox
       - ca-certificates-bundle
+      - coreutils # needed by `make check`
       - flex
       - gawk
       - grep
@@ -57,26 +51,30 @@ environment:
     GCC_SPEC_FILE: /dev/null
 
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      uri: https://ftp.gnu.org/gnu/libc/glibc-${{package.version}}.tar.xz
-      expected-sha256: 19a890175e9263d748f627993de6f4b1af9cd21e03f080e4bfb3a1fac10205a2
+      expected-commit: 74f59e9271cbb4071671e5a474e7d4f1622b186f
+      # sourceware.org often has clone issues, switch to mirror
+      # recommended at https://sourceware.org/glibc/wiki/GlibcGit
+      repository: https://repo.or.cz/glibc.git
+      tag: glibc-${{package.version}}
 
   - uses: patch
     with:
       patches: Disable-AVX512VL.patch
 
-  - name: 'Set up build directory'
+  - name: "Set up build directory"
     runs: |
       mkdir build
 
-  - name: 'Configure glibc'
+  - name: "Configure glibc"
     runs: |
       cd build
       echo "user-defined-trusted-dirs=/usr/local/lib:/usr/local/lib64:/usr/lib:/usr/lib64:/lib:/lib64" >> configparms.base
       echo "rtlddir=/lib" >> configparms.base
       echo "slibdir=/lib" >> configparms.base
       echo "libdir=/usr/lib" >> configparms.base
+      echo "rootsbindir=/usr/bin" >> configparms.base
 
       echo "build-programs=no" > configparms
       cat configparms.base >> configparms
@@ -96,7 +94,8 @@ pipeline:
         --with-pkgversion="glibc-${{package.full-version}}" \
         --disable-werror \
         --disable-crypt \
-        --enable-kernel=4.9
+        --enable-kernel=4.9 \
+        --sbindir=/usr/bin
 
   - runs: |
       make -C build -j$(nproc)
@@ -110,17 +109,34 @@ pipeline:
   - runs: |
       make -C build -j$(nproc) install DESTDIR="${{targets.destdir}}"
 
+  - name: "Run the glibc testsuite, not blocking on failures for now"
+    runs: |
+      # For now we run the glibc testsuite for manual investigation.
+      # Later on we'll establish a baseline and make regressions fail the build.
+      make -C build -j$(nproc) check || true
+
   - name: "Set up ldconfig"
     runs: |
-      cp vendor/ld.so.conf "${{targets.destdir}}"/etc/ld.so.conf
+      mkdir -p "${{targets.destdir}}"/etc
+      cp vendor/ld.so.conf "${{targets.destdir}}"/etc
+      mkdir -p "${{targets.destdir}}"/etc/ld.so.conf.d
+      cp vendor/ld.so.conf.d/*.conf "${{targets.destdir}}"/etc/ld.so.conf.d
+      mkdir -p ${{targets.destdir}}/etc/apk/commit_hooks.d
+      cp ldconfig-commit.sh -p ${{targets.destdir}}/etc/apk/commit_hooks.d/
 
-  - name: 'Clean up documentation'
+  - name: "Clean up documentation"
     runs: |
       rm -rf ${{targets.destdir}}/usr/share/info
 
-  - name: 'Generate and install locale data'
+  - name: "Generate and install locale data"
     runs: |
       make -C build -j$(nproc) localedata/install-locale-files DESTDIR="${{targets.destdir}}"
+
+  - name: 'Usrmerge /usr/sbin' # Some binaries ignore --sbindir for some reason
+    runs: |
+      mkdir -p "${{targets.destdir}}"/usr/bin
+      mv "${{targets.destdir}}"/usr/sbin/* "${{targets.destdir}}"/usr/bin
+      rmdir "${{targets.destdir}}"/usr/sbin
 
   - uses: strip
 
@@ -338,6 +354,18 @@ data:
       zu: Zulu
 
 subpackages:
+  - name: "glibc-testresults"
+    description: "Test results and logs from the current GLIBC build - for Wolfi development only"
+    pipeline:
+      - runs: |
+          resultdir="${{targets.subpkgdir}}"/usr/share/glibc-testresults
+          mkdir -p $resultdir
+          cd build/
+          # Move all the test results and log files
+          find . \( -name "*.test-result" -o -name "*.out" \) \
+            -exec sh -c 'dir=$(dirname $1); mkdir -p $2/$dir; cp $1 $2/$dir' _ {} $resultdir \;
+          cp tests.sum $resultdir
+
   - name: "ld-linux"
     description: "the GLIBC ELF interpreter"
     pipeline:
@@ -348,18 +376,64 @@ subpackages:
             runs: |
               mkdir -p "${{targets.subpkgdir}}"/lib
               mv "${{targets.destdir}}"/lib/ld-linux-aarch64.so.1 "${{targets.subpkgdir}}"/lib/
-          # Regrettably, the LSB *requires* the GLIBC ELF loader to be installed in `/lib64`.
+          # Regrettably, the LSB *requires* the GLIBC ELF loader to be installed in `/lib64`
+          # Note that /lib64 is always a symlink in wolfi-baselayout
           - if: ${{build.arch}} == 'x86_64'
             runs: |
-              mkdir -p "${{targets.subpkgdir}}"/lib64
-              mv "${{targets.destdir}}"/lib/ld-linux-x86-64.so.2 "${{targets.subpkgdir}}"/lib64/
+              mkdir -p "${{targets.subpkgdir}}"/lib
+              mv "${{targets.destdir}}"/lib/ld-linux-x86-64.so.2 "${{targets.subpkgdir}}"/lib/
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/etc
           mv "${{targets.destdir}}"/etc/ld.so.* "${{targets.subpkgdir}}"/etc/
     dependencies:
       provider-priority: 10
       runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
         - wolfi-baselayout
+    test:
+      environment:
+        contents:
+          packages:
+            - gcc
+            - glibc-dev
+      pipeline:
+        - name: Check lib64 and apk audit locations of ld-linux
+          runs: |
+            [ -e /lib64/ld-linux-* ]
+            [ -z "$(apk audit --full | grep ld-linux)" ]
+        - name: Test usage of /etc/ld.so.conf.d/ snippets
+          runs: |
+            tmpdir="$(mktemp -d)"
+            tmplibdir="$(mktemp -d)"
+            ldcfg="/etc/ld.so.conf.d/test-snippet.conf"
+            cleanup() {
+              rm -f "$ldcfg"
+              rm -rf "$tmpdir" "$tmplibdir"
+            }
+            trap cleanup EXIT
+            cat > "$tmpdir/ldsoconfdotd.c" << EOF
+            #include <stdio.h>
+
+            void ldsoconfdotd_test(void) {
+              printf("Calling %s\n", __func__);
+            }
+            EOF
+            cat > "$tmpdir/test.c" << EOF
+            void ldsoconfdotd_test(void);
+            int main(void) {
+              ldsoconfdotd_test();
+            }
+            EOF
+            gcc -c -fpic "$tmpdir/ldsoconfdotd.c" -o "$tmpdir/ldsoconfdotd.o"
+            gcc -shared -o "$tmplibdir/libldsoconfdotd.so" \
+              "$tmpdir/ldsoconfdotd.o"
+            echo "$tmplibdir" > "$ldcfg"
+            ldconfig
+            LIBRARY_PATH="$tmplibdir" \
+              gcc "$tmpdir/test.c" -o "$tmpdir/test" -lldsoconfdotd
+            "$tmpdir"/test
 
   - name: "glibc-dev"
     description: "GLIBC development headers"
@@ -371,8 +445,11 @@ subpackages:
           [ -f "${{targets.destdir}}"/usr/lib/libm.so ] && mv "${{targets.destdir}}"/usr/lib/libm.so "${{targets.subpkgdir}}"/usr/lib/
     dependencies:
       runtime:
-        - linux-headers
         - libxcrypt-dev
+        - linux-headers
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "glibc-iconv"
     description: "GLIBC iconv tables"
@@ -381,13 +458,18 @@ subpackages:
           mkdir -p "${{targets.subpkgdir}}"/usr/lib
           mv "${{targets.destdir}}"/usr/lib/gconv "${{targets.subpkgdir}}"/usr/lib/
 
-          mkdir -p "${{targets.subpkgdir}}"/usr/sbin
-          mv "${{targets.destdir}}"/usr/sbin/iconvconfig "${{targets.subpkgdir}}"/usr/sbin
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/iconvconfig "${{targets.subpkgdir}}"/usr/bin
     test:
       pipeline:
         - runs: |
             iconvconfig --version
             iconvconfig --help
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "glibc-locales"
     description: "GLIBC locale data"
@@ -396,17 +478,21 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/share
           mv "${{targets.destdir}}"/usr/share/i18n "${{targets.subpkgdir}}"/usr/share/i18n
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "tzutils"
     description: "Timezone utilities"
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/bin
-          mkdir -p "${{targets.subpkgdir}}"/usr/sbin
 
           mv "${{targets.destdir}}"/usr/bin/tzselect "${{targets.subpkgdir}}"/usr/bin
           mv "${{targets.destdir}}"/usr/bin/zdump "${{targets.subpkgdir}}"/usr/bin
-          mv "${{targets.destdir}}"/usr/sbin/zic "${{targets.subpkgdir}}"/usr/sbin
+          mv "${{targets.destdir}}"/usr/bin/zic "${{targets.subpkgdir}}"/usr/bin
     test:
       pipeline:
         - runs: |
@@ -416,12 +502,22 @@ subpackages:
             zdump --help
             zic --version
             zic --help
+    dependencies:
+      runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "posix-libc-utils"
     description: "POSIX XCU utilities included with the C library"
     dependencies:
       runtime:
         - bash
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/bin
@@ -462,6 +558,12 @@ subpackages:
         - runs: |
             localedef --version
             localedef --help
+    dependencies:
+      runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "sotruss"
     description: "Shared object tracing tool"
@@ -477,18 +579,31 @@ subpackages:
         - runs: |
             sotruss --version
             sotruss --help
+        - uses: test/tw/ldd-check
+    dependencies:
+      runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "nscd"
     description: "NSS caching daemon"
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/sbin
-          mv "${{targets.destdir}}"/usr/sbin/nscd "${{targets.subpkgdir}}"/usr/sbin/
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/nscd "${{targets.subpkgdir}}"/usr/bin/
     test:
       pipeline:
         - runs: |
             nscd --version
             nscd --help
+    dependencies:
+      runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "nss-db"
     description: "NSS module for database lookups"
@@ -506,6 +621,12 @@ subpackages:
         - runs: |
             makedb --version
             makedb --help
+        - uses: test/tw/ldd-check
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "nss-hesiod"
     description: "NSS module for hesiod lookups"
@@ -513,6 +634,14 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/lib
           mv "${{targets.destdir}}"/lib/libnss_hesiod.so.2 "${{targets.subpkgdir}}"/lib
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "pcprofiledump"
     description: "PC profiling tool"
@@ -528,6 +657,12 @@ subpackages:
         - runs: |
             pcprofiledump --version
             pcprofiledump --help
+    dependencies:
+      runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "glibc-tracing"
     description: "GLIBC tracing and profiling utilities"
@@ -544,18 +679,30 @@ subpackages:
             sprof --help
             xtrace --version
             xtrace --help
+    dependencies:
+      runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "sln"
     description: "Staticly-linked symbolic link tool"
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/sbin
-          mv "${{targets.destdir}}"/sbin/sln "${{targets.subpkgdir}}"/sbin
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/sln "${{targets.subpkgdir}}"/usr/bin
     test:
       pipeline:
         - runs: |
             sln --version
             sln --help
+    dependencies:
+      runtime:
+        - glibc=${{package.full-version}}
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "libcrypt1"
     description: "Password hashing library included with glibc"
@@ -564,7 +711,11 @@ subpackages:
       provides:
         - so:libcrypt.so.1=1
       runtime:
+        - glibc=${{package.full-version}}
         - libxcrypt
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - name: "glibc-locale-posix"
     description: "POSIX locale data for glibc"
@@ -572,6 +723,11 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib/locale
           mv "${{targets.destdir}}"/usr/lib/locale/C.utf8 "${{targets.subpkgdir}}"/usr/lib/locale/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   - range: locales
     name: "glibc-locale-${{range.key}}"
@@ -587,20 +743,33 @@ subpackages:
           # glibc-locale-en is ~18x as big as it should be due to duplicate files.
           # rdfind replaces redundant files with hardlinks.
           rdfind -makehardlinks true "${{targets.subpkgdir}}"/usr/lib/locale/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
 
   # Similar to https://packages.debian.org/bookworm/libc-bin
   - name: "libc-bin"
     description: "GNU C Library: Binaries"
     dependencies:
       runtime:
+        - localedef
+        - merged-sbin
+        - merged-usrsbin
         - posix-libc-utils
         - tzutils
-        - localedef
+        - wolfi-baselayout
     checks:
       disabled:
         - empty
 
 test:
+  environment:
+    contents:
+      packages:
+        - gcc
+        - glibc-dev
   pipeline:
     - runs: |
         # Ensure locales are excluded from glibc
@@ -617,9 +786,37 @@ test:
         ldconfig --help
         ld.so --version
         ld.so --help
-    - uses: test/ldd-check
-      with:
-        packages: ${{package.name}}
+    - uses: test/tw/ldd-check
+    - name: Confirm that we're still compatible with current gcc
+      runs: |
+        # This was a problem due to some legacy fix-includes in gcc that interfered
+        # with new glibc private symbols.  Let's make sure that doesn't break again
+        cat <<EOF >gcc_test.cc
+        #include <thread>
+        #include <future>
+        int main(void)
+        {
+          return 0;
+        }
+        EOF
+        g++ -o test_build gcc_test.cc
+    - name: Verify apk bootstrap works
+      runs: |
+        # Verify that glibc + bash-binsh bootstrap works
+        mkdir -p /tmp/glibc-bash/etc/apk
+        cp -r /etc/apk/repositories /etc/apk/keys /tmp/glibc-bash/etc/apk
+        apk add --initdb --root /tmp/glibc-bash glibc bash-binsh &> bootstrap.log || true
+        cat bootstrap.log
+        grep -e ERROR: bootstrap.log | grep -v 'updating directory permissions' >errors.log || true
+        grep -e ERROR: errors.log && exit 1
+
+        # Verify that glibc + busybox bootstrap works
+        mkdir -p /tmp/glibc-busybox/etc/apk
+        cp -r /etc/apk/repositories /etc/apk/keys /tmp/glibc-busybox/etc/apk
+        apk add --initdb --root /tmp/glibc-busybox glibc busybox &> bootstrap.log || true
+        cat bootstrap.log
+        grep -e ERROR: bootstrap.log | grep -v 'updating directory permissions' > errors.log || true
+        grep -e ERROR: errors.log && exit 1
 
 update:
   enabled: true

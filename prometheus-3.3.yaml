@@ -1,0 +1,143 @@
+package:
+  name: prometheus-3.3
+  version: "3.3.0"
+  epoch: 0
+  description: The Prometheus monitoring system and time series database.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - prometheus=${{package.full-version}}
+    runtime:
+      - merged-usrsbin
+      - wolfi-baselayout
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - go
+      - nodejs
+      - npm
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: bae6541e786e0255a8a0e7a7e8575ea8d883f192
+      repository: https://github.com/prometheus/prometheus
+      tag: v${{package.version}}
+
+  - uses: patch
+    with:
+      patches: disable-pprof.patch
+
+  - runs: |
+      GOLDFLAGS="-X github.com/prometheus/common/version.Version=${{package.version}}
+        -X github.com/prometheus/common/version.Revision=WolfiLinux
+        -X github.com/prometheus/common/version.Branch=master
+        -X github.com/prometheus/common/version.BuildUser=$USER@$HOSTNAME
+        -X github.com/prometheus/common/version.BuildDate=$(date -u "+%Y%m%d-%H:%M:%S" ${SOURCE_DATE_EPOCH:+-d @$SOURCE_DATE_EPOCH})
+      "
+      if [ -n "$LDFLAGS" ]; then
+        # LDFLAGS (and only LDFLAGS) should be passed to -extldflags.
+        GOLDFLAGS="$GOLDFLAGS -extldflags '$LDFLAGS'"
+      fi
+
+      # set -j1 to run things in the correct order in makefile
+      # actual go building is still parallel
+      make -j1 assets-compress
+
+      go build \
+        -trimpath \
+        -mod=readonly \
+        -ldflags "$GOLDFLAGS" \
+        -tags netgo,builtinassets \
+        ./cmd/prometheus
+      go build \
+        -trimpath \
+        -mod=readonly \
+        -ldflags "$GOLDFLAGS" \
+        ./cmd/promtool
+
+  - runs: |
+      install -Dm755 prometheus "${{targets.destdir}}"/usr/bin/prometheus
+      install -Dm755 promtool "${{targets.destdir}}"/usr/bin/promtool
+
+      install -Dm644 prometheus.confd \
+        "${{targets.destdir}}"/etc/conf.d/prometheus
+
+      install -dm644 "${{targets.destdir}}"/var/lib/prometheus/data
+
+      install -Dm644 -t "${{targets.destdir}}"/etc/prometheus \
+        documentation/examples/prometheus.yml
+
+subpackages:
+  - name: ${{package.name}}-bitnami-compat
+    dependencies:
+      provides:
+        - prometheus-bitnami-compat=${{package.full-version}}
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
+    description: "compat package with bitnami/prometheus image"
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: prometheus
+          version-path: 2/debian-12
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/prometheus/bin/
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/prometheus/conf
+
+          chmod g+rwX ${{targets.subpkgdir}}/opt/bitnami
+
+          cp ${{targets.destdir}}/usr/bin/prometheus ${{targets.subpkgdir}}/opt/bitnami/prometheus/bin/prometheus
+          cp ${{targets.destdir}}/usr/bin/promtool ${{targets.subpkgdir}}/opt/bitnami/prometheus/bin/promtool
+          cp -r ${{targets.destdir}}/etc/prometheus/* ${{targets.subpkgdir}}/opt/bitnami/prometheus/conf/
+          cp -r ${{targets.destdir}}/var/lib/prometheus/data ${{targets.subpkgdir}}/opt/bitnami/prometheus/data
+
+update:
+  ignore-regex-patterns:
+    - '\+stringlabels' # looks like stringlabels are still experimental, let's stick to the main version stream.
+  enabled: true
+  github:
+    identifier: prometheus/prometheus
+    strip-prefix: v
+    tag-filter-prefix: v3.3
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+  pipeline:
+    - name: Check Prometheus Rules
+      runs: |
+        cat << 'EOF' > rules.example
+        groups:
+        - name: http
+          rules:
+          - record: job:http_inprogress_requests:sum
+            expr: sum(http_inprogress_requests) by (job)
+        EOF
+        promtool check rules rules.example
+        prometheus --version
+        prometheus --help
+        promtool --version
+        promtool --help
+    - name: Verify Prometheus Installation and Server Running Capability
+      runs: |
+        cat << 'EOF' > prometheus.yml
+        global:
+          scrape_interval: 15s
+
+        scrape_configs:
+          - job_name: "prometheus"
+            static_configs:
+            - targets: ["localhost:9090"]
+        EOF
+        prometheus --config.file=./prometheus.yml --web.listen-address=127.0.0.1:9090 &
+        sleep 5
+        curl -s "http://127.0.0.1:9090/-/healthy" | grep -q "Prometheus Server is Healthy."

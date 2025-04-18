@@ -247,3 +247,7 @@ check-bootstrap:
 	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
+
+cue_targets = $(foreach name,$(yamls),cue_vet/$(name))
+$(cue_targets): cue_vet/%:
+	cue vet $* schema.cue

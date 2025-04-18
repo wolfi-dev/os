@@ -27,7 +27,6 @@ MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
 MELANGE_OPTS += --license 'Apache-2.0'
 MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
-MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
 MELANGE_OPTS += --cache-dir ${CACHEDIR}
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}

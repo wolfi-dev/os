@@ -29,6 +29,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Code Style Guidelines
 - Package YAML files follow strict formatting (enforced by `yam`)
 - YAML fields: maintain alphabetical order when possible
+- Remove all trailing whitespace from files
+- Ensure consistent indentation (2 spaces for YAML)
 - Package versioning: increment "epoch" when changing a package without version bump
 - Reset "epoch" to 0 for new package versions
 - PR naming: `<package-name>/<version>: <description>`
@@ -36,6 +38,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - When patching CVEs: use `<CVE-ID>.patch` naming convention
 - Security fixes must be recorded in the advisories repo
 - Version streams: use version string in package name, provide logical unversioned forms
+- ALWAYS run `./lint.sh <filename.yaml>` after updating any YAML file to ensure proper formatting
 
 ## File Structure
 Package definitions are YAML files with build instructions for Melange.
@@ -83,7 +86,7 @@ test:
       runs: |
         ruby <<-EOF
         require 'gem_name'
-        
+
         begin
           # Actual functionality tests with sample inputs and expected outputs
           # Use raise to fail the test on unexpected results
@@ -107,6 +110,26 @@ test:
 - If a gem has optional parameters (like bias, ignore flags), test those too when possible
 - Use exit code 1 to indicate test failures
 - Validate that key classes, methods, and constants from the package are present and working
+- Write tests that verify command behavior, not just execution
+- For shell condition checks, use direct comparison with `[ "$OUTPUT" = "expected" ]` style
+- Avoid redundant error exits like `|| exit 1` as test scripts will fail on their own
+- For numeric outputs, use appropriate numeric comparisons like `[ "$COUNT" -eq 3 ]`
+- Test multiple command options and features when possible
+- When matching patterns in complex outputs, use variable expansion with grep but without the error exit: `[ "$(echo "$OUTPUT" | grep "pattern")" != "" ]`
+
+### Avoiding Fragile Tests
+- For version checks, simply run `--version` without validating the output at all
+- Never validate specific version numbers in tests, even when using `${{package.version}}` interpolation
+  - Version number formats may change (e.g., from "1.2" to "v1.2.0")
+  - Additional information may be added to version outputs between releases
+  - Patch releases may include suffixes or build information that break exact matches
+- When testing CLI programs, focus only on successful execution of commands
+- For version and help commands, verify:
+  - The command runs successfully (non-zero exit code would fail the test naturally)
+  - For extremely important elements, check their presence very loosely with pattern matching
+- Focus exclusively on testing behavior and functionality, not output format or content
+- For help text, at most verify that key commands appear somewhere in the output
+- If you must check for output content, use very minimal pattern matching looking for single keywords
 
 #### Common Testing Mistakes to Avoid
 - Testing a dependency instead of the actual package being built

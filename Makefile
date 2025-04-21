@@ -98,10 +98,11 @@ ${CACHEDIR}/.libraries_token.txt: cache
 .PHONY: lib-token
 lib-token: ${CACHEDIR}/.libraries_token.txt
 
-.PHONY: fetch-kernel
+.PHONY: apk-token
 apk-token:
 	chainctl auth login --audience apk.cgr.dev
 
+.PHONY: fetch-kernel
 fetch-kernel: apk-token
 	$(eval KERNEL_PKG := $(shell curl -L --silent --output - --user user:$$(chainctl auth token --audience apk.cgr.dev) https://apk.cgr.dev/chainguard-private/$(ARCH)/APKINDEX.tar.gz | \
 		zcat | \

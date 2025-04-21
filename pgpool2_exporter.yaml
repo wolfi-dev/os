@@ -1,0 +1,104 @@
+package:
+  name: pgpool2_exporter
+  version: "1.2.2"
+  epoch: 0
+  description: Prometheus exporter for Pgpool-II metrics.
+  copyright:
+    - license: MIT
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: http://github.com/pgpool/pgpool2_exporter
+      tag: v${{package.version}}
+      expected-commit: 06a68dead344308c3346f53aba811c929eff71d5
+
+  - uses: go/build
+    with:
+      packages: ./cmd/pgpool2_exporter
+      modroot: .
+      output: pgpool2_exporter
+      ldflags: |
+        -X github.com/prometheus/common/version.Version=${{package.version}}
+        -X github.com/prometheus/common/version.Branch=master
+        -X github.com/prometheus/common/version.Revision=$(git rev-parse HEAD)
+        -X github.com/prometheus/common/version.BuildDate=$(date -u -d "@$([ "${SOURCE_DATE_EPOCH:-0}" -eq 0 ] && date +%s || echo $SOURCE_DATE_EPOCH)" +'%Y-%m-%dT%H:%M:%SZ')
+        -X github.com/prometheus/common/version.BuildUser=chainguard-dev
+
+update:
+  enabled: true
+  github:
+    identifier: pgpool/pgpool2_exporter
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql
+        - postgresql-client
+        - pgpool2
+        - curl
+        - bash
+        - shadow
+        - sudo-rs
+    environment:
+      PG_USER: "testuser"
+      PG_PASSWORD: "testpass"
+      PG_DB: "postgres"
+      PG_PORT: "5432"
+      PG_DATA: "/tmp/pgdata"
+      PGHOST: "localhost"
+      PGPOOL_PORT: "9999"
+      EXPORTER_PORT: "9187"
+  pipeline:
+    - name: "Test Version and help flags"
+      runs: |
+        pgpool2_exporter --version 2>&1 | grep -q "${{package.version}}"
+        pgpool2_exporter --help 2>&1 | grep -q "${{package.name}}"
+
+    - name: "Set up PostgreSQL"
+      runs: |
+        useradd -m $PG_USER
+        sudo -u $PG_USER initdb -D $PG_DATA --username=$PG_USER
+
+        # Start PostgreSQL in the background
+        sudo -u $PG_USER pg_ctl -D $PG_DATA -o "-p $PG_PORT" -w start
+
+        # Create DB and grant privileges
+        # psql -U $PG_USER -h "$PGHOST" -p "$PG_PORT" -d ${PG_DB} -c "CREATE DATABASE $PG_DB OWNER $PG_USER;"
+        psql -U $PG_USER -h "$PGHOST" -p "$PG_PORT" -d ${PG_DB} -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB TO $PG_USER;"
+    - name: "Start Pgpool-II"
+      runs: |
+        mkdir -p /etc/pgpool2 /var/log/pgpool /tmp/pgpool
+        # Pgpool config
+        cat <<EOF > /etc/pgpool2/pgpool.conf
+        backend_hostname0 = 'localhost'
+        backend_port0 = ${PG_PORT}
+        backend_weight0 = 1
+        backend_data_directory0 = '${PG_DATA}'
+        listen_addresses = '*'
+        port = ${PGPOOL_PORT}
+        enable_pool_hba = off
+        load_balance_mode = off
+        sr_check_user = '${PG_USER}'
+        sr_check_password = '${PG_PASSWORD}'
+        EOF
+        # Run Pgpool2
+        pgpool -n -f /etc/pgpool2/pgpool.conf &
+        sleep 5
+
+    - name: "Run pgpool2_exporter and validate metrics"
+      runs: |
+        export DATA_SOURCE_NAME="postgresql://${PG_USER}:${PG_PASSWORD}@localhost:${PGPOOL_PORT}/${PG_DB}?sslmode=disable"
+        pgpool2_exporter --web.listen-address=":${EXPORTER_PORT}" --log.level=debug &
+        sleep 2
+        curl -s http://localhost:${EXPORTER_PORT}/metrics 2>&1 | grep -q "pgpool2_backend_used 1"
+        echo "Updating DB by running 5 queries through Pgpool"
+        for i in $(seq 1 5); do
+          echo "- Running query $i"
+          PGPASSWORD=$PG_PASSWORD psql -U $PG_USER -h localhost -p ${PGPOOL_PORT} -d $PG_DB -c "SELECT generate_series(1, 100);" > /dev/null 2>&1
+          sleep 1
+        done
+        echo "Validating updated Pgpool metrics"
+        curl -s http://localhost:${EXPORTER_PORT}/metrics | grep '^pgpool2_pool_nodes_select_cnt{' | awk '{print $2}' | grep -q "5"

@@ -1,7 +1,7 @@
 package:
   name: kiali
   version: "2.8.0"
-  epoch: 1
+  epoch: 2
   description: The Console for Istio Service Mesh
   copyright:
     - license: Apache-2.0
@@ -66,14 +66,116 @@ subpackages:
 
 test:
   pipeline:
-    - name: Verify Kiali API
+    - name: Verify Kiali API Binary
       runs: |
         # Check if binary runs
         /opt/kiali/kiali --help
-    - name: Verify Kiali UI
+    - name: Verify Kiali UI Assets
       runs: |
-        # Make sure webroot HTML index file exists
+        # Verify webroot HTML index file exists and contains expected content
+        test -f /opt/kiali/console/index.html
         grep '</html>' /opt/kiali/console/index.html
+
+        # Verify static assets presence using find instead of tree
+        find /opt/kiali/console -type f -name "*.js" | grep -q "static/js" || exit 1
+        find /opt/kiali/console -type f -name "*.css" | grep -q "static/css" || exit 1
+
+        # Verify essential UI files exist
+        test -f /opt/kiali/console/manifest.json
+        test -f /opt/kiali/console/kiali_icon_lightbkg_16px.png
+    - uses: test/kwok/cluster
+    - name: Verify Kiali Health Endpoint
+      runs: |
+        # Get kubeconfig from Kwok cluster and write to file
+        kwokctl get kubeconfig > kubeconfig.yaml
+        if [ ! -s kubeconfig.yaml ]; then
+          echo "Error: Failed to get kubeconfig from Kwok cluster"
+          exit 1
+        fi
+
+        if ! kubectl --kubeconfig kubeconfig.yaml get nodes; then
+          echo "Error: Invalid kubeconfig"
+          cat kubeconfig.yaml
+          exit 1
+        fi
+
+        # Extract server URL from kubeconfig
+        SERVER_URL=$(kubectl --kubeconfig kubeconfig.yaml config view -o jsonpath='{.clusters[0].cluster.server}')
+        if [ -z "$SERVER_URL" ]; then
+          echo "Error: Could not extract server URL from kubeconfig"
+          exit 1
+        fi
+
+        # Parse host and port from server URL
+        KUBERNETES_SERVICE_HOST=$(echo $SERVER_URL | sed -E 's|https?://([^:]+):.*|\1|')
+        KUBERNETES_SERVICE_PORT=$(echo $SERVER_URL | sed -E 's|https?://[^:]+:([0-9]+).*|\1|')
+
+        echo "Setting KUBERNETES_SERVICE_HOST=$KUBERNETES_SERVICE_HOST"
+        echo "Setting KUBERNETES_SERVICE_PORT=$KUBERNETES_SERVICE_PORT"
+
+        # Create service account token directory and files
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        echo "dummy-token" > /var/run/secrets/kubernetes.io/serviceaccount/token
+        echo "dummy-namespace" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+        echo "dummy-ca.crt" > /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+        # Create minimal config with Kwok cluster settings
+        PORT=20001
+        cat >kiali-config.yaml <<EOF
+        server:
+          port: $PORT
+          address: ""  # Listen on all interfaces
+          gzip_enabled: true
+          cors_allow_all: false
+        auth:
+          strategy: anonymous
+        external_services:
+          istio:
+            root_namespace: istio-system
+        deployment:
+          accessible_namespaces:
+            - '**'
+        kubernetes:
+          config_file: "$(pwd)/kubeconfig.yaml"
+          in_cluster: false
+          service_account_token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+          service_account_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+          use_service_account: true
+        EOF
+
+        echo "Using kubeconfig at: $(pwd)/kubeconfig.yaml"
+        echo "Kiali config:"
+        cat kiali-config.yaml
+
+        # Start Kiali in background with config and environment variables
+        KUBERNETES_SERVICE_HOST=$KUBERNETES_SERVICE_HOST \
+        KUBERNETES_SERVICE_PORT=$KUBERNETES_SERVICE_PORT \
+        /opt/kiali/kiali --config kiali-config.yaml --kubeconfig kubeconfig.yaml &>kiali.log &
+        KAILI_PID=$!
+
+        sleep 2
+        if ! kill -0 $KAILI_PID 2>/dev/null; then
+          echo "Error: Kiali process failed to start"
+          cat kiali.log
+          exit 1
+        fi
+
+        # Check if curl and jq are available
+        if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+          curl -sf http://localhost:$PORT/api/healthz | jq -e '.status=="OK"'
+        else
+          echo "Warning: curl or jq not available, skipping health check"
+        fi
+
+        # Cleanup - only kills if process exists
+        if kill -0 $KAILI_PID 2>/dev/null; then
+          kill $KAILI_PID
+          sleep 1
+          # Force kill if still running
+          kill -9 $KAILI_PID 2>/dev/null || true
+        fi
+        rm -f kiali.log kiali-config.yaml kubeconfig.yaml
+        rm -rf /var/run/secrets/kubernetes.io/serviceaccount
 
 update:
   enabled: true

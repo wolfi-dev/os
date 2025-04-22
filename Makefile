@@ -19,6 +19,12 @@ SOURCES ?= gs://wolfi-sources/
 ifneq (${MELANGE_RUNNER},)
 	MELANGE_OPTS += --runner ${MELANGE_RUNNER}
 endif
+QEMU_KERNEL_IMAGE ?= kernel/boot/vmlinuz
+ifeq (${MELANGE_RUNNER},qemu)
+	QEMU_KERNEL_DEP = ${QEMU_KERNEL_IMAGE}
+	export QEMU_KERNEL_IMAGE
+endif
+
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
 MELANGE_OPTS += --signing-key ${KEY}
@@ -84,6 +90,7 @@ cache:
 .PHONY: clean
 clean:
 	rm -rf packages/${ARCH}
+	rm -rf kernel/
 
 .PHONY: clean-cache
 clean-cache:
@@ -103,18 +110,38 @@ apk-token:
 	chainctl auth login --audience apk.cgr.dev
 
 .PHONY: fetch-kernel
-fetch-kernel: apk-token
-	$(eval KERNEL_PKG := $(shell curl -L --silent --output - --user user:$$(chainctl auth token --audience apk.cgr.dev) https://apk.cgr.dev/chainguard-private/$(ARCH)/APKINDEX.tar.gz | \
-		zcat | \
-		grep -a -A1 "^P:linux$$" | \
-		grep "^V:" | \
-		sort -V | \
-		tail -n1 | sed -e "s/^V://"))
-	curl -s -LSo /tmp/linux.apk --user user:$(shell chainctl auth token --audience apk.cgr.dev) https://apk.cgr.dev/chainguard-private/$(ARCH)/linux-$(KERNEL_PKG).apk
-	mkdir -p /tmp/kernel
-	tar -xf /tmp/linux.apk -C /tmp/kernel/ 2>/dev/null
-	export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz
-	export MELANGE_OPTS="--runner=qemu"
+fetch-kernel:
+	rm -rf kernel
+	$(MAKE) kernel/boot/vmlinuz
+
+kernel/APKINDEX.tar.gz:
+	$(MAKE) apk-token
+	mkdir -p kernel
+	curl -LS --silent -o $@ \
+	  --user user:$$(chainctl auth token --audience apk.cgr.dev) \
+	  https://apk.cgr.dev/chainguard-private/$(ARCH)/APKINDEX.tar.gz
+
+kernel/APKINDEX: kernel/APKINDEX.tar.gz
+	tar -x -C kernel -f $< $(notdir $@)
+	touch $@
+
+kernel/chosen: kernel/APKINDEX
+	grep -e '^P:' -e '^V:' $< | sed -n '/^P:linux$$/{n;p}' > \
+	  kernel/available
+	grep '^V:' kernel/available | sed 's/V://' | \
+	  sort -V | tail -n1 > kernel/chosen
+
+kernel/linux.apk: kernel/chosen
+	$(MAKE) apk-token
+	kver=$(file < kernel/chosen); \
+	  curl -LS --silent -o $@.tmp \
+	  --user user:$$(chainctl auth token --audience apk.cgr.dev) \
+	  https://apk.cgr.dev/chainguard-private/$(ARCH)/linux-$$kver.apk
+	mv $@.tmp $@
+
+kernel/boot/vmlinuz: kernel/linux.apk
+	tar -x -C kernel -f $< boot/ 2> /dev/null
+	touch $@
 
 yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))
@@ -125,7 +152,7 @@ $(pkg_targets): package/%:
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
-packages/$(ARCH)/%.apk: cache $(KEY)
+packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
@@ -137,7 +164,7 @@ $(docker_pkg_targets): docker-package/%:
 	MELANGE_EXTRA_OPTS="--runner docker" make package/$*
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
-$(dbg_targets): debug/%: cache $(KEY)
+$(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"

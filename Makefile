@@ -99,13 +99,20 @@ ${CACHEDIR}/.libraries_token.txt: cache
 lib-token: ${CACHEDIR}/.libraries_token.txt
 
 .PHONY: fetch-kernel
-fetch-kernel:
-	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
-	curl -s -LSo linux-virt.apk "https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/$(KERNEL_PKG)"
+apk-token:
+	chainctl auth login --audience apk.cgr.dev
+
+fetch-kernel: apk-token
+	$(eval KERNEL_PKG := $(shell curl -L --silent --output - --user user:$$(chainctl auth token --audience apk.cgr.dev) https://apk.cgr.dev/chainguard-private/$(ARCH)/APKINDEX.tar.gz | \
+		zcat | \
+		grep -a -A1 "^P:linux$$" | \
+		grep "^V:" | \
+		sort -V | \
+		tail -n1 | sed -e "s/^V://"))
+	curl -s -LSo /tmp/linux.apk --user user:$(shell chainctl auth token --audience apk.cgr.dev) https://apk.cgr.dev/chainguard-private/$(ARCH)/linux-$(KERNEL_PKG).apk
 	mkdir -p /tmp/kernel
-	tar -xf ./linux-virt.apk -C /tmp/kernel/ 2>/dev/null
-	export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz-virt
-	export QEMU_KERNEL_MODULES=/tmp/kernel/lib/modules/
+	tar -xf /tmp/linux.apk -C /tmp/kernel/ 2>/dev/null
+	export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz
 	export MELANGE_OPTS="--runner=qemu"
 
 yamls := $(wildcard *.yaml)

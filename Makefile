@@ -117,9 +117,10 @@ fetch-kernel:
 kernel/APKINDEX.tar.gz:
 	$(MAKE) apk-token
 	mkdir -p kernel
-	curl -LS --silent -o $@ \
+	curl -LS --silent -o $@.tmp \
 	  --user user:$$(chainctl auth token --audience apk.cgr.dev) \
 	  https://apk.cgr.dev/chainguard-private/$(ARCH)/APKINDEX.tar.gz
+	mv $@.tmp $@
 
 kernel/APKINDEX: kernel/APKINDEX.tar.gz
 	tar -x -C kernel -f $< $(notdir $@)

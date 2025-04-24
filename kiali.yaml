@@ -65,6 +65,21 @@ subpackages:
           mv build ${{targets.contextdir}}/opt/kiali/console
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+    environment:
+      KIALI_SERVER_PORT: "20001"
+      KIALI_SERVER_ADDRESS: ""
+      KIALI_SERVER_GZIP_ENABLED: "true"
+      KIALI_SERVER_CORS_ALLOW_ALL: "false"
+      KIALI_AUTH_STRATEGY: "anonymous"
+      KIALI_EXTERNAL_SERVICES_ISTIO_ROOT_NAMESPACE: "istio-system"
+      KIALI_DEPLOYMENT_ACCESSIBLE_NAMESPACES: '["**"]'
+      KIALI_KUBERNETES_IN_CLUSTER: "false"
+      KIALI_KUBERNETES_USE_SERVICE_ACCOUNT: "true"
+      KIALI_SERVER_SESSION_SIGNING_KEY: "0123456789abcdef0123456789abcdef" # 32 bytes hex string
   pipeline:
     - name: Verify Kiali API Binary
       runs: |
@@ -85,73 +100,62 @@ test:
         test -f /opt/kiali/console/kiali_icon_lightbkg_16px.png
     - uses: test/kwok/cluster
     - name: Verify Kiali Health Endpoint
-      runs: |
-        # Get kubeconfig from Kwok cluster and write to file
-        kwokctl get kubeconfig > kubeconfig.yaml
-        if [ ! -s kubeconfig.yaml ]; then
-          echo "Error: Failed to get kubeconfig from Kwok cluster"
-          exit 1
-        fi
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          set -ex
+          kwokctl get kubeconfig > kubeconfig.yaml
 
-        if ! kubectl --kubeconfig kubeconfig.yaml get nodes; then
-          echo "Error: Invalid kubeconfig"
-          cat kubeconfig.yaml
-          exit 1
-        fi
+          SERVER_URL=$(kubectl --kubeconfig kubeconfig.yaml config view -o jsonpath='{.clusters[0].cluster.server}')
+          KUBERNETES_SERVICE_HOST=$(echo "$SERVER_URL" | cut -d: -f2 | cut -d/ -f3)
+          KUBERNETES_SERVICE_PORT=$(echo "$SERVER_URL" | cut -d: -f3)
 
-        # Extract server URL from kubeconfig
-        SERVER_URL=$(kubectl --kubeconfig kubeconfig.yaml config view -o jsonpath='{.clusters[0].cluster.server}')
-        if [ -z "$SERVER_URL" ]; then
-          echo "Error: Could not extract server URL from kubeconfig"
-          exit 1
-        fi
+          echo "Setting KUBERNETES_SERVICE_HOST=$KUBERNETES_SERVICE_HOST"
+          echo "Setting KUBERNETES_SERVICE_PORT=$KUBERNETES_SERVICE_PORT"
 
-        # Parse host and port from server URL
-        KUBERNETES_SERVICE_HOST=$(echo $SERVER_URL | sed -E 's|https?://([^:]+):.*|\1|')
-        KUBERNETES_SERVICE_PORT=$(echo $SERVER_URL | sed -E 's|https?://[^:]+:([0-9]+).*|\1|')
+          mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+          echo "dummy-token" > /var/run/secrets/kubernetes.io/serviceaccount/token
+          echo "dummy-namespace" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+          echo "dummy-ca.crt" > /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 
-        echo "Setting KUBERNETES_SERVICE_HOST=$KUBERNETES_SERVICE_HOST"
-        echo "Setting KUBERNETES_SERVICE_PORT=$KUBERNETES_SERVICE_PORT"
-
-        # Create service account token directory and files
-        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
-        echo "dummy-token" > /var/run/secrets/kubernetes.io/serviceaccount/token
-        echo "dummy-namespace" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
-        echo "dummy-ca.crt" > /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-
-        # Create minimal config with Kwok cluster settings
-        PORT=20001
-        cat >kiali-config.yaml <<EOF
-        server:
-          port: $PORT
-          address: ""  # Listen on all interfaces
-          gzip_enabled: true
-          cors_allow_all: false
-        auth:
-          strategy: anonymous
-        external_services:
-          istio:
-            root_namespace: istio-system
-        deployment:
-          accessible_namespaces:
-            - '**'
-        kubernetes:
-          config_file: "$(pwd)/kubeconfig.yaml"
-          in_cluster: false
-          service_account_token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token"
-          service_account_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-          use_service_account: true
-        EOF
-
-        echo "Using kubeconfig at: $(pwd)/kubeconfig.yaml"
-        echo "Kiali config:"
-        cat kiali-config.yaml
-
-        # Start Kiali in background with config and environment variables
-        KUBERNETES_SERVICE_HOST=$KUBERNETES_SERVICE_HOST \
-        KUBERNETES_SERVICE_PORT=$KUBERNETES_SERVICE_PORT \
-        /opt/kiali/kiali --config kiali-config.yaml --kubeconfig kubeconfig.yaml &>kiali.log &
-        KAILI_PID=$!
+          # Create Kiali configuration file
+          cat >kiali-config.yaml <<'EOF'
+          server:
+            port: 20001
+            address: ""
+            gzip_enabled: true
+            cors_allow_all: false
+            session_signing_key: "0123456789abcdef0123456789abcdef"
+          auth:
+            strategy: anonymous
+          external_services:
+            istio:
+              root_namespace: istio-system
+          deployment:
+            accessible_namespaces:
+              - "**"
+          kubernetes:
+            config_file: "$(pwd)/kubeconfig.yaml"
+            in_cluster: false
+            service_account_token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+            service_account_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+            use_service_account: true
+          EOF
+        start: |
+          export KUBERNETES_SERVICE_HOST="$KUBERNETES_SERVICE_HOST"
+          export KUBERNETES_SERVICE_PORT="$KUBERNETES_SERVICE_PORT"
+          export KUBECONFIG="$(pwd)/kubeconfig.yaml"
+          exec /opt/kiali/kiali --config kiali-config.yaml
+        timeout: 60
+        expected_output: |
+          Kiali: Console URL is
+        post: |
+          # Wait for the server to be ready
+          sleep 5
+          # Check health endpoint
+          curl -s http://localhost:20001/healthz | grep '"status":"pass"' || exit 1
+          # Check API endpoint
+          curl -s http://localhost:20001/api/namespaces | grep -q '"namespaces"' || exit 1
 
 update:
   enabled: true

@@ -1,0 +1,246 @@
+package:
+  name: pgpool2-4.6
+  version: 4.6.0
+  epoch: 0
+  description: Middleware that works between PostgreSQL servers and a PostgreSQL database client.
+  copyright:
+    - license: BSD-3-Clause AND MIT
+  dependencies:
+    provides:
+      - pgpool2=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - bison
+      - build-base
+      - busybox
+      - flex
+      - libtool
+      - openssl-dev
+      - postgresql-dev
+
+var-transforms:
+  - from: ${{package.version}}
+    match: \.
+    replace: _
+    to: mangled-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/pgpool/pgpool2
+      tag: V${{vars.mangled-package-version}}
+      expected-commit: 7bcfd1ffec63105c177d2e42202a520373960b2f
+
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --sysconfdir=/etc/pgpool2 --with-openssl
+
+  # build src/parser explicitly to avoid build failures due to missing parser files with -j flag
+  - runs: |
+      make -C src/parser V=1
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - uses: strip
+
+  - runs: |
+      mkdir -p "${{targets.contextdir}}/var/run/pgpool"
+
+subpackages:
+  - name: ${{package.name}}-dev
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      provides:
+        - pgpool2-dev=${{package.full-version}}
+      runtime:
+        - ${{package.name}}
+
+  - name: ${{package.name}}-bitnami-compat
+    description: "compat package for bitnami/pgpool image"
+    dependencies:
+      provides:
+        - pgpool2-bitnami-compat=${{package.full-version}}
+      runtime:
+        - busybox
+        - coreutils
+        - openldap
+        - postgresql-client
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: pgpool
+          version-path: 4/debian-12
+      # Add patch for setting LDAP_NSLCD_GROUP and hardcoded path for ldap.conf to set up LDAP
+      - uses: patch
+        working-directory: "${{targets.contextdir}}"
+        with:
+          patches: /home/build/bitnami-compat-remove-os-flavour.patch
+      - name: "Create Symlinks for pgpool binaries"
+        runs: |
+          mkdir -p "${{targets.contextdir}}/opt/bitnami/pgpool/bin"
+          # symlink all pgpool, pcp_* binaries to /opt/bitnami/pgpool/bin
+          for bin in \
+            pcp_attach_node pcp_detach_node pcp_health_check_stats pcp_node_count \
+            pcp_node_info pcp_pool_status pcp_proc_count pcp_proc_info pcp_promote_node \
+            pcp_recovery_node pcp_stop_pgpool pcp_watchdog_info \
+            pg_enc pg_md5 pgpool pgpool_setup pgproto watchdog_setup wd_cli \
+          ; do
+            ln -s "/usr/bin/${bin}" "${{targets.contextdir}}/opt/bitnami/pgpool/bin/${bin}"
+          done
+
+          # copy etc to pgpool/etc
+          mkdir -p "${{targets.contextdir}}/opt/bitnami/pgpool/etc"
+          cp -pr "${{targets.destdir}}/etc/pgpool2/." "${{targets.contextdir}}/opt/bitnami/pgpool/etc/"
+
+          # copy etc to pgpool/etc.default
+          mkdir -p "${{targets.contextdir}}/opt/bitnami/pgpool/etc.default"
+          cp -pr "${{targets.destdir}}/etc/pgpool2/." "${{targets.contextdir}}/opt/bitnami/pgpool/etc.default/"
+
+          # link postgres binaries to /opt/bitnami/postgresql/bin
+          mkdir -p "${{targets.contextdir}}/opt/bitnami/postgresql/bin"
+          for bin in \
+            pg_dump pg_dumpall pg_restore psql \
+          ; do
+            ln -s "/usr/bin/${bin}" "${{targets.contextdir}}/opt/bitnami/postgresql/bin/${bin}"
+          done
+    test:
+      environment:
+        accounts:
+          users:
+            - username: bitnami
+              uid: 1001
+              gid: 0
+          run-as: 0
+        contents:
+          packages:
+            - ${{package.name}}
+            - busybox
+            - coreutils
+            - sudo
+      pipeline:
+        - runs: |
+            test -f /opt/bitnami/pgpool/bin/pgpool
+            test -f /opt/bitnami/postgresql/bin/psql
+        - uses: bitnami/validate-welcome-message
+          with:
+            app-name: pgpool
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - _RPM
+  version-transform:
+    - match: "_"
+      replace: .
+  github:
+    identifier: pgpool/pgpool2
+    strip-prefix: V
+    use-tag: true
+    tag-filter-prefix: V4_6
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql
+        - postgresql-client
+        - shadow
+        - sudo-rs
+    environment:
+      PG_USER: "wolfi"
+      PG_PASSWORD: "28b48ce7ae1f2db6539f7ed94728d992"
+      PG_DB: "postgres"
+      PG_PORT: "5432"
+      PG_DATA: "/tmp/pgdata"
+      PGHOST: "localhost"
+      PGPOOL_PORT: "9999"
+      PCP_PORT: "9998"
+      PCPPASSFILE: "/etc/pgpool2/.pcppass"
+  pipeline:
+    - name: "Test binaries"
+      runs: |
+        pgpool --version 2>&1 | grep -q ${{package.version}}
+        pgpool --help
+    - name: "Configure postgresql"
+      runs: |
+        useradd -m $PG_USER
+        sudo -u $PG_USER initdb -D $PG_DATA --username=$PG_USER
+        # Start PostgreSQL in the background
+        sudo -u $PG_USER pg_ctl -D $PG_DATA -o "-p $PG_PORT" -w start
+        # Grant privileges to DB
+        psql -U $PG_USER -h "$PGHOST" -p "$PG_PORT" -d ${PG_DB} -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB TO $PG_USER;"
+        psql -U $PG_USER -h "$PGHOST" -p "$PG_PORT" -d $PG_DB -c "CREATE TABLE IF NOT EXISTS test_table (id INTEGER, str TEXT); INSERT INTO test_table VALUES(1, 'Test value');"
+    - name: "Configure and start pgpool"
+      runs: |
+        mkdir -p /etc/pgpool2 /var/log/pgpool /tmp/pgpool
+        # Set up PCP authentication
+        echo "${PGHOST}:${PCP_PORT}:${PG_USER}:${PG_PASSWORD}" > $PCPPASSFILE
+        chmod 600 $PCPPASSFILE
+        echo "${PG_USER}:$(pg_md5 $PG_PASSWORD)" > /etc/pgpool2/pcp.conf
+        # Set up pgpool config
+        cat <<EOF > /etc/pgpool2/pgpool.conf
+        listen_addresses = '*'
+        port = ${PGPOOL_PORT}
+        backend_hostname0 = 'localhost'
+        backend_port0 = '${PG_PORT}'
+        backend_weight0 = 1
+        backend_data_directory0 = '${PG_DATA}'
+        enable_pool_hba = off
+        load_balance_mode = off
+        sr_check_user = '${PG_USER}'
+        sr_check_password = '${PG_PASSWORD}'
+        pcp_port = '${PCP_PORT}'
+        pcp_config_file = '/etc/pgpool2/pcp.conf'
+        health_check_period = 2
+        health_check_timeout = 2
+        health_check_user = '${PG_USER}'
+        health_check_password = '${PG_PASSWORD}'
+        EOF
+        # Start pgpool2
+        pgpool -n -f /etc/pgpool2/pgpool.conf &
+        sleep 5
+    - name: "Test query via pgpool port"
+      runs: |
+        # connect via pgpool and validate connection ; retry in case pgpool is not up yet
+        for attempt in $(seq 1 10) ; do
+          if ! psql -U${PG_USER} -h${PGHOST} -p${PG_PORT} ${PG_DB} -c "SELECT * FROM test_table" \
+            | grep 'Test value' ; then
+            sleep 3
+          else
+            exit 0
+          fi
+        done
+        echo "Unable to query data"
+        exit 1
+    - name: "Test pcp_node_count"
+      runs: |
+        pcp_node_count -U "$PG_USER" -h "$PGHOST" -p "${PCP_PORT}" | grep -q "1"
+    - name: "Test healtcheck via pcp_node_info"
+      runs: |
+        pcp_node_info -U "$PG_USER" -h "$PGHOST" -p "$PCP_PORT" -w 0 | grep -q "primary"
+    - name: "Check healthcheck stats"
+      runs: |
+        pcp_health_check_stats -U "$PG_USER" -h "$PGHOST" -p "$PCP_PORT" -w -v 0 | grep -q "primary"
+    - name: "Display and validate Pgpool childprocesses"
+      runs: |
+        pcp_proc_count -U "$PG_USER" -h "$PGHOST" -p "$PCP_PORT"
+        psql -U $PG_USER -h localhost -p $PGPOOL_PORT -d ${PG_DB} -c "SELECT pg_sleep(60);" & sleep 1
+        pcp_proc_info -U "$PG_USER" -h "$PGHOST" -p "$PCP_PORT" --all | grep -q "Execute command"
+    - name: "Check and validate pcp_pool_status"
+      runs: |
+        pcp_pool_status -U "$PG_USER" -h "$PGHOST" -p "$PCP_PORT" | grep -q "wolfi" #used sr_check_user
+    - name: "Detach primary node"
+      runs: |
+        pcp_detach_node -U "$PG_USER" -h "$PGHOST" -p "$PCP_PORT" -n 0 --gracefully | grep -q "Command Successful"
+    - name: "Stop pgpool using pcp_stop_pgpool"
+      runs: |
+        pcp_stop_pgpool -U "$PG_USER" -h "$PGHOST" -p "$PCP_PORT" --mode=fast | grep -q "Command Successful"
+    - uses: test/tw/ldd-check

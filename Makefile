@@ -124,7 +124,7 @@ kernel/chosen: kernel/APKINDEX
 	grep '^V:' kernel/available | sed 's/V://' | \
 	  sort -V | tail -n1 > $@.tmp
 	# Sanity check that this looks like an apk version
-	grep -E '^([0-9]+\.)+[0-9]+-r[0-9]+$' $@.tmp
+	grep -E '^([0-9]+\.)+[0-9]+-r[0-9]+$$' $@.tmp
 	mv $@.tmp $@
 
 kernel/linux.apk: kernel/chosen

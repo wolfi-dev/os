@@ -122,7 +122,10 @@ kernel/chosen: kernel/APKINDEX
 	grep -e '^P:' -e '^V:' $< | sed -n '/^P:linux$$/{n;p}' > \
 	  kernel/available
 	grep '^V:' kernel/available | sed 's/V://' | \
-	  sort -V | tail -n1 > kernel/chosen
+	  sort -V | tail -n1 > $@.tmp
+	# Sanity check that this looks like an apk version
+	grep -E '^([0-9]+\.)+[0-9]+-r[0-9]+$' $@.tmp
+	mv $@.tmp $@
 
 kernel/linux.apk: kernel/chosen
 	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(file < kernel/chosen).apk)

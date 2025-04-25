@@ -1,0 +1,153 @@
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: nextcloud-server
+  version: 31.0.4
+  epoch: 0
+  description: "Nextcloud server, a safe home for all your data"
+  copyright:
+    - license: AGPL-3.0-or-later
+  dependencies:
+    runtime:
+      - busybox
+      - bzip2
+      - libldap
+      - libmagic
+      - php-${{vars.php-version}}
+      - rsync
+  scriptlets:
+    post-install: |
+      #!/bin/sh
+      echo '*/5 * * * * php -f /var/www/html/cron.php' > /var/spool/cron/crontabs/www-data
+
+vars:
+  php-version: 8.1
+
+# Create a new major-version variable that contains only the major version
+# to use in the `nextcloud/docker` repo to find out the correct folder for the image.
+# e.g. 31.0.4 will create a new var major-version=31
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - composer
+      - git
+      - php-${{vars.php-version}}
+  environment:
+    APACHE_BODY_LIMIT: "1073741824"
+    PHP_MEMORY_LIMIT: "512M"
+    PHP_UPLOAD_LIMIT: "512M"
+    PHP_OPCACHE_MEMORY_CONSUMPTION: "128"
+    PHP_INI_DIR: "etc/php"
+
+pipeline:
+  - runs: mkdir -p ${{targets.destdir}}/usr/src
+
+  - uses: fetch
+    with:
+      uri: https://download.nextcloud.com/server/releases/nextcloud-${{package.version}}.tar.bz2
+      expected-sha256: a47541566d5c6ac6f63e4f617e27da295156da47daa2cd22eee3400fd2ad1251
+      directory: ${{targets.destdir}}/usr/src
+      delete: true
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/nextcloud/docker
+      branch: master # It's ok to use master branch here, as this is something is not build-able thing; we just copy files around.
+      expected-commit: af005991484e03918488bb6cdb75750598a121f5
+      destination: nextcloud-docker
+
+  - name: Create dirs
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/src/nextcloud/data
+      mkdir -p ${{targets.destdir}}/usr/src/nextcloud/custom_apps
+      mkdir -p ${{targets.destdir}}/var/www/data
+      mkdir -p ${{targets.destdir}}/usr/src/nextcloud/occ
+      mkdir -p ${{targets.destdir}}/docker-entrypoint-hooks.d/pre-installation
+      mkdir -p ${{targets.destdir}}/docker-entrypoint-hooks.d/post-installation
+      mkdir -p ${{targets.destdir}}/docker-entrypoint-hooks.d/pre-upgrade
+      mkdir -p ${{targets.destdir}}/docker-entrypoint-hooks.d/post-upgrade
+      mkdir -p ${{targets.destdir}}/docker-entrypoint-hooks.d/before-starting
+      chmod +x ${{targets.destdir}}/usr/src/nextcloud/occ
+
+  - working-directory: nextcloud-docker/${{vars.major-version}}/apache
+    runs: |
+      install -m755 config/* ${{targets.destdir}}/usr/src/nextcloud/config
+      install -m755 *.sh ${{targets.destdir}}/
+      install -m755 upgrade.exclude ${{targets.destdir}}/
+
+  - name: Prepare configs
+    runs: |
+      # Write opcache recommended settings
+      {
+          echo 'opcache.enable=1'
+          echo 'opcache.interned_strings_buffer=32'
+          echo 'opcache.max_accelerated_files=10000'
+          echo "opcache.memory_consumption=${PHP_OPCACHE_MEMORY_CONSUMPTION}"
+          echo 'opcache.save_comments=1'
+          echo 'opcache.revalidate_freq=60'
+          echo 'opcache.jit=1255'
+          echo 'opcache.jit_buffer_size=8M'
+      } > ${{targets.destdir}}/${PHP_INI_DIR}/conf.d/opcache-recommended.ini
+
+      # Enable APCu for CLI
+      {
+        echo 'apc.enable_cli=1'
+      } > ${{targets.destdir}}/${PHP_INI_DIR}/conf.d/docker-php-ext-apcu.ini
+
+      # Configure igbinary serializer
+      {
+          echo 'apc.serializer=igbinary'
+          echo 'session.serialize_handler=igbinary'
+      } >> ${{targets.destdir}}/${PHP_INI_DIR}/conf.d/docker-php-ext-igbinary.ini
+
+      # Set Nextcloud PHP limits
+      {
+          echo "memory_limit=${PHP_MEMORY_LIMIT}"
+          echo "upload_max_filesize=${PHP_UPLOAD_LIMIT}"
+          echo "post_max_size=${PHP_UPLOAD_LIMIT}"
+      } > ${{targets.destdir}}/${PHP_INI_DIR}/conf.d/nextcloud.ini
+
+      # Set apache config RemoteIPs
+      {
+        echo 'RemoteIPHeader X-Real-IP'
+        echo 'RemoteIPInternalProxy 10.0.0.0/8'
+        echo 'RemoteIPInternalProxy 172.16.0.0/12'
+        echo 'RemoteIPInternalProxy 192.168.0.0/16'
+      } > ${{targets.destdir}}/etc/apache2/conf-available/remoteip.conf
+
+      # Set apache config LimitRequestBody
+      {
+        echo 'LimitRequestBody ${APACHE_BODY_LIMIT}'
+      } > ${{targets.destdir}}/etc/apache2/conf-available/apache-limits.conf
+
+update:
+  enabled: true
+  github:
+    identifier: nextcloud/server
+    use-tag: true
+    strip-prefix: v
+
+test:
+  pipeline:
+    - name: Ensure installed files
+      runs: |
+        stat /cron.sh /entrypoint.sh /upgrade.exclude
+        find /usr/src/nextcloud/config/ -type f -name "*.php" | grep -q .
+    - working-directory: /var/www/html
+      pipeline:
+        - name: "start daemon on localhost"
+          uses: test/daemon-check-output
+          with:
+            start: "/entrypoint.sh apache2-foreground"
+            timeout: 120
+            expected_output: |
+              Server Running

@@ -15,6 +15,7 @@ WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 SOURCES ?= gs://wolfi-sources/
+QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
 ifneq (${MELANGE_RUNNER},)
 	MELANGE_OPTS += --runner ${MELANGE_RUNNER}
@@ -105,22 +106,13 @@ ${CACHEDIR}/.libraries_token.txt: cache
 .PHONY: lib-token
 lib-token: ${CACHEDIR}/.libraries_token.txt
 
-.PHONY: apk-token
-apk-token:
-	chainctl auth login --audience apk.cgr.dev
-
 .PHONY: fetch-kernel
 fetch-kernel:
 	rm -rf kernel
 	$(MAKE) kernel/boot/vmlinuz
 
 kernel/APKINDEX.tar.gz:
-	$(MAKE) apk-token
-	mkdir -p kernel
-	curl -LS --silent -o $@.tmp \
-	  --user user:$$(chainctl auth token --audience apk.cgr.dev) \
-	  https://apk.cgr.dev/chainguard-private/$(ARCH)/APKINDEX.tar.gz
-	mv $@.tmp $@
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/APKINDEX.tar.gz)
 
 kernel/APKINDEX: kernel/APKINDEX.tar.gz
 	tar -x -C kernel -f $< $(notdir $@)
@@ -133,12 +125,7 @@ kernel/chosen: kernel/APKINDEX
 	  sort -V | tail -n1 > kernel/chosen
 
 kernel/linux.apk: kernel/chosen
-	$(MAKE) apk-token
-	kver=$(file < kernel/chosen); \
-	  curl -LS --silent -o $@.tmp \
-	  --user user:$$(chainctl auth token --audience apk.cgr.dev) \
-	  https://apk.cgr.dev/chainguard-private/$(ARCH)/linux-$$kver.apk
-	mv $@.tmp $@
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(file < kernel/chosen).apk)
 
 kernel/boot/vmlinuz: kernel/linux.apk
 	tar -x -C kernel -f $< boot/ 2> /dev/null
@@ -282,3 +269,10 @@ check-bootstrap:
 	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
+
+authget = tok=$$(chainctl auth token --audience=$(1)) || \
+  { echo "failed token from $(1) for target $@"; exit 1; }; \
+  mkdir -p $$(dirname $(2)) && \
+  echo "auth-download[$(1)] to $(2) from $(3)" && \
+  curl -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
+	mv "$(2).tmp" "$(2)"

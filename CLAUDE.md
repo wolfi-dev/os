@@ -116,6 +116,8 @@ test:
 - When adding tests, always review existing tests and avoid creating redundant tests.
 - When a command is expected to fail, explicitly check for an error code and fail if the command passes.
 - Use your understanding of the package under test to determine the core functionality to validate
+- All shell code should be compatible with busybox, not bash-specific features
+- When including multiple shell commands, organize them into semantic groupings with comments (if logical grouping exists) or sort them alphabetically
 - For shell condition checks, use direct comparison with `[ "$OUTPUT" = "expected" ]` style
 - The test environment is ephemeral, any non-zero exit code indicates a failure, you do not need to explicitly validate exit codes unless they are relevant to the test
 - For numeric outputs, use appropriate numeric comparisons like `[ "$COUNT" -eq 3 ]`

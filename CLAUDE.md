@@ -83,6 +83,38 @@ test:
         EOF
 ```
 
+#### External Test Files
+
+For more complex tests (generally over 10 lines), create an external Ruby test file rather than embedding the test directly in the YAML file:
+
+1. Create a directory with the same name as your package YAML file:
+   ```
+   # For a package ruby3.4-example.yaml
+   mkdir -p ruby3.4-example
+   ```
+
+2. Add your test file to this directory with appropriate permissions:
+   ```
+   # Create and make executable
+   touch ruby3.4-example/test-functionality.rb
+   chmod +x ruby3.4-example/test-functionality.rb
+   ```
+
+3. In your package YAML, invoke the test file:
+   ```yaml
+   test:
+     environment:
+       contents:
+         packages:
+           - ruby-${{vars.rubyMM}}
+     pipeline:
+       - name: Test functionality
+         runs: |
+           ruby ./test-functionality.rb
+   ```
+
+This approach keeps tests maintainable and package YAML files cleaner.
+
 #### Testing Best Practices
 - CRITICAL: Always test the ACTUAL PACKAGE that is being built, not just its dependencies
 - Ensure tests exercise the main functionality that users of the gem would use

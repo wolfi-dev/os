@@ -50,23 +50,60 @@ When working with Ruby packages:
 - Always increment the epoch when updating a package
 - When adding a test, add it to all Ruby version variants (e.g., ruby3.2-*, ruby3.3-*, ruby3.4-*)
 - Test environment should include ruby-${{vars.rubyMM}} and any direct dependencies
-- Typical testing pattern for gems:
-  ```yaml
-  test:
-    environment:
-      contents:
-        packages:
-          - ruby-${{vars.rubyMM}}
-    pipeline:
-      - name: Verify library loading
-        runs: |
-          ruby -e "require 'gem_name'; puts 'Successfully loaded gem'"
-      - name: Verify functionality
-        runs: |
-          ruby <<-EOF
-          require 'gem_name'
-          # Basic functionality test
-          EOF
-  ```
+- Use the test/tw/gem-check pipeline step when appropriate to verify gem installation
+- Implement thorough testing for gem functionality, not just loading
+
+### Testing Ruby Packages
+
+#### Basic Testing Structure
+```yaml
+test:
+  environment:
+    contents:
+      packages:
+        - ruby-${{vars.rubyMM}}
+  pipeline:
+    - uses: test/tw/gem-check  # Verify gem installation
+    - name: Verify library loading
+      runs: |
+        ruby -e "require 'gem_name'; puts 'Successfully loaded gem'"
+    - name: Test basic functionality
+      runs: |
+        ruby <<-EOF
+        require 'gem_name'
+        
+        begin
+          # Actual functionality tests with sample inputs and expected outputs
+          # Use raise to fail the test on unexpected results
+          puts "All tests passed!"
+        rescue => e
+          puts "Test failed: \#{e.message}"
+          exit 1
+        end
+        EOF
+```
+
+#### Testing Best Practices
+- CRITICAL: Always test the ACTUAL PACKAGE that is being built, not just its dependencies
+- Ensure tests exercise the main functionality that users of the gem would use
+- Include comprehensive tests that verify actual gem functionality, not just loading
+- Test with realistic inputs and verify expected outputs
+- Use begin/rescue blocks to handle errors and provide informative failure messages
+- Test edge cases and parameter variations where applicable
+- For CLI tools, verify command execution (e.g., `rspec --version`)
+- Group related tests into logical sections with clear pass/fail messages
+- If a gem has optional parameters (like bias, ignore flags), test those too when possible
+- Use exit code 1 to indicate test failures
+- Validate that key classes, methods, and constants from the package are present and working
+
+#### Common Testing Mistakes to Avoid
+- Testing a dependency instead of the actual package being built
+- Only testing that a gem can be loaded without testing any functionality
+- Missing required dependencies in the test environment
+- Testing trivial aspects while ignoring core functionality
+- Failing to handle errors or provide useful error messages
+
+#### Dependencies
 - For dependencies, check if they actually need to be specified in the test environment or if they are already included via package dependencies
 - Common issue: missing gem dependencies often result in loading errors at test time
+- Test that expected dependencies are present and correctly loaded

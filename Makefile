@@ -119,8 +119,9 @@ kernel/APKINDEX: kernel/APKINDEX.tar.gz
 	touch $@
 
 kernel/chosen: kernel/APKINDEX
-	grep -e '^P:' -e '^V:' $< | sed -n '/^P:linux$$/{n;p}' > \
-	  kernel/available
+	# Extract lines with 'P:linux' and the following line that contains the version
+	# This approach is compatible with both GNU and BSD sed
+	awk '/^P:linux$$/ {print; getline; print}' $< > kernel/available
 	grep '^V:' kernel/available | sed 's/V://' | \
 	  sort -V | tail -n1 > $@.tmp
 	# Sanity check that this looks like an apk version
@@ -128,7 +129,7 @@ kernel/chosen: kernel/APKINDEX
 	mv $@.tmp $@
 
 kernel/linux.apk: kernel/chosen
-	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(file < kernel/chosen).apk)
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(shell cat kernel/chosen).apk)
 
 kernel/boot/vmlinuz: kernel/linux.apk
 	tar -x -C kernel -f $< boot/ 2> /dev/null

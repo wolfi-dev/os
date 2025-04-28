@@ -14,12 +14,17 @@ package:
       - merged-usrsbin
       - netcat-openbsd # nc is required
       - posix-libc-utils # genconf is required
-      - python-3.12
+      - python-${{vars.py-version}}
       - tzdata
       - unixodbc
       - wolfi-baselayout
   copyright:
     - license: Apache-2.0
+
+# As of now airflow is primarily available for python 3.12 and will break for python 3.13
+# For ref: https://airflow.apache.org/blog/airflow-2.9.0
+vars:
+  py-version: 3.12
 
 environment:
   contents:
@@ -37,13 +42,13 @@ environment:
       - pkgconf-dev
       - pnpm
       - postgresql-dev
-      - py3-pip
-      - py3-xmlsec
-      - py3.12-build-bin
-      - py3.12-pip
+      - py${{vars.py-version}}-build-bin
+      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-xmlsec
       # Airflow requires python<3.13
-      - python-3.12
-      - python-3.12-dev
+      - python-${{vars.py-version}}
+      - python-${{vars.py-version}}-dev
       - rust
       - wolfi-base
       - xmlsec-dev
@@ -84,8 +89,8 @@ pipeline:
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
 
-      python3.12 -m build --wheel
-      pip3.12 install --verbose \
+      python${{vars.py-version}} -m build --wheel
+      pip${{vars.py-version}} install --verbose \
        --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
 
   - runs: |
@@ -94,10 +99,10 @@ pipeline:
       # gcloud-aio-auth>=4.0.0,<5.0.0 . gcloud-aio-auth 4 is backlevel and has
       # setuptools in it's pyproject.toml 'tool.poetry.dependencies'
       # The tldr; For that case it is not needed in runtime.
-      pip3.12 uninstall --yes setuptools
+      pip${{vars.py-version}} uninstall --yes setuptools
 
       #GHSA-8w49-h785-mj3c/GHSA-8495-4g3g-x7pr/GHSA-27mf-ghqm-j3j8 fixes
-      pip3.12 install --verbose \
+      pip${{vars.py-version}} install --verbose \
         --force-reinstall --prefix=/opt/airflow --root="${{targets.contextdir}}" \
         aiohttp>=3.10.11 tornado>=6.4.2 apache-airflow-providers-celery==3.10.0 statsd packaging pyparsing
       # NOTE: apache-airflow-providers-celery is pinned to 3.10.0 because 3.10.3 introduced a regresssion.
@@ -108,28 +113,22 @@ pipeline:
 
   - runs: |
       mkdir -p ${{targets.destdir}}/opt/airflow/dags
+      mkdir -p ${{targets.destdir}}/opt/airflow/logs
       mkdir -p ${{targets.destdir}}/scripts/docker
 
       # The first time you run Airflow, it will create a file called `airflow.cfg` in
       # `$AIRFLOW_HOME` directory
       # However, for production case it is advised to generate the configuration
-      export PYTHONPATH=${{targets.destdir}}/opt/airflow/lib/python3.12/site-packages
+      export PYTHONPATH=${{targets.destdir}}/opt/airflow/lib/python${{vars.py-version}}/site-packages
 
       ${{targets.destdir}}/opt/airflow/bin/airflow config list --defaults > ${{targets.destdir}}/"airflow.cfg"
 
       cp airflow-core/src/airflow/config_templates/default_webserver_config.py ${{targets.contextdir}}/
 
-      cp scripts/docker/entrypoint_prod.sh ${{targets.destdir}}/entrypoint
-      chmod 755 ${{targets.destdir}}/entrypoint
-
-      cp scripts/docker/clean-logs.sh ${{targets.destdir}}/clean-logs
-      chmod 755 ${{targets.destdir}}/clean-logs
-
-      cp scripts/docker/airflow-scheduler-autorestart.sh ${{targets.destdir}}/airflow-scheduler-autorestart
-      chmod 755 ${{targets.destdir}}/airflow-scheduler-autorestart
-
-      cp -r scripts/docker/* ${{targets.destdir}}/scripts/docker
-      chmod 755 ${{targets.destdir}}/scripts/docker
+      install -Dm755 scripts/docker/entrypoint_prod.sh ${{targets.destdir}}/entrypoint
+      install -Dm755 scripts/docker/clean-logs.sh ${{targets.destdir}}/clean-logs
+      install -Dm755 scripts/docker/airflow-scheduler-autorestart.sh ${{targets.destdir}}/airflow-scheduler-autorestart
+      install -Dm755 scripts/docker/* ${{targets.destdir}}/scripts/docker
 
 subpackages:
   - name: airflow-3-compat
@@ -191,18 +190,55 @@ test:
   environment:
     contents:
       packages:
-        - python3
+        - python-${{vars.py-version}}
   pipeline:
-    - name: "Test Python package import"
+    - name: "Test Python package import and version"
       runs: |
         export PATH=/opt/airflow/bin:$PATH
-        export PYTHONPATH=/opt/airflow/lib/python3.12/site-packages
+        export PYTHONPATH=/opt/airflow/lib/python${{vars.py-version}}/site-packages
         HOME=/home/build airflow version | grep ${{package.version}}
-        python3.12 -c "import airflow"
+        python${{vars.py-version}} -c "import airflow"
     - name: "List providers"
       runs: |
         export PATH=/opt/airflow/bin:$PATH
-        export PYTHONPATH=/opt/airflow/lib/python3.12/site-packages
-        HOME=/home/build airflow version | grep ${{package.version}}
+        export PYTHONPATH=/opt/airflow/lib/python${{vars.py-version}}/site-packages
 
         airflow providers list
+    - name: "Load and test a DAG"
+      runs: |
+        # Set environment variables
+        export PATH=/opt/airflow/bin:$PATH
+        export PYTHONUSERBASE=/opt/airflow
+        export AIRFLOW_HOME=/opt/airflow
+
+        # Prevents warnings about example dags not being in the right place under /opt/airflow
+        # This is expected as we intentionally put them under /home/airflow, and we use our own test dag
+        export AIRFLOW__CORE__LOAD_EXAMPLES=False
+
+        # Initialize Airflow database
+        airflow db migrate
+
+        # Create and test a simple DAG
+        echo "Creating and testing a simple DAG..."
+        mkdir -p /opt/airflow/dags
+        cat <<EOF > /opt/airflow/dags/test_dag.py
+        from airflow import DAG
+        from airflow.operators.bash import BashOperator
+        from datetime import datetime
+
+        with DAG("test_dag", start_date=datetime(2024, 1, 1), schedule=None) as dag:
+            task = BashOperator(
+                task_id="test_task",
+                bash_command="echo Hello World!"
+            )
+        EOF
+
+        # Reload the db
+        airflow dags reserialize
+
+        # List DAGs
+        airflow dags list | grep test_dag || (echo "DAG not found!" && exit 1)
+
+        # Test Task Execution in DAG
+        airflow tasks test test_dag test_task 2024-01-01 || (echo "Task execution failed!" && exit 1)
+    - uses: test/tw/ldd-check

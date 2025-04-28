@@ -11,17 +11,21 @@ package:
   dependencies:
     runtime:
       - coreutils # numfmt is required
+      - eudev-dev # for libudev.so.1
+      - keyutils # mysql provider requires libkeyutils.so.1
+      - mariadb-connector-c # for libmariadb.so.3
       - merged-usrsbin
       - netcat-openbsd # nc is required
       - posix-libc-utils # genconf is required
       - python-${{vars.py-version}}
+      - py${{vars.py-version}}-packaging # Airflow uses this at runtime for config loading
       - tzdata
       - unixodbc
       - wolfi-baselayout
   copyright:
     - license: Apache-2.0
 
-# As of now airflow is primarily available for python 3.12 and will break for python 3.13
+# As of now (2025/04/28), airflow is primarily available for python 3.12 and will break for python 3.13
 # For ref: https://airflow.apache.org/blog/airflow-2.9.0
 vars:
   py-version: 3.12
@@ -44,9 +48,7 @@ environment:
       - postgresql-dev
       - py${{vars.py-version}}-build-bin
       - py${{vars.py-version}}-pip
-      - py${{vars.py-version}}-pip
       - py${{vars.py-version}}-xmlsec
-      # Airflow requires python<3.13
       - python-${{vars.py-version}}
       - python-${{vars.py-version}}-dev
       - rust
@@ -62,12 +64,6 @@ pipeline:
       tag: ${{package.version}}
       expected-commit: 40cb51d135094c6eca7c69e75fb192f9d1113bde
 
-  - runs: |
-      # By default, the airflow celery provider is not built, but running the upstream helm chart requires it
-      #python patch.py # WIP
-      # remove the patcher
-      rm -rf patch.py
-
   - uses: patch
     with:
       patches: urllib3.patch
@@ -81,7 +77,8 @@ pipeline:
       yarn run build
       rm -rf node_modules
 
-  - runs: |
+  - name: "Build and install the main package"
+    runs: |
       # requires EPOCH to be later that 1980
       export SOURCE_DATE_EPOCH=315532800
 
@@ -93,21 +90,21 @@ pipeline:
       pip${{vars.py-version}} install --verbose \
        --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
 
-  - runs: |
-      # CVE-2024-6345 GHSA-cx63-2mw6-8hw5
-      # setuptools comes from airflow/providers/google/provider.yaml having
-      # gcloud-aio-auth>=4.0.0,<5.0.0 . gcloud-aio-auth 4 is backlevel and has
-      # setuptools in it's pyproject.toml 'tool.poetry.dependencies'
-      # The tldr; For that case it is not needed in runtime.
-      pip${{vars.py-version}} uninstall --yes setuptools
+  - name: "Build and install the additional provider packages"
+    runs: |
+      # By default, the airflow celery provider is not built, but running the upstream helm chart requires it
+      # There are a few others we want to include by default as well
 
-      #GHSA-8w49-h785-mj3c/GHSA-8495-4g3g-x7pr/GHSA-27mf-ghqm-j3j8 fixes
-      pip${{vars.py-version}} install --verbose \
-        --force-reinstall --prefix=/opt/airflow --root="${{targets.contextdir}}" \
-        aiohttp>=3.10.11 tornado>=6.4.2 apache-airflow-providers-celery==3.10.0 statsd packaging pyparsing
-      # NOTE: apache-airflow-providers-celery is pinned to 3.10.0 because 3.10.3 introduced a regresssion.
-      # https://github.com/apache/airflow/issues/47781 details more about it.
-      # before removing the pinning, please check if the images are coming good with helm charts.
+      cd providers
+      # If changing this list, be sure to update the test below too
+      # Use / as a separator
+      for pkg in amazon celery cncf/kubernetes docker elasticsearch google grpc hashicorp microsoft/azure mysql odbc openlineage postgres redis sendgrid sftp slack snowflake ssh; do
+        cd "$pkg"
+        python${{vars.py-version}} -m build --wheel
+        pip${{vars.py-version}} install --verbose \
+          --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
+        cd -
+      done
 
   - runs: find . -name '__pycache__' -exec rm -rf {} +
 
@@ -204,6 +201,13 @@ test:
         export PYTHONPATH=/opt/airflow/lib/python${{vars.py-version}}/site-packages
 
         airflow providers list
+
+        # If changing this list, be sure to update the same list above too
+        # Use - as a separator
+        for pkg in amazon celery cncf-kubernetes docker elasticsearch google grpc hashicorp microsoft-azure mysql odbc openlineage postgres redis sendgrid sftp slack snowflake ssh; do
+          airflow providers list | grep "apache-airflow-providers-$pkg"
+        done
+
     - name: "Load and test a DAG"
       runs: |
         # Set environment variables

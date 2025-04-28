@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build Commands
 - Set up QEMU runner (first time): `make fetch-kernel` (only needed once to download kernel files)
-- Enable QEMU environment: `export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz; export MELANGE_OPTS="--runner=qemu"`
+- Enable QEMU environment: `export QEMU_KERNEL_IMAGE=$(pwd)/kernel/boot/vmlinuz; export MELANGE_OPTS="--runner=qemu"`
 - Build a package: `make package/<package-name>`
 - Build with Docker (fallback): `make docker-package/<package-name>`
 - Test a package: `make test/<package-name>`

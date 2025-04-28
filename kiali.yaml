@@ -1,7 +1,7 @@
 package:
   name: kiali
   version: "2.8.0"
-  epoch: 1
+  epoch: 2
   description: The Console for Istio Service Mesh
   copyright:
     - license: Apache-2.0
@@ -65,15 +65,97 @@ subpackages:
           mv build ${{targets.contextdir}}/opt/kiali/console
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+    environment:
+      KIALI_SERVER_PORT: "20001"
+      KIALI_SERVER_ADDRESS: ""
+      KIALI_SERVER_GZIP_ENABLED: "true"
+      KIALI_SERVER_CORS_ALLOW_ALL: "false"
+      KIALI_AUTH_STRATEGY: "anonymous"
+      KIALI_EXTERNAL_SERVICES_ISTIO_ROOT_NAMESPACE: "istio-system"
+      KIALI_DEPLOYMENT_ACCESSIBLE_NAMESPACES: '["**"]'
+      KIALI_KUBERNETES_IN_CLUSTER: "false"
+      KIALI_KUBERNETES_USE_SERVICE_ACCOUNT: "true"
+      KIALI_SERVER_SESSION_SIGNING_KEY: "0123456789abcdef0123456789abcdef" # 32 bytes hex string
   pipeline:
-    - name: Verify Kiali API
+    - name: Verify Kiali API Binary
       runs: |
         # Check if binary runs
         /opt/kiali/kiali --help
-    - name: Verify Kiali UI
+    - name: Verify Kiali UI Assets
       runs: |
-        # Make sure webroot HTML index file exists
+        # Verify webroot HTML index file exists and contains expected content
+        test -f /opt/kiali/console/index.html
         grep '</html>' /opt/kiali/console/index.html
+
+        # Verify static assets presence using find instead of tree
+        find /opt/kiali/console -type f -name "*.js" | grep -q "static/js" || exit 1
+        find /opt/kiali/console -type f -name "*.css" | grep -q "static/css" || exit 1
+
+        # Verify essential UI files exist
+        test -f /opt/kiali/console/manifest.json
+        test -f /opt/kiali/console/kiali_icon_lightbkg_16px.png
+    - uses: test/kwok/cluster
+    - name: Verify Kiali Health Endpoint
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          set -ex
+          kwokctl get kubeconfig > kubeconfig.yaml
+
+          SERVER_URL=$(kubectl --kubeconfig kubeconfig.yaml config view -o jsonpath='{.clusters[0].cluster.server}')
+          KUBERNETES_SERVICE_HOST=$(echo "$SERVER_URL" | cut -d: -f2 | cut -d/ -f3)
+          KUBERNETES_SERVICE_PORT=$(echo "$SERVER_URL" | cut -d: -f3)
+
+          echo "Setting KUBERNETES_SERVICE_HOST=$KUBERNETES_SERVICE_HOST"
+          echo "Setting KUBERNETES_SERVICE_PORT=$KUBERNETES_SERVICE_PORT"
+
+          mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+          echo "dummy-token" > /var/run/secrets/kubernetes.io/serviceaccount/token
+          echo "dummy-namespace" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+          echo "dummy-ca.crt" > /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+          # Create Kiali configuration file
+          cat >kiali-config.yaml <<'EOF'
+          server:
+            port: 20001
+            address: ""
+            gzip_enabled: true
+            cors_allow_all: false
+            session_signing_key: "0123456789abcdef0123456789abcdef"
+          auth:
+            strategy: anonymous
+          external_services:
+            istio:
+              root_namespace: istio-system
+          deployment:
+            accessible_namespaces:
+              - "**"
+          kubernetes:
+            config_file: "$(pwd)/kubeconfig.yaml"
+            in_cluster: false
+            service_account_token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+            service_account_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+            use_service_account: true
+          EOF
+        start: |
+          export KUBERNETES_SERVICE_HOST="$KUBERNETES_SERVICE_HOST"
+          export KUBERNETES_SERVICE_PORT="$KUBERNETES_SERVICE_PORT"
+          export KUBECONFIG="$(pwd)/kubeconfig.yaml"
+          exec /opt/kiali/kiali --config kiali-config.yaml
+        timeout: 60
+        expected_output: |
+          Kiali: Console URL is
+        post: |
+          # Wait for the server to be ready
+          sleep 5
+          # Check health endpoint
+          curl -s http://localhost:20001/healthz | grep '"status":"pass"' || exit 1
+          # Check API endpoint
+          curl -s http://localhost:20001/api/namespaces | grep -q '"namespaces"' || exit 1
 
 update:
   enabled: true

@@ -1,7 +1,7 @@
 import os
 
 # Path to the file you want to modify
-file_path = 'hatch_build.py'
+file_path = 'pyproject.toml'
 
 # Lines to be added
 lines_to_add = [
@@ -33,7 +33,7 @@ with open(file_path, 'r') as file:
 # Find the index of the line where the new lines should be inserted
 insert_index = None
 for i, line in enumerate(file_contents):
-    if line.strip() == 'PRE_INSTALLED_PROVIDERS = [':
+    if line.strip() == 'dependencies = [':
         insert_index = i + 1
         break
 

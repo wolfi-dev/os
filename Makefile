@@ -14,7 +14,6 @@ MELANGE ?= $(shell which melange)
 WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
-SOURCES ?= gs://wolfi-sources/
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
 ifneq (${MELANGE_RUNNER},)
@@ -58,10 +57,6 @@ MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signin
 MELANGE_TEST_OPTS += --test-package-append wolfi-base
 MELANGE_TEST_OPTS += --debug
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
-
-ifeq (${USE_CACHE}, yes)
-	MELANGE_OPTS += --cache-source ${SOURCES}
-endif
 
 ifeq (${LINT}, yes)
 	MELANGE_OPTS += --fail-on-lint-warning

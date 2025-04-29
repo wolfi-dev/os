@@ -141,6 +141,7 @@ test:
     contents:
       packages:
         - curl
+        - wait-for-it
   pipeline:
     - name: "Check operator binary"
       runs: |
@@ -148,148 +149,68 @@ test:
         operator --help
     - name: "Setup mock Kubernetes cluster"
       uses: test/kwok/cluster
-    # Instead of using the full bundle.yaml which contains large OpenAPI validation schemas in
-    # annotations, we have created minimal CRDs that only include the essential fields needed for testing
     - name: "Setup minimal CRDs"
       runs: |
         kubectl create namespace prometheus-operator-test
-
-        cat <<EOF | kubectl apply -f -
-        apiVersion: apiextensions.k8s.io/v1
-        kind: CustomResourceDefinition
-        metadata:
-          name: prometheuses.monitoring.coreos.com
-        spec:
-          group: monitoring.coreos.com
-          names:
-            kind: Prometheus
-            plural: prometheuses
-            singular: prometheus
-          scope: Namespaced
-          versions:
-          - name: v1
-            served: true
-            storage: true
-            schema:
-              openAPIV3Schema:
-                type: object
-                properties:
-                  spec:
-                    type: object
-                    properties:
-                      replicas:
-                        type: integer
-                      serviceAccountName:
-                        type: string
-                      serviceMonitorSelector:
-                        type: object
-                      resources:
-                        type: object
-                        properties:
-                          requests:
-                            type: object
-                            properties:
-                              memory:
-                                type: string
-        ---
-        apiVersion: apiextensions.k8s.io/v1
-        kind: CustomResourceDefinition
-        metadata:
-          name: servicemonitors.monitoring.coreos.com
-        spec:
-          group: monitoring.coreos.com
-          names:
-            kind: ServiceMonitor
-            plural: servicemonitors
-            singular: servicemonitor
-          scope: Namespaced
-          versions:
-          - name: v1
-            served: true
-            storage: true
-            schema:
-              openAPIV3Schema:
-                type: object
-                properties:
-                  spec:
-                    type: object
-                    properties:
-                      selector:
-                        type: object
-                        properties:
-                          matchLabels:
-                            type: object
-                            additionalProperties:
-                              type: string
-                      endpoints:
-                        type: array
-                        items:
-                          type: object
-                          properties:
-                            port:
-                              type: string
-        EOF
-
+        kubectl apply -f https://github.com/prometheus-operator/prometheus-operator/releases/download/v${{package.version}}/stripped-down-crds.yaml
         sleep 5
     - name: "Test operator deployment"
-      runs: |
-        # Start operator in background
-        operator \
-          --log-level=debug \
-          --apiserver $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}') \
-          --tls-insecure > /tmp/operator.log 2>&1 &
-        OPERATOR_PID=$!
+      uses: test/daemon-check-output
+      with:
+        start: |
+          operator \
+            --log-level=debug \
+            --apiserver $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}') \
+            --tls-insecure
+        timeout: 30
+        expected_output: |
+          Starting Prometheus Operator
+        error_strings: |
+          ERROR
+          FATAL
+        post: |
+          # Create Prometheus instance
+          cat <<EOF | kubectl apply -f -
+          apiVersion: monitoring.coreos.com/v1
+          kind: Prometheus
+          metadata:
+            name: test-prometheus
+            namespace: prometheus-operator-test
+          spec:
+            replicas: 1
+            serviceAccountName: prometheus-operator
+            serviceMonitorSelector: {}
+            resources:
+              requests:
+                memory: 400Mi
+          EOF
 
-        sleep 5
+          sleep 5
 
-        if ! grep -q "Starting Prometheus Operator" /tmp/operator.log; then
-          echo "Operator failed to start"
-          cat /tmp/operator.log
-          exit 1
-        fi
+          if ! kubectl get prometheus -n prometheus-operator-test test-prometheus; then
+            echo "Prometheus creation failed"
+            exit 1
+          fi
 
-        # Create Prometheus instance
-        cat <<EOF | kubectl apply -f -
-        apiVersion: monitoring.coreos.com/v1
-        kind: Prometheus
-        metadata:
-          name: test-prometheus
-          namespace: prometheus-operator-test
-        spec:
-          replicas: 1
-          serviceAccountName: prometheus-operator
-          serviceMonitorSelector: {}
-          resources:
-            requests:
-              memory: 400Mi
-        EOF
+          # Create ServiceMonitor
+          cat <<EOF | kubectl apply -f -
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: test-servicemonitor
+            namespace: prometheus-operator-test
+          spec:
+            selector:
+              matchLabels:
+                app: test-app
+            endpoints:
+            - port: metrics
+          EOF
 
-        sleep 5
-
-        if ! kubectl get prometheus -n prometheus-operator-test test-prometheus; then
-          echo "Prometheus creation failed"
-          exit 1
-        fi
-
-        # Create ServiceMonitor
-        cat <<EOF | kubectl apply -f -
-        apiVersion: monitoring.coreos.com/v1
-        kind: ServiceMonitor
-        metadata:
-          name: test-servicemonitor
-          namespace: prometheus-operator-test
-        spec:
-          selector:
-            matchLabels:
-              app: test-app
-          endpoints:
-          - port: metrics
-        EOF
-
-        if ! kubectl get servicemonitor -n prometheus-operator-test test-servicemonitor; then
-          echo "ServiceMonitor creation failed"
-          exit 1
-        fi
+          if ! kubectl get servicemonitor -n prometheus-operator-test test-servicemonitor; then
+            echo "ServiceMonitor creation failed"
+            exit 1
+          fi
     - name: "Cleanup test resources"
       runs: |
         kubectl delete namespace prometheus-operator-test

@@ -1,45 +1,72 @@
 package:
   name: azure-service-operator
-  version: 2.12.0
-  epoch: 2
+  version: "2.13.0"
+  epoch: 1
   description: Azure Service Operator to provision Azure resources and connect your applications to them from within Kubernetes.
   copyright:
     - license: MIT
+
+environment:
+  contents:
+    packages:
+      - controller-gen
+      - gettext
+      - gofumpt
+      - kustomize
+      - python3
+      - task
+      - yq
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/Azure/azure-service-operator
       tag: v${{package.version}}
-      expected-commit: 5b5d690fd68451d0dcf11896a3122e216c18452d
+      expected-commit: 450cdf31697325635e2889590fd35d6cdf30547b
+      recurse-submodules: true
 
-  - uses: go/bump
-    with:
-      deps: |-
-        golang.org/x/crypto@v0.35.0
-        golang.org/x/net@v0.36.0
-        github.com/golang-jwt/jwt/v4@v4.5.2
-        golang.org/x/oauth2@v0.27.0
-        google.golang.org/protobuf@v1.33.0
+  - working-directory: v2
+    pipeline:
+      - uses: go/build
+        with:
+          packages: cmd/controller/main.go
+          output: aso-controller
 
-  - uses: go/build
-    with:
-      packages: main.go
-      output: ${{package.name}}
+  - pipeline:
+      - name: Generate CRDs
+        runs: |
+          mkdir reports
+          # The following task is a dependency of the task controller:bundle-crds,
+          # but we need to patch the generated kustomization because it's generated in
+          # legacy form of field `patches`, which is no longer compatible with the
+          # current version of Kustomize.
+          # So we need to patch it before it's consumed by the controller:bundle-crds
+          # task.
+          task controller:generate-kustomize
+          cd v2/config/crd/generated && \
+            sed -i "s|patches:|patchesStrategicMerge:|g" kustomization.yaml && \
+            kustomize edit fix && \
+            cd -
+          task controller:bundle-crds
+          mkdir -p ${{targets.contextdir}}/usr/share/${{package.name}}
+          cp -R v2/out/crds ${{targets.contextdir}}/usr/share/${{package.name}}/
 
 subpackages:
   - name: ${{package.name}}-compat
     pipeline:
       - name: Ensure symlinks
-        runs: ln -sf /usr/bin/${{package.name}} ${{targets.contextdir}}/manager
+        runs: |
+          ln -sf /usr/bin/aso-controller ${{targets.contextdir}}/aso-controller
+          ln -sf /usr/share/${{package.name}}/crds ${{targets.contextdir}}/crds
     test:
       environment:
         contents:
           packages:
             - ${{package.name}}
       pipeline:
-        - runs: test -f $(readlink -f /manager)
-        - runs: test "$(readlink /manager)" = "/usr/bin/${{package.name}}"
+        - runs: test -f $(readlink -f /aso-controller)
+        - runs: test "$(readlink /aso-controller)" = "/usr/bin/aso-controller"
+        - runs: test "$(readlink /crds)" = "/usr/share/${{package.name}}/crds"
 
 update:
   enabled: true
@@ -62,19 +89,19 @@ test:
   pipeline:
     - name: Smoke test
       runs: |
-        azure-service-operator --help
+        aso-controller --help
     - uses: test/kwok/cluster
     - name: Test operator manager startup
       uses: test/daemon-check-output
       with:
-        setup: |
-          git clone https://github.com/Azure/azure-service-operator
-          cd azure-service-operator
-          git checkout v${{package.version}}
-          kubectl apply -f charts/azure-service-operator/crds
-        start: /usr/bin/${{package.name}} --kubeconfig ~/.kube/config
+        # crds dir is expected at cwd by the manager.
+        setup: ln -s /usr/share/${{package.name}}/crds .
+        start: |
+          aso-controller --crd-pattern="resources.azure.com/*"
         timeout: 30
         expected_output: |
-          Starting Controller
-          Starting workers
-          Stopping and waiting for HTTP servers
+          "Launching with flags" flags="MetricsAddr: 0, SecureMetrics: true, ProfilingMetrics: false, HealthAddr: , WebhookPort: 9443, WebhookCertDir: , EnableLeaderElection: false, CRDManagementMode: auto, CRDPatterns: resources.azure.com
+          "Loaded CRD" logger="controllers" crdPath="crds/apiextensions.k8s.io_v1_customresourcedefinition_resourcegroups.resources.azure.com.yaml" name="resourcegroups.resources.azure.com"
+          "Will update CRD" logger="controllers" crd="resourcegroups.resources.azure.com"
+          "Applying CRD" logger="controllers" progress="1/1" crd="resourcegroups.resources.azure.com"
+          "Restarting operator pod after updating CRDs" logger="controllers"

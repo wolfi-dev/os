@@ -1,6 +1,6 @@
 package:
   name: pulumi
-  version: "3.162.0"
+  version: "3.165.0"
   epoch: 0
   description: Infrastructure as Code in any programming language
   copyright:
@@ -28,16 +28,16 @@ pipeline:
   - uses: git-checkout
     with:
       destination: ${{package.name}}
-      expected-commit: 1f52815bcfe5f1e9307ebe6f342563283f5bc35e
+      expected-commit: 372cbc1020245a06ac3349b358c264d40f180fdb
       repository: https://github.com/pulumi/pulumi.git
       tag: v${{package.version}}
 
   - uses: go/bump
     with:
       deps: |-
-        golang.org/x/crypto@v0.35.0
+        golang.org/x/crypto@v0.37.0
         golang.org/x/oauth2@v0.27.0
-        golang.org/x/net@v0.36.0
+        golang.org/x/net@v0.38.0
       modroot: pulumi/pkg
 
   - pipeline:
@@ -47,7 +47,7 @@ pipeline:
           export PULUMI_VERSION="v${{package.version}}"
           export PULUMI_ROOT="$(mktemp -d)"
           export GOBIN="${PULUMI_ROOT}/bin"
-          mkdir -p "${{targets.contextdir}}/usr/bin"
+          mkdir -p "${{targets.contextdir}}/usr/bin" "${{targets.contextdir}}/usr/lib"
 
           # Build the Pulumi CLI itself
           make install
@@ -57,36 +57,41 @@ pipeline:
           for lang in go nodejs python; do
             cd "sdk/${lang}"
 
+            # Update some more dependencies
             # go mod tidy is needed because of some go generate stuff that mutates the go.mod
-            cd pulumi-language-${lang} && \
+            if [[ "${lang}" == "go" ]]; then
               # Remediate GHSA-m425-mq94-257g
-              go get google.golang.org/grpc@v1.58.3 && \
-              go get golang.org/x/crypto@v0.35.0 && \
-              go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.36.0 && \
-              go get github.com/go-git/go-git/v5@v5.13.0 && \
-              go get github.com/Azure/azure-sdk-for-go/sdk/azidentity@v1.6.0 && \
-              go get github.com/hashicorp/go-retryablehttp@v0.7.7 && \
-              go get github.com/pulumi/pulumi/pkg/v3 && \
-              go get github.com/pulumi/pulumi/sdk/v3 && \
-              go mod tidy && \
-              cd ..
-            cd cmd/pulumi-language-${lang} && \
+              cd pulumi-language-${lang} && \
+                go get golang.org/x/crypto@v0.37.0 && \
+                go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.38.0 && \
+                go get github.com/Azure/azure-sdk-for-go/sdk/azidentity@v1.6.0 && \
+                go get github.com/hashicorp/go-retryablehttp@v0.7.7 && \
+                go get github.com/pulumi/pulumi/pkg/v3 && \
+                go get github.com/pulumi/pulumi/sdk/v3 && \
+                go mod tidy && \
+                cd ..
+
+            # Python and Node have a cmd folder, Go does not
+            elif [[ "${lang}" == "nodejs" || "${lang}" == "python" ]]; then
               # Remediate GHSA-m425-mq94-257g
-              go get google.golang.org/grpc@v1.58.3 && \
-              go get golang.org/x/crypto@v0.35.0 && \
-              go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.36.0 && \
-              go get github.com/go-git/go-git/v5@v5.13.0 && \
-              go get github.com/Azure/azure-sdk-for-go/sdk/azidentity@v1.6.0 && \
-              go get github.com/hashicorp/go-retryablehttp@v0.7.7 && \
-              go get github.com/pulumi/pulumi/pkg/v3 && \
-              go get github.com/pulumi/pulumi/sdk/v3 && \
-              go mod tidy && \
-              cd ../..
+              cd cmd/pulumi-language-${lang} && \
+                go get golang.org/x/crypto@v0.37.0 && \
+                go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.38.0 && \
+                go get github.com/Azure/azure-sdk-for-go/sdk/azidentity@v1.6.0 && \
+                go get github.com/hashicorp/go-retryablehttp@v0.7.7 && \
+                go get github.com/pulumi/pulumi/pkg/v3 && \
+                go get github.com/pulumi/pulumi/sdk/v3 && \
+                go mod tidy && \
+                cd ../..
+            fi
 
             make build
+            make install
 
-            # "make install_package" is needed for all SDKs, Go needs make_install plugin
-            [[ "${lang}" == "go" ]] && make install_plugin || make install_package
+            # Copy the npm modules so that `require.resolve()` will work later at runtime:
+            if [[ "${lang}" == "nodejs" ]]; then
+              cp -R "${PULUMI_ROOT}/node_modules" "${{targets.contextdir}}/usr/lib/node_modules"
+            fi
 
             # Remove .cmd files only used on Windows
             rm -f "${PULUMI_ROOT}"/bin/*.cmd
@@ -111,20 +116,31 @@ subpackages:
 
   - name: "pulumi-language-nodejs"
     description: "Pulumi Language SDK for Node.js"
+    dependencies:
+      runtime:
+        - nodejs
     pipeline:
       - runs: |
-          mkdir -p "${{targets.contextdir}}/usr/bin"
+          mkdir -p "${{targets.contextdir}}/usr/bin" "${{targets.contextdir}}/usr/lib"
           mv -v "${{targets.destdir}}"/usr/bin/pulumi-*nodejs* "${{targets.contextdir}}/usr/bin"
           # pulumi-analyzer-policy is built by the nodejs sdk even though it doesnt contain the string "nodejs"
           mv -v "${{targets.destdir}}"/usr/bin/pulumi-analyzer-policy "${{targets.contextdir}}/usr/bin"
+
+          # Move node modules from main package to this subpackage so the tools can find and use them
+          mv "${{targets.destdir}}/usr/lib/node_modules" "${{targets.contextdir}}/usr/lib/node_modules"
+
+          # Remove any powershell junk
+          find "${{targets.contextdir}}/usr/lib/node_modules/" -type f -name "*.ps1" -exec rm -f {} \;
+
+          # Fix up the wrapper scripts to be able to locate the necessary node modules
+          sed -i 's|PULUMI_RUN_SCRIPT_PATH=.*|PULUMI_RUN_SCRIPT_PATH="/usr/lib/node_modules/@pulumi/pulumi/cmd/run-policy-pack/index.js"|' "${{targets.contextdir}}/usr/bin/pulumi-analyzer-policy"
+          sed -i 's|PULUMI_DYNAMIC_PROVIDER_SCRIPT_PATH=.*|PULUMI_DYNAMIC_PROVIDER_SCRIPT_PATH="/usr/lib/node_modules/@pulumi/pulumi/cmd/dynamic-provider/index.js"|' "${{targets.contextdir}}/usr/bin/pulumi-resource-pulumi-nodejs"
     test:
       pipeline:
         - runs: |
-            pulumi-analyzer-policy --version
-            pulumi-analyzer-policy --help
+            pulumi-analyzer-policy 2>&1 | grep "usage:"
             pulumi-language-nodejs --help
-            pulumi-resource-pulumi-nodejs --version
-            pulumi-resource-pulumi-nodejs --help
+            pulumi-resource-pulumi-nodejs 2>&1 | grep "fatal: Missing <engine> address"
 
   - name: "pulumi-language-python"
     description: "Pulumi Language SDK for Python"
@@ -141,7 +157,7 @@ test:
   pipeline:
     - name: Verify Pulumi installation
       runs: |
-        pulumi version || exit 1
+        pulumi version | grep ${{package.version}}
         pulumi --help
 
 update:

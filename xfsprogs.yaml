@@ -1,7 +1,7 @@
 package:
   name: xfsprogs
-  version: "6.13.0"
-  epoch: 40
+  version: "6.14.0"
+  epoch: 2
   description: XFS filesystem utilities
   copyright:
     - license: LGPL-2.1-or-later
@@ -9,6 +9,7 @@ package:
     runtime:
       - merged-usrsbin
       - wolfi-baselayout
+      - xfsprogs-core
 
 environment:
   contents:
@@ -34,7 +35,7 @@ pipeline:
   - uses: fetch
     with:
       uri: https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${{package.version}}.tar.xz
-      expected-sha512: 9fd73c8585cd295b79b227cd5855407da4b3ea2d40a1ca82e0a93887644b497cced182960bcd8f3c45805dda4a244d1555fd49da5d7e82fe4525d345c766a63a
+      expected-sha512: 249a64fb5a92ceb9e58b75a270a90773cfe2c90e863d3f9853c14b3eb0f414bf55b8b67c220a1d7386894ef9295622e224977bd3c6600c9dcba826cb4a634f49
 
   - uses: autoconf/configure
     with:
@@ -56,12 +57,27 @@ pipeline:
 subpackages:
   - name: xfsprogs-dev
     description: "headers for xfsprogs"
-    pipeline:
-      - uses: split/dev
     dependencies:
       runtime:
         - merged-usrsbin
         - wolfi-baselayout
+        - xfsprogs-libs
+    pipeline:
+      - uses: split/dev
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib64
+          mv ${{targets.destdir}}/usr/lib64/libhandle.so ${{targets.subpkgdir}}/usr/lib64
+
+  - name: xfsprogs-doc
+    description: xfsprogs docs
+    pipeline:
+      - uses: split/manpages
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/share/doc
+          mv ${{targets.destdir}}/usr/share/doc/xfsprogs ${{targets.subpkgdir}}/usr/share/doc
+    test:
+      pipeline:
+        - uses: test/docs
 
   - name: xfsprogs-libs
     description: "libraries for xfsprogs"
@@ -77,17 +93,47 @@ subpackages:
         - merged-usrsbin
         - wolfi-baselayout
 
-  - name: xfsprogs-doc
-    description: "xfsprogs manpages"
+  - name: xfsprogs-core
+    description: "core xfs use utilities - mkfs and fsck"
     pipeline:
-      - uses: split/manpages
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/bin"
+          mv ${{targets.destdir}}/usr/bin/mkfs.xfs "${{targets.subpkgdir}}/usr/bin"
+
+          # bring mkfs.conf files with mkfs (like usr/share/xfsprogs/mkfs/lts_4.19.conf)
+          mkdir -p ${{targets.subpkgdir}}/usr/share/xfsprogs/mkfs
+          mv ${{targets.destdir}}/usr/share/xfsprogs/mkfs ${{targets.subpkgdir}}/usr/share/xfsprogs
+
+          # fsck.xfs is what systemd or many other things would expect to execute.
+          # fsck.xfs is a shell script wrapper around xfs_repair.
+          mv ${{targets.destdir}}/usr/bin/xfs_repair "${{targets.subpkgdir}}/usr/bin"
+          mv ${{targets.destdir}}/usr/bin/fsck.xfs "${{targets.subpkgdir}}/usr/bin"
     test:
+      environment:
+        contents:
+          packages:
+            - busybox
       pipeline:
-        - uses: test/docs
-    dependencies:
-      runtime:
-        - merged-usrsbin
-        - wolfi-baselayout
+        - name: "Check -V for programs"
+          runs: |
+            fail() { echo "FATAL:" "$@" 1>&2; exit 1; }
+            vercheck() {
+              local p="$1" out="" ver="${{package.version}}"
+              out=$($p -V) || fail "$p -V exited $?"
+              echo "$out" | grep -F "$ver" ||
+                fail "output of '$p -V' did not contain '$ver'"
+            }
+
+            vercheck mkfs.xfs
+            vercheck xfs_repair
+        - name: "Check fsck.xfs executes"
+          runs: |
+            fsck.xfs || fail "fsck.xfs exited $?"
+        - name: "Test xfs_repair functionality"
+          runs: |
+            dd if=/dev/zero of=xfs.img bs=1M count=300
+            mkfs.xfs xfs.img
+            xfs_repair -f xfs.img 2>&1 | grep '^done$'
 
   - name: xfs-scrub
     description: "xfs-scrub attempts to check and repair all metadata in a mounted XFS filesystem"
@@ -105,55 +151,74 @@ subpackages:
           mkdir -p "${{targets.subpkgdir}}"/usr/bin
           mv "${{targets.destdir}}"/usr/bin/xfs_scrub* "${{targets.subpkgdir}}"/usr/bin/
 
+  - name: xfsprogs-extra
+    description: "extra xfsprogs"
+    dependencies:
+      runtime:
+        - python3
+        - xfsprogs-core
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/bin"
+          mv ${{targets.destdir}}/usr/bin/* ${{targets.subpkgdir}}/usr/bin
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+            - file
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "Check -V(version) output of binaries"
+          runs: |
+            fail() { echo "FATAL:" "$@" 1>&2; exit 1; }
+
+            vercheck() {
+              local p="$1" out="" ver="${{package.version}}"
+              out=$($p -V) || fail "$p -V exited $?"
+              echo "$out" | grep -F "$ver" ||
+                fail "output of '$p -V' did not contain '$ver'"
+            }
+
+            vercheck xfs_admin
+            vercheck xfs_bmap
+            vercheck xfs_estimate
+            vercheck xfs_fsr
+            vercheck xfs_mkfile
+            vercheck xfs_quota
+            vercheck xfs_property
+            vercheck xfs_spaceman
+        - name: "Check help output for programs"
+          runs: |
+            xfs_admin help
+            xfs_estimate help
+            xfs_fsr help
+            xfs_mkfile help
+            xfs_quota help
+        - name: "Test basic xfs_db functionality"
+          runs: |
+            dd if=/dev/zero of=xfs.img bs=1M count=300
+            mkfs.xfs xfs.img
+            xfs_db -c 'sb 0' -c 'p' xfs.img | grep 'magicnum'
+        - name: "Test xfs_info functionality"
+          runs: |
+            dd if=/dev/zero of=xfs.img bs=1M count=300
+            mkfs.xfs xfs.img
+            xfs_info xfs.img | grep -E 'naming\s*=\s*version\s*2'
+        - name: "Test xfs_metadump functionality"
+          runs: |
+            dd if=/dev/zero of=xfs.img bs=1M count=300
+            mkfs.xfs xfs.img
+            xfs_metadump xfs.img xfs_metadata.img
+            file xfs_metadata.img | grep 'XFS filesystem'
+        - name: "Test xfs_admin functionality"
+          runs: |
+            dd if=/dev/zero of=xfs.img bs=1M count=300
+            mkfs.xfs xfs.img
+            xfs_admin -L "TestXFS" xfs.img
+            xfs_admin -l xfs.img | grep 'TestXFS'
+
 update:
   enabled: true
   release-monitor:
     identifier: 5188
-
-test:
-  environment:
-    contents:
-      packages:
-        - util-linux
-        - file
-  pipeline:
-    - name: "Check xfs_repair version"
-      runs: |
-        xfs_repair -V
-        xfs_admin version
-        xfs_admin help
-        xfs_bmap -v
-        xfs_estimate version
-        xfs_estimate help
-        xfs_fsr version
-        xfs_fsr help
-        xfs_mkfile version
-        xfs_mkfile help
-        xfs_quota version
-        xfs_quota help
-    - name: "Check mkfs.xfs version"
-      runs: |
-        mkfs.xfs -V
-    - name: "Test basic xfs_db functionality"
-      runs: |
-        dd if=/dev/zero of=xfs.img bs=1M count=300
-        mkfs.xfs xfs.img
-        xfs_db -c 'sb 0' -c 'p' xfs.img | grep 'magicnum'
-    - name: "Test xfs_info functionality"
-      runs: |
-        dd if=/dev/zero of=xfs.img bs=1M count=300
-        mkfs.xfs xfs.img
-        xfs_info xfs.img | grep -E 'naming\s*=\s*version\s*2'
-    - name: "Test xfs_metadump functionality"
-      runs: |
-        dd if=/dev/zero of=xfs.img bs=1M count=300
-        mkfs.xfs xfs.img
-        xfs_metadump xfs.img xfs_metadata.img
-        file xfs_metadata.img | grep 'XFS filesystem'
-    - name: "Test xfs_admin functionality"
-      runs: |
-        dd if=/dev/zero of=xfs.img bs=1M count=300
-        mkfs.xfs xfs.img
-        xfs_admin -L "TestXFS" xfs.img
-        xfs_admin -l xfs.img | grep 'TestXFS'
-    - uses: test/tw/ldd-check

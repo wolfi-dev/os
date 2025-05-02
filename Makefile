@@ -3,13 +3,27 @@ ARCH ?= $(shell uname -m)
 ifeq (${ARCH}, arm64)
 	ARCH = aarch64
 endif
+ifeq (${TMPDIR}, )
+        CACHEDIR = /tmp/melange-cache
+else
+        CACHEDIR = ${TMPDIR}/melange-cache
+endif
 TARGETDIR = packages/${ARCH}
 
 MELANGE ?= $(shell which melange)
 WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
-CACHE_DIR ?= gs://wolfi-sources/
+QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
+
+ifneq (${MELANGE_RUNNER},)
+	MELANGE_OPTS += --runner ${MELANGE_RUNNER}
+endif
+QEMU_KERNEL_IMAGE ?= kernel/boot/vmlinuz
+ifeq (${MELANGE_RUNNER},qemu)
+	QEMU_KERNEL_DEP = ${QEMU_KERNEL_IMAGE}
+	export QEMU_KERNEL_IMAGE
+endif
 
 MELANGE_OPTS += --repository-append ${REPO}
 MELANGE_OPTS += --keyring-append ${KEY}.pub
@@ -19,7 +33,7 @@ MELANGE_OPTS += --env-file build-${ARCH}.env
 MELANGE_OPTS += --namespace wolfi
 MELANGE_OPTS += --license 'Apache-2.0'
 MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
-MELANGE_OPTS += --generate-index false # TODO: This false gets parsed as argv not flag value!!!
+MELANGE_OPTS += --cache-dir ${CACHEDIR}
 MELANGE_OPTS += --pipeline-dir ./pipelines/
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
@@ -44,10 +58,6 @@ MELANGE_TEST_OPTS += --test-package-append wolfi-base
 MELANGE_TEST_OPTS += --debug
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
 
-ifeq (${USE_CACHE}, yes)
-	MELANGE_OPTS += --cache-source ${CACHE_DIR}
-endif
-
 ifeq (${LINT}, yes)
 	MELANGE_OPTS += --fail-on-lint-warning
 endif
@@ -69,17 +79,56 @@ endif
 ${KEY}:
 	${MELANGE} keygen ${KEY}
 
+.PHONY: cache
+cache:
+	mkdir -p ${CACHEDIR}
+
+.PHONY: clean
 clean:
 	rm -rf packages/${ARCH}
+	rm -rf kernel/
 
+.PHONY: clean-cache
+clean-cache:
+	rm -rf ${CACHEDIR}
+
+${CACHEDIR}/.libraries_token.txt: cache
+	tmpf=$(shell mktemp); \
+	chainctl auth login --audience libraries.cgr.dev; \
+	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
+	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
+
+.PHONY: lib-token
+lib-token: ${CACHEDIR}/.libraries_token.txt
+
+.PHONY: fetch-kernel
 fetch-kernel:
-	$(eval KERNEL_PKG := $(shell curl -sL https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/APKINDEX.tar.gz | tar -Oxz APKINDEX | awk -F':' '$$1 == "P" {printf "%s-", $$2} $$1 == "V" {printf "%s.apk\n", $$2}' | grep "linux-virt" | grep -v dev))
-	@curl -s -LSo linux-virt.apk "https://dl-cdn.alpinelinux.org/alpine/edge/main/$(ARCH)/$(KERNEL_PKG)"
-	@mkdir -p /tmp/kernel
-	@tar -xf ./linux-virt.apk -C /tmp/kernel/ 2>/dev/null
-	export QEMU_KERNEL_IMAGE=/tmp/kernel/boot/vmlinuz-virt
-	export QEMU_KERNEL_MODULES=/tmp/kernel/lib/modules/
-	export MELANGE_OPTS="--runner=qemu"
+	rm -rf kernel
+	$(MAKE) kernel/boot/vmlinuz
+
+kernel/APKINDEX.tar.gz:
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/APKINDEX.tar.gz)
+
+kernel/APKINDEX: kernel/APKINDEX.tar.gz
+	tar -x -C kernel -f $< $(notdir $@)
+	touch $@
+
+kernel/chosen: kernel/APKINDEX
+	# Extract lines with 'P:linux' and the following line that contains the version
+	# This approach is compatible with both GNU and BSD sed
+	awk '/^P:linux$$/ {print; getline; print}' $< > kernel/available
+	grep '^V:' kernel/available | sed 's/V://' | \
+	  sort -V | tail -n1 > $@.tmp
+	# Sanity check that this looks like an apk version
+	grep -E '^([0-9]+\.)+[0-9]+-r[0-9]+$$' $@.tmp
+	mv $@.tmp $@
+
+kernel/linux.apk: kernel/chosen
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(shell cat kernel/chosen).apk)
+
+kernel/boot/vmlinuz: kernel/linux.apk
+	tar -x -C kernel -f $< boot/ 2> /dev/null
+	touch $@
 
 yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))
@@ -90,11 +139,11 @@ $(pkg_targets): package/%:
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
-packages/$(ARCH)/%.apk: $(KEY)
-	@mkdir -p ./$(pkgname)/
+packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
+	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
-	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
@@ -102,18 +151,18 @@ $(docker_pkg_targets): docker-package/%:
 	MELANGE_EXTRA_OPTS="--runner docker" make package/$*
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
-$(dbg_targets): debug/%: $(KEY)
+$(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
-	@mkdir -p ./"$*"/
+	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
-	@SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
-$(test_targets): test/%: $(KEY)
-	@mkdir -p ./$(*)/
+$(test_targets): test/%: cache $(KEY)
+	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
@@ -125,13 +174,14 @@ $(docker_test_targets): docker-test/%:
 	MELANGE_EXTRA_OPTS="--runner docker" make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
-$(testdbg_targets): test-debug/%: $(KEY)
-	@mkdir -p ./$(*)/
+$(testdbg_targets): test-debug/%: cache $(KEY)
+	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
 
+.PHONY: dev-container
 dev-container:
 	docker run --pull=always --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
@@ -144,20 +194,21 @@ PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # changes to the packages. It mounts the local packages folder as a read-only,
 # and sets up the necessary keys for you to run `apk add` commands, and then
 # test the packages however you see fit.
-local-wolfi:
-	@mkdir -p "${PWD}/packages"
+.PHONY: local-wolfi
+local-wolfi: $(KEY)
+	mkdir -p "${PWD}/packages"
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
-	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
-	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
+	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
+	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
 	docker run --pull=always --rm -it \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
-		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
+		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
 		cgr.dev/chainguard/wolfi-base:latest
-	@rm "$(TMP_REPOS_FILE)"
-	@rmdir "$(TMP_REPOS_DIR)"
+	rm "$(TMP_REPOS_FILE)"
+	rmdir "$(TMP_REPOS_DIR)"
 
 # This target spins up a docker container that is helpful for building images
 # using local packages.
@@ -192,27 +243,35 @@ local-wolfi:
 OUT_LOCAL_DIR ?= /work/out
 OS_LOCAL_DIR ?= /work/os
 OS_DIR ?= ${PWD}
-dev-container-wolfi:
+
+.PHONY: dev-container-wolfi
+dev-container-wolfi: $(KEY)
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir -d "$@.XXXXXX"))
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
-	@echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
-	@echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
+	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
+	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
 	docker run --pull=always --rm -it \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
-		--mount type=bind,source="${PWD}/local-melange.rsa.pub",destination="/etc/apk/keys/local-melange.rsa.pub",readonly \
+		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
 		ghcr.io/wolfi-dev/sdk:latest
-	@rm "$(TMP_REPOS_FILE)"
-	@rmdir "$(TMP_REPOS_DIR)"
+	rm "$(TMP_REPOS_FILE)"
+	rmdir "$(TMP_REPOS_DIR)"
 
 # Checks that the repo can be built in order from bootstrap packages.
+.PHONY: check-bootstrap
 check-bootstrap:
 	$(WOLFICTL) text --dir . --type name --pipeline-dir=./pipelines/ \
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
 
-.PHONY: clean fetch-kernel dev-container local-wolfi dev-container-wolfi check-bootstrap
+authget = tok=$$(chainctl auth token --audience=$(1)) || \
+  { echo "failed token from $(1) for target $@"; exit 1; }; \
+  mkdir -p $$(dirname $(2)) && \
+  echo "auth-download[$(1)] to $(2) from $(3)" && \
+  curl -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
+	mv "$(2).tmp" "$(2)"

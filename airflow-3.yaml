@@ -11,8 +11,8 @@ package:
   dependencies:
     runtime:
       - coreutils # numfmt is required
-      - eudev-dev # for libudev.so.1
       - keyutils # mysql provider requires libkeyutils.so.1
+      - libudev # for libudev.so.1
       - mariadb-connector-c # for libmariadb.so.3
       - merged-usrsbin
       - netcat-openbsd # nc is required
@@ -25,10 +25,20 @@ package:
   copyright:
     - license: Apache-2.0
 
-# As of now (2025/04/28), airflow is primarily available for python 3.12 and will break for python 3.13
-# For ref: https://airflow.apache.org/blog/airflow-2.9.0
 vars:
+  # As of now (2025/04/28), airflow is primarily available for python 3.12 and will break for python 3.13
+  # For ref: https://airflow.apache.org/blog/airflow-2.9.0
   py-version: 3.12
+  # This list is based on providers that were part of the 2.x version of this package, as well as manually added dependencies
+  # to ensure we're building dependent providers too (not pulling from PyPi). This is an ordered list.
+  # Use / as a separator
+  providers: "standard amazon sqlite imap smtp ftp fab http celery cncf/kubernetes docker elasticsearch google grpc hashicorp microsoft/azure mysql odbc openlineage postgres redis sendgrid sftp slack snowflake ssh"
+
+var-transforms:
+  - from: ${{vars.providers}}
+    match: "/"
+    replace: "-"
+    to: providers-with-dash
 
 environment:
   contents:
@@ -86,11 +96,9 @@ pipeline:
 
       # To install mysqlclient wheel
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
-      export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
 
       python${{vars.py-version}} -m build --wheel
-      pip${{vars.py-version}} install --verbose \
-       --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
+      pip${{vars.py-version}} install --verbose --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
 
   - name: "Build and install the additional provider packages"
     runs: |
@@ -98,13 +106,14 @@ pipeline:
       # There are a few others we want to include by default as well
 
       cd providers
-      # If changing this list, be sure to update the test below too
-      # Use / as a separator
-      for pkg in amazon celery cncf/kubernetes docker elasticsearch google grpc hashicorp microsoft/azure mysql odbc openlineage postgres redis sendgrid sftp slack snowflake ssh; do
+      for pkg in ${{vars.providers}}; do
         cd "$pkg"
+        if [[ "$pkg" == "celery" ]]; then
+            # Python will sometimes pull a 2.x airflow version, we do not want this.
+            sed -i 's/"apache-airflow>=2.9.0"/"apache-airflow==3.0.0"/' pyproject.toml
+        fi
         python${{vars.py-version}} -m build --wheel
-        pip${{vars.py-version}} install --verbose \
-          --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
+        pip${{vars.py-version}} install --verbose --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
         cd -
       done
 
@@ -206,8 +215,18 @@ test:
   environment:
     contents:
       packages:
-        - python-${{vars.py-version}}
+        - py${{vars.py-version}}-pip
   pipeline:
+    - name: "Ensure no airflow 2.x components are pulled in by mistake"
+      runs: |
+        pip list --path=/opt/airflow/lib/python${{vars.py-version}}/site-packages/ | grep airflow
+        ls -lah /opt/airflow/lib/python${{vars.py-version}}/site-packages/
+
+        # A known bad file example: apache_airflow-2.10.5.dist-info
+        if ls -1 /opt/airflow/lib/python${{vars.py-version}}/site-packages | grep -q "apache_airflow-2.*.dist-info"; then
+            echo "Error: apache_airflow-2.* file(s) found! Please diagnose"
+            exit 1
+        fi
     - name: "Test Python package import and version"
       runs: |
         export PATH=/opt/airflow/bin:$PATH
@@ -222,9 +241,8 @@ test:
         PROVIDERS_LIST=$(airflow providers list)
         echo $PROVIDERS_LIST
 
-        # If changing this list, be sure to update the same list above too
         # Use - as a separator
-        for pkg in amazon celery cncf-kubernetes docker elasticsearch google grpc hashicorp microsoft-azure mysql odbc openlineage postgres redis sendgrid sftp slack snowflake ssh; do
+        for pkg in ${{vars.providers-with-dash}}; do
           echo $PROVIDERS_LIST | grep "apache-airflow-providers-$pkg"
         done
     - name: "Load and test a DAG"

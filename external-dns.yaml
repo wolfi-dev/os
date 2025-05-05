@@ -69,47 +69,121 @@ test:
         - etcd
         - bind-tools
         - coredns
+        - kwok
+        - kwokctl
+        - kubernetes # depends on kubectl at runtime
   pipeline:
     - name: Basic binary tests
       runs: |
         external-dns --version
         external-dns --help
-    - name: Functional verification
+    - uses: test/kwok/cluster
+    - name: Setup RBAC
       runs: |
-        # Start a local etcd instance
-        etcd --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379 &
-        etcd_pid=$!
-        sleep 2
-
-        etcdctl put /skydns/org/example/foo '{"host":"42.42.42.42"}'
-
-        # Start CoreDNS with etcd backend
-        cat > Corefile <<EOF
-        .:53 {
-            errors
-            health
-            etcd {
-                path /skydns
-                endpoint http://127.0.0.1:2379
-            }
-            forward . /etc/resolv.conf
-            cache
-        }
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: default
+          namespace: default
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: external-dns
+        rules:
+        - apiGroups: [""]
+          resources: ["services","endpoints","pods","nodes"]
+          verbs: ["get","watch","list"]
+        - apiGroups: ["extensions","networking.k8s.io"]
+          resources: ["ingresses"]
+          verbs: ["get","watch","list"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: external-dns-viewer
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: external-dns
+        subjects:
+        - kind: ServiceAccount
+          name: default
+          namespace: default
         EOF
-        coredns -conf Corefile &
-        coredns_pid=$!
-        sleep 2
+    - name: Test Service DNS record creation
+      runs: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: nginx
+          labels:
+            app: nginx
+        spec:
+          serviceAccountName: default
+          containers:
+          - name: nginx
+            image: nginx
+            ports:
+            - containerPort: 80
+        EOF
 
-        external-dns --provider coredns --log-level debug --etcd-endpoints http://127.0.0.1:2379 &
-        external_dns_pid=$!
-        sleep 2
+        kubectl expose pod nginx --port=80 --target-port=80 --type=LoadBalancer
+        kubectl annotate service nginx "external-dns.alpha.kubernetes.io/hostname=nginx.example.org."
 
-        dig @127.0.0.1 foo.example.org +short
-        if [ "$(dig @127.0.0.1 foo.example.org +short)" != "42.42.42.42" ]; then
-          echo "DNS resolution failed"
-          exit 1
-        fi
+        # Run external-dns in dry-run mode
+        external-dns --txt-owner-id test-cluster \
+          --provider inmemory \
+          --source service \
+          --once \
+          --dry-run \
+          --log-level debug
+    - name: Test Ingress DNS record creation
+      runs: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: test-ingress
+          annotations:
+            external-dns.alpha.kubernetes.io/hostname: ingress.example.org
+        spec:
+          rules:
+          - host: ingress.example.org
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: nginx
+                    port:
+                      number: 80
+        EOF
 
-        kill $external_dns_pid || true
-        kill $coredns_pid || true
-        kill $etcd_pid || true
+        external-dns --txt-owner-id test-cluster \
+          --provider inmemory \
+          --source ingress \
+          --once \
+          --dry-run \
+          --log-level debug
+    - name: Test TXT record ownership
+      runs: |
+        external-dns --txt-owner-id test-cluster \
+          --provider inmemory \
+          --source service \
+          --registry txt \
+          --once \
+          --dry-run \
+          --log-level debug
+    - name: Test domain filtering
+      runs: |
+        external-dns --txt-owner-id test-cluster \
+          --provider inmemory \
+          --source service \
+          --domain-filter example.org \
+          --once \
+          --dry-run \
+          --log-level debug

@@ -1,0 +1,141 @@
+package:
+  name: xcover
+  version: 0.1.0
+  epoch: 0
+  description: "Profile coverage of functional tests without instrumenting your binaries."
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - libbpf
+
+environment:
+  contents:
+    packages:
+      - bpftool
+      - busybox
+      - clang
+      - go
+      - libbpf-dev
+
+capabilities:
+  add:
+    # CAP_BPF is not enough for BPF_LINK_TYPE_UPROBE_MULTI programs.
+    - CAP_SYS_ADMIN
+    # Needed because of this:
+    # https://github.com/aquasecurity/libbpfgo/issues/489
+    - CAP_SYS_RESOURCE
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/maxgio92/xcover
+      tag: ${{package.version}}
+      expected-commit: 0ff50efd5d2b7c45029a27f15e6f40ac2f76e602
+      recurse-submodules: true
+
+  - name: Generate vmlinux.h
+    runs: |
+      make vmlinux.h
+
+  - name: Compile libbpfgo dynamically
+    runs: |
+      make libbpfgo-dynamic
+
+  - name: Configure xcover dynamic
+    runs: |
+      # Depend on libbpfgo dynamically compiled.
+      sed -i "s|-static|-dynamic|g" Makefile
+      # Link against system libbpf.
+      sed -i "s|-lelf -lz \$(current_dir)/\$(LIBBPFGO)/output/libbpf/libbpf.a|-lelf -lz -lbpf|g" Makefile
+
+  - name: Compile xcover
+    runs: |
+      make xcover/bpf
+      make xcover/frontend
+
+  - name: Install xcover
+    runs: |
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      cp xcover ${{targets.contextdir}}/usr/bin/
+
+update:
+  enabled: true
+  github:
+    identifier: maxgio92/xcover
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - crane
+        - jq
+        - gcc
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Profile Crane tests
+      runs: |
+        # Smoke test for BPF program load with libbpfgo.
+        # libbpfgo still uses rlimit for increasing the
+        # hard limit for maximum amoutn of kernel memory
+        # that can be locked.
+        cat <<"EOF" >test-setrlimit.c
+        #include <stdio.h>
+        #include <sys/resource.h>
+        #include <errno.h>
+        #include <string.h>
+
+        int main() {
+            struct rlimit rlim;
+
+            // Set both soft and hard limit to 512 MB
+            rlim.rlim_cur = 512L << 20; // 512 MB
+            rlim.rlim_max = 512L << 20; // 512 MB
+
+            if (setrlimit(RLIMIT_MEMLOCK, &rlim) != 0) {
+                fprintf(stderr, "Error setting RLIMIT_MEMLOCK: %s\n", strerror(errno));
+                return 1;
+            }
+
+            printf("Successfully set RLIMIT_MEMLOCK to 512 MB\n");
+            return 0;
+        }
+        EOF
+        gcc -o test-setrlimit test-setrlimit.c
+        ./test-setrlimit || \
+          { echo "Cannot increase memory lock with rlimit. Needed to load BPF program with libbpfgo. Skipping tests"; exit 0; }
+
+        # Run xcover in background.
+        xcover profile \
+          --path $(command -v crane) \
+          --exclude "^(runtime\.|internal\/)" \
+          --log-level=debug \
+          --verbose=false \
+          --status &
+
+        # Wait for the xcover profiler to be ready,
+        # which means that the tracee that we are
+        # going to test is now traced.
+        # Only then, start executing tests.
+        xcover wait --timeout 60s
+
+        crane version >/dev/null
+        crane --help >/dev/null
+        crane manifest chainguard/static >/dev/null
+        crane ls chainguard/static >/dev/null
+        crane digest chainguard/static:latest >/dev/null
+        crane pull chainguard/static:latest static_latest.tar >/dev/null
+
+        kill -SIGINT %1
+        sleep 3 # Graceful shutdown timeout.
+
+        # Validate coverage report
+        test -f xcover-report.json || \
+          { echo "Skip report validation: report does not exist."; exit 0; }
+        coverage=$(jq '.cov_by_func' < <(cat xcover-report.json))
+        true=1
+        if [[ $(echo "$coverage > 15" | bc -l) != $true ]]; then
+          echo "Coverage seems wrong"
+          exit 1
+        fi

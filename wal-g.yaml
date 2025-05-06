@@ -1,0 +1,104 @@
+package:
+  name: wal-g
+  version: "3.0.7"
+  epoch: 0
+  description: "Archival and Restoration for databases in the Cloud"
+  copyright:
+    - license: "Apache-2.0"
+  dependencies:
+    runtime:
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - libarchive-tools # bsdtar
+      - libsodium-dev
+      - openssl-dev
+  environment:
+    PYTHONPATH: "/usr/lib/python3.11/site-packages"
+
+vars:
+  python-version: "3.11"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: "https://github.com/wal-g/wal-g.git"
+      expected-commit: "6ea13b90a3198bd5c8f8ac2ae323f28e33cf9f06"
+      tag: "v${{package.version}}"
+      recurse-submodules: true
+
+  - runs: |
+      go mod tidy
+      cp CMakeLists-brotli.txt submodules/brotli/CMakeLists.txt
+
+subpackages:
+  - name: ${{package.name}}-pg
+    description: PostgreSQL support for wal-g
+    dependencies:
+      runtime:
+        - postgresql
+        - postgresql-contrib
+        - python3
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./main/pg
+          ldflags: |
+            -X github.com/wal-g/wal-g/cmd/pg.buildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+            -X github.com/wal-g/wal-g/cmd/pg.gitRevision=$(git rev-parse --short HEAD || echo '<unknown>')
+            -X github.com/wal-g/wal-g/cmd/pg.walgVersion=${{package.version}}
+          output: wal-g
+          vendor: true
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - postgresql-client
+            - jq
+        environment:
+          PGDATA: /tmp/pgdata
+          WALG_FILE_PREFIX: /tmp/walg_pg
+      pipeline:
+        - name: "Check wal-g version"
+          runs: |
+            wal-g --version | grep -q "wal-g version ${{package.version}}"
+        - uses: test/pkgconf
+        - uses: test/tw/ldd-check
+          with:
+            packages: ${{subpkg.name}}
+        - name: Initialize PostgreSQL
+          runs: |
+            mkdir -p "/tmp/walg_pg"
+            mkdir -p "$PGDATA"
+            initdb -D "$PGDATA"
+        - name: Start PostgreSQL and wait
+          runs: |
+            pg_ctl -D "$PGDATA" -o "-k /tmp" -w start
+            createdb -h /tmp -U build walg
+            mkdir -p ~/.walg
+            cat > ~/.walg/wal-g.yaml <<EOF
+            WALG_FILE_PREFIX: /tmp/walg_pg
+            PGUSER: build
+            PGDATABASE: walg
+            EOF
+
+            mkdir -p /tmp/walg_pg
+            wal-g backup-push "$PGDATA" --config ~/.walg/wal-g.yaml
+            BACKUP_NAME=$(wal-g backup-list --json | jq -r '.[-1].backup_name')
+            echo "Backup pushed: $BACKUP_NAME"
+            pg_ctl -D "$PGDATA" -m fast stop
+
+update:
+  enabled: true
+  github:
+    identifier: wal-g/wal-g
+    strip-prefix: v
+    tag-filter: v
+    use-tag: true

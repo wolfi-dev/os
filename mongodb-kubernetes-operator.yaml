@@ -1,0 +1,147 @@
+package:
+  name: mongodb-kubernetes-operator
+  version: "0.13.0"
+  epoch: 0
+  description: Kubernetes Operator which deploys MongoDB Community into Kubernetes clusters.
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - bash-binsh
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/mongodb/mongodb-kubernetes-operator
+      tag: v${{package.version}}
+      expected-commit: e2467068a94f77757714eff9677be3b79bc4e114
+
+  - uses: go/build
+    with:
+      output: manager
+      packages: ./cmd/manager/main.go
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          # link /usr/bin/manager to /manager due to hardcoded command "./manager" in entrypoint script
+          # see "./${OPERATOR}" https://github.com/mongodb/mongodb-kubernetes-operator/blob/master/build/bin/entrypoint#L13
+          # and OPERATOR env variable is set to "manager" https://github.com/mongodb/mongodb-kubernetes-operator/blob/master/scripts/dev/templates/operator/Dockerfile.operator#L6
+          mkdir -p ${{targets.subpkgdir}}/
+          ln -sf /usr/bin/manager ${{targets.subpkgdir}}/manager
+
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          cp -av build/bin/* ${{targets.subpkgdir}}/usr/local/bin/
+    test:
+      pipeline:
+        - runs: |
+            stat /manager
+            stat /usr/local/bin/entrypoint
+
+  # Note: Upstream uses different versioning for components (e.g., operator: 0.12.x, version hook: 1.0.x),
+  # but Chainguard images use a unified tag matching the main operator version due to Git-based automation.
+  # See upstream version mapping in release.json: https://github.com/mongodb/mongodb-kubernetes-operator/blob/master/release/release.json
+  # All components are built from the same source, even if upstream lacks separate tags.
+  - name: ${{package.name}}-version-upgrade-post-start-hook
+    dependencies:
+      runtime:
+        - coreutils # for `cp`
+        - bash
+    pipeline:
+      - uses: go/build
+        with:
+          output: version-upgrade-hook
+          packages: ./cmd/versionhook/main.go
+    test:
+      environment:
+        environment:
+          AGENT_STATUS_FILEPATH: "/var/log/mongodb-mms-automation/healthstatus/agent-health-status.json"
+      pipeline:
+        - name: "Verify version-upgrade-hook"
+          uses: test/daemon-check-output
+          with:
+            start: |
+              version-upgrade-hook
+            timeout: 60
+            expected_output: |
+              Running version change post-start hook
+
+  - name: ${{package.name}}-version-upgrade-post-start-hook-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/
+          ln -sf /usr/bin/version-upgrade-hook ${{targets.subpkgdir}}/version-upgrade-hook
+    test:
+      pipeline:
+        - runs: |
+            stat /version-upgrade-hook
+
+  - name: ${{package.name}}-readinessprobe
+    dependencies:
+      runtime:
+        - coreutils # for `cp`
+        - bash
+    pipeline:
+      - uses: go/build
+        with:
+          output: readinessprobe
+          packages: ./cmd/readiness/main.go
+    test:
+      pipeline:
+        - name: "Verify readinessprobe"
+          uses: test/daemon-check-output
+          with:
+            start: |
+              readinessprobe
+            timeout: 60
+            expected_output: |
+              KUBERNETES_SERVICE_HOST
+              KUBERNETES_SERVICE_PORT
+
+  - name: ${{package.name}}-readinessprobe-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/probes/
+          ln -sf /usr/bin/readinessprobe ${{targets.subpkgdir}}/probes/readinessprobe
+    test:
+      pipeline:
+        - runs: |
+            stat /probes/readinessprobe
+
+test:
+  environment:
+    environment:
+      OPERATOR: manager
+      USER_UID: 2000
+      USER_NAME: mongodb-kubernetes-operator
+      MONGODB_REPO_URL: "quay.io/mongodb"
+      MONGODB_IMAGE: "mongodb-community-server"
+      AGENT_IMAGE: "quay.io/mongodb/mongodb-agent-ubi:108.0.2.8729-1"
+      VERSION_UPGRADE_HOOK_IMAGE: "quay.io/mongodb/mongodb-kubernetes-operator-version-upgrade-post-start-hook:1.0.9"
+      READINESS_PROBE_IMAGE: "quay.io/mongodb/mongodb-kubernetes-readinessprobe:1.0.22"
+      WATCH_NAMESPACE: "*"
+  pipeline:
+    - name: "Setup KWOK cluster"
+      uses: test/kwok/cluster
+    - name: "Install mongodbcommunity.mongodb.com CRD that the operator watches"
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/mongodb/mongodb-kubernetes-operator/51761b993543fb4865741bf4ef15f7b1c99a2e72/config/crd/bases/mongodbcommunity.mongodb.com_mongodbcommunity.yaml
+        kubectl wait --for=condition=Established crd --all --timeout=60s
+    - name: "Verify entrypoint"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          manager
+        timeout: 60
+        expected_output: |
+          Watching all namespaces
+          Registering Components
+          Starting the Cmd
+
+update:
+  enabled: true
+  github:
+    identifier: mongodb/mongodb-kubernetes-operator
+    strip-prefix: v
+    use-tag: true

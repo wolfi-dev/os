@@ -1,7 +1,7 @@
 package:
   name: airflow
   version: "2.10.5"
-  epoch: 2
+  epoch: 43
   description: Platform to programmatically author, schedule, and monitor workflows
   options:
     #  There is a dependency on libarrow.so although it
@@ -11,11 +11,13 @@ package:
   dependencies:
     runtime:
       - coreutils # numfmt is required
+      - merged-usrsbin
       - netcat-openbsd # nc is required
       - posix-libc-utils # genconf is required
       - python-3.12
       - tzdata
       - unixodbc
+      - wolfi-baselayout
   copyright:
     - license: Apache-2.0
 
@@ -23,18 +25,22 @@ environment:
   contents:
     packages:
       - cargo-auditable
+      - findutils
       - gcc
       - glibc-dev
+      - glibc-locales
+      - localedef
       - mariadb-connector-c-dev
       - mariadb-dev
       - nodejs
+      - npm
       - pkgconf-dev
       - postgresql-dev
       - py3-pip
       - py3-xmlsec
       - py3.12-build-bin
       - py3.12-pip
-      # Airflow requires pytonn<3.13
+      # Airflow requires python<3.13
       - python-3.12
       - python-3.12-dev
       - rust
@@ -51,7 +57,7 @@ pipeline:
       expected-commit: b93c3db6b1641b0840bd15ac7d05bc58ff2cccbf
 
   - runs: |
-      # by default airflow celery provider is not built,but running the upstream helm chart requires it
+      # By default, the airflow celery provider is not built, but running the upstream helm chart requires it
        python patch.py
        # remove the patcher
        rm -rf patch.py
@@ -64,6 +70,8 @@ pipeline:
     runs: |
       # front-end build
       yarn install --frozen-lockfile
+      # Update BrowsersList regularly: https://github.com/browserslist/update-db#readme
+      npx update-browserslist-db@latest
       yarn run build
       rm -rf node_modules
 
@@ -90,7 +98,13 @@ pipeline:
       #GHSA-8w49-h785-mj3c/GHSA-8495-4g3g-x7pr/GHSA-27mf-ghqm-j3j8 fixes
       pip3.12 install --verbose \
         --force-reinstall --prefix=/opt/airflow --root="${{targets.contextdir}}" \
-        aiohttp>=3.10.11 tornado>=6.4.2 statsd packaging pyparsing
+        aiohttp>=3.10.11 tornado>=6.4.2 statsd packaging pyparsing \
+        apache-airflow==${{package.version}} apache-airflow-providers-celery==3.10.0 "flask>=2.2.1,<2.3"
+      # NOTE: apache-airflow-providers-celery is pinned to 3.10.0 because 3.10.3 introduced a regresssion.
+      # https://github.com/apache/airflow/issues/47781 details more about it.
+      # NOTE: flask is pinned to < 2.3 as required by apache-airflow-providers-fab:
+      # https://github.com/apache/airflow/blob/21b8621539a382c3382f869752651be99ba30421/providers/fab/pyproject.toml#L68
+      # Before removing these pins, please check if the airflow[-bitnami] image helm tests pass.
 
   - runs: find . -name '__pycache__' -exec rm -rf {} +
 
@@ -124,11 +138,48 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-usrsbin
+        - wolfi-baselayout
     pipeline:
       - runs: |
           # Symlink libstdc++ from usr/lib to /usr/lib/$(uname -m)-linux-gnu/
           mkdir -p ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu
           ln -sf /usr/lib/libstdc++.so.6 ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu/
+
+  - name: airflow-bitnami-compat
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - bash
+        - busybox
+        - coreutils
+        - ini-file
+        - merged-usrsbin
+        - wait-for-port
+        - wolfi-baselayout
+    description: "Compatibility package for Bitnami's Airflow image"
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: airflow
+          version-path: 2/debian-12
+          commit: 2fe4a9e70c66f608d4c7669ca2b52009cc6f4663
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami
+          ln -sf /opt/airflow ${{targets.subpkgdir}}/opt/bitnami
+          mkdir -p ${{targets.subpkgdir}}/opt/airflow/venv
+          chmod g+rwX ${{targets.subpkgdir}}/opt/bitnami
+          ln -sf /opt/airflow/lib /opt/airflow/bin ${{targets.subpkgdir}}/opt/airflow/venv
+          mkdir -p ${{targets.subpkgdir}}/opt/airflow/bin
+          touch ${{targets.subpkgdir}}/opt/airflow/bin/activate
+          chmod 0755 ${{targets.subpkgdir}}/opt/airflow/bin/activate
+          find ${{targets.subpkgdir}}/opt/bitnami/scripts -type f -exec sed -i 's|/opt/bitnami/scripts/|${{targets.subpkgdir}}/opt/bitnami/scripts/|g' {} +
+          sed -i 's/-g "root"//g' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
+          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/add-extra-locales.sh
+          ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
+          ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/add-extra-locales.sh
+          find ${{targets.contextdir}}/opt/bitnami -type f -exec sed -E 's#${{targets.contextdir}}##g' -i {} \;
+          sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/entrypoint.sh
 
 update:
   enabled: true
@@ -137,6 +188,7 @@ update:
     - 'helm-chart*'
   github:
     identifier: apache/airflow
+    tag-filter-prefix: 2.
 
 test:
   environment:

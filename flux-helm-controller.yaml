@@ -1,19 +1,10 @@
 package:
   name: flux-helm-controller
   version: "1.2.0"
-  epoch: 4
+  epoch: 8
   description: The GitOps Toolkit Helm reconciler, for declarative Helming
   copyright:
     - license: Apache-2.0
-
-environment:
-  contents:
-    packages:
-      - busybox
-      - ca-certificates-bundle
-      - go
-  environment:
-    CGO_ENABLED: "0"
 
 pipeline:
   - uses: git-checkout
@@ -28,14 +19,32 @@ pipeline:
         oras.land/oras-go@v1.2.6
         golang.org/x/oauth2@v0.27.0
         golang.org/x/crypto@v0.35.0
-        golang.org/x/net@v0.36.0
         github.com/containerd/containerd@v1.7.27
+        helm.sh/helm/v3@v3.17.3
+        golang.org/x/net@v0.38.0
 
   - uses: go/build
     with:
       ldflags: -X main.Version=${{package.version}}
       output: helm-controller
       packages: .
+
+subpackages:
+  - name: ${{package.name}}-bitnami-compat
+    description: "compat package for bitnami fluxcd-helm-controller image"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/fluxcd-helm-controller/bin/
+          ln -sf /usr/bin/helm-controller ${{targets.contextdir}}/opt/bitnami/fluxcd-helm-controller/bin/helm-controller
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        # the test is extensive in the main package and this is the same binary invoked via a symlink.
+        - runs: |
+            /opt/bitnami/fluxcd-helm-controller/bin/helm-controller --help 2>&1 | grep -i "Usage of /opt/bitnami/fluxcd-helm-controller/bin/helm-controller"
 
 update:
   enabled: true
@@ -54,9 +63,22 @@ test:
         - curl
   pipeline:
     - uses: test/kwok/cluster
-    - name: Verify helm-controller installation
-      runs: |
-        kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
-        kubectl wait --for=condition=Ready nodes --all
-        helm-controller --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1 & \
-        sleep 5; curl -s localhost:8081/metrics  | grep rest_client_requests_total
+    - name: "start ${{package.name}} and test"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
+          kubectl wait --for=condition=Ready nodes --all
+        start: helm-controller --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1
+        timeout: 30
+        expected_output: |
+          starting manager
+          Serving metrics server
+          helm.toolkit.fluxcd.io
+          Starting Controller
+          Starting workers
+        post: |
+          #!/bin/sh -e
+          set -o pipefail
+          curl -s localhost:8081/metrics  | grep rest_client_requests_total
+          curl -v localhost:9441/healthz 2>&1 | grep -i "200 OK"

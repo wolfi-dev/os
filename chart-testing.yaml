@@ -1,0 +1,124 @@
+package:
+  name: chart-testing
+  version: "3.12.0"
+  epoch: 3
+  description: Tool for testing Helm charts, used for linting and testing pull requests.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - busybox
+      - git
+      - helm
+      - kubectl
+      - openssh-client
+      - py3-yamale-bin
+      - yamllint
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/helm/chart-testing
+      tag: v${{package.version}}
+      expected-commit: d6991035017d7ac0e3dec3d1b5ad2e5f18674b32
+
+  - uses: go/bump
+    with:
+      deps: |-
+        helm.sh/helm/v3@v3.17.3
+
+  - uses: go/build
+    with:
+      modroot: .
+      packages: ./ct
+      output: ct
+      ldflags: |
+        -X github.com/helm/chart-testing/v3/ct/cmd.Version=${{package.version}}
+        -X github.com/helm/chart-testing/v3/ct/cmd.BuildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
+        -X github.com/helm/chart-testing/v3/ct/cmd.GitCommit=$(git rev-parse --short HEAD)
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/etc/ct
+      install -Dm755 ./etc/chart_schema.yaml ${{targets.destdir}}/etc/ct/chart_schema.yaml
+      install -Dm755 ./etc/lintconf.yaml ${{targets.destdir}}/etc/ct/lintconf.yaml
+
+update:
+  enabled: true
+  github:
+    identifier: helm/chart-testing
+    strip-prefix: v
+
+test:
+  pipeline:
+    - name: "Version and help test"
+      runs: |
+        ct version 2>&1 | grep ${{package.version}}
+        ct --help > help_output.txt 2>&1
+        grep -q "Lint and test" help_output.txt
+    - name: "Completion command test"
+      runs: |
+        ct completion bash > bash_completion.sh 2>&1
+        grep -q "bash completion V2 for ct" bash_completion.sh
+    - name: "Ct lint test"
+      runs: |
+        # Using grafana helm chart
+        git clone https://github.com/grafana/helm-charts.git
+        cd helm-charts
+        git config user.email "test@example.com"
+        git config user.name "Test User"
+        CHART_FILE="charts/grafana/Chart.yaml"
+        # Increment chart version for test
+        current_version=$(grep '^version:' "$CHART_FILE" | awk '{ print $2 }')
+        major=$(echo "$current_version" | cut -d. -f1)
+        minor=$(echo "$current_version" | cut -d. -f2)
+        patch=$(echo "$current_version" | cut -d. -f3)
+        new_patch=$((patch + 1)) # Increment patch version
+        new_version="$major.$minor.$new_patch"
+        sed -i "s/^version: .*/version: $new_version/" "$CHART_FILE" # Replace version in Chart.yaml
+        git add .
+        git commit -m "Trigger chart change"
+        # ct config file
+        cat > ct-config.yaml <<EOF
+        chart-dirs:
+          - charts
+        chart-repos:
+          - "grafana=https://grafana.github.io/helm-charts"
+        target-branch: main
+        skip-clone: true
+        validate-chart-schema: false
+        EOF
+        # Helm lint config
+        cat > lintconf.yaml <<EOF
+        strict: true
+        EOF
+        # Run ct lint
+        ct lint --config ct-config.yaml | grep -q "All charts linted successfully"
+        # Ct lint error case, injecting errors:
+        echo "bad: [unclosed" >> charts/grafana/values.yaml
+        echo "# test change2" >> charts/grafana/Chart.yaml
+        new_patch=$((patch + 2)) # Increment patch version
+        new_version="$major.$minor.$new_patch"
+        sed -i "s/^version: .*/version: $new_version/" "$CHART_FILE" # Updating version again for further testing errors
+        ct lint --config ct-config.yaml > lint_output.txt 2>&1 || true
+        grep -q "failed linting charts" lint_output.txt
+    - name: "Ct install test"
+      runs: |
+        cd helm-charts
+        sed -i '$d' charts/grafana/values.yaml
+        sed -i '$d' charts/grafana/values.yaml
+        # Install (dry-run mode)
+        ct install --config ct-config.yaml --helm-extra-args '--dry-run --debug' > install_output.txt 2>&1 || true
+        # Check that the install was attempted
+        grep -q "Installing chart" install_output.txt
+        # Note: Install chart deployment would fail because of unavailability of k8s cluster, but attempt was made, which comes under scope of ct's functionality
+    - name: "Ct lint-install test"
+      runs: |
+        cd helm-charts
+        ct lint-and-install --config ct-config.yaml --helm-extra-args='--dry-run --debug' > lint_install_output.txt 2>&1 || true
+        grep -q "Linting charts/grafana" lint_install_output.txt
+        grep -q "Installing chart with values" lint_install_output.txt
+    - name: "Ct list-changed test"
+      runs: |
+        cd helm-charts
+        ct list-changed --target-branch main > changed.txt 2>&1
+        grep -q "grafana" changed.txt

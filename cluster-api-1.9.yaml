@@ -1,0 +1,117 @@
+package:
+  name: cluster-api-1.9
+  version: "1.9.7"
+  epoch: 0
+  description: Cluster API meta package
+  dependencies:
+    provides:
+      - cluster-api=${{package.full-version}}
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: da813c315bf59cb8588465432485142df3d19793
+      repository: https://github.com/kubernetes-sigs/cluster-api
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/net@v0.38.0
+
+data:
+  - name: backends-go-builds
+    items:
+      kubeadm-bootstrap-controller: bootstrap/kubeadm
+      kubeadm-controlplane-controller: controlplane/kubeadm
+      clusterctl: cmd/clusterctl
+      controller: .
+
+subpackages:
+  - range: backends-go-builds
+    name: ${{package.name}}-${{range.key}}
+    description: cluster-api core components
+    dependencies:
+      provides:
+        - cluster-api-${{range.key}}=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          output: ${{range.key}}
+          packages: ./${{range.value}}
+          ldflags: |
+            -X sigs.k8s.io/cluster-api/version.gitVersion=${{package.version}} \
+            -X sigs.k8s.io/cluster-api/version.gitCommit=${GIT_COMMIT} \
+            -X sigs.k8s.io/cluster-api/version.gitTreeState=$(shell git diff --quiet >/dev/null 2>&1 || echo "dirty" || echo "clean") \
+            -X sigs.k8s.io/cluster-api/version.buildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')
+
+  - range: backends-go-builds
+    name: ${{package.name}}-${{range.key}}-compat
+    description: cluster-api core ${{range.key}} compat packages
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          if [[ "${{range.key}}" == "kubeadm-bootstrap-controller" ]]; then
+              ln -s /usr/bin/${{range.key}} ${{targets.contextdir}}/manager
+          elif [[ "${{range.key}}" == "kubeadm-controlplane-controller" ]]; then
+              ln -s /usr/bin/${{range.key}} ${{targets.contextdir}}/manager
+          else
+          ln -s /usr/bin/${{range.key}} ${{targets.contextdir}}/${{range.key}}
+
+          fi
+
+## The package requires a full blown kubernetes cluster for complete testing so most of the tests are just to test the execution of the binaries for each component
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-controller
+        - ${{package.name}}-kubeadm-bootstrap-controller
+        - ${{package.name}}-kubeadm-controlplane-controller
+        - ${{package.name}}-clusterctl
+        - ${{package.name}}-controller-compat
+        - ${{package.name}}-clusterctl-compat
+  pipeline:
+    - uses: git-checkout
+      with:
+        expected-commit: da813c315bf59cb8588465432485142df3d19793
+        repository: https://github.com/kubernetes-sigs/cluster-api
+        tag: v${{package.version}}
+    - uses: test/kwok/cluster
+    - runs: kubectl apply -f config/crd/bases/
+    - uses: test/daemon-check-output
+      with:
+        start: /controller --profiler-address=127.0.0.1:8080 --health-addr=127.0.0.1:8081
+        expected_output: |
+          Starting workers
+          Starting webhook server
+          Starting EventSource
+          All workers finished
+    - uses: test/daemon-check-output
+      with:
+        start: kubeadm-controlplane-controller
+        expected_output: |
+          Registering webhook
+          Conversion webhook enabled
+          Starting manager
+          problem running manager
+    - uses: test/daemon-check-output
+      with:
+        start: kubeadm-bootstrap-controller
+        expected_output: |
+          Stopping and waiting for webhooks
+          Stopping and waiting for HTTP servers
+    - runs: |
+        /clusterctl version | grep -q ${{package.version}}
+        /clusterctl --help | grep -q "Get started with Cluster API using clusterctl"
+        /clusterctl config repositories | grep helm
+
+update:
+  enabled: true
+  git:
+    tag-filter-prefix: v1.9
+    strip-prefix: v

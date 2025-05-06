@@ -1,0 +1,6 @@
+library(SparkR)
+sparkR.session()
+df <- as.DataFrame(data.frame(id = c(1, 2), name = c("Alice", "Bob")))
+createOrReplaceTempView(df, "people")
+df2 <- sql("SELECT * FROM people WHERE id > 1")
+stopifnot(count(df2) == 1)

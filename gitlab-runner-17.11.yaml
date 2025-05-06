@@ -1,0 +1,183 @@
+vars:
+  # GitLab Base Images tags: https://gitlab.com/gitlab-org/ci-cd/runner-tools/base-images/-/tags
+  base-images-tag: 0.0.14
+  base-images-commit: c59a57f330bb554d44a99128a0e15f99460dc1b8
+  # Docker Machine tags: https://gitlab.com/gitlab-org/ci-cd/docker-machine/-/tags
+  docker-machine-tag: v0.16.2-gitlab.35
+  docker-machine-commit: cf3838a1fea6e12f8a167f7f76df1f939ef69662
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+package:
+  name: gitlab-runner-17.11
+  # ---Additional updates required--- Review 'vars' section (above), when reviewing version bumps.
+  version: "17.11.1"
+  epoch: 0
+  description: GitLab Runner is the open source project that is used to run your CI/CD jobs and send the results back to GitLab
+  copyright:
+    - license: MIT
+  dependencies:
+    provides:
+      - gitlab-runner=${{package.full-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.com/gitlab-org/gitlab-runner
+      tag: v${{package.version}}
+      expected-commit: 96856197176687bb5744a7562cc65130b32d4005
+
+  - name: Verify base-images-tag matches the expected upstream value
+    runs: |
+      # Ensure the expected tag used of the base images align with upstream.
+      # Each GitLab Runner version depends on a specific base image version.
+      # We manually verify that `base-images-tag` matches the expected upstream value
+      # defined in the corresponding GitLab Runner configuration:
+      # https://gitlab.com/gitlab-org/gitlab-runner/-/blob/v${{package.version}}/.gitlab/ci/_common.gitlab-ci.yml
+      # (variable: RUNNER_IMAGES_VERSION)
+
+      BASE_IMAGES_TAG=$(cat ./.gitlab/ci/_common.gitlab-ci.yml | sed -n 's/.*RUNNER_IMAGES_VERSION: "\([0-9.]*\)".*/\1/p')
+
+      if [ "${{vars.base-images-tag}}" != "${BASE_IMAGES_TAG}" ]; then
+        echo "Expected BASE_IMAGES_TAG: ${{vars.base-images-tag}} but got: $BASE_IMAGES_TAG"
+        exit 1
+      fi
+
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.com/gitlab-org/ci-cd/runner-tools/base-images
+      tag: v${{vars.base-images-tag}}
+      expected-commit: ${{vars.base-images-commit}}
+      destination: ./base-images
+
+  - name: Verify docker-machine-tag matches the expected value
+    runs: |
+      # Ensure the expected tag used of the docker machine align with upstream base images.
+      # The version used by the upstream can be found in the following file:
+      # https://gitlab.com/gitlab-org/ci-cd/runner-tools/base-images/-/blob/v${{vars.base-images-tag}}/dockerfiles/runner/docker-bake.hcl
+      # (as: DOCKER_MACHINE_VERSION)
+
+      DOCKER_MACHINE_VERSION=$(sed -n 's/.*DOCKER_MACHINE_VERSION *= *"\([^"]*\)".*/\1/p' ./base-images/dockerfiles/runner/docker-bake.hcl)
+
+      if [ "${{vars.docker-machine-tag}}" != "${DOCKER_MACHINE_VERSION}" ]; then
+        echo "Expected DOCKER_MACHINE_VERSION: ${{vars.docker-machine-tag}} but got: $DOCKER_MACHINE_VERSION"
+        exit 1
+      fi
+
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.com/gitlab-org/ci-cd/docker-machine
+      tag: ${{vars.docker-machine-tag}}
+      expected-commit: ${{vars.docker-machine-commit}}
+      destination: ./machine
+
+  - uses: go/bump
+    with:
+      modroot: ./machine
+      deps: |-
+        golang.org/x/crypto@v0.37.0
+        golang.org/x/oauth2@v0.27.0
+        github.com/golang-jwt/jwt/v4@v4.5.2
+        golang.org/x/net@v0.38.0
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.38.0
+        golang.org/x/oauth2@v0.27.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: gitlab-runner
+      ldflags: -w -X gitlab.com/gitlab-org/gitlab-runner/common.NAME=${{package.name}} -X gitlab.com/gitlab-org/gitlab-runner/common.VERSION=v${{package.version}}
+
+subpackages:
+  - name: gitlab-runner-helper-${{vars.major-minor-version}}
+    description: GitLab Runner Helper
+    dependencies:
+      provides:
+        - gitlab-runner-helper=${{package.full-version}}
+    pipeline:
+      - uses: go/bump
+        with:
+          deps: |-
+            golang.org/x/net@v0.38.0
+      - uses: go/build
+        with:
+          packages: ./apps/gitlab-runner-helper
+          output: gitlab-runner-helper
+          ldflags: -w -X gitlab.com/gitlab-org/gitlab-runner/common.NAME=${{package.name}} -X gitlab.com/gitlab-org/gitlab-runner/common.VERSION=v${{package.version}}
+
+  - name: "gitlab-runner-oci-entrypoint-${{vars.major-minor-version}}"
+    description: "Gitlab-runner oci entrypoint"
+    dependencies:
+      provides:
+        - gitlab-runner-oci-entrypoint=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+          cp ./base-images/dockerfiles/runner/alpine/entrypoint "${{targets.subpkgdir}}"/entrypoint
+          chmod 755 "${{targets.subpkgdir}}"/entrypoint
+
+  # As of 17.8, the entrypoint is now sourced from yet another repository
+  - name: "gitlab-runner-helper-oci-entrypoint-${{vars.major-minor-version}}"
+    description: "Gitlab-runner-helper oci entrypoint"
+    dependencies:
+      provides:
+        - gitlab-runner-helper-oci-entrypoint=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          cp ./base-images/dockerfiles/runner-helper/scripts/gitlab-runner-build "${{targets.subpkgdir}}"/usr/bin/gitlab-runner-build
+          cp ./base-images/dockerfiles/runner-helper/helpers/entrypoint "${{targets.subpkgdir}}"/entrypoint
+
+  - name: "gitlab-runner-helper-compat-${{vars.major-minor-version}}"
+    description: "Gitlab-runner-helper compat"
+    dependencies:
+      provides:
+        - gitlab-runner-helper-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          ln -sf /usr/bin/gitlab-runner "${{targets.subpkgdir}}"/usr/bin/gitlab-ci-multi-runner
+          ln -sf /usr/bin/miniperl "${{targets.subpkgdir}}"/usr/bin/perl
+
+  - name: gitlab-docker-machine-${{vars.major-minor-version}}
+    description: "Creates Docker hosts used by GitLab runner."
+    dependencies:
+      provides:
+        - gitlab-docker-machine=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/docker-machine
+          output: docker-machine
+          ldflags: -w -X github.com/docker/machine/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null)
+          modroot: ./machine
+    test:
+      pipeline:
+        - runs: |
+            DOCKER_MACHINE_VERSION=$(echo ${{vars.docker-machine-tag}} | sed 's/^v//')
+            docker-machine -v | grep $DOCKER_MACHINE_VERSION
+            docker-machine -h
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: v17.11
+
+test:
+  environment:
+    contents:
+      packages:
+        - gitlab-runner-helper=${{package.full-version}}
+  pipeline:
+    - runs: |
+        gitlab-runner --help
+        gitlab-runner-helper --help

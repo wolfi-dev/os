@@ -1,0 +1,283 @@
+package:
+  name: dapr-1.15
+  version: "1.15.4"
+  epoch: 2
+  description: Portable, event-driven, runtime for building distributed applications across cloud and edge.
+  dependencies:
+    provides:
+      - dapr=${{package.full-version}}
+  copyright:
+    - license: Apache-2.0
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - protobuf
+      - protobuf-dev
+      - protoc
+      - protoc-gen-go
+      - protoc-gen-go-grpc
+  environment:
+    GO_TAGS: "allcomponents"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: eb94584f0e14b9fb61d2d139277c2962c1567064
+      repository: https://github.com/dapr/dapr
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        github.com/choleraehyq/pid@v0.0.20
+        github.com/golang-jwt/jwt/v4@v4.5.2
+        golang.org/x/net@v0.38.0
+        github.com/open-policy-agent/opa@v1.4.0
+
+  - runs: |
+      # Generate proto code
+      # We will have to disable this using sed because this check forces to use protobuf 25 while we use latest 26
+      # https://github.com/dapr/dapr/blob/ceaeefd39167c58c005ed1bf96258e653824344b/Makefile#L507
+      sed -i '/check-proto-version:/,/^$/d' Makefile
+      make gen-proto
+
+data:
+  - name: binaries
+    items:
+      daprd: Daprd side car
+      placement: Dapr Placement control plane service
+      operator: Dapr Operator service manages Dapr component updates and provides Kubernetes services endpoints for Dapr
+      injector: Looks for pods initialized with the Dapr annotations, and then creates another container in that pod for the daprd service
+      scheduler: Dapr Scheduler service is used to schedule different types of jobs, running in self-hosted mode or on Kubernetes.Dapr Scheduler service is used to schedule different types of jobs, running in self-hosted mode or on Kubernetes.
+      sentry: Dapr Sentry service manages mTLS between services and acts as a certificate authority
+
+subpackages:
+  - range: binaries
+    name: "dapr-${{range.key}}-${{vars.major-minor-version}}"
+    description: ${{range.value}}
+    dependencies:
+      provides:
+        - dapr-${{range.key}}=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/${{range.key}}
+          output: ${{range.key}}
+          ldflags: |
+            -X github.com/dapr/dapr/pkg/buildinfo.gitversion=$(git describe --always --abbrev=7 --dirty)
+            -X github.com/dapr/dapr/pkg/buildinfo.gitcommit=$(git rev-list -1 HEAD)
+            -X github.com/dapr/dapr/pkg/buildinfo.version=v${{package.version}}
+            -X github.com/dapr/kit/logger.DaprVersion=v${{package.version}}
+          tags: $GO_TAGS
+
+  - range: binaries
+    name: "dapr-${{range.key}}-${{vars.major-minor-version}}-oci-compat"
+    description: OCI compat for dapr-${{range.key}}
+    dependencies:
+      provides:
+        - dapr-${{range.key}}-oci-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+          ln -sf /usr/bin/${{range.key}} ${{targets.subpkgdir}}/${{range.key}}
+    test:
+      pipeline:
+        - runs: |
+            stat /${{range.key}}
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubectl
+        - git
+        - curl
+        - jq
+        - python3
+        - wait-for-it
+        - dapr
+        - dapr-daprd
+        - dapr-injector
+        - dapr-placement
+        - dapr-operator
+        - dapr-scheduler
+        - dapr-sentry
+    environment:
+      NAMESPACE: "default"
+  pipeline:
+    - uses: test/kwok/cluster
+    - name: Install Dapr CRDs
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/dapr/dapr/v${{package.version}}/charts/dapr/crds/components.yaml
+        # Give it a sec to settle
+        sleep 2
+    - name: Launch Dapr Operator and verify component processing
+      uses: test/daemon-check-output
+      with:
+        start: operator
+        expected_output: "Starting Dapr Operator"
+        post: |
+          echo "Deploying test Component..."
+          cat <<EOF | kubectl apply -f -
+          apiVersion: dapr.io/v1alpha1
+          kind: Component
+          metadata:
+            name: test-comp
+            namespace: default
+          spec:
+            type: bindings.cron
+            version: v1
+            metadata:
+              - name: schedule
+                value: "@every 5s"
+              - name: direction
+                value: input
+          EOF
+
+          echo "Waiting for component to be processed..."
+          sleep 5
+
+          echo "Verifying component..."
+          if kubectl get component test-comp -o yaml | grep -q "bindings.cron"; then
+            echo "✅ Operator processed component"
+          else
+            echo "❌ Component not processed"
+            exit 1
+          fi
+    - name: Prepare Dapr configs
+      runs: |
+        mkdir -p /etc/dapr
+        echo '{"id": "testapp", "appPort": 8080}' > /etc/dapr/config.json
+        cat <<EOF > /etc/dapr/component.yaml
+        apiVersion: dapr.io/v1alpha1
+        kind: Component
+        metadata:
+          name: testpubsub
+        spec:
+          type: pubsub.in-memory
+          version: v1
+          metadata: []
+        EOF
+    - name: Start placement service
+      uses: test/daemon-check-output
+      with:
+        start: placement
+        expected_output: "placement server leadership acquired"
+        timeout: 15
+    - name: Start sentry with fake config
+      uses: test/daemon-check-output
+      with:
+        start: sentry --config /etc/dapr/daprsystem
+        expected_output: "Starting Dapr Sentry certificate authority"
+        timeout: 10
+    - name: Start scheduler
+      uses: test/daemon-check-output
+      with:
+        start: scheduler
+        expected_output: "Dapr Scheduler listening on: :50006"
+        timeout: 10
+        post: |
+          wait-for-it localhost:50006 --timeout=30
+    # We can only check that it starts and fails in melange
+    - name: Start injector (expect failure without env)
+      uses: test/daemon-check-output
+      with:
+        start: injector
+        expected_output: "Error getting config"
+        timeout: 10
+    - name: Start daprd and publish + receive message
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          export DAPR_HTTP_PORT=3500
+          export DAPR_GRPC_PORT=50001
+          export DAPR_APP_ID=testapp
+          export DAPR_COMPONENTS_PATH=/etc/dapr
+
+          cat <<EOF > /tmp/fake-subscriber.py
+          import http.server, json
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == "/dapr/subscribe":
+                      subs = [{
+                          "pubsubname": "testpubsub",
+                          "topic": "test",
+                          "route": "/"
+                      }]
+                      body = json.dumps(subs).encode()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  else:
+                      self.send_error(404)
+
+              def do_POST(self):
+                  length = int(self.headers.get("Content-Length", 0))
+                  body = self.rfile.read(length)
+                  with open("/tmp/received.log", "wb") as f:
+                      f.write(body)
+                  self.send_response(200)
+                  self.end_headers()
+
+          http.server.HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+          EOF
+
+
+          python3 /tmp/fake-subscriber.py &
+          echo $! > /tmp/subscriber.pid
+
+          wait-for-it localhost:8080 --timeout=60
+          # Component and subscription config (declarative)
+          cat <<EOF > /etc/dapr/sub.yaml
+          apiVersion: dapr.io/v1alpha1
+          kind: Subscription
+          metadata:
+            name: test-cron
+          spec:
+            topic: test
+            route: /
+            pubsubname: testpubsub
+          EOF
+        start: daprd --app-id=testapp --components-path=/etc/dapr --resources-path=/etc/dapr --app-port=8080
+        expected_output: "Starting Dapr Runtime"
+        timeout: 10
+        post: |
+          wait-for-it localhost:3500 --timeout=60
+          echo "---- Health check ----"
+          curl -sf http://localhost:3500/v1.0/healthz
+
+          echo "---- Publish message ----"
+          curl -sf --retry 5 --retry-delay 1 -X POST http://localhost:3500/v1.0/publish/testpubsub/test -d '"hello"'
+
+          echo "Printing message"
+          cat /tmp/received.log | jq .
+
+          echo "---- Check message received ----"
+
+          # Extract .data field and grep it
+          if jq -r '.data' /tmp/received.log 2>/dev/null | grep -qx 'hello'; then
+            echo "✅ Message successfully received!"
+          else
+            echo "❌ Message not received"
+            cat /tmp/received.log
+            exit 1
+          fi
+          kill $(cat /tmp/subscriber.pid)
+
+update:
+  enabled: true
+  github:
+    identifier: dapr/dapr
+    strip-prefix: v
+    tag-filter: v1.15.
+    use-tag: true

@@ -1,10 +1,14 @@
 package:
   name: flux-source-controller
   version: "1.5.0"
-  epoch: 7
+  epoch: 43
   description: The GitOps Toolkit source management component
   copyright:
     - license: Apache-2.0
+  dependencies:
+    runtime:
+      - merged-usrsbin
+      - wolfi-baselayout
 
 environment:
   contents:
@@ -31,8 +35,11 @@ pipeline:
         github.com/go-jose/go-jose/v3@v3.0.4
         golang.org/x/oauth2@v0.27.0
         golang.org/x/crypto@v0.35.0
-        golang.org/x/net@v0.36.0
         github.com/containerd/containerd@v1.7.27
+        github.com/golang-jwt/jwt/v4@v4.5.2
+        github.com/golang-jwt/jwt/v5@v5.2.2
+        helm.sh/helm/v3@v3.17.3
+        golang.org/x/net@v0.38.0
 
   - runs: |
       mkdir -p "${{targets.destdir}}"/usr/bin
@@ -44,23 +51,25 @@ pipeline:
   - uses: strip
 
 subpackages:
-  - name: fluxcd-source-controller-bitnami-compat
-    description: "compat package with bitnami/flux image"
+  - name: ${{package.name}}-bitnami-compat
+    description: "Compatibility package for usage with the Bitnami helm chart."
     pipeline:
-      - uses: bitnami/compat
-        with:
-          image: fluxcd-source-controller
-          version-path: 1/debian-12
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/flux/bin/
-          chmod g+rwX ${{targets.subpkgdir}}/opt/bitnami
-          ln -sf /usr/bin/source-controller ${{targets.subpkgdir}}/opt/bitnami/flux/bin/source-controller
-          cp LICENSE ${{targets.subpkgdir}}/opt/bitnami/licenses/LICENSE
+          mkdir -p ${{targets.contextdir}}/opt/bitnami/flux/bin/
+          ln -sf /usr/bin/source-controller ${{targets.contextdir}}/opt/bitnami/flux/bin/source-controller
     test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
       pipeline:
+        # the test is extensive in the main package and this is the same binary invoked via a symlink.
         - runs: |
-            run-script --version
-            run-script --help
+            /opt/bitnami/flux/bin/source-controller --help 2>&1 | grep -i "Usage of /opt/bitnami/flux/bin/source-controller"
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
 
 update:
   enabled: true
@@ -73,9 +82,13 @@ update:
 
 test:
   environment:
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
     contents:
       packages:
         - ${{package.name}}
+        - curl
   pipeline:
     # the source-controller when passing the -h flag exit with error code 2
     - runs: |
@@ -85,3 +98,24 @@ test:
           echo "expected 2, got $?"
           exit 1
         fi
+    # only passes with docker runner: `MELANGE_EXTRA_OPTS="--runner docker" make test/flux-notification-controller`
+    - uses: test/kwok/cluster
+    - name: "start ${{package.name}} and test"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
+          kubectl wait --for=condition=Ready nodes --all
+        start: source-controller --storage-adv-addr=source-controller.default.svc.cluster.local --storage-path=/ --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1
+        timeout: 30
+        expected_output: |
+          starting file server
+          starting manager
+          source.toolkit.fluxcd.io
+          Starting Controller
+          Starting workers
+        post: |
+          #!/bin/sh -e
+          set -o pipefail
+          curl -s localhost:8081/metrics  | grep rest_client_requests_total
+          curl -v localhost:9441/healthz 2>&1 | grep -i "200 OK"

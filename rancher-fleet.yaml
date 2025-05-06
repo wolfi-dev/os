@@ -1,7 +1,7 @@
 package:
   name: rancher-fleet
-  version: "0.11.5"
-  epoch: 3
+  version: "0.12.2"
+  epoch: 2
   description: Deploy workloads from Git to large fleets of Kubernetes clusters
   copyright:
     - license: Apache-2.0
@@ -9,16 +9,17 @@ package:
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 19df0c4f76e7b278eb173692a2bd74581e173542
+      expected-commit: fcb09948fb937f043ab421b2b7ef03d7cbcce02b
       repository: https://github.com/rancher/fleet
       tag: v${{package.version}}
 
   - uses: go/bump
     with:
       deps: |-
-        golang.org/x/crypto@v0.35.0
         golang.org/x/oauth2@v0.27.0
-        github.com/containerd/containerd@v1.7.27
+        helm.sh/helm/v3@v3.17.3
+        golang.org/x/net@v0.38.0
+        k8s.io/kubernetes@v1.32.4
 
 subpackages:
   - name: ${{package.name}}-agent
@@ -34,6 +35,87 @@ subpackages:
       pipeline:
         - runs: |
             fleetagent --version | grep ${{package.version}}
+
+  - name: ${{package.name}}-cli
+    pipeline:
+      - uses: go/build
+        with:
+          ldflags: |
+            -X github.com/rancher/fleet/pkg/version.GitCommit=$(git rev-parse HEAD)
+            -X github.com/rancher/fleet/pkg/version.Version=${{package.version}}
+          output: fleet
+          packages: ./cmd/fleetcli/main.go
+    test:
+      pipeline:
+        - runs: |
+            fleet --version | grep ${{package.version}}
+            fleet completion bash | grep -qE "__fleet_debug.*starting completion logic.*"
+        - name: "Setup KWOK cluster"
+          uses: test/kwok/cluster
+        - name: "Install CRDs"
+          runs: |
+            kubectl apply -f https://raw.githubusercontent.com/rancher/fleet/refs/tags/v${{package.version}}/charts/fleet-crd/templates/crds.yaml
+            kubectl wait --for=condition=Established crd --all --timeout=60s
+        - name: "Cleanup cluster registrations"
+          runs: |
+            fleet cleanup clusterregistration | grep "Cleaning up outdated cluster registrations"
+
+  - name: ${{package.name}}-controller
+    pipeline:
+      - uses: go/build
+        with:
+          ldflags: |
+            -X github.com/rancher/fleet/pkg/version.GitCommit=$(git rev-parse HEAD)
+            -X github.com/rancher/fleet/pkg/version.Version=${{package.version}}
+          output: fleetcontroller
+          packages: ./cmd/fleetcontroller
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+      pipeline:
+        - runs: |
+            fleetcontroller --version
+            fleetcontroller --help
+        - name: "Setup KWOK cluster"
+          uses: test/kwok/cluster
+        - name: "Install CRDs"
+          runs: |
+            kubectl apply -f https://raw.githubusercontent.com/rancher/fleet/refs/tags/v${{package.version}}/charts/fleet-crd/templates/crds.yaml
+            kubectl wait --for=condition=Established crd --all --timeout=60s
+            kubectl create ns cattle-fleet-system
+        - name: "Start fleet controller daemon"
+          uses: test/daemon-check-output
+          with:
+            start: |
+              fleetcontroller \
+                --namespace cattle-fleet-system  \
+                --kubeconfig ~/.kube/config
+            timeout: 30
+            expected_output: |
+              listening for changes on local cluster
+              starting job scheduler
+              starting manager
+              successfully acquired lease
+            post: |
+              # Check metrics endpoint
+              curl -fsSL http://localhost:8080/metrics | grep "leader_election_master_status"
+
+  - name: ${{package.name}}-termination-log
+    description: fleet-termination-log outputs fleet's termination log to /dev/termination-log
+    dependencies:
+      runtime:
+        - busybox
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          cp package/log.sh ${{targets.subpkgdir}}/usr/bin/log.sh
+          chmod +x ${{targets.subpkgdir}}/usr/bin/log.sh
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/bin/log.sh
 
 update:
   enabled: true

@@ -14,7 +14,6 @@ MELANGE ?= $(shell which melange)
 WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
-SOURCES ?= gs://wolfi-sources/
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
 ifneq (${MELANGE_RUNNER},)
@@ -58,10 +57,6 @@ MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signin
 MELANGE_TEST_OPTS += --test-package-append wolfi-base
 MELANGE_TEST_OPTS += --debug
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
-
-ifeq (${USE_CACHE}, yes)
-	MELANGE_OPTS += --cache-source ${SOURCES}
-endif
 
 ifeq (${LINT}, yes)
 	MELANGE_OPTS += --fail-on-lint-warning
@@ -119,8 +114,9 @@ kernel/APKINDEX: kernel/APKINDEX.tar.gz
 	touch $@
 
 kernel/chosen: kernel/APKINDEX
-	grep -e '^P:' -e '^V:' $< | sed -n '/^P:linux$$/{n;p}' > \
-	  kernel/available
+	# Extract lines with 'P:linux' and the following line that contains the version
+	# This approach is compatible with both GNU and BSD sed
+	awk '/^P:linux$$/ {print; getline; print}' $< > kernel/available
 	grep '^V:' kernel/available | sed 's/V://' | \
 	  sort -V | tail -n1 > $@.tmp
 	# Sanity check that this looks like an apk version
@@ -128,7 +124,7 @@ kernel/chosen: kernel/APKINDEX
 	mv $@.tmp $@
 
 kernel/linux.apk: kernel/chosen
-	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(file < kernel/chosen).apk)
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(shell cat kernel/chosen).apk)
 
 kernel/boot/vmlinuz: kernel/linux.apk
 	tar -x -C kernel -f $< boot/ 2> /dev/null

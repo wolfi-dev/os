@@ -1,0 +1,101 @@
+package:
+  name: wal-g
+  version: "3.0.7"
+  epoch: 1
+  description: "Archival and Restoration for databases in the Cloud"
+  copyright:
+    - license: "Apache-2.0"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - libsodium-dev
+      - openssl-dev
+
+vars:
+  py-version: "3.11"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: "https://github.com/wal-g/wal-g.git"
+      expected-commit: "6ea13b90a3198bd5c8f8ac2ae323f28e33cf9f06"
+      tag: "v${{package.version}}"
+      recurse-submodules: true
+
+  - uses: go/bump
+    with:
+      deps: |-
+        google.golang.org/grpc@v1.64.1
+        golang.org/x/oauth2@v0.27.0
+
+  - runs: |
+      cp CMakeLists-brotli.txt submodules/brotli/CMakeLists.txt
+
+subpackages:
+  - name: ${{package.name}}-pg
+    description: PostgreSQL support for wal-g
+    dependencies:
+      runtime:
+        - postgresql
+        - postgresql-contrib
+        - python-${{vars.py-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./main/pg
+          ldflags: |
+            -X github.com/wal-g/wal-g/cmd/pg.buildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+            -X github.com/wal-g/wal-g/cmd/pg.gitRevision=$(git rev-parse --short HEAD || echo '<unknown>')
+            -X github.com/wal-g/wal-g/cmd/pg.walgVersion=${{package.version}}
+          output: wal-g
+          vendor: true
+    test:
+      environment:
+        contents:
+          packages:
+            - postgresql-client
+            - jq
+            - shadow
+            - sudo-rs
+        environment:
+          PGDATA: /tmp/pgdata
+          PGUSER: wally
+          WALG_FILE_PREFIX: /tmp/walg_pg
+      pipeline:
+        - name: "Check wal-g version"
+          runs: |
+            wal-g --version | grep -q "wal-g version ${{package.version}}"
+        - uses: test/tw/ldd-check
+          with:
+            packages: ${{subpkg.name}}
+        - name: Create a Postgres backup
+          runs: |
+            mkdir -p "/tmp/walg_pg"
+            useradd $PGUSER
+
+            sudo -u $PGUSER initdb -D "$PGDATA"
+            sudo -u $PGUSER pg_ctl -D "$PGDATA" -o "-k /tmp" -w start
+            createdb -h /tmp -U $PGUSER walg
+            mkdir -p ~/.walg
+            cat > ~/.walg/wal-g.yaml <<EOF
+            WALG_FILE_PREFIX: /tmp/walg_pg
+            PGUSER: $PGUSER
+            PGDATABASE: walg
+            EOF
+
+            mkdir -p /tmp/walg_pg
+            wal-g backup-push "$PGDATA" --config ~/.walg/wal-g.yaml
+            BACKUP_NAME=$(wal-g backup-list --json | jq -r '.[-1].backup_name')
+            echo "Backup pushed: $BACKUP_NAME"
+            sudo -u $PGUSER pg_ctl -D "$PGDATA" -m fast stop
+
+update:
+  enabled: true
+  github:
+    identifier: wal-g/wal-g
+    strip-prefix: v
+    tag-filter: v
+    use-tag: true

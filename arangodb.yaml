@@ -1,0 +1,288 @@
+#nolint:valid-spdx-license
+package:
+  name: arangodb
+  version: "3.12.4.3"
+  epoch: 0
+  description: "Native multi-model database with flexible data models for documents, graphs, and key-values."
+  copyright:
+    - license: "BSL-1.1"
+  dependencies:
+    provides:
+      - arangodb=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-19
+      - clang-19-dev
+      - cmake
+      - curl
+      - gc-dev
+      - icu-dev
+      - jemalloc-dev
+      - jitterentropy-library-dev
+      - libunwind-dev
+      - lld
+      - llvm-19
+      - llvm-libcxx-16
+      - llvm-libcxx-16-dev
+      - lz4-dev
+      - nodejs
+      - npm
+      - openblas-dev
+      - openmp-19-dev
+      - openssl-dev
+      - perl
+      - py3-setuptools
+      - python3-dev
+      - snappy-dev
+      - systemd-dev
+      - yarn
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/arangodb/arangodb
+      tag: v${{package.version}}
+      expected-commit: e17f4bad1640adffecb663efc61422a8369f6500
+
+  - name: Get dependencies
+    runs: |
+      git submodule update --init --recursive
+
+  # - name: Fix CVE-2024-21538 GHSA-3xgq-45jj-v275
+  #   uses: patch
+  #   with:
+  #     patches: |
+  #       js-node.patch
+
+  # - name: Regenrate node modules
+  #   runs: |
+  #     rm -rf js/node/node_modules js/node/package-lock.json
+  #     cd js/node
+  #     npm install
+
+  - name: Hack to use our libs
+    runs: |
+      sed -i '/if (LIBOMP)/,/endif ()/c\
+        message(STATUS "Using shared libomp.so from /usr/lib")\
+        set(OpenMP_C_FLAGS "-fopenmp=libomp -L/usr/lib -Wl,-rpath,/usr/lib")\
+        set(OpenMP_CXX_FLAGS "${OpenMP_C_FLAGS}")' 3rdParty/CMakeLists.txt
+      mkdir -p /usr/lib/x86_64-linux-gnu/blas
+      mkdir -p /usr/lib/x86_64-linux-gnu/lapack
+      ln -sf /usr/lib/libopenblas.a /usr/lib/x86_64-linux-gnu/blas/libblas.a
+      ln -sf /usr/lib/libopenblas.a /usr/lib/x86_64-linux-gnu/lapack/liblapack.a
+
+  - name: Configure the build
+    runs: |
+      cmake \
+        -DSTATIC_EXECUTABLES=OFF \
+        -DOpenMP_C_FLAGS="-fopenmp" \
+        -DOpenMP_CXX_FLAGS="-fopenmp" \
+        -DOpenMP_C_LIB_NAMES="omp" \
+        -DOpenMP_CXX_LIB_NAMES="omp" \
+        -DOpenMP_omp_LIBRARY="/usr/lib/libomp.so" \
+        -DOpenMP_ROOT="/usr/lib" \
+        -DCMAKE_C_COMPILER=clang-19 \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_C_COMPILER_AR="/usr/bin/llvm-ar" \
+        -DCMAKE_CXX_COMPILER_AR="/usr/bin/llvm-ar" \
+        -DCMAKE_C_COMPILER_RANLIB="/usr/bin/llvm-ranlib" \
+        -DCMAKE_CXX_COMPILER_RANLIB="/usr/bin/llvm-ranlib" \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--build-id=sha1 -fno-stack-protector -fuse-ld=lld -ljitterentropy" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
+        -DUSE_LIBUNWIND=true -DUSE_PRECOMPILED_V8=false \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_C_FLAGS="-fPIC" \
+        -DCMAKE_CXX_FLAGS="-fPIC" \
+        -DSNAPPY_INCLUDE_DIR=/usr/include \
+        -DJEMALLOC_INCLUDE=/usr/include \
+        -DZLIB_INCLUDE_DIR=/usr/include \
+        -DUNWIND_INCLUDE_DIR=/usr/include \
+        -DOPENSSL_ROOT_DIR=/usr/lib \
+        --preset community
+
+  - name: Build
+    runs: |
+      # cmake \
+      #   --build \
+      #   --preset community \
+      #   --target arangodb \
+      #   -- -j$(nproc) VERBOSE=1
+      cmake --build --preset community --target arangodb -- -j$(nproc) --keep-going VERBOSE=1 2>&1 | tee build.log # -j$(nproc) --keep-going
+
+  - name: Install binaries
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/bin
+      cd build-presets/community/bin
+      cp -a arangobench arangod arangodump arangoexport arangoimp arangoimport arangoinspect arangorestore arangosh arangovpack ${{targets.destdir}}/usr/bin
+
+  # Reference: https://github.com/arangodb/oskar/blob/04f8b7902bc8ac4fa1ebec3187313e28126489f7/debian/3.11/common/rules
+  - name: Install helpers and configurations
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/share/arangodb3
+      cp -a js ${{targets.destdir}}/usr/share/arangodb3/js
+      cp Installation/arangodb-helper ${{targets.destdir}}/usr/share/arangodb3/arangodb-helper
+      cp Installation/arangodb-update-db ${{targets.destdir}}/usr/share/arangodb3/arangodb-update-db
+      cp 3rdParty/V8/v7.9.317/third_party/icu/ios/icudtl.dat ${{targets.destdir}}/usr/share/arangodb3/icudtl.dat
+      cp -a 3rdParty/tzdata ${{targets.destdir}}/usr/share/arangodb3/
+
+      mkdir -p ${{targets.destdir}}/etc
+      cp -a build-presets/community/etc/arangodb3 ${{targets.destdir}}/etc/arangodb3
+      mkdir -p ${{targets.destdir}}/var/log/arangodb3
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://raw.githubusercontent.com/arangodb/oskar/master/containers/arangodb311deb.docker/entrypoint.sh
+          extract: false
+          expected-sha512: e0ac15d896c966f959c07d189a185de0f6958dcf8dfe3072552a5d8ff5779c636f3caa46d22190985a1ed857adb4481a36987c465c52bf13f200e924873bc3bb
+      - name: Install entrypoint
+        runs: cp entrypoint.sh "${{targets.destdir}}/usr/share"
+      # This entrypoint does not exist in the upstream repo under v3.11.x and is added by their external build system.
+      # This does exist for 3.12.x in the main repo.
+      - name: Create symlinks
+        runs: |
+          ln -sf /usr/share/entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
+    dependencies:
+      provides:
+        - arangodb-compat=${{package.full-version}}
+
+update:
+  enabled: true
+  github:
+    identifier: arangodb/arangodb
+    tag-filter: v3.12
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    accounts:
+      users:
+        - username: arangodb
+          uid: 1000
+          gid: 0
+      # sudo must retain permissions
+      run-as: 0
+    contents:
+      packages:
+        - curl
+        - jq
+        - sudo
+        - wait-for-it
+  pipeline:
+    - name: Test arangodb and arangosh end-to-end
+      runs: |
+        #!/bin/bash
+        set -ueo pipefail
+
+        sudo chown -R arangodb:root /var
+
+        # Start arangod with authentication disabled.
+        sudo -u arangodb arangod \
+          -c /etc/arangodb3/arangod.conf \
+          --server.endpoint tcp://127.0.0.1:8529 \
+          --server.authentication=false \
+          /tmp/database-dir &
+        wait-for-it localhost:8529 --timeout=10
+
+        # Set credentials using arangosh tool.
+        arangosh --server.endpoint tcp://127.0.0.1:8529 \
+          --server.authentication false \
+          --javascript.execute-string 'require("@arangodb/users").update("root", "newpassword")'
+
+        # Restart arangod with authentication enabled.
+        kill -9 $!
+        arangod \
+          -c /etc/arangodb3/arangod.conf \
+          --server.endpoint tcp://127.0.0.1:8529 \
+          /tmp/database-dir &
+        wait-for-it localhost:8529 --timeout=10
+
+        # Test variables.
+        ARANGO_HOST="http://localhost:8529"
+        DB_NAME="testdb"
+        COLLECTION_NAME="testcollection"
+        DOC_NAME="testdoc"
+        USER="root"
+        PASSWORD="newpassword"
+        AUTH_HEADER=""
+        if [[ -n "$PASSWORD" ]]; then
+          AUTH_HEADER="-u $USER:$PASSWORD"
+        fi
+
+        # Check the version.
+        version=$(jq '.version' < <(curl --silent --fail $AUTH_HEADER "$ARANGO_HOST/_api/version") | tr -d '"')
+        if [[ ${version//-/.} != ${{package.version}} ]]; then
+          echo "Version ${version//-/.} does not match package version ${{package.version}}"
+          exit 1
+        fi
+
+        # Create a database.
+        err=$(jq '.error' < <(curl --silent --fail -X POST $AUTH_HEADER \
+          -H "Content-Type: application/json" \
+          -d "{\"name\": \"$DB_NAME\"}" \
+          "$ARANGO_HOST/_api/database"))
+        if [[ $err != "false" ]]; then
+          echo "Failed creating a database"
+          exit 1
+        fi
+
+        # Create a collection.
+        err=$(jq '.error' < <(curl --silent --fail -X POST $AUTH_HEADER \
+          -H "Content-Type: application/json" \
+          -d "{\"name\": \"$COLLECTION_NAME\"}" \
+          "$ARANGO_HOST/_db/$DB_NAME/_api/collection"))
+        if [[ $err != "false" ]]; then
+          echo "Failed creating a collection"
+          exit 1
+        fi
+
+        # Create a document.
+        id=$(jq '._id' < <(curl --silent --fail -X POST $AUTH_HEADER \
+          -H "Content-Type: application/json" \
+          -d "{\"_key\": \"${DOC_NAME}\", \"name\": \"Test\"}" \
+          "$ARANGO_HOST/_db/$DB_NAME/_api/document/$COLLECTION_NAME"))
+        if [[ "${id//\"/}" != "${COLLECTION_NAME}/${DOC_NAME}" ]]; then
+          echo "Failed inserting a document"
+          exit 1
+        fi
+
+        # Get a document.
+        res=$(curl --silent -X POST $AUTH_HEADER \
+          -H "Content-Type: application/json" \
+          -d "{\"query\": \"FOR doc IN $COLLECTION_NAME FILTER doc._key == \\\"$DOC_NAME\\\" RETURN doc\"}" \
+          "$ARANGO_HOST/_db/$DB_NAME/_api/cursor")
+
+        error=$(jq '.error' < <(echo $res))
+        if [[ $error != "false" ]]; then
+          echo "Failed querying document"
+          exit 1
+        fi
+        id=$(jq '.result[0]._id' < <(echo $res))
+        if [[ ${id//\"/} != "${COLLECTION_NAME}/${DOC_NAME}" ]]; then
+          echo "Failed querying document"
+          exit 1
+        fi
+
+        # Cleanup.
+        err=$(jq '.error' < <(curl --silent -X DELETE $AUTH_HEADER "$ARANGO_HOST/_db/$DB_NAME/_api/collection/$COLLECTION_NAME"))
+        if [[ $err != "false" ]]; then
+          echo "Failed cleaning up collection"
+          exit 1
+        fi
+
+        err=$(jq '.error' < <(curl --silent -X DELETE $AUTH_HEADER "$ARANGO_HOST/_api/database/$DB_NAME"))
+        if [[ $err != "false" ]]; then
+          echo "Failed cleaning up database"
+          exit 1
+        fi

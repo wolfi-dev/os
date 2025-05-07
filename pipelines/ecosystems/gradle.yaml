@@ -1,0 +1,65 @@
+name: Configure gradle to fetch Chainguard Libraries dependencies.
+
+needs:
+  packages:
+    - busybox
+    - curl
+    - jq
+
+inputs:
+  identity:
+    description: the identity to use for Chainguard Libraries
+    default: "720909c9f5279097d847ad02a2f24ba8f59de36a/a49c7fedc33adf69"
+  group:
+    description: the group to use for Chainguard Libraries
+    default: "720909c9f5279097d847ad02a2f24ba8f59de36a"
+
+pipeline:
+  - name: Setup Gradle credentials
+    runs: |
+      set -euo pipefail
+
+      # If libraries token exists in melange's cache, use that.
+      # Fetch the token with: make lib-token
+      if [ -f /var/cache/melange/.libraries_token.txt ]; then
+        cgtoken=$(cat /var/cache/melange/.libraries_token.txt)
+      else
+        idtoken=$(curl --fail-with-body -sSL -H "Metadata-Flavor: Google" http://metadata/computeMetadata/v1/instance/service-accounts/default/identity?audience=issuer.enforce.dev)
+        cgtoken=$(curl --fail-with-body -sSL -H "Authorization: Bearer ${idtoken}" 'https://issuer.enforce.dev/sts/exchange?aud=libraries.cgr.dev&scope=${{inputs.group}}&identity=${{inputs.identity}}' | jq -r '.token')
+      fi
+
+      echo "Removing gradle cache, if exists..."
+      rm -rf /root/.gradle && mkdir -p /root/.gradle
+
+      echo "Creating gradle init script..."
+      cat > /root/.gradle/init.gradle <<EOF
+      import org.gradle.api.artifacts.dsl.RepositoryHandler
+      import org.gradle.api.artifacts.verification.DependencyVerificationMode
+
+      // Verification of metadata will fail for artifacts expected to come from
+      // Maven Central when we've rebuilt them as the metadata will be different
+      gradle.startParameter.setDependencyVerificationMode(DependencyVerificationMode.OFF)
+
+      // Disable mavenCentral
+      RepositoryHandler.metaClass.mavenCentral = { -> }
+
+      // Define and inject mvn repo for Libraries
+      def injectLibraries = { RepositoryHandler repos ->
+        repos.maven {
+          name = "chainguard"
+          url = "https://libraries.cgr.dev/java-all/"
+          credentials {
+            username = ""
+            password = "$cgtoken"
+          }
+        }
+      }
+
+      // Inject repo for projects and buildscripts
+      allprojects { project ->
+        // Ensures Libraries are evaluated first
+        project.beforeEvaluate {
+          [buildscript.repositories, repositories].each(injectLibraries)
+        }
+      }
+      EOF

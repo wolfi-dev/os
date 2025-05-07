@@ -128,8 +128,10 @@ kernel/%/linux.apk: kernel/%/chosen
 	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$*/linux-$(shell cat kernel/$*/chosen).apk)
 
 kernel/%/vmlinuz: kernel/%/linux.apk
-	tmpd=kernel/.$$$$ && mkdir -p $$tmpd $(dir $@) && tar -x -C $$tmpd -f $< boot/ 2> /dev/null && \
-		mv $$tmpd/boot/* $(dir $@) && rc=$$?; rm -Rf $$tmpd; exit $$rc
+	tmpd=kernel/.$$$$ && mkdir -p $$tmpd $(dir $@) && \
+		tar -x -C $$tmpd -f $< boot/ 2> /dev/null && \
+		[ -f $$tmpd/boot/vmlinuz ] && mv $$tmpd/boot/* $(dir $@) && \
+		rc=$$?; rm -Rf $$tmpd; exit $$rc
 	touch $@
 
 yamls := $(wildcard *.yaml)
@@ -163,7 +165,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
-$(test_targets): test/%: cache $(KEY)
+$(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
@@ -176,7 +178,7 @@ $(docker_test_targets): docker-test/%:
 	MELANGE_RUNNER=docker make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
-$(testdbg_targets): test-debug/%: cache $(KEY)
+$(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))

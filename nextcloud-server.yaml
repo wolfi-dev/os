@@ -34,6 +34,7 @@ package:
       - php-${{vars.php-version}}-bcmath
       - php-${{vars.php-version}}-exif
       - php-${{vars.php-version}}-ftp
+      - php-${{vars.php-version}}-fpm
       - php-${{vars.php-version}}-gd
       - php-${{vars.php-version}}-gmp
       - php-${{vars.php-version}}-intl
@@ -61,6 +62,7 @@ package:
       - php-${{vars.php-version}}-posix
       - php-${{vars.php-version}}-xmlwriter
       - rsync
+      - ${{package.name}}-apache2-config
   scriptlets:
     post-install: |
       #!/bin/sh
@@ -83,6 +85,7 @@ var-transforms:
 environment:
   contents:
     packages:
+      - apache2-config
       - bash
       - build-base
       - busybox
@@ -190,6 +193,70 @@ pipeline:
       mkdir -p ${{targets.destdir}}/usr/local/etc/php
       ln -sf /${PHP_INI_DIR}/conf.d ${{targets.destdir}}/usr/local/etc/php/conf.d
 
+  - name: Activate Apache site + modules
+    runs: |
+      # IMPORTANT: The additional configuration files are need to be in the conf.d directory
+      # in order to be loaded by the Apache server. And since we use the `apache2-compat` package
+      # at runtime, the `ServerRoot` is set to `/usr/local/apache2`, so we need to
+      # create the `conf.d` directory in there. If we don't do this, the Apache server will not
+      # load the additional configuration files and the server will not work as expected. It would
+      # only print the default Apache page: "It works!".
+
+      mkdir -p ${{targets.destdir}}/etc/apache2/conf.d
+
+      cat > ${{targets.destdir}}/etc/apache2/conf.d/000-nextcloud.conf <<'EOF'
+      # ---- Nextcloud on Wolfi ----
+      # Extra modules not already enabled in stock httpd.conf
+      LoadModule deflate_module     /usr/lib/apache2/modules/mod_deflate.so
+      LoadModule negotiation_module /usr/lib/apache2/modules/mod_negotiation.so
+      LoadModule rewrite_module     /usr/lib/apache2/modules/mod_rewrite.so
+      LoadModule remoteip_module    /usr/lib/apache2/modules/mod_remoteip.so
+      LoadModule php_module         /usr/lib/apache2/modules/libphp.so
+
+      ServerName localhost
+      DocumentRoot "/var/www/html"
+
+      <FilesMatch \.php$>
+        SetHandler application/x-httpd-php
+      </FilesMatch>
+
+      <Directory "/var/www/html">
+        Require all granted
+        AllowOverride All
+        Options Indexes FollowSymLinks
+        DirectoryIndex index.php index.html
+      </Directory>
+
+      IncludeOptional /etc/apache2/conf-available/remoteip.conf
+      IncludeOptional /etc/apache2/conf-available/apache-limits.conf
+      EOF
+
+subpackages:
+  - name: ${{package.name}}-apache2-config
+    description: ${{package.name}} Apache2 httpd.conf configuration
+    dependencies:
+      replaces:
+        - apache2-config
+      provides:
+        - apache2-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/etc/apache2
+          # First, copy the default httpd.conf file from the apache2-config package
+          cp /etc/apache2/httpd.conf "${{targets.contextdir}}"/etc/apache2/httpd.conf
+
+          # Comment out threaded MPMs and add prefork
+          sed -ri \
+            -e 's/^(\s*)LoadModule\s+mpm_event_module/#\1LoadModule mpm_event_module/' \
+            -e 's/^(\s*)LoadModule\s+mpm_worker_module/#\1LoadModule mpm_worker_module/' \
+            "${{targets.contextdir}}/etc/apache2/httpd.conf"
+
+          grep -q mpm_prefork_module "${{targets.contextdir}}"/etc/apache2/httpd.conf || \
+            sed -i '/mod_mime\.so/a LoadModule mpm_prefork_module modules/mod_mpm_prefork.so' "${{targets.contextdir}}"/etc/apache2/httpd.conf
+
+          echo 'ServerRoot "/etc/apache2"' >> "${{targets.contextdir}}/etc/apache2/httpd.conf"
+          echo 'IncludeOptional conf.d/*.conf' >> "${{targets.contextdir}}/etc/apache2/httpd.conf"
+
 update:
   enabled: true
   github:
@@ -216,6 +283,7 @@ test:
       NEXTCLOUD_ADMIN_USER: admin
       NEXTCLOUD_ADMIN_PASSWORD: admin
   pipeline:
+    # TODO: ensure enabled modules "httpd -M | grep -E 'php|rewrite|remoteip'"
     - name: Ensure installed files
       runs: |
         for f in /cron.sh /entrypoint.sh /upgrade.exclude; do
@@ -223,6 +291,12 @@ test:
           [ -x "$f" ]
         done
         find /usr/src/nextcloud/config/ -type f -name "*.php" | grep -q .
+    - name: Ensure all needed modules are enabled
+      runs: |
+        # Those modules are scraped from the upstream image `nextcloud:latest`: `apache2-foreground -e debug`
+        apache2-foreground -M 2>/dev/null \
+        | grep -E '(access_compat|alias|auth_basic|authn_(core|file)|authz_(core|host|user)|autoindex|deflate|dir|env|filter|headers|mime|mpm_prefork|negotiation|php|remoteip|reqtimeout|rewrite|setenvif|status)_module'
+
     - working-directory: /var/www/html
       pipeline:
         - name: "start daemon on localhost"

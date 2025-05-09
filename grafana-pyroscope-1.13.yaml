@@ -1,0 +1,111 @@
+package:
+  name: grafana-pyroscope-1.13
+  version: "1.13.2"
+  epoch: 0
+  description: Continuous Profiling Platform. Debug performance issues down to a single line of code
+  copyright:
+    - license: AGPL-3.0-only
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - cairo-dev
+      - go
+      - node-gyp
+      - nodejs-20
+      - pango-dev
+      - python3
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 911010c0f6ad80952da3bed7aede0ef640d4fbfe
+      repository: https://github.com/grafana/pyroscope
+      tag: v${{package.version}}
+
+  - runs: |
+      # https://github.com/grafana/pyroscope/blob/3da96b8e449de267d4663e14207b8b272f9edc6d/.github/workflows/release.yml#L48C14-L48C33
+      mkdir -p pyroscope/scripts/webpack
+      mkdir -p pyroscope/public/app
+      mkdir -p pyroscope/public/templates
+      cp yarn.lock package.json tsconfig.json ./pyroscope
+      cd pyroscope
+      yarn --frozen-lockfile
+      cp -r ../scripts/webpack ./scripts/
+      cp -r ../public/app ./public/
+      cp -r ../public/templates ./public/
+      yarn build
+      cp -r ./public/build ../public/build
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.38.0
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X github.com/grafana/pyroscope/pkg/util/build.Branch=main
+        -X github.com/grafana/pyroscope/pkg/util/build.Version=${{package.version}}
+        -X github.com/grafana/pyroscope/pkg/util/build.Revision=$(git rev-parse HEAD)
+        -X github.com/grafana/pyroscope/pkg/util/build.BuildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+      output: pyroscope
+      tags: embedassets
+      packages: ./cmd/pyroscope
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X github.com/grafana/pyroscope/pkg/util/build.Branch=main
+        -X github.com/grafana/pyroscope/pkg/util/build.Version=${{package.version}}
+        -X github.com/grafana/pyroscope/pkg/util/build.Revision=$(git rev-parse HEAD)
+        -X github.com/grafana/pyroscope/pkg/util/build.BuildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+      output: profilecli
+      packages: ./cmd/profilecli
+
+  - runs: |
+      mkdir -p "${{targets.contextdir}}"/etc/pyroscope
+      install -Dm755 ./cmd/pyroscope/pyroscope.yaml "${{targets.contextdir}}"/etc/pyroscope/config.yaml
+
+update:
+  enabled: true
+  github:
+    identifier: grafana/pyroscope
+    strip-prefix: v
+    tag-filter: v1.13.
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+  pipeline:
+    - name: "Verify help and version command output"
+      runs: |
+        profilecli -h
+        profilecli --version | grep -i ${{package.version}}
+        pyroscope --help
+        pyroscope -version | grep -i ${{package.version}}
+    - name: "Start and verify Grafana pyroscope"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          pyroscope -config.file=/etc/pyroscope/config.yaml
+        timeout: 30
+        expected_output: |
+          Pyroscope started
+          server listening on addresses
+        post: |
+          # check for the ready endpoint
+          curl -s http://localhost:4040/ready
+
+          # check for the metrics endpoint
+          curl -s http://localhost:4040/metrics | grep -i "pyroscopedb_block_opening_duration_bucket"
+
+          PROFILECLI_URL=http://localhost:4040 profilecli query series --query='{service_name="pyroscope"}' | grep -i "pyroscope"
+
+          # check for the UI endpoint
+          curl -L http://localhost:4040/ui | grep -i "Grafana Pyroscope"

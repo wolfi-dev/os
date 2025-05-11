@@ -31,6 +31,7 @@ package:
       - libmagic
       - imagemagick
       - php-${{vars.php-version}}
+      - php-${{vars.php-version}}-config
       - php-${{vars.php-version}}-apache
       - php-${{vars.php-version}}-bcmath
       - php-${{vars.php-version}}-exif
@@ -140,6 +141,10 @@ pipeline:
       mkdir -p ${{targets.destdir}}/${PHP_INI_DIR}/conf.d
       mkdir -p ${{targets.destdir}}/etc/apache2/conf-available
 
+  - name: Set permissions
+    runs: |
+      chmod +x ${{targets.destdir}}/usr/src/nextcloud/occ
+
   - working-directory: nextcloud-docker/${{vars.major-version}}/apache
     runs: |
       cp -a config/. "${{targets.destdir}}/usr/src/nextcloud/config/"
@@ -230,6 +235,12 @@ subpackages:
           sed -i 's|/usr/share/apache2/default-site/htdocs|/var/www/html|' "$TARGET"
           sed -i 's|/usr/local/apache2/htdocs|/var/www/html|' "$TARGET"
 
+          # Fix the error: `Apache is running a threaded MPM, but your PHP Module is not compiled to be threadsafe. You need to recompile PHP.`
+          sed -ri \
+            -e 's|^(\s*)LoadModule mpm_event_module|\1#LoadModule mpm_event_module|' \
+            -e 's|^(\s*)#*LoadModule mpm_prefork_module|\1LoadModule mpm_prefork_module|' \
+            "${{targets.subpkgdir}}"/etc/apache2/httpd.conf
+
           cat <<EOF >> "$TARGET"
           LoadModule deflate_module     /usr/lib/apache2/modules/mod_deflate.so
           LoadModule negotiation_module /usr/lib/apache2/modules/mod_negotiation.so
@@ -256,6 +267,8 @@ test:
       packages:
         - wait-for-it
         - curl
+        - crane
+        - gnutar
     accounts:
       groups:
         - groupname: www-data
@@ -269,7 +282,6 @@ test:
       NEXTCLOUD_ADMIN_USER: admin
       NEXTCLOUD_ADMIN_PASSWORD: admin
   pipeline:
-    # TODO: ensure enabled modules "httpd -M | grep -E 'php|rewrite|remoteip'"
     - name: Ensure installed files
       runs: |
         for f in /cron.sh /entrypoint.sh /upgrade.exclude; do
@@ -281,11 +293,55 @@ test:
       runs: |
         # Check if the httpd.conf file is valid
         cat /etc/apache2/httpd.conf | grep "ServerRoot"
-    # - name: Ensure all needed modules are enabled
-    #   runs: |
-    #     # Those modules are scraped from the upstream image `nextcloud:latest`: `apache2-foreground -e debug`
-    #     apache2-foreground -M 2>/dev/null \
-    #     | grep -E '(access_compat|alias|auth_basic|authn_(core|file)|authz_(core|host|user)|autoindex|deflate|dir|env|filter|headers|mime|mpm_prefork|negotiation|php|remoteip|reqtimeout|rewrite|setenvif|status)_module'
+    - name: Ensure the PHP modules match Nextcloud image
+      runs: |
+        /bin/bash -c '
+        set -eo pipefail
+
+        required_modules=$(crane export nextcloud:${{package.version}} - | \
+          tar -tvf - | \
+          grep "usr/local/lib/php/extensions/.*\.so$" | \
+          awk -F"/" "{print \$NF}" | \
+          sed "s/\.so\$//" | \
+          sort -u)
+
+        echo "Modules required by nextcloud:${{package.version}}:"
+        echo "$required_modules"
+
+        loaded_modules=$(php -m | tr "[:upper:]" "[:lower:]" | sed "s/zend opcache/opcache/")
+
+        missing_modules=()
+        while read -r module; do
+          if ! grep -iq "^${module}$" <<< "$loaded_modules"; then
+            missing_modules+=("$module")
+          fi
+        done <<< "$required_modules"
+
+        if [ ${#missing_modules[@]} -ne 0 ]; then
+          echo "Missing PHP modules: ${missing_modules[*]}"
+          exit 1
+        else
+          echo "All required PHP modules are loaded!"
+        fi
+        '
+    - name: Ensure the apache2-foreground loads the modules
+      runs: |
+        # Those modules are scraped from the upstream image `nextcloud:latest`: `apache2-foreground -e debug`
+        set -e
+        { apache2-foreground -e debug 2>&1 | tee /tmp/apache2-foreground.log; } &>/dev/null &
+        sleep 5 # Wait for apache to write the log, then it will exit anyway due to permissions
+        set +e
+        PID=$!
+        wait $PID
+        kill $PID 2>/dev/null || true
+        OUTPUT=$(cat /tmp/apache2-foreground.log)
+        for m in mpm_prefork authn_file authn_core authz_host authz_groupfile authz_user authz_core access_compat auth_basic reqtimeout filter mime log_config env headers setenvif version unixd status autoindex dir alias deflate negotiation rewrite remoteip php; do
+          if ! echo "$OUTPUT" | grep -qi "loaded module $m"; then
+            echo "Module $m is not enabled."
+            echo "Output: $OUTPUT"
+            exit 1
+          fi
+        done
     - working-directory: /var/www/html
       pipeline:
         - name: "start daemon on localhost"
@@ -296,6 +352,45 @@ test:
             expected_output: |
               Initializing nextcloud
               Initializing finished
+              resuming normal operations
+            # Override the default error strings to check for additional errors
+            error_strings: |
+              ERROR
+              FAIL
+              FATAL
+              Traceback.*most.recent.call
+              Exception in thread
+              java.lang.*Exception
+              command not found
+              No such file or directory
+              php:crit
+              PHP Module is not compiled to be threadsafe
+              Pre-configuration failed
             post: |
               wait-for-it -t 10 --strict localhost:80
-              curl -sSf --retry 3 http://localhost | grep -iq "It works!"
+              # If http://localhost:80 shows "It works!", that means Apache is running
+              # but wrongly configured, so we need to check if the Nextcloud page is actually shown.
+              # Ensure that the we dont get the default Apache page, "It works!".
+              set -e
+              OUTPUT=$(curl -sSfL --retry 3 http://localhost:80)
+              set +e
+              if echo "$OUTPUT" | grep -qi "It works"; then
+                echo "Apache is running but not configured correctly!"
+                echo "Output: $OUTPUT"
+                exit 1
+              fi
+              if echo "$OUTPUT" | grep -qi "not installed"; then
+                echo "One or more PHP modules are not installed!"
+                echo "Output: $OUTPUT"
+                exit 1
+              fi
+              if echo "$OUTPUT" | grep -qi "New nextcloud instance"; then
+                echo "Nextcloud is not properly configured!"
+                echo "Output: $OUTPUT"
+                exit 1
+              fi
+              if ! echo "$OUTPUT" | grep -qi "Initializing nextcloud ${{package.version}}"; then
+                echo "Nextcloud version is not set correctly!"
+                echo "Output: $OUTPUT"
+                exit 1
+              fi

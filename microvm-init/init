@@ -1,6 +1,5 @@
 #!/bin/busybox sh
 set -e
-set -x
 
 PATH=/usr/bin:/usr/sbin:/sbin:/bin
 
@@ -8,6 +7,13 @@ PATH=/usr/bin:/usr/sbin:/sbin:/bin
 chmod 0755 /
 
 mount -t proc proc -o nodev,nosuid,hidepid=2 /proc
+# Fetch settings from cmdline
+DNS="$(tr ' ' '\n' < /proc/cmdline | grep "dns=" | cut -d'=' -f2-)"
+HOSTNAME="$(tr ' ' '\n' < /proc/cmdline | grep "hostname=" | cut -d'=' -f2-)"
+SSHKEY="$(tr ' ' '\n' < /proc/cmdline | grep "sshkey=" | cut -d'=' -f2- | base64 -d)"
+
+# TODO(mattmoor): Check for debug logging and enable "set -x"
+
 mount -t devtmpfs -o nosuid,noexec devtmpfs /dev
 mount -t sysfs sys -o nodev,nosuid,noexec /sys
 mount -t tmpfs -o nodev,nosuid tmpfs /tmp
@@ -26,10 +32,6 @@ mkdir /dev/pts
 mount -t devpts devpts -o noexec,nosuid,newinstance,ptmxmode=0666,mode=0620,gid=tty /dev/pts/
 mount --bind /dev/pts/ptmx /dev/ptmx
 
-# Fetch settings from cmdline
-DNS="$(tr ' ' '\n' < /proc/cmdline | grep "dns=" | cut -d'=' -f2-)"
-HOSTNAME="$(tr ' ' '\n' < /proc/cmdline | grep "hostname=" | cut -d'=' -f2-)"
-SSHKEY="$(tr ' ' '\n' < /proc/cmdline | grep "sshkey=" | cut -d'=' -f2- | base64 -d)"
 
 if [ -z "${SSHKEY}" ]; then
 	echo "Missing default mount for ssh keys"
@@ -73,13 +75,9 @@ if [ -e /dev/vda ]; then
 	# ensure permissions are correct for sshd's ChrootDirectory
 	chown root:root /mount
 	chmod 0755 /mount
-fi
 
-if grep -q 1000 /mount/etc/passwd; then
-	username="$(grep 1000:1000 /mount/etc/passwd | cut -d':' -f1)"
-	group="$(grep 1000 /mount/etc/group | cut -d':' -f1)"
-	mkdir -p /mount/home/"$username"
-	chown -R "$username":"$group" /mount/home/"$username"
+	# Make /home/build world writeable under /mount
+	chmod 0777 /mount/home/build
 fi
 
 # Set default hard limit of open file descriptors to match systemd init
@@ -104,6 +102,9 @@ mount -t 9p \
 	-o posixacl=on \
 	-o msize=104857600 \
 	defaultshare /mount/mnt/
+
+# Allow the user we are running as to copy things to the shared dir
+chmod 0777 /mount/mnt
 
 mount --bin /proc /mount/proc
 mount --bin /dev /mount/dev
@@ -133,14 +134,20 @@ echo "nameserver ${DNS:-"10.0.2.3"}" > /mount/etc/resolv.conf
 mkdir -p -m 0700 /root/.ssh/
 echo "${SSHKEY}" > /root/.ssh/authorized_keys
 chmod 0400 /root/.ssh/authorized_keys
-if grep -q 1000 /etc/passwd; then
-	username="$(grep 1000:1000 /etc/passwd | cut -d':' -f1)"
-	group="$(grep 1000 /etc/group | cut -d':' -f1)"
-	mkdir -p /home/"$username"/.ssh/
-	echo "${SSHKEY}" > /home/"$username"/.ssh/authorized_keys
-	chmod 0400 /home/"$username"/.ssh/authorized_keys
-	chown -R "$username":"$group" /home/"$username"/.ssh/
-fi
+
+# Copy the user/group files from the guest filesystem to the host
+# and make sure that all the users that have /bin/sh as their shell
+# have their home directory created and the ssh key copied there.
+cp /mount/etc/passwd /etc/passwd
+cp /mount/etc/group /etc/group
+for i in $(awk -F: '$7 == "/bin/sh" {print $1}' /etc/passwd); do
+	home="$(grep "^$i:" /etc/passwd | cut -d':' -f6)"
+	group="$(grep "^$i:" /etc/passwd | cut -d':' -f4)"
+	mkdir -p "$home/.ssh"
+	echo "${SSHKEY}" > "/home/$i/.ssh/authorized_keys"
+	chmod 0400 "/home/$i/.ssh/authorized_keys"
+	chown -R "$i":"$group" "$home"
+done
 
 # Setting up Chroot and accept env AcceptEnv
 # Order here is important! ChrootDirectory must be the first!

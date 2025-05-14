@@ -282,4 +282,6 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
 
 cue_targets = $(foreach name,$(yamls),cue_vet/$(name))
 $(cue_targets): cue_vet/%:
-	cue vet $* schema.cue
+	$(MELANGE) compile --arch ${ARCH} --pipeline-dir ./pipelines/ $* > /tmp/$*.json
+	cue vet /tmp/$*.json schema.cue
+	rm /tmp/$*.json

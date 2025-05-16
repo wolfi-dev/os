@@ -15,6 +15,7 @@ package:
     runtime:
       - merged-usrsbin
       - wolfi-baselayout
+      - python3
 
 environment:
   contents:
@@ -23,9 +24,14 @@ environment:
       - busybox
       - ca-certificates-bundle
       - coreutils
-      - curl
-      - go
-      - rust=1.82.0
+      - libprotobuf
+      - lld
+      - protobuf-dev
+      - protoc
+      - python3
+      - python3-dev
+      - rust
+      - rustup
 
 var-transforms:
   - from: ${{package.version}}
@@ -38,23 +44,52 @@ pipeline:
     with:
       repository: https://github.com/influxdata/influxdb
       tag: v${{package.version}}
-      expected-commit: 5cc48482e9e0b3f301e265e403c32869db988029
+      expected-commit: d80d6cd60049c7b266794a48c97b1b6438ac5da9
       destination: influxdb
 
   - runs: |
+      # TODO - move these
+      export CARGO_INCREMENTAL=yes
+      export CARGO_NET_GIT_FETCH_WITH_CLI=false
+      export PROFILE=release
+      export FEATURES=aws,gcp,azure,jemalloc_replacing_malloc
+      export PACKAGE=influxdb3
+
+      # Bump the thread count up, otherwise builds take a long time
+      export CARGO_JOBS=12
+
+
+      # Note: the static linking used in python standalone doesn't play
+      # nicely with packaging.
+      #
+      # We therefore don't use python standalone and instead pin a specific
+      # version of python as a dependency (which has the benefit that we'll
+      # continue to remediate CVEs)
+
+      # Create a directory to output build to. This is kept consistent with
+      # upstream for ease of maintenance
+      mkdir /influxdb3/target -p
+
+      # Build
       cd influxdb
-      unset LDFLAGS
+      rustup toolchain install
 
-      make generate-web-assets
+      cargo build --target-dir /influxdb3/target --package="$PACKAGE" --profile="$PROFILE" --no-default-features --features="$FEATURES"
 
-      make influxd
+      objcopy --compress-debug-sections "/influxdb3/target/$PROFILE/$PACKAGE"
+
+      # This is where we start to deviate, we want to put the files where melange expects
+      #mkdir -p ${{targets.destdir}}/var/lib/influxdb3
+      #mkdir -p ${{targets.destdir}}/usr/lib/influxdb3
       mkdir -p ${{targets.destdir}}/usr/bin
-      mv bin/linux/influxd ${{targets.destdir}}/usr/bin
 
-      mkdir -p ${{targets.destdir}}/etc/defaults/influxdb2/
-      mv ../default-config.yml ${{targets.destdir}}/etc/defaults/influxdb2/config.yml
+      cp "/influxdb3/target/$PROFILE/$PACKAGE" ${{targets.destdir}}/usr/bin/$PACKAGE
+
+      # We're not building an image yet, so skip creation of the plugins dir
+      # mkdir -p ${{targets.destdir}}/plugins
 
   - uses: strip
+
 
 subpackages:
   - name: ${{package.name}}-oci-entrypoint
@@ -70,78 +105,6 @@ subpackages:
         - wolfi-baselayout
         - yq
 
-  - name: ${{package.name}}-bitnami-compat
-    description: "compat package with bitnami/influxdb image"
-    dependencies:
-      runtime:
-        - bash
-        - coreutils
-        - curl
-        - findutils
-        - grep
-        - influx
-        - influxd
-        - libgcc
-        - merged-usrsbin
-        - procps
-        - sed
-        - wait-for-port # used in /opt/bitnami/scripts/libinfluxdb.sh
-        - wolfi-baselayout
-    pipeline:
-      - uses: bitnami/compat
-        with:
-          image: influxdb
-          version-path: ${{vars.major-version}}/debian-12
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/influxdb/bin
-          ln -sf /usr/bin/influxd ${{targets.subpkgdir}}/opt/bitnami/influxdb/bin/influxd
-          ln -sf /usr/bin/influx ${{targets.subpkgdir}}/opt/bitnami/influxdb/bin/influx
-
-          # copy etc to influxdb/etc.default
-          mkdir -p ${{targets.subpkgdir}}/opt/bitnami/influxdb/etc.default
-          install -m755 -Dt ${{targets.subpkgdir}}/opt/bitnami/influxdb/etc.default/defaults/influxdb2 ${{targets.destdir}}/etc/defaults/influxdb2/config.yml
-          chmod -R u+rwX,g+rwX,o+rw ${{targets.subpkgdir}}/opt/bitnami/
-
-          mkdir -p ${{targets.subpkgdir}}/bitnami/influxdb
-          chmod -R u+rwX,g+rwX,o+rw ${{targets.subpkgdir}}/bitnami/influxdb
-
-          mkdir -p ${{targets.subpkgdir}}/docker-entrypoint-initdb.d/
-
-          # Use package path while unpacking
-          find . -iname "*.sh" -exec sed 's#/opt/bitnami#${{targets.subpkgdir}}/opt/bitnami#g' -i {} \;
-            ${{targets.subpkgdir}}/opt/bitnami/scripts/influxdb/postunpack.sh
-          # Restore path
-          find ${{targets.subpkgdir}}/opt/bitnami -type f -exec sed 's#${{targets.subpkgdir}}##g' -i {} \;
-    test:
-      environment:
-        environment:
-          BITNAMI_APP_NAME: "influxd"
-        accounts:
-          users:
-            - username: influxdb
-              gid: 0
-              uid: 1001
-      pipeline:
-        - name: version tests
-          runs: |
-            /opt/bitnami/influxdb/bin/influxd version | grep ${{package.version}}
-        - name: Start the influxd server
-          uses: test/daemon-check-output
-          with:
-            start: |
-              env INFLUXDB_ADMIN_USER=marty \
-                  INFLUXDB_ADMIN_USER_PASSWORD=F1uxKapacit0r85 \
-                  INFLUXDB_ADMIN_ORG=InfluxData \
-                  INFLUXDB_ADMIN_BUCKET=telegraf \
-                  INFLUXDB_ADMIN_RETENTION=168 \
-                  INFLUXDB_ADMIN_USER_TOKEN=where-were-going-we-dont-need-roads \
-                  /opt/bitnami/scripts/influxdb/entrypoint.sh /opt/bitnami/scripts/influxdb/run.sh
-            timeout: 60
-            expected_output: |
-              Welcome to the Chainguard image for: influxd, providing compatibility with the Bitnami Helm Chart
-              Starting InfluxDB in background...
-              Deploying InfluxDB from scratch
-
 update:
   enabled: true
   github:
@@ -150,8 +113,108 @@ update:
     tag-filter: v3.0.
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - py3-psutil
   pipeline:
-    # AUTOGENERATED
-    - runs: |
-        influxd --help
-        influxd version
+    - name: Version Tests
+      runs: |
+        influxdb3 --help
+        influxdb3 --version
+    - name: Start the influxd server
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir /plugins
+        start: |
+          influxdb3 serve --object-store memory \
+          --node-id testnode \
+          --plugin-dir /plugins
+        timeout: 30
+        expected_output: |
+          InfluxDB 3 Core server starting
+          Creating shared query executor
+          startup time:.
+    - name: Write data
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir /plugins
+          influxdb3 serve --object-store memory \
+          --node-id testnode \
+          --plugin-dir /plugins &
+          sleep 5
+        start: |
+          curl -H "Authorization: Bearer $(influxdb3 create token --admin | grep 'Token:' | cut -d\  -f2)" \
+          http://127.0.0.1:8181/write?db=test \
+          -d 'cpu,cpu=1234 user=1.0,system=0.1' -s -w 'Result: %{http_code}\n'
+        timeout: 30
+        expected_output: |
+          Result: 204
+
+    - name: Query data
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir /plugins
+          influxdb3 serve --object-store memory \
+          --node-id testnode \
+          --plugin-dir /plugins &
+          sleep 5
+          influxdb3 create token --admin | grep 'Token:' | cut -d\  -f2 > influx.token
+          curl -H "Authorization: Bearer $(cat influx.token)" \
+          http://127.0.0.1:8181/write?db=test \
+          -d "cpu,cpu=1234 user=1.0,system=0.1"
+        start: |
+          curl -H "Authorization: Bearer $(cat influx.token)" \
+                http://127.0.0.1:8181/query?db=test \
+                -d "q=select * from cpu"
+        timeout: 30
+        expected_output: |
+          "results"
+          "1234"
+
+    - name: Check Processing Engine
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir /plugins
+          mkdir /data
+          influxdb3 serve \
+          --object-store file \
+          --data-dir /data \
+          --node-id testnode \
+          --plugin-dir /plugins &
+          sleep 5
+
+          # Create a database by writing into it
+          influxdb3 create token --admin | grep 'Token:' | cut -d\  -f2 > influx.token
+          curl -H "Authorization: Bearer $(cat influx.token)" \
+          http://127.0.0.1:8181/write?db=test \
+          -d "cpu,cpu=1234 user=1.0,system=0.1"
+
+          # Create a plugin trigger
+          influxdb3 create trigger \
+            --trigger-spec "every:10s" \
+            --plugin-filename "gh:examples/schedule/system_metrics/system_metrics.py" \
+            --database test \
+            --token "$(cat influx.token)" \
+            system_usage
+
+          # Stop Influx so that we can start again and monitor output
+          pkill influxdb3
+
+        start: |
+          influxdb3 serve \
+          --object-store file \
+          --data-dir /data \
+          --node-id testnode \
+          --plugin-dir /plugins
+
+        timeout: 60
+        expected_output: |
+          processing engine: Successfully collected system metrics
+
+

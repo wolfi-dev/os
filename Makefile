@@ -109,6 +109,12 @@ fetch-kernel:
 
 kernel/%/APKINDEX.tar.gz:
 	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/APKINDEX.tar.gz)
+	# Retry in case of failure
+	@if grep -q "UNAUTHORIZED" kernel/$(ARCH)/APKINDEX.tar.gz; then \
+		echo "Auth failed, retrying"; \
+		rm -rf kernel/$(ARCH); \
+		make kernel/$(ARCH)/APKINDEX.tar.gz; \
+	fi
 
 kernel/%/APKINDEX: kernel/%/APKINDEX.tar.gz
 	tar -x -C kernel --to-stdout -f $< APKINDEX > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@

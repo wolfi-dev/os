@@ -16,6 +16,10 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
+# Default to the QEMU runner, but allow overriding it
+# with the MELANGE_RUNNER environment variable.
+MELANGE_RUNNER ?= qemu
+
 ifneq (${MELANGE_RUNNER},)
 	MELANGE_OPTS += --runner=${MELANGE_RUNNER}
 	MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}

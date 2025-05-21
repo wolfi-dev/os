@@ -1,7 +1,7 @@
 package:
-  name: calico-3.29
-  version: "3.29.3"
-  epoch: 43
+  name: calico-3.30
+  version: "3.30.0"
+  epoch: 0
   description: "Cloud native networking and network security"
   copyright:
     - license: Apache-2.0
@@ -35,9 +35,9 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
-      # - llvm16-tools
-      - clang-16
-      - clang-16-dev
+      # - llvm18-tools
+      - clang-18
+      - clang-18-dev
       # TODO: Can remove this when cni-plugins are built from source
       - curl
       # for felix
@@ -50,7 +50,7 @@ environment:
       - libbpf-dev
       - libpcap-dev
       - linux-headers
-      - llvm16
+      - llvm-18
       - zlib-dev
       - zstd-dev
 
@@ -68,22 +68,7 @@ pipeline:
     with:
       repository: https://github.com/projectcalico/calico
       tag: v${{package.version}}
-      expected-commit: b5d7d74c111d943251b61827ea88d9e5518f823b
-  - runs: |
-      # apiserver/cmd/apiserver
-      sed -i '/_ "k8s.io\/code-generator\/cmd\/import-boss"/s/^/\/\//g' apiserver/cmd/apiserver/tools.go
-      sed -i '/_ "k8s.io\/code-generator\/cmd\/openapi-gen"/s/^/\/\//g' apiserver/cmd/apiserver/tools.go
-      sed -i '/_ "k8s.io\/code-generator\/cmd\/set-gen"/s/^/\/\//g' apiserver/cmd/apiserver/tools.go
-      # libcaliico-go
-      sed -i '/_ "k8s.io\/code-generator\/cmd\/import-boss"/s/^/\/\//g' libcalico-go/tools.go
-      sed -i '/_ "k8s.io\/code-generator\/cmd\/set-gen"/s/^/\/\//g' libcalico-go/tools.go
-      # updates all x.30.9 to x.30.11
-      sed -i 's/\.30\.9/\.30\.11/g' go.mod
-  - uses: go/bump
-    with:
-      deps: |-
-        golang.org/x/oauth2@v0.27.0
-        golang.org/x/net@v0.38.0
+      expected-commit: 572a32dd9b2f9784d66d74712d5ec2e703d25083
   # Because we are using tigera-operator during image test we are reliant on tigera-operator setting
   # up all the required rbac rules that are needed for calico-apiserver to run. Currently it does not and
   # this is a temporary solution until https://github.com/tigera/operator/issues/3780 is resolved upstream with a new
@@ -93,6 +78,11 @@ pipeline:
   - uses: patch
     with:
       patches: calico-apiserver-disable-validating-admission-policy.patch
+  # Upstream build libbpf as part of their build, but we want to use our system
+  # libraries.
+  - uses: patch
+    with:
+      patches: fix-bpf-includes.patch
   - working-directory: felix
     pipeline:
       # Equivalent to target: "build-bpf"
@@ -101,26 +91,14 @@ pipeline:
           #   /usr/include/gnu/stubs.h:7:11: fatal error: 'gnu/stubs-32.h' file not found
           # This is a hack, but feels safe enough given we already assume and restrict this package to 64bit archs
           # NOTE: This disables Wolfi's default host level CFLAGS since this is BPF bytecode, instead, we pick up the defaults specified in the Makefiles
-          export CFLAGS="-Wno-error=unused-but-set-variable -D__x86_64__"
+          export CFLAGS="-O2 -Wno-error=unused-but-set-variable -D__x86_64__"
 
           if [ "${{build.arch}}" = "x86_64" ]; then
-            export CFLAGS="-Wno-error=unused-but-set-variable -m64 -D__x86_64__"
+            export CFLAGS="-O2 -Wno-error=unused-but-set-variable -m64 -D__x86_64__"
           fi
-          make -C bpf-gpl CC=clang LD=llc -j$(nproc)
-          make -C bpf-apache CC=clang LD=llc -j$(nproc)
-      # Equivalent to target: "libbpf"
-      - runs: |
-          _arch=${{build.goarch}}
-          mkdir -p bpf-gpl/include/libbpf/src/${{build.goarch}}
-
-          # NOTE: This disables Wolfi's default host level CFLAGS since this is BPF bytecode, instead, we pick up the defaults specified in the Makefiles
-
-          export CFLAGS="-Wno-error=sign-compare"
-          if [ "${{build.arch}}" = "x86_64" ]; then
-            export CFLAGS="-Wno-error=sign-compare -m64"
-          fi
-
-          make -C bpf-gpl/include/libbpf/src BUILD_STATIC_ONLY=2 OBJDIR=$_arch -j$(nproc)
+          # Build the two BPF trees with the extra backend flag
+          make -C bpf-gpl    CC="clang-18 -mllvm -bpf-stack-size=1024" LD=llc -j$(nproc)
+          make -C bpf-apache CC="clang-18 -mllvm -bpf-stack-size=1024" LD=llc -j$(nproc)
   # This fetches and builds the statically compiled calico fork of BIRD
   - working-directory: bird
     pipeline:
@@ -193,11 +171,10 @@ subpackages:
             runs: |
               _arch=${{build.goarch}}
 
-              LIBBPF_CONTAINER_PATH=/home/build/felix/bpf-gpl/include/libbpf/src
-              BPFGPL_CONTAINER_PATH=/home/build/felix/bpf-gpl
+              LIBBPF_INCLUDE_PATH=/usr/include/bpf
 
-              CGO_LDFLAGS="-L$LIBBPF_CONTAINER_PATH/$_arch -lbpf -lelf -lz"
-              CGO_CFLAGS="-I$LIBBPF_CONTAINER_PATH -I$BPFGPL_CONTAINER_PATH"
+              CGO_LDFLAGS="-L$LIBBPF_INCLUDE_PATH/$_arch -lbpf -lelf -lz"
+              CGO_CFLAGS="-I$LIBBPF_INCLUDE_PATH"
 
               LDFLAGS="-w"
               LDFLAGS="$LDFLAGS -X node/pkg/lifecycle/startup.VERSION=${{package.version}}"
@@ -216,11 +193,10 @@ subpackages:
           - runs: |
               _arch=${{build.goarch}}
 
-              LIBBPF_CONTAINER_PATH=/home/build/felix/bpf-gpl/include/libbpf/src
-              BPFGPL_CONTAINER_PATH=/home/build/felix/bpf-gpl
+              LIBBPF_INCLUDE_PATH=/usr/include/bpf
 
-              CGO_LDFLAGS="-L$LIBBPF_CONTAINER_PATH/$_arch -lbpf -lelf -lz"
-              CGO_CFLAGS="-I$LIBBPF_CONTAINER_PATH -I$BPFGPL_CONTAINER_PATH"
+              CGO_LDFLAGS="-L$LIBBPF_INCLUDE_PATH/$_arch -lbpf -lelf -lz"
+              CGO_CFLAGS="-I$LIBBPF_INCLUDE_PATH"
               CGO_ENABLED=1 \
                 CGO_LDFLAGS="$CGO_LDFLAGS" \
                 CGO_CFLAGS="$CGO_CFLAGS" \
@@ -275,11 +251,10 @@ subpackages:
       - runs: |
           _arch=${{build.goarch}}
 
-          LIBBPF_CONTAINER_PATH=$(pwd)/felix/bpf-gpl/include/libbpf/src
-          BPFGPL_CONTAINER_PATH=$(pwd)/felix/bpf-gpl
+          LIBBPF_INCLUDE_PATH=/usr/include/bpf
 
-          CGO_LDFLAGS="-L$LIBBPF_CONTAINER_PATH/$_arch -lbpf -lelf -lz"
-          CGO_CFLAGS="-I$LIBBPF_CONTAINER_PATH -I$BPFGPL_CONTAINER_PATH"
+          CGO_LDFLAGS="-L$LIBBPF_INCLUDE_PATH/$_arch -lbpf -lelf -lz"
+          CGO_CFLAGS="-I$LIBBPF_INCLUDE_PATH"
 
           LDFLAGS="-w"
           LDFLAGS="$LDFLAGS -X node/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
@@ -612,7 +587,7 @@ update:
   github:
     identifier: projectcalico/calico
     strip-prefix: v
-    tag-filter: v3.29.
+    tag-filter: v3.30.
 
 test:
   environment:

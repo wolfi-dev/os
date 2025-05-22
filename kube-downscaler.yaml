@@ -44,3 +44,83 @@ update:
   enabled: false
   manual: true
   exclude-reason: we need to manually update because it does not use github
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubectl
+        - git
+  pipeline:
+    - uses: test/kwok/cluster
+    - runs: |
+        # Step 1: Clone the kube-downscaler repository
+        git clone https://codeberg.org/hjacobs/kube-downscaler
+        cd kube-downscaler
+
+        # Step 2: Apply the RBAC and ConfigMap
+        kubectl apply -f deploy/rbac.yaml
+        kubectl apply -f deploy/config.yaml
+
+        # Step 3: Modify the kube-downscaler deployment to use the installed binary
+        # Set a default downtime, short interval, and crucially, a very short grace-period for testing.
+        # Ensure it runs continuously (no --once flag).
+        awk '
+          /^- name: downscaler/ {
+            print "      - name: downscaler"
+            print "        image: dummy-image-for-test # Kube-downscaler binary is installed on host"
+            print "        command: [\"/usr/bin/python3\", \"-m\", \"kube_downscaler.downscaler\"]"
+            print "        args: [" \
+            "\"--default-downtime=Mon-Sun 00:00-23:59 UTC\", " \
+            "\"--interval=5s\", " \
+            "\"--logtostderr=true\", " \
+            "\"--grace-period=1s\"" \
+            "]"
+            skip_block = 1
+            next
+          }
+          /^- name:/ && skip_block {
+            skip_block = 0
+          }
+          !skip_block { print }
+        ' deploy/deployment.yaml > deploy/deployment_test.yaml
+
+        kubectl apply -f deploy/deployment_test.yaml
+
+        # Step 4: Wait for the kube-downscaler deployment to be ready
+        echo "Waiting for kube-downscaler deployment to be ready..."
+        kubectl wait --for=condition=Available deployment/kube-downscaler --namespace=default --timeout=120s
+
+        # Step 5: Create a deployment for nginx with 1 replica
+        kubectl create deployment nginx --image=nginx --replicas=1 --namespace=default
+
+        # Step 6: Wait for the nginx deployment to roll out
+        echo "Waiting for nginx deployment to roll out..."
+        kubectl rollout status deployment/nginx --namespace=default --timeout=120s
+
+        # Step 7: Apply the uptime annotation to nginx
+        # This uptime (Mon-Fri 00:00-09:00 America/Buenos_Aires) ensures the current time
+        # (2:03 PM EDT / 3:03 PM ART) is outside the uptime window, triggering downtime.
+        kubectl annotate deploy nginx 'downscaler/uptime=Mon-Fri 00:00-09:00 America/Buenos_Aires' --namespace=default --overwrite
+
+        # Step 8: Give kube-downscaler time to process and scale
+        echo "Giving kube-downscaler time to scale down nginx..."
+        # Given --interval=5s and --grace-period=1s, 10-15 seconds should be ample.
+        sleep 10
+
+        # Step 9: Check if the replica count is 0 (default downtime behavior)
+        REPLICAS=$(kubectl get deployment nginx -n default -o jsonpath='{.spec.replicas}')
+        if [ "$REPLICAS" -eq 0 ]; then
+          echo "Test Passed: Deployment scaled down to 0 replicas as expected during downtime."
+        else
+          echo "Test Failed: Deployment replicas not as expected. Actual replicas: $REPLICAS. Expected 0."
+          echo "Kube-downscaler logs:"
+          # Try to get logs by pod name, as 'deployment/name' sometimes fails if pod is restarting/crashing
+          POD_NAME=$(kubectl get pods -n default -l app=kube-downscaler -o jsonpath='{.items[0].metadata.name}' || echo "")
+          if [ -n "$POD_NAME" ]; then
+              kubectl logs "$POD_NAME" --namespace=default
+          else
+              echo "Could not find kube-downscaler pod to get logs."
+          fi
+          exit 1
+        fi

@@ -1,0 +1,147 @@
+package:
+  name: drupal
+  description: Drupal is an open source content management platform powering millions of websites and applications.
+  version: "11.1.7"
+  epoch: 0
+  copyright:
+    - license: GPL-2.0-only
+  dependencies:
+    runtime:
+      - docker-library-php
+      - php-${{vars.php-version}}
+      - php-${{vars.php-version}}-apache
+      - php-${{vars.php-version}}-dom
+      - php-${{vars.php-version}}-gd
+      - php-${{vars.php-version}}-mbstring
+      - php-${{vars.php-version}}-opcache
+      - php-${{vars.php-version}}-pdo
+      - php-${{vars.php-version}}-pdo_mysql
+      - php-${{vars.php-version}}-pdo_pgsql
+      - php-${{vars.php-version}}-pdo_sqlite
+      - php-${{vars.php-version}}-simplexml
+      - php-${{vars.php-version}}-xml
+      - php-${{vars.php-version}}-zip
+
+environment:
+  contents:
+    packages:
+      - apache2-config
+      - build-base
+      - busybox
+      - composer
+      - php-${{vars.php-version}}-dom
+      - php-${{vars.php-version}}-gd
+      - php-${{vars.php-version}}-mbstring
+      - php-${{vars.php-version}}-pdo
+      - php-${{vars.php-version}}-simplexml
+      - php-${{vars.php-version}}-xml
+      - php-${{vars.php-version}}-zip
+
+vars:
+  php-version: 8.4
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/drupal/core.git
+      tag: ${{package.version}}
+      expected-commit: b0241948975ede8ca221971ecd3f71793447fded
+
+  - name: Prep config
+    runs: |
+      install -d ${{targets.destdir}}/etc/php/conf.d/
+      tee ${{targets.destdir}}/etc/php/conf.d/${{package.name}}-opcache-recommended.ini <<EOF
+      opcache.memory_consumption=128
+      opcache.interned_strings_buffer=8
+      opcache.max_accelerated_files=4000
+      opcache.revalidate_freq=60
+      EOF
+
+  - name: Build Drupal
+    runs: |
+      export COMPOSER_ALLOW_SUPERUSER=1
+      export COMPOSER_HOME="$(mktemp -d)"
+      install -d ${{targets.destdir}}/opt/drupal
+      cd ${{targets.destdir}}/opt/drupal
+      composer create-project --no-interaction "drupal/recommended-project:${{package.version}}" ./
+      composer check-platform-reqs
+      # Drupal's [INSTALL.txt](https://github.com/drupal/core/blob/4487e6b99d5554dfe402318618244bb55a217486/INSTALL.txt#L2) recommends setting `chmod a+w` for thse files
+      # Doing that gives us `0777` as the file perms in `stat`
+      install -Dpm0777 ${{targets.destdir}}/opt/drupal/web/sites/default/default.settings.php ${{targets.destdir}}/opt/drupal/web/sites/default/settings.php
+      install -dpm0777 ${{targets.destdir}}/opt/drupal/web/sites/default/files
+
+  - name: Configure symlinks
+    runs: |
+      # Upstream image uses /usr/bin/apache2, but we have /usr/bin/httpd instead, both are the same
+      # https://github.com/docker-library/php/blob/d21ab07e7f4014a5443f47c8ff8e292f9c703a58/apache2-foreground#L40
+      install -d ${{targets.destdir}}/usr/bin
+      ln -sf /usr/bin/httpd ${{targets.destdir}}/usr/bin/apache2
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat subpackage for drupal project upstream image
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/var/www
+          ln -f -s /opt/drupal/web ${{targets.contextdir}}/var/www/html
+
+  - name: ${{package.name}}-apache2-config
+    description: ${{package.name}} Apache2 httpd.conf configuration
+    dependencies:
+      replaces:
+        - apache2-config
+        - apache2-config-compat
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/etc/apache2
+          mkdir -p "${{targets.contextdir}}"/etc/apache2/extra/
+
+          TARGET="${{targets.contextdir}}"/etc/apache2/httpd.conf
+
+          cp /etc/apache2/httpd.conf "$TARGET"
+          cp /etc/apache2/extra/httpd-ssl.conf "${{targets.contextdir}}"/etc/apache2/extra/httpd-ssl.conf
+
+          sed -i 's|/usr/share/apache2/default-site/htdocs|/var/www/html|' "$TARGET"
+          sed -i 's|/usr/local/apache2/htdocs|/var/www/html|' "$TARGET"
+
+          # Fix the error: `Apache is running a threaded MPM, but your PHP Module is not compiled to be threadsafe. You need to recompile PHP.`
+          sed -ri \
+            -e 's|^(\s*)LoadModule mpm_event_module|\1#LoadModule mpm_event_module|' \
+            -e 's|^(\s*)#*LoadModule mpm_prefork_module|\1LoadModule mpm_prefork_module|' \
+            "${{targets.subpkgdir}}"/etc/apache2/httpd.conf
+
+          # Load additional modules that upstream image loads by default
+          # Also include the config files for remoteip and apache-limits as upstream image does
+          cat <<EOF >> "$TARGET"
+          LoadModule deflate_module     /usr/lib/apache2/modules/mod_deflate.so
+          LoadModule negotiation_module /usr/lib/apache2/modules/mod_negotiation.so
+          LoadModule rewrite_module     /usr/lib/apache2/modules/mod_rewrite.so
+          LoadModule remoteip_module    /usr/lib/apache2/modules/mod_remoteip.so
+          LoadModule php_module         /usr/lib/apache2/modules/libphp.so
+          <FilesMatch \.php$>
+            SetHandler application/x-httpd-php
+          </FilesMatch>
+          <Directory "/var/www/html">
+            AllowOverride All
+          </Directory>
+          EOF
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - curl
+  pipeline:
+    - uses: test/daemon-check-output
+      with:
+        start: |
+          apache2-foreground
+        timeout: 60
+        expected_output: |
+          <html><body><h1>It works!</h1></body></html>
+        post: |
+          curl -s http://localhost:80

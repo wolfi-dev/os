@@ -16,10 +16,17 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
-ifneq (${MELANGE_RUNNER},)
-	MELANGE_OPTS += --runner=${MELANGE_RUNNER}
-	MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
+ifeq (${MELANGE_RUNNER},)
+MELANGE_RUNNER = qemu
+$(warning ****************************** WARNING ******************************)
+$(warning *** MELANGE_RUNNER is unset. The default runner is now qemu, which)
+$(warning *** requires chainctl authentication to access the Chainguard kernel.)
+$(warning *** See `melange build --help` for a list of other runner options.)
+$(warning ****************************** WARNING ******************************)
 endif
+
+MELANGE_OPTS += --runner=${MELANGE_RUNNER}
+MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
 QEMU_KERNEL_IMAGE ?= kernel/$(ARCH)/vmlinuz
 ifeq (${MELANGE_RUNNER},qemu)
 	QEMU_KERNEL_DEP = ${QEMU_KERNEL_IMAGE}
@@ -109,12 +116,6 @@ fetch-kernel:
 
 kernel/%/APKINDEX.tar.gz:
 	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/APKINDEX.tar.gz)
-	# Retry in case of failure
-	@if grep -q "UNAUTHORIZED" kernel/$(ARCH)/APKINDEX.tar.gz; then \
-		echo "Auth failed, retrying"; \
-		rm -rf kernel/$(ARCH); \
-		make kernel/$(ARCH)/APKINDEX.tar.gz; \
-	fi
 
 kernel/%/APKINDEX: kernel/%/APKINDEX.tar.gz
 	tar -x -C kernel --to-stdout -f $< APKINDEX > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
@@ -283,5 +284,5 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
   { echo "failed token from $(1) for target $@"; exit 1; }; \
   mkdir -p $$(dirname $(2)) && \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
-  curl -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
+  curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
 	mv "$(2).tmp" "$(2)"

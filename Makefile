@@ -107,7 +107,10 @@ ${CACHEDIR}/.libraries_token.txt: cache
 	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
 
 .PHONY: lib-token
-lib-token: ${CACHEDIR}/.libraries_token.txt
+lib-token:
+	if command -v chainctl; then \
+		$(MAKE) ${CACHEDIR}/.libraries_token.txt; \
+	fi
 
 .PHONY: fetch-kernel
 fetch-kernel:
@@ -150,7 +153,7 @@ $(pkg_targets): package/%:
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
-packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
+packages/$(ARCH)/%.apk: cache lib-token $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
@@ -162,7 +165,7 @@ $(docker_pkg_targets): docker-package/%:
 	MELANGE_RUNNER=docker make package/$*
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
-$(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
+$(dbg_targets): debug/%: cache lib-token $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
@@ -172,7 +175,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
-$(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
+$(test_targets): test/%: cache lib-token $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
@@ -185,7 +188,7 @@ $(docker_test_targets): docker-test/%:
 	MELANGE_RUNNER=docker make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
-$(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
+$(testdbg_targets): test-debug/%: cache lib-token $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
@@ -193,9 +196,10 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
 
 .PHONY: dev-container
-dev-container:
+dev-container: lib-token
 	docker run --pull=always --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
+	    -v "${CACHEDIR}:/tmp/melange-cache" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
 	    ghcr.io/wolfi-dev/sdk:latest

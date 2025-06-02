@@ -122,9 +122,9 @@ kernel/%/APKINDEX: kernel/%/APKINDEX.tar.gz
 	touch $@
 
 kernel/%/chosen: kernel/%/APKINDEX
-	# Extract lines with 'P:linux' and the following line that contains the version
+	# Extract lines with 'P:linux-qemu-generic' and the following line that contains the version
 	# This approach is compatible with both GNU and BSD sed
-	awk '/^P:linux$$/ {print; getline; print}' $< > kernel/$*/available
+	awk '/^P:linux-qemu-generic$$/ {print; getline; print}' $< > kernel/$*/available
 	grep '^V:' kernel/$*/available | sed 's/V://' | \
 	  sort -V | tail -n1 > $@.tmp
 	# Sanity check that this looks like an apk version
@@ -132,7 +132,7 @@ kernel/%/chosen: kernel/%/APKINDEX
 	mv $@.tmp $@
 
 kernel/%/linux.apk: kernel/%/chosen
-	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$*/linux-$(shell cat kernel/$*/chosen).apk)
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$*/linux-qemu-generic-$(shell cat kernel/$*/chosen).apk)
 
 kernel/%/vmlinuz: kernel/%/linux.apk
 	tmpd=kernel/.$$$$ && mkdir -p $$tmpd $(dir $@) && \

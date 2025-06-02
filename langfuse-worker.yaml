@@ -1,26 +1,28 @@
 package:
   name: langfuse-worker
   version: 3.63.1
-  epoch: 14
+  epoch: 5
   description: LLM engineering platform that can be self-hosted
   copyright:
     - license: MIT
   dependencies:
     runtime:
       - glibc
+      - ld-linux
       - libgcc
       - libstdc++
-      - nodejs
+      - nodejs-20
+      - dumb-init
 
 environment:
   contents:
     packages:
       - build-base
-      - busybox
-      - ca-certificates-bundle
       - corepack
+      - busybox
+      - nodejs-20
       - npm
-      - scanelf
+      - rsync
 
 pipeline:
   - uses: git-checkout
@@ -31,58 +33,154 @@ pipeline:
 
   - runs: |
       npm install turbo@^1.13.4 --global
+
       corepack enable
       corepack prepare pnpm@9.5.0 --activate
-      turbo prune --scope=worker --docker
-      mkdir -p "${{targets.destdir}}"/app
-      cp out/pnpm-lock.yaml "${{targets.destdir}}"/app/pnpm-lock.yaml
-      cp out/pnpm-workspace.yaml "${{targets.destdir}}"/app/pnpm-workspace.yaml
-      cp -r out/json/* "${{targets.destdir}}"/app/
-      pnpm install --frozen-lockfile
-      cp -rL node_modules "${{targets.destdir}}"/app/
-      cp -r out/full/* "${{targets.destdir}}"/app/
-      turbo run build --filter=worker...
-      cp -r worker/ "${{targets.destdir}}"/app/
-      chmod +x "${{targets.destdir}}"/app/worker/entrypoint.sh
 
-
-      cd "${{targets.destdir}}/app"
+      # Configure architecture
       if [ "${{build.arch}}" = "aarch64" ]; then
-      # Remove x86_64 binaries
-        scanelf -R -n . | awk '/x86_64/ {print $NF}' | xargs rm -rf || true
+        TARGET_CPU="arm64"
       else
-       # Remove aarch64 binaries
-        scanelf -R -n . | awk '/aarch64/ {print $NF}' | xargs rm -rf || true
-        fi
+        TARGET_CPU="x64"
+      fi
+
+      cat > .npmrc << EOF
+      platform=linux
+      arch=$TARGET_CPU
+      libc=glibc
+      EOF
+
+      export SKIP_MIGRATE_DATABASE_SCHEMA=1
+      export SKIP_SEED_PRISMA_DATABASE=1
+
+      turbo prune --scope=worker --docker
+
+      mkdir -p build && cd build
+      cp ../out/pnpm-lock.yaml .
+      cp ../out/pnpm-workspace.yaml .
+      cp -r ../out/json/. .
+
+      export HUSKY=0
+      pnpm install --frozen-lockfile
+
+      pnpm run -r postinstall --if-present --filter='!husky' || true
+
+      cp -r ../out/full/. .
+      mkdir -p worker/node_modules/@prisma
+      PRISMA_CLIENT_PATH=$(find node_modules/.pnpm -name "@prisma+client@*" -type d | head -1)
+      [ -n "$PRISMA_CLIENT_PATH" ] && \
+        ln -sf "../../../$PRISMA_CLIENT_PATH/node_modules/@prisma/client" \
+                worker/node_modules/@prisma/client
+
+      mkdir -p worker/node_modules/@langfuse
+      ln -sf ../../packages/shared worker/node_modules/@langfuse/shared
+
+      turbo run build --filter=worker...
+
+      mkdir -p "${{targets.destdir}}"/app
+      cp package.json pnpm-lock.yaml pnpm-workspace.yaml "${{targets.destdir}}"/app/
+      
+      mkdir -p "${{targets.destdir}}"/app/worker
+      cp -r worker/dist "${{targets.destdir}}"/app/worker/
+      cp worker/package.json "${{targets.destdir}}"/app/worker/
+      cp worker/entrypoint.sh "${{targets.destdir}}"/app/worker/ || true
+      
+      mkdir -p "${{targets.destdir}}"/app/packages/shared
+      cp -r packages/shared/dist "${{targets.destdir}}"/app/packages/shared/
+      cp packages/shared/package.json "${{targets.destdir}}"/app/packages/shared/
+
+      mkdir -p "${{targets.destdir}}"/app/node_modules
+      rsync -a node_modules/ "${{targets.destdir}}"/app/node_modules/
+      
+      mkdir -p "${{targets.destdir}}"/app/worker/node_modules/@langfuse
+      ln -sf ../../../packages/shared "${{targets.destdir}}"/app/worker/node_modules/@langfuse/shared
+
+      # Clean up wrong architecture binaries
+      APPDIR="${{targets.destdir}}/app"
+      
+      # Remove all musl, darwin, and windows directories
+      find "$APPDIR" -type d \( -name "*musl*" -o -name "*darwin*" -o -name "*win32*" -o -name "*windows*" \) -exec rm -rf {} + 2>/dev/null || true
+      
+      # Remove wrong architecture directories
+      if [ "${{build.arch}}" = "aarch64" ]; then
+        find "$APPDIR" -type d \( -name "*-x64" -o -name "*-x86*" -o -name "linuxglibc-x64" \) -exec rm -rf {} + 2>/dev/null || true
+      else  
+        find "$APPDIR" -type d \( -name "*-arm64" -o -name "*-aarch64" -o -name "linuxglibc-arm64" \) -exec rm -rf {} + 2>/dev/null || true
+      fi
+      
+      echo "Verifying architecture..."
+      if [ "${{build.arch}}" = "aarch64" ]; then
+        ! find "$APPDIR" -name "*.so*" -exec ldd {} \; 2>/dev/null | grep -q "ld-linux-x86-64.so.2"
+      else
+        ! find "$APPDIR" -name "*.so*" -exec ldd {} \; 2>/dev/null | grep -q "ld-linux-aarch64.so.1"
+      fi
+      
+      chmod +x "${{targets.destdir}}"/app/worker/entrypoint.sh
 
 test:
   environment:
     contents:
       packages:
-        - nodejs
+        - nodejs-20
         - dumb-init
         - curl
         - procps
+        - redis
+        - postgresql
+        - postgresql-client
     environment:
-      DATABASE_URL: "postgresql://localhost:5432/test"
-      NODE_ENV: "test"
-      PORT: "3030"
-      REDIS_HOST: "localhost"
-      REDIS_PORT: "6379"
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test"
+      DIRECT_URL:   "postgresql://postgres:postgres@localhost:5432/test"
+      NODE_ENV:     "test"
+      PORT:         "3030"
+      REDIS_HOST:     "127.0.0.1"
+      REDIS_PORT:     "6379"
+      REDIS_URL:      "redis://localhost:6379"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "dummy-bucket"
+      CLICKHOUSE_URL: "http://localhost:8123"
+      CLICKHOUSE_USER: "testuser"
+      CLICKHOUSE_PASSWORD: "testpass"
       NEXT_PUBLIC_LANGFUSE_CLOUD_REGION: ""
   pipeline:
-    - name: "Verify entrypoint script exists and is executable"
+    - name: "Start Redis & Postgres, apply Prisma schema"
       working-directory: /app
       runs: |
-        test -f ./worker/entrypoint.sh
-        test -x ./worker/entrypoint.sh
-        echo "✓ Entrypoint script exists and is executable"
-    - name: "Test worker startup and health check"
+        redis-server --daemonize yes
+
+        mkdir -p /var/lib/postgresql/data
+        chown build:build /var/lib/postgresql/data
+
+        mkdir -p /var/run/postgresql
+        chown build:build /var/run/postgresql
+
+        su build -c "initdb -D /var/lib/postgresql/data"
+
+        su build -c "pg_ctl -D /var/lib/postgresql/data -o '-k /var/run/postgresql' start"
+
+        su build -c "/usr/bin/psql \
+          -h /var/run/postgresql \
+          -d postgres \
+          -v ON_ERROR_STOP=1 <<-EOSQL
+            CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'postgres';
+            CREATE DATABASE test OWNER postgres;
+        EOSQL"
+
+        /app/node_modules/.bin/prisma db push \
+          --accept-data-loss \
+          --skip-generate \
+          --schema=/app/node_modules/.prisma/client/schema.prisma
+
+    - name: "Verify worker files (with Redis & Postgres schema)"
       working-directory: /app
       runs: |
-        # Start the worker with dumb-init
+        test -f worker/entrypoint.sh
+        test -x worker/entrypoint.sh
+        test -f worker/dist/index.js
+
         dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js &
         WORKER_PID=$!
+        sleep 2
+        kill $WORKER_PID || true
 
 update:
   enabled: true

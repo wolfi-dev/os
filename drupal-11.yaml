@@ -9,17 +9,21 @@ package:
     runtime:
       - ${{package.name}}-apache2-config
       - docker-library-php
+      # `make test/drupal*` should complain about missing extensions
       - php-${{vars.php-version}}
       - php-${{vars.php-version}}-apache
+      - php-${{vars.php-version}}-curl
       - php-${{vars.php-version}}-dom
       - php-${{vars.php-version}}-gd
       - php-${{vars.php-version}}-mbstring
+      - php-${{vars.php-version}}-mysqlnd
       - php-${{vars.php-version}}-opcache
       - php-${{vars.php-version}}-pdo
       - php-${{vars.php-version}}-pdo_mysql
       - php-${{vars.php-version}}-pdo_pgsql
       - php-${{vars.php-version}}-pdo_sqlite
       - php-${{vars.php-version}}-simplexml
+      - php-${{vars.php-version}}-sodium
       - php-${{vars.php-version}}-xml
       - php-${{vars.php-version}}-zip
     provides:
@@ -32,6 +36,12 @@ update:
     use-tag: true
     tag-filter: "11"
 
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
 environment:
   environment:
     PHP_INI_DIR: /usr/local/etc/php
@@ -42,11 +52,15 @@ environment:
       - busybox
       - composer
       - php-${{vars.php-version}}-curl
+      - php-${{vars.php-version}}-curl
       - php-${{vars.php-version}}-dom
       - php-${{vars.php-version}}-gd
       - php-${{vars.php-version}}-mbstring
+      - php-${{vars.php-version}}-mysqlnd
       - php-${{vars.php-version}}-pdo
+      - php-${{vars.php-version}}-pdo_mysql
       - php-${{vars.php-version}}-simplexml
+      - php-${{vars.php-version}}-sodium
       - php-${{vars.php-version}}-xml
       - php-${{vars.php-version}}-xmlwriter
       - php-${{vars.php-version}}-zip
@@ -110,6 +124,8 @@ pipeline:
       # https://github.com/docker-library/php/blob/d21ab07e7f4014a5443f47c8ff8e292f9c703a58/apache2-foreground#L40
       install -d ${{targets.destdir}}/usr/bin
       ln -sf /usr/bin/httpd ${{targets.destdir}}/usr/bin/apache2
+      # There is normally a README here, but it is an entire repo we need to clone, so no need for that
+      install -d ${{targets.destdir}}/opt/drupal/recipes
 
 subpackages:
   - name: ${{package.name}}-compat
@@ -162,6 +178,13 @@ subpackages:
             AllowOverride All
           </Directory>
           EOF
+    test:
+      pipeline:
+        - name: Validate httpd config
+          runs: |
+            grep -i 'ServerRoot "/usr/local/apache2"' /etc/apache2/httpd.conf
+            grep -i 'DocumentRoot "//var/www/html"' /etc/apache2/httpd.conf
+            apachectl -S # Lints the httpd config
 
 test:
   environment:
@@ -171,8 +194,21 @@ test:
         - ${{package.name}}-apache2-config
         - curl
         - wait-for-it
+        - crane
+    # accounts:
+    #   groups:
+    #     - groupname: www-data
+    #       gid: 65532
+    #   users:
+    #     - username: www-data
+    #       gid: 65532
+    #       uid: 65532
+    environment:
+      DRUPAL_ADMIN_PASSWORD: admin
+      DRUPAL_PORT: 8080
+      DRUPAL_HOST: localhost
   pipeline:
-    - name: Test endpoints
+    - name: Test production endpoint with httpd
       runs: |
         apache2-foreground &
         APACHE_PID=$!
@@ -182,3 +218,62 @@ test:
         curl -s "${DRUPAL_ENDPOINT}" | grep 'Redirecting to <a href="/core/install.php">'
         curl -s "${DRUPAL_ENDPOINT}/core/install.php" | grep '<span class="site-version">${{package.version}}</span>'
         kill -9 "${APACHE_PID}"
+    - working-directory: /opt/drupal/web/core/scripts
+      name: Smoke tests
+      runs: |
+        php ./drupal --version | grep ${{package.version}}
+        php ./drupal help recipe | grep 'Applies a recipe to a site.'
+        php ./drupal help list | grep 'List commands'
+        php ./drupal help generate-theme | grep 'Generates a new theme'
+    - name: Ensure demo quickstart website works
+      working-directory: /opt/drupal/web
+      runs: |
+        DRUPAL_TEST_NAME="Drupal_Test"
+        php -d memory_limit=256M core/scripts/drupal quick-start demo_umami \
+          --suppress-login \
+          --site-name "$DRUPAL_TEST_NAME" \
+          --password "${DRUPAL_ADMIN_PASSWORD}" \
+          --host "${DRUPAL_HOST}" \
+          --port "${DRUPAL_PORT}" &
+        DRUPAL_SERVER=$!
+        wait-for-it -t 30 --strict "${DRUPAL_HOST}:${DRUPAL_PORT}"
+        curl "${DRUPAL_HOST}:${DRUPAL_PORT}" | grep "<title>Home | $DRUPAL_TEST_NAME</title>"
+        curl "${DRUPAL_HOST}:${DRUPAL_PORT}" | grep "content=\"Drupal ${{vars.major-version}}"
+        kill -9 "${DRUPAL_SERVER}"
+    - name: Ensure the PHP modules match Nextcloud image
+      runs: |
+        /bin/bash -c '
+        set -eo pipefail
+
+        # Sometimes the tag is not available yet, so its ok to use the previous one
+        # e.g. 31.0.4 -> 31.0.3
+        tag=${{package.version}}
+        DRUPAL_IMAGE="docker.io/library/drupal"
+        crane manifest $DRUPAL_IMAGE:$tag >/dev/null 2>&1 || tag=${tag%.*}.$(( ${tag##*.} - 1 ))
+
+        required_modules=$(crane export $DRUPAL_IMAGE:$tag - | \
+          tar -tvf - | \
+          grep "usr/local/lib/php/extensions/.*\.so$" | \
+          awk -F"/" "{print \$NF}" | \
+          sed "s/\.so\$//" | \
+          sort -u)
+
+        echo "Modules required by $DRUPAL_IMAGE:$tag:"
+        echo "$required_modules"
+
+        loaded_modules=$(php -m | tr "[:upper:]" "[:lower:]" | sed "s/zend opcache/opcache/")
+
+        missing_modules=()
+        while read -r module; do
+          if ! grep -iq "^${module}$" <<< "$loaded_modules"; then
+            missing_modules+=("$module")
+          fi
+        done <<< "$required_modules"
+
+        if [ ${#missing_modules[@]} -ne 0 ]; then
+          echo "Missing PHP modules: ${missing_modules[*]}"
+          exit 1
+        else
+          echo "All required PHP modules are loaded!"
+        fi
+        '

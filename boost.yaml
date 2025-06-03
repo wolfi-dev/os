@@ -1,7 +1,7 @@
 package:
   name: boost
-  version: 1.87.0
-  epoch: 1
+  version: "1.88.0"
+  epoch: 4
   description: "Free peer-reviewed portable C++ source libraries"
   copyright:
     - license: "BSL-1.0"
@@ -12,15 +12,28 @@ package:
 environment:
   contents:
     packages:
-      - build-base
       - busybox
+      - bzip2-dev
       - ca-certificates-bundle
       - patch
-      - python3
-      - python3-dev
+      - py3-supported-build-base-dev
       - wolfi-base
+      - xz-dev
+      - zlib-dev
+      - zstd-dev
+
+vars:
+  b2: './tools/build/src/engine/b2'
+  build-opts: 'release toolset=gcc debug-symbols=off threading=single,multi runtime-link=shared link=shared,static cflags=-fno-strict-aliasing --layout=tagged -q'
 
 data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
   - name: libs
     items:
       atomic: atomic
@@ -37,7 +50,6 @@ data:
       math: math
       prg_exec_monitor: prg_exec_monitor
       program_options: program_options
-      python3: python3
       random: random
       regex: regex
       serialization: serialization
@@ -47,7 +59,7 @@ data:
       wave: wave
       wserialization: wserialization
 
-# transform melange version 1.81.0 => 1_81_0
+# transform melange version, i.e. 1.81.0 => 1_81_0
 var-transforms:
   - from: ${{package.version}}
     match: \.
@@ -58,73 +70,151 @@ pipeline:
   - uses: fetch
     with:
       uri: https://archives.boost.io/release/${{package.version}}/source/boost_${{vars.mangled-package-version}}.tar.gz
-      expected-sha256: f55c340aa49763b1925ccf02b2e83f35fdcf634c9d5164a2acb87540173c741d
+      expected-sha256: 3621533e820dcab1e8012afd583c0c73cf0f77694952b81352bf38c1488f9cb4
+
+  # Build the Boost build tool
+  - working-directory: tools/build/src/engine
+    runs: ./build.sh cc gcc
+
+  # Build the Boost BCP tool
+  - working-directory: tools/bcp
+    runs: ../build/src/engine/b2 -j$(nproc)
 
   - runs: |
-      abiflags="$(python3-config --abiflags)"
+      # Build Boost, excluding Boost.Python
+      # Boost.Python is built below for each Python version
+      ${{vars.b2}} ${{vars.build-opts}} \
+        --prefix="${{targets.contextdir}}/usr" \
+        -j$(nproc) \
+        --without-python
 
-      # create user-config.jam
-      PY3_VERSION=$(python3 -c 'import sys; print("%i.%i" % (sys.version_info.major, sys.version_info.minor))')
-      cat > user-config.jam <<-__EOF__
-      using gcc : : $CC : <cxxflags>"${CXXFLAGS}" <linkflags>"${LDFLAGS}" ;
-      using python : ${PY3_VERSION:+$PY3_VERSION }: /usr/bin/python3 : ${PY3_VERSION:+/usr/include/python${PY3_VERSION}${abiflags} }: : : : ${abiflags:+$abiflags };
-      __EOF__
+      # Install Boost
+      ${{vars.b2}} \
+        --includedir="${{targets.contextdir}}"/usr/include \
+        --libdir="${{targets.contextdir}}"/usr/lib \
+        install \
+        --without-python
 
-      cd tools/build/src/engine
-      ./build.sh cc gcc
-      cd ../../../../
-
-      cd tools/bcp
-      ../build/src/engine/b2 -j $(nproc)
-      cd ../../
-
-      ./tools/build/src/engine/b2 \
-        --user-config=user-config.jam \
-        --prefix="${{targets.destdir}}/usr" \
-        release \
-        toolset=gcc \
-        debug-symbols=off \
-        threading=single,multi \
-        runtime-link=shared \
-        link=shared,static \
-        cflags=-fno-strict-aliasing \
-        --layout=tagged \
-        -q \
-        -j $(nproc)
-
-      mkdir -p "${{targets.destdir}}"/usr/bin
-      install -Dm755 tools/build/src/engine/b2 "${{targets.destdir}}"/usr/bin/b2
-      install -Dm755 dist/bin/bcp "${{targets.destdir}}"/usr/bin/bcp
+      # Install Boost tools and license
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      install -Dm755 tools/build/src/engine/b2 "${{targets.contextdir}}"/usr/bin/b2
+      install -Dm755 dist/bin/bcp "${{targets.contextdir}}"/usr/bin/bcp
       install -Dm644 LICENSE_1_0.txt \
-        "${{targets.destdir}}"/usr/share/licenses/${{package.name}}/LICENSE_1_0.txt
-
-      "${{targets.destdir}}"/usr/bin/b2 \
-        --includedir="${{targets.destdir}}"/usr/include \
-        --libdir="${{targets.destdir}}"/usr/lib \
-        install
+        "${{targets.contextdir}}"/usr/share/licenses/${{package.name}}/LICENSE_1_0.txt
 
   - uses: strip
 
 subpackages:
-  - name: boost-dev
+  - range: py-versions
+    name: py${{range.key}}-libboost
+    description: "Boost library for Python ${{range.key}}"
     pipeline:
-      - uses: split/dev
+      - runs: |
+          abiflags="$(python${{range.key}}-config --abiflags)"
 
-  - name: boost-static
+          # Create user config that includes Python version and abiflags
+          PY3_VERSION=$(python${{range.key}} -c 'import sys; print("%i.%i" % (sys.version_info.major, sys.version_info.minor))')
+          cat > user-config.jam <<-__EOF__
+          using python : ${PY3_VERSION:+$PY3_VERSION }: /usr/bin/python${{range.key}} : ${PY3_VERSION:+/usr/include/python${PY3_VERSION}${abiflags} }: : : : ${abiflags:+$abiflags };
+          __EOF__
+
+          # Build Boost.Python
+          ${{vars.b2}} ${{vars.build-opts}} \
+            --prefix="${{targets.destdir}}/usr" \
+            --build-dir=build-py${{range.key}} \
+            --stagedir=stage-py${{range.key}} \
+            -j$(nproc) \
+            --with-python
+
+          # Install Boost.Python in the main package
+          # This is intentional as we want to ship bindings in boost-dev
+          # and this makes splitting those away easier
+          ${{vars.b2}} \
+            --user-config=user-config.jam \
+            --includedir="${{targets.destdir}}"/usr/include \
+            --libdir="${{targets.destdir}}"/usr/lib \
+            --build-dir=build-py${{range.key}} \
+            --stagedir=stage-py${{range.key}} \
+            install \
+            --with-python
+
+          # Install Boost Python library
+          mkdir -p "${{targets.contextdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libboost_python${{range.value}}*.so.* "${{targets.contextdir}}"/usr/lib/
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - boost-dev
+            - gcc
+            - python-${{range.key}}-dev
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "Test Python ${{range.key}} bindings"
+          runs: |
+            cat > py_test.cpp << 'EOF'
+            #include <boost/python.hpp>
+            #include <iostream>
+
+            char const* hello() { return "Hello, there!"; }
+
+            BOOST_PYTHON_MODULE(hello_there)
+            {
+                boost::python::def("hello", hello);
+            }
+            EOF
+
+            g++ -fPIC -shared -o hello_there.so py_test.cpp -lboost_python${{range.value}} $(python${{range.key}}-config --includes) $(python${{range.key}}-config --ldflags)
+
+            cat > test_libboost_python.py << 'EOF'
+            import hello_there
+            print(hello_there.hello())
+            EOF
+
+            python${{range.key}} test_libboost_python.py
+
+  - name: py3-supported-libboost
+    description: "Meta-package for Boost Python libraries"
+    dependencies:
+      runtime:
+        - py3.10-libboost
+        - py3.11-libboost
+        - py3.12-libboost
+        - py3.13-libboost
+
+  - range: libs
+    name: libboost-${{range.key}}
+    description: "Boost ${{range.key}} library"
     pipeline:
-      - uses: split/static
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libboost_${{range.key}}*.so.* "${{targets.contextdir}}"/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 
   - name: boost-docs
+    description: "Boost documentation"
     pipeline:
       - uses: split/manpages
 
-  - range: libs
-    name: boost-${{range.key}}
-    description: "${{range.key}} boost library"
+  - name: boost-static
+    description: "Boost static libraries"
     pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/lib
-          mv "${{targets.destdir}}"/usr/lib/libboost_${{range.key}}* "${{targets.subpkgdir}}"/usr/lib/
+      - uses: split/static
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: boost-dev
+    description: "Development files for Boost"
+    dependencies:
+      runtime:
+        - boost
+        - boost-static
+    pipeline:
+      - uses: split/dev
 
 update:
   enabled: true
@@ -137,15 +227,14 @@ test:
   environment:
     contents:
       packages:
-        - build-base
-        - gcc
-        - python3
         - boost-dev
+        - gcc
   pipeline:
     - name: "Verify core tools installation"
       runs: |
         b2 -v
         bcp --version
+    - uses: test/tw/ldd-check
     - name: "Test basic header compilation"
       runs: |
         cat > test.cpp << 'EOF'
@@ -219,11 +308,3 @@ test:
         EOF
         g++ serial_test.cpp -o serial_test -lboost_serialization
         ./serial_test
-    - name: "Test Python bindings"
-      runs: |
-        # TODO(joshrwolf): This is broken potentially for a real reason
-        # cat > py_test.py << 'EOF'
-        # import boost.python
-        # print("Python bindings loaded successfully")
-        # EOF
-        # python3 py_test.py: "Test thread library"

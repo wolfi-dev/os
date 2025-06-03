@@ -2,8 +2,8 @@ package:
   name: datadog-agent
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: "7.63.2"
-  epoch: 0
+  version: "7.66.0"
+  epoch: 1
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -16,6 +16,10 @@ package:
       - libpcap
       - libseccomp
       - shadow
+
+capabilities:
+  add:
+    - CAP_SYS_ADMIN # This is needed to run unshare(1).
 
 vars:
   py-version: "3.12"
@@ -37,6 +41,7 @@ var-transforms:
 environment:
   contents:
     packages:
+      - binutils
       - bison
       - build-base
       - busybox
@@ -58,7 +63,7 @@ environment:
       # - gstatus # TODO: Required by gluster
       - gcc-12
       - gnutar
-      - go
+      - go-1.23
       - krb5-dev
       - libbpf-dev
       - libedit-dev
@@ -94,7 +99,7 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: 51c6eb811f038f43571e46c9ad55f97e8971d4be
+      expected-commit: 8005fe11a031c36cd8487c55fe05a54ac87e6609
 
   # Recent commit to the init.go code changed some of the logic of Python path resolving
   # for the embedded Python, causing issues. Let's revert the commit to return to the previous
@@ -102,12 +107,12 @@ pipeline:
   # https://github.com/DataDog/datadog-agent/pull/31426
   - uses: patch
     with:
-      patches: revert-import-python-relatively-instead-of-using-the-patch.patch remove-removed-godebug.patch
+      patches: dont-import-python-relatively.patch fix-7.66.0-ftbfs.patch
 
   # Ensure that we don't run into nvidia GPU issues at runtime.
   - runs: |
       gccdir="$(GCC_SPEC_FILE=/dev/null gcc --print-search-dirs | grep ^install: | cut -d' ' -f2)"
-      sed -r 's/,?-z,now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
+      sed -r 's/-z now//' < "$gccdir/openssf.spec" > /home/build/openssf.spec
 
   # Install `invoke` (build) dependencies. We ultimately package with venv so
   # these won't leak into the package.
@@ -123,15 +128,8 @@ pipeline:
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
 
-  - uses: go/bump
-    with:
-      modroot: pkg/trace
-      # Requires +incompatible or it'll throw an error
-      deps: |-
-        github.com/docker/distribution@v2.8.3+incompatible
-      show-diff: true
-
   - if: ${{build.arch}} == 'aarch64'
+    name: Install clang-12
     runs: |
       mkdir -p /usr/src
       wget -O arch.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-arm64_${LINUX_KERNEL_VERSION}_arm64.deb
@@ -144,6 +142,7 @@ pipeline:
       echo "3d4ad804b7c85007686548cbc917ab067bf17eaedeab43d9eb83d3a683d8e9d4  /tmp/clang.tar.xz" | sha256sum --check
 
   - if: ${{build.arch}} == 'x86_64'
+    name: Install clang-12
     runs: |
       mkdir -p /usr/src
       wget -O arch.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-amd64_${LINUX_KERNEL_VERSION}_amd64.deb
@@ -157,11 +156,13 @@ pipeline:
       echo "6b3cc55d3ef413be79785c4dc02828ab3bd6b887872b143e3091692fc6acefe7  /tmp/clang.tar.xz" | sha256sum --check
 
   # need to link libpcap.a to /home/build/dev/lib/libpcap.a else the build will attempt to download libpcap
-  - runs: |
+  - name: Create libpcap.a symlink expected by the build
+    runs: |
       mkdir -p /home/build/dev/lib
       ln -s /usr/lib/libpcap.a /home/build/dev/lib/libpcap.a
 
-  - runs: |
+  - name: Build the System Probe
+    runs: |
       wget -O common.deb http://deb.debian.org/debian-security/pool/updates/main/l/linux-5.10/linux-headers-${LINUX_HEADERS_VERSION}-common_${LINUX_KERNEL_VERSION}_all.deb
       dpkg -x common.deb /tmp/common
       ln -s /tmp/common/usr/src/linux-headers-${LINUX_HEADERS_VERSION}-common /usr/src/linux-headers-${LINUX_HEADERS_VERSION}-common
@@ -181,10 +182,21 @@ pipeline:
       # Build once to correctly setup links/generates. The system-probe we end
       # up using will be part of the multicall below.
       unshare --user --map-root-user \
-        invoke -e system-probe.build \
-        --bundle-ebpf
+        invoke -e system-probe.build
+        #--bundle-ebpf # This makes oom-kill.o to fail because it expects it to be embedded in the Go binary at /build, because
+        # of this: https://github.com/DataDog/datadog-agent/blob/eab078f2e713852de8e4f4c168ea009065841903/pkg/ebpf/co_re.go#L71
+        # where c.coreDir is by default: /opt/datadog-agent/embedded/share/system-probe/ebpf/co-re
+        # but is then overwritten to /build when the Go build tag ebpf_bindata, here:
+        # https://github.com/DataDog/datadog-agent/blob/eab078f2e713852de8e4f4c168ea009065841903/pkg/ebpf/bytecode/asset_reader_bindata.go#L29
+        # and the build tag is set when the inboke task flag --bundle-ebpf is set, ehre:
+        # https://github.com/DataDog/datadog-agent/blob/17329b350f3e31ef8bb7906e842e1989486ec097/tasks/system_probe.py#L830
+        # Instead, when the Go build tag ebpf_bindata / --bundle-ebpf Invoke task flag are not set, the directory is not overwriten and remains
+        # /opt/datadog-agent/embedded/share/system-probe/ebpf/co-re, here:
+        # https://github.com/DataDog/datadog-agent/blob/eab078f2e713852de8e4f4c168ea009065841903/pkg/ebpf/bytecode/asset_reader_nobindata.go#L18.
+        # which is where object files like the oom-kill.o BPF CO-RE programs live, hence can be loaded correctly.
 
-  - runs: |
+  - name: Ensure Go dependencies
+    runs: |
       export PATH=$PATH:$GOPATH/bin
       mkdir -p "$GOPATH/src/github.com/DataDog/"
       ln -sf /home/build/ "$GOPATH"/src/github.com/DataDog/datadog-agent
@@ -192,7 +204,9 @@ pipeline:
 
       invoke -e deps
 
-  - runs: |
+  # RtLoader: https://github.com/DataDog/datadog-agent/tree/main/rtloader
+  - name: Build the RtLoader wrapper
+    runs: |
       invoke -e rtloader.make \
         --install-prefix="${{targets.destdir}}/usr" \
         --cmake-options="\
@@ -202,6 +216,8 @@ pipeline:
           -DCMAKE_C_FLAGS=-Os"
       invoke -e rtloader.install
 
+  - name: Build the agent
+    runs: |
       # Default includes [process-agent, security-agent, trace-agent]. Add in
       # the `system-probe` as well, which saves us ~140Mb.
       invoke -e agent.build \
@@ -211,10 +227,11 @@ pipeline:
         --bundle security-agent \
         --exclude-rtloader \
         --no-development \
-        --bundle-ebpf \
         --embedded-path /usr/lib
+        #--bundle-ebpf \ # Same as above for the system-probe.build Invoke task.
 
-  - runs: |
+  - name: Install the agent and its components
+    runs: |
       mkdir -p \
         ${{targets.contextdir}}${{vars.destd}}/bin/agent \
         ${{targets.contextdir}}${{vars.destd}}/embedded/bin
@@ -321,7 +338,7 @@ subpackages:
             with:
               repository: https://github.com/DataDog/integrations-core
               branch: ${{vars.datadog-major-minor-x}} # 7.x.y
-              expected-commit: eb1cc6cf7b6d521bda3a8d1529cfe952e5355e89 # needs to be updated with each new release
+              expected-commit: 3040577a9e2f266b8202294db17da354dcb41c47 # needs to be updated with each new release
           - uses: patch
             with:
               patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-datadog_checks_base-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch /home/build/int-core-agent_requirements-in.patch
@@ -343,6 +360,9 @@ subpackages:
                 "./datadog_checks_base[deps, http]" \
                 "./datadog_checks_downloader" \
                 $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
+
+              # Remediate GHSA-5rjg-fvgr-3xxf
+              .venv/bin/pip${{vars.py-version}} install --upgrade setuptools
 
               find .venv -name "*.pyc" -delete
               find .venv -name "__pycache__" -exec rm -rf {} +
@@ -577,6 +597,30 @@ subpackages:
             withstdinas version
             withstdinas help
 
+  - name: dogstatsd
+    dependencies:
+      runtime:
+        - busybox
+        - netcat-openbsd
+    pipeline:
+      - runs: |
+          invoke -e dogstatsd.build
+          strip bin/dogstatsd/dogstatsd
+          install -Dm755 bin/dogstatsd/dogstatsd "${{targets.subpkgdir}}/dogstatsd"
+          mkdir -p ${{targets.subpkgdir}}/etc/conf.d
+          mkdir -p ${{targets.subpkgdir}}/etc/init.d
+      - working-directory: Dockerfiles/dogstatsd/alpine
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp ./install_info ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp ./dogstatsd.yaml ${{targets.subpkgdir}}/etc/datadog-agent/
+          install -Dm755 entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
+          install -Dm755 probe.sh ${{targets.subpkgdir}}/probe.sh
+    test:
+      pipeline:
+        - runs: |
+            /dogstatsd start --help
+
 update:
   enabled: true
   github:
@@ -646,6 +690,4 @@ test:
         security-agent version | grep "Security agent"
         process-agent version | grep Agent
         system-probe version | grep "System Probe"
-    - uses: test/ldd-check
-      with:
-        packages: ${{package.name}}
+    - uses: test/tw/ldd-check

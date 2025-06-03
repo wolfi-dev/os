@@ -1,0 +1,102 @@
+package:
+  name: ipfs-cluster
+  version: "1.1.4"
+  epoch: 1
+  description: Pinset orchestration for IPFS
+  copyright:
+    - license: Apache-2.0 AND MIT
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/ipfs-cluster/ipfs-cluster
+      tag: v${{package.version}}
+      expected-commit: 5523c608fe0a69b2e18efd397e4569aa9871b853
+
+  - uses: go/build
+    with:
+      packages: ./cmd/ipfs-cluster-service
+      output: ipfs-cluster-service
+      ldflags: -X 'main.commit=$(git rev-parse HEAD)'
+
+  - uses: go/build
+    with:
+      packages: ./cmd/ipfs-cluster-follow
+      output: ipfs-cluster-follow
+      ldflags: -X 'main.commit=$(git rev-parse HEAD)'
+
+  - uses: go/build
+    with:
+      packages: ./cmd/ipfs-cluster-ctl
+      output: ipfs-cluster-ctl
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/ipfs-cluster-service ${{targets.contextdir}}/usr/local/bin/ipfs-cluster-service
+          ln -sf /usr/bin/ipfs-cluster-follow ${{targets.contextdir}}/usr/local/bin/ipfs-cluster-follow
+          ln -sf /usr/bin/ipfs-cluster-ctl ${{targets.contextdir}}/usr/local/bin/ipfs-cluster-ctl
+    test:
+      pipeline:
+        - runs: |
+            # Check that the symlinks are valid
+            test "$(readlink /usr/local/bin/ipfs-cluster-service)" = "/usr/bin/ipfs-cluster-service"
+            test "$(readlink /usr/local/bin/ipfs-cluster-follow)" = "/usr/bin/ipfs-cluster-follow"
+            test "$(readlink /usr/local/bin/ipfs-cluster-ctl)" = "/usr/bin/ipfs-cluster-ctl"
+
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint for ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+          cp -p docker/entrypoint.sh ${{targets.contextdir}}/usr/local/bin/entrypoint.sh
+          chmod +x ${{targets.contextdir}}/usr/local/bin/entrypoint.sh
+    test:
+      pipeline:
+        - runs: stat /usr/local/bin/entrypoint.sh
+
+update:
+  enabled: true
+  github:
+    identifier: ipfs-cluster/ipfs-cluster
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - ipfs
+        - wait-for-it
+  pipeline:
+    - runs: |
+        ipfs init
+        ipfs daemon &
+        IPFS_DAEMON_PID=$!
+
+        wait-for-it -t 10 127.0.0.1:5001
+        ipfs-cluster-service init --consensus=crdt
+        IPFS_CLUSTER_LOGFILE=$(mktemp)
+        ipfs-cluster-service daemon &> "${IPFS_CLUSTER_LOGFILE}" &
+        IPFS_CLUSTER_PID=$!
+
+        MAX_RETRIES=10
+        RETRY_INTERVAL=1
+        BACKOFF_FACTOR=2
+        retry_count=0
+        while ! grep "IPFS Cluster is READY" $IPFS_CLUSTER_LOGFILE; do
+          if [ $retry_count -ge $MAX_RETRIES ]; then
+            echo "Max retries reached. IPFS Cluster did not start."
+            exit 1
+          fi
+          # Wait before the next retry
+          echo "Failed to find IPFS started logs. Retrying in ${RETRY_INTERVAL}s..."
+          sleep $RETRY_INTERVAL
+          # Increase retry interval (backoff)
+          RETRY_INTERVAL=$((RETRY_INTERVAL * BACKOFF_FACTOR))
+          retry_count=$((retry_count + 1))
+        done
+        kill -9 $IPFS_CLUSTER_PID
+        kill -9 $IPFS_DAEMON_PID

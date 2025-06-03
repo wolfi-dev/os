@@ -1,0 +1,121 @@
+package:
+  name: flink-2.0
+  version: "2.0.0"
+  epoch: 0
+  description: Apache Flink is an open source stream processing framework with powerful stream- and batch-processing capabilities.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bash # some helper scripts use bash: https://github.com/apache/flink-docker/blob/54c53458ad99bfb21acca66d5c6e91b5812c26ce/1.19/scala_2.12-java11-ubuntu/docker-entrypoint.sh#L1
+      - busybox
+      - gettext # for envsubst command in docker-entrypoint.sh
+      - gosu
+      - openjdk-17-default-jvm
+    provides:
+      - flink=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - maven
+      - npm
+      - openjdk-17-default-jdk
+      - python3
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+
+vars:
+  FLINK_DOCKER_COMMIT: "d32c85bcf93b430d56685b54ab5732a20e472e2e"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/flink
+      tag: release-${{package.version}}
+      expected-commit: cc017da9ae12ea58d473d730a84d39440ef928a3
+
+  - name: Build the project
+    runs: |
+      mkdir -p "${{targets.contextdir}}"/opt/flink
+      mvn clean install -DskipTests -Dfast -T 1C
+      cp -r build-target/* "${{targets.contextdir}}"/opt/flink
+      # Replace default REST/RPC endpoint bind address to use the container's network interface
+      sed -i 's/bind-address: localhost/bind-address: 0.0.0.0/g' "${{targets.contextdir}}"/opt/flink/conf/config.yaml
+      sed -i 's/address: localhost/address: 0.0.0.0/g' "${{targets.contextdir}}"/opt/flink/conf/config.yaml
+      sed -i 's/bind-host: localhost/bind-host: 0.0.0.0/g' "${{targets.contextdir}}"/opt/flink/conf/config.yaml
+      sed -i 's/host: localhost/host: 0.0.0.0/g' "${{targets.contextdir}}"/opt/flink/conf/config.yaml
+
+  - name: Setup docker-entrypoint
+    runs: |
+      builddir=$(pwd)
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      tmpdir=$(mktemp -d)
+      git clone https://github.com/apache/flink-docker $tmpdir
+      cd $tmpdir
+      # pin to the specific commit for reproducibility
+      git reset --hard ${{vars.FLINK_DOCKER_COMMIT}}
+      cd $builddir
+      install -Dm755 $tmpdir/${{vars.major-minor-version}}/scala_2.12-java17-ubuntu/docker-entrypoint.sh "${{targets.contextdir}}"/usr/bin
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    dependencies:
+      provides:
+        - flink-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+          # https://github.com/apache/flink-docker/blob/54c53458ad99bfb21acca66d5c6e91b5812c26ce/1.19/scala_2.12-java11-ubuntu/Dockerfile#L92
+          ln -sf /usr/bin/docker-entrypoint.sh ${{targets.subpkgdir}}/docker-entrypoint.sh
+
+update:
+  enabled: true
+  github:
+    identifier: apache/flink
+    use-tag: true
+    strip-prefix: release-
+    tag-filter: release-2.0
+
+test:
+  environment:
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+  pipeline:
+    - runs: |
+        FLINK_DIR=/opt/flink
+        # Start Flink cluster
+        echo "Starting Flink cluster..."
+        $FLINK_DIR/bin/start-cluster.sh
+
+        # Wait for the cluster to start
+        sleep 30
+
+        # Run a sample Flink job (WordCount example)
+        echo "Running WordCount example..."
+        $FLINK_DIR/bin/flink run $FLINK_DIR/examples/streaming/WordCount.jar --input $FLINK_DIR/README.txt --output /tmp/flink-wordcount-output
+
+        # Check the job result
+        if [ $? -eq 0 ]; then
+            echo "Flink job completed successfully."
+            # Display output
+            echo "WordCount output:"
+            cat /tmp/flink-wordcount-output/*/*
+        else
+            echo "Flink job failed."
+        fi
+
+        # Stop Flink cluster
+        echo "Stopping Flink cluster..."
+        $FLINK_DIR/bin/stop-cluster.sh

@@ -32,7 +32,7 @@ What it does is start the `ghcr.io/wolfi-dev/sdk` image and mount the current wo
 
 ## Write your first Wolfi package
 
-Wolfi packages are built using melange. If you want to learn how packages are built, you can see all the details in the [`ci-build`](.github/workflows/ci-build.yaml) workflow and in the [Makefile](Makefile).
+Wolfi packages are built using melange. If you want to learn how packages are built, you can see all the details in the [Makefile](Makefile).
 
 Start by cloning this repository and create a build configuration YAML file named `<your-new-package-name>.yaml` in its root directory. If you have any patch files that are needed to build this package, create a folder at the root of the repository with the same name as the package and put the patches there.
 
@@ -76,17 +76,9 @@ Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CV
 
 - melange has a few built-in pipelines. You can see their source code [in the melange repository](https://github.com/chainguard-dev/melange/tree/main/pkg/build/pipelines).
 
-- You don't need to add `environment.contents.repositories` and `environment.contents.keyring`. Those are added automatically in the `ci-build.yaml` script during CI.
+- You don't need to add `environment.contents.repositories` and `environment.contents.keyring`. Those are added automatically.
 
 - For patching CVEs, you can follow the [documentation here](HOW_TO_PATCH_CVES.md).
-
-- If you don't want to build all the packages locally, you can install `gsutil` and use it to sync the prebuilt packages from `gs://wolfi-production-registry-destination/os/` bucket:
-
-```sh
-gsutil -m rsync -r gs://wolfi-production-registry-destination/os/ ./packages
-```
-
-- If you dont want to install `gsutil` locally, you can use this image `gcr.io/google.com/cloudsdktool/google-cloud-cli:slim` which is the official SDK image from GCP and already include `gsutil` in there.
 
 - When deciding how to add `update:` configuration see the [update docs](./docs/UPDATES.md)
 

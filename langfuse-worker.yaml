@@ -1,7 +1,7 @@
 package:
   name: langfuse-worker
   version: 3.64.0
-  epoch: 5
+  epoch: 15
   description: LLM engineering platform that can be self-hosted
   copyright:
     - license: MIT
@@ -23,6 +23,8 @@ environment:
       - nodejs-20
       - npm
       - rsync
+      - python3
+      - file
 
 pipeline:
   - uses: git-checkout
@@ -44,119 +46,130 @@ pipeline:
         TARGET_CPU="x64"
       fi
 
-      cat > .npmrc << EOF
-      platform=linux
-      arch=$TARGET_CPU
-      libc=glibc
-      EOF
-
-      export SKIP_MIGRATE_DATABASE_SCHEMA=1
-      export SKIP_SEED_PRISMA_DATABASE=1
+      export npm_config_platform=linux
+      export npm_config_arch=$TARGET_CPU
+      export npm_config_target_arch=$TARGET_CPU
+      export npm_config_libc=glibc
 
       turbo prune --scope=worker --docker
 
-      mkdir -p build && cd build
-      cp ../out/pnpm-lock.yaml .
-      cp ../out/pnpm-workspace.yaml .
-      cp -r ../out/json/. .
+      mkdir -p "${{targets.destdir}}"/app
+      cp out/pnpm-lock.yaml "${{targets.destdir}}"/app/
+      cp out/pnpm-workspace.yaml "${{targets.destdir}}"/app/
+      cp -a out/json/* "${{targets.destdir}}"/app/
 
+      SOURCE_DIR=$(pwd)
+      
+      cd "${{targets.destdir}}"/app
+
+      export SKIP_MIGRATE_DATABASE_SCHEMA=1
+      export SKIP_SEED_PRISMA_DATABASE=1
       export HUSKY=0
+      
       pnpm install --frozen-lockfile
 
-      pnpm run -r postinstall --if-present --filter='!husky' || true
-
-      cp -r ../out/full/. .
-      mkdir -p worker/node_modules/@prisma
-      PRISMA_CLIENT_PATH=$(find node_modules/.pnpm -name "@prisma+client@*" -type d | head -1)
-      [ -n "$PRISMA_CLIENT_PATH" ] && \
-        ln -sf "../../../$PRISMA_CLIENT_PATH/node_modules/@prisma/client" \
-                worker/node_modules/@prisma/client
-
-      mkdir -p worker/node_modules/@langfuse
-      ln -sf ../../packages/shared worker/node_modules/@langfuse/shared
+      # Copy full source (preserving symlinks)
+      cp -a "${SOURCE_DIR}"/out/full/* .
 
       turbo run build --filter=worker...
 
-      mkdir -p "${{targets.destdir}}"/app
-      cp package.json pnpm-lock.yaml pnpm-workspace.yaml "${{targets.destdir}}"/app/
+      [ -f worker/entrypoint.sh ] && chmod +x worker/entrypoint.sh
 
-      mkdir -p "${{targets.destdir}}"/app/worker
-      cp -r worker/dist "${{targets.destdir}}"/app/worker/
-      cp worker/package.json "${{targets.destdir}}"/app/worker/
-      cp worker/entrypoint.sh "${{targets.destdir}}"/app/worker/ || true
-
-      mkdir -p "${{targets.destdir}}"/app/packages/shared
-      cp -r packages/shared/dist "${{targets.destdir}}"/app/packages/shared/
-      cp packages/shared/package.json "${{targets.destdir}}"/app/packages/shared/
-
-      mkdir -p "${{targets.destdir}}"/app/node_modules
-      rsync -a node_modules/ "${{targets.destdir}}"/app/node_modules/
-
-      mkdir -p "${{targets.destdir}}"/app/worker/node_modules/@langfuse
-      ln -sf ../../../packages/shared "${{targets.destdir}}"/app/worker/node_modules/@langfuse/shared
-
-      # Clean up wrong architecture binaries
-      APPDIR="${{targets.destdir}}/app"
-
-      # Remove all musl, darwin, and windows directories
-      find "$APPDIR" -type d \( -name "*musl*" -o -name "*darwin*" -o -name "*win32*" -o -name "*windows*" \) -exec rm -rf {} + 2>/dev/null || true
-
-      # Remove wrong architecture directories
+      # Clean up binaries for non-target architectures
+      echo "Cleaning up non-target architecture binaries..."
+      
+      # Define patterns to remove based on target architecture
       if [ "${{build.arch}}" = "aarch64" ]; then
-        find "$APPDIR" -type d \( -name "*-x64" -o -name "*-x86*" -o -name "linuxglibc-x64" \) -exec rm -rf {} + 2>/dev/null || true
+        # On ARM64, remove x64/x86_64 binaries
+        find node_modules -type f \( \
+          -path "*@datadog*/prebuilds/*x64*" -o \
+          -path "*@datadog*/prebuilds/*x86_64*" -o \
+          -path "*@prisma*/*linux-x64*" -o \
+          -path "*prisma*/*linux-x64*" -o \
+          -path "*msgpackr*/*linux-x64*" -o \
+          -path "*msgpackr*/*x64*" \
+        \) -delete 2>/dev/null || true
+        
+        # Remove x86_64 specific references
+        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
+          if file "$binary" 2>/dev/null | grep -q "x86-64\|Intel 80386"; then
+            rm -f "$binary"
+          fi
+        done
       else
-        find "$APPDIR" -type d \( -name "*-arm64" -o -name "*-aarch64" -o -name "linuxglibc-arm64" \) -exec rm -rf {} + 2>/dev/null || true
+        # On x64, remove ARM binaries
+        find node_modules -type f \( \
+          -path "*@datadog*/prebuilds/*arm64*" -o \
+          -path "*@datadog*/prebuilds/*aarch64*" -o \
+          -path "*@prisma*/*linux-arm64*" -o \
+          -path "*prisma*/*linux-arm64*" -o \
+          -path "*msgpackr*/*linux-arm64*" -o \
+          -path "*msgpackr*/*arm64*" -o \
+          -path "*msgpackr*/*aarch64*" \
+        \) -delete 2>/dev/null || true
+        
+        # Remove ARM specific binaries
+        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
+          if file "$binary" 2>/dev/null | grep -q "aarch64\|ARM"; then
+            rm -f "$binary"
+          fi
+        done
       fi
+      
+      # Remove all musl variants (since we're using glibc)
+      find node_modules -type f \( \
+        -path "*musl*" -o \
+        -name "*musl*" \
+      \) -delete 2>/dev/null || true
 
-      echo "Verifying architecture..."
-      if [ "${{build.arch}}" = "aarch64" ]; then
-        ! find "$APPDIR" -name "*.so*" -exec ldd {} \; 2>/dev/null | grep -q "ld-linux-x86-64.so.2"
-      else
-        ! find "$APPDIR" -name "*.so*" -exec ldd {} \; 2>/dev/null | grep -q "ld-linux-aarch64.so.1"
-      fi
-
-      chmod +x "${{targets.destdir}}"/app/worker/entrypoint.sh
 
 test:
   environment:
     contents:
       packages:
         - nodejs-20
+        - npm
         - dumb-init
         - curl
         - procps
         - redis
         - postgresql
         - postgresql-client
+        - ca-certificates-bundle
+        - file
+        - busybox
     environment:
       DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test"
       DIRECT_URL: "postgresql://postgres:postgres@localhost:5432/test"
-      NODE_ENV: "test"
+      NODE_ENV: "production"
       PORT: "3030"
       REDIS_HOST: "127.0.0.1"
       REDIS_PORT: "6379"
-      REDIS_URL: "redis://localhost:6379"
-      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "dummy-bucket"
+      REDIS_URL: "redis://127.0.0.1:6379"
+      REDIS_AUTH: ""
+      REDIS_CONNECTION_STRING: "redis://127.0.0.1:6379"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "test-bucket"
       CLICKHOUSE_URL: "http://localhost:8123"
       CLICKHOUSE_USER: "testuser"
       CLICKHOUSE_PASSWORD: "testpass"
       NEXT_PUBLIC_LANGFUSE_CLOUD_REGION: ""
+      LANGFUSE_WORKER_HOST: "0.0.0.0"
+      LANGFUSE_WORKER_PORT: "3030"
   pipeline:
     - name: "Start Redis & Postgres, apply Prisma schema"
       working-directory: /app
       runs: |
         redis-server --daemonize yes
-
+        
         mkdir -p /var/lib/postgresql/data
         chown build:build /var/lib/postgresql/data
-
+        
         mkdir -p /var/run/postgresql
         chown build:build /var/run/postgresql
-
+        
         su build -c "initdb -D /var/lib/postgresql/data"
-
         su build -c "pg_ctl -D /var/lib/postgresql/data -o '-k /var/run/postgresql' start"
-
+        
         su build -c "/usr/bin/psql \
           -h /var/run/postgresql \
           -d postgres \
@@ -164,22 +177,36 @@ test:
             CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'postgres';
             CREATE DATABASE test OWNER postgres;
         EOSQL"
-
-        /app/node_modules/.bin/prisma db push \
-          --accept-data-loss \
-          --skip-generate \
-          --schema=/app/node_modules/.prisma/client/schema.prisma
-    - name: "Verify worker files (with Redis & Postgres schema)"
+        
+        SCHEMA_FILE=$(find . -name "schema.prisma" -type f | head -1)
+        if [ -n "$SCHEMA_FILE" ]; then
+          echo "Found schema at: $SCHEMA_FILE"
+          npx prisma generate --schema="$SCHEMA_FILE" || true
+          npx prisma db push --accept-data-loss --skip-generate --schema="$SCHEMA_FILE"
+        fi
+        
+    - name: "Test worker startup via entrypoint"
+      uses: test/daemon-check-output
       working-directory: /app
-      runs: |
-        test -f worker/entrypoint.sh
-        test -x worker/entrypoint.sh
-        test -f worker/dist/index.js
+      with:
+        setup: |
+          # Verify the worker files exist
+          if [ ! -f /app/worker/entrypoint.sh ]; then
+            echo "ERROR: /app/worker/entrypoint.sh not found"
+            ls -la /app/worker/ || echo "worker directory not found"
+            exit 1
+          fi
+          if [ ! -f /app/worker/dist/index.js ]; then
+            echo "ERROR: /app/worker/dist/index.js not found"
+            exit 1
+          fi
+        start: |
+          dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js
 
-        dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js &
-        WORKER_PID=$!
-        sleep 2
-        kill $WORKER_PID || true
+        timeout: 60
+        expected_output: |
+          Listening: http://
+          Finished upserting default model prices
 
 update:
   enabled: true

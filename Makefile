@@ -14,13 +14,20 @@ MELANGE ?= $(shell which melange)
 WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
-SOURCES ?= gs://wolfi-sources/
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
-ifneq (${MELANGE_RUNNER},)
-	MELANGE_OPTS += --runner ${MELANGE_RUNNER}
+ifeq (${MELANGE_RUNNER},)
+MELANGE_RUNNER = qemu
+$(warning ****************************** WARNING ******************************)
+$(warning *** MELANGE_RUNNER is unset. The default runner is now qemu, which)
+$(warning *** requires chainctl authentication to access the Chainguard kernel.)
+$(warning *** See `melange build --help` for a list of other runner options.)
+$(warning ****************************** WARNING ******************************)
 endif
-QEMU_KERNEL_IMAGE ?= kernel/boot/vmlinuz
+
+MELANGE_OPTS += --runner=${MELANGE_RUNNER}
+MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
+QEMU_KERNEL_IMAGE ?= kernel/$(ARCH)/vmlinuz
 ifeq (${MELANGE_RUNNER},qemu)
 	QEMU_KERNEL_DEP = ${QEMU_KERNEL_IMAGE}
 	export QEMU_KERNEL_IMAGE
@@ -58,10 +65,6 @@ MELANGE_TEST_OPTS += --keyring-append https://packages.wolfi.dev/os/wolfi-signin
 MELANGE_TEST_OPTS += --test-package-append wolfi-base
 MELANGE_TEST_OPTS += --debug
 MELANGE_TEST_OPTS += ${MELANGE_EXTRA_OPTS}
-
-ifeq (${USE_CACHE}, yes)
-	MELANGE_OPTS += --cache-source ${SOURCES}
-endif
 
 ifeq (${LINT}, yes)
 	MELANGE_OPTS += --fail-on-lint-warning
@@ -108,31 +111,34 @@ lib-token: ${CACHEDIR}/.libraries_token.txt
 
 .PHONY: fetch-kernel
 fetch-kernel:
-	rm -rf kernel
-	$(MAKE) kernel/boot/vmlinuz
+	rm -rf kernel/$(ARCH)
+	$(MAKE) kernel/$(ARCH)/vmlinuz
 
-kernel/APKINDEX.tar.gz:
+kernel/%/APKINDEX.tar.gz:
 	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/APKINDEX.tar.gz)
 
-kernel/APKINDEX: kernel/APKINDEX.tar.gz
-	tar -x -C kernel -f $< $(notdir $@)
+kernel/%/APKINDEX: kernel/%/APKINDEX.tar.gz
+	tar -x -C kernel --to-stdout -f $< APKINDEX > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
 	touch $@
 
-kernel/chosen: kernel/APKINDEX
-	# Extract lines with 'P:linux' and the following line that contains the version
+kernel/%/chosen: kernel/%/APKINDEX
+	# Extract lines with 'P:linux-qemu-generic' and the following line that contains the version
 	# This approach is compatible with both GNU and BSD sed
-	awk '/^P:linux$$/ {print; getline; print}' $< > kernel/available
-	grep '^V:' kernel/available | sed 's/V://' | \
+	awk '/^P:linux-qemu-generic$$/ {print; getline; print}' $< > kernel/$*/available
+	grep '^V:' kernel/$*/available | sed 's/V://' | \
 	  sort -V | tail -n1 > $@.tmp
 	# Sanity check that this looks like an apk version
 	grep -E '^([0-9]+\.)+[0-9]+-r[0-9]+$$' $@.tmp
 	mv $@.tmp $@
 
-kernel/linux.apk: kernel/chosen
-	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$(ARCH)/linux-$(shell cat kernel/chosen).apk)
+kernel/%/linux.apk: kernel/%/chosen
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$*/linux-qemu-generic-$(shell cat kernel/$*/chosen).apk)
 
-kernel/boot/vmlinuz: kernel/linux.apk
-	tar -x -C kernel -f $< boot/ 2> /dev/null
+kernel/%/vmlinuz: kernel/%/linux.apk
+	tmpd=kernel/.$$$$ && mkdir -p $$tmpd $(dir $@) && \
+		tar -x -C $$tmpd -f $< boot/ 2> /dev/null && \
+		[ -f $$tmpd/boot/vmlinuz ] && mv $$tmpd/boot/* $(dir $@) && \
+		rc=$$?; rm -Rf $$tmpd; exit $$rc
 	touch $@
 
 yamls := $(wildcard *.yaml)
@@ -153,7 +159,7 @@ packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
 	@echo "Building using docker runner"
-	MELANGE_EXTRA_OPTS="--runner docker" make package/$*
+	MELANGE_RUNNER=docker make package/$*
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
@@ -166,7 +172,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
-$(test_targets): test/%: cache $(KEY)
+$(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
@@ -176,10 +182,10 @@ $(test_targets): test/%: cache $(KEY)
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
 $(docker_test_targets): docker-test/%:
 	@echo "Testing using docker runner"
-	MELANGE_EXTRA_OPTS="--runner docker" make test/$*
+	MELANGE_RUNNER=docker make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
-$(testdbg_targets): test-debug/%: cache $(KEY)
+$(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
@@ -278,5 +284,5 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
   { echo "failed token from $(1) for target $@"; exit 1; }; \
   mkdir -p $$(dirname $(2)) && \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
-  curl -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
+  curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
 	mv "$(2).tmp" "$(2)"

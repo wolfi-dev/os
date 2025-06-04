@@ -1,7 +1,7 @@
 package:
   name: tigera-operator-1.37
   version: "1.37.2"
-  epoch: 1
+  epoch: 3
   description: Kubernetes operator for installing Calico and Calico Enterprise
   copyright:
     - license: Apache-2.0
@@ -17,6 +17,8 @@ environment:
       - ca-certificates-bundle
       - git
       - go
+  environment:
+    CGO_ENABLED: 0
 
 pipeline:
   - uses: git-checkout
@@ -33,18 +35,14 @@ pipeline:
         golang.org/x/crypto@v0.35.0
         golang.org/x/net@v0.38.0
 
-  - runs: |
-      PACKAGE_NAME=github.com/tigera/operator
-      ARCH=$(go env GOARCH)
-      BINDIR=build/_output/bin
-      GIT_VERSION=$(git describe --tags --dirty --always --abbrev=12)
-      CGO_ENABLED=0
-
-      echo "Building operator for ${ARCH} with CGO_ENABLED=${CGO_ENABLED} GOEXPERIMENT=${GOEXPERIMENT} TAGS=${TAGS}"
-      GOEXPERIMENT=${GOEXPERIMENT} GO111MODULE=on CGO_ENABLED=${CGO_ENABLED} go build -buildvcs=false -v -o ${BINDIR}/operator-${ARCH} -tags "${TAGS}" -ldflags "-X ${PACKAGE_NAME}/version.VERSION=${GIT_VERSION} -w" ./cmd/main.go
-      install -Dm755 build/_output/bin/operator-$(go env GOARCH) "${{targets.destdir}}"/usr/bin/operator
-
-  - uses: strip
+  - uses: go/build
+    with:
+      packages: ./cmd/main.go
+      output: operator
+      ldflags: |
+        -X github.com/tigera/operator/version.VERSION=v${{package.version}}
+        -X github.com/tigera/operator/version.GitCommit=$(git rev-parse HEAD)
+        -X github.com/tigera/operator/version.BuildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
 
 update:
   enabled: true
@@ -55,6 +53,10 @@ update:
     tag-filter: v1.37.
 
 test:
+  environment:
+    contents:
+      packages:
+        - k3s
   pipeline:
     - name: Check if binary exists
       runs: |
@@ -79,3 +81,41 @@ test:
           exit 1
         fi
         echo "Operator help command executed successfully."
+    - name: "Launch operator and check for readiness"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # NOTE: While test/kwok/cluster was initially considered for this test it failed to capture the required logs.
+          # due to which we prefer using k3s ensures the operator starts reliably, logs are captured as expected.
+
+          k3s server --disable-agent > /dev/null 2>&1 &
+          K3S_PID=$!
+          for i in {1..20}; do
+            if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+              export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+              if kubectl get nodes >/dev/null 2>&1; then
+                echo "k3s is ready"
+                break
+              fi
+            fi
+            echo "Waiting for k3s to become ready..."
+            sleep 2
+          done
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+          mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+          echo "default" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+        start: operator -kubeconfig /tmp/kubeconfig.yaml -enable-leader-election=false -manage-crds -bootstrap-crds -variant Calico
+        timeout: 40
+        expected_output: |
+          Active operator: proceeding
+          CRDs installed successfully
+        post: |
+          echo "Verifying that Tigera CRDs have been installed..."
+
+          if kubectl get crds | grep -q tigera; then
+            echo "Tigera CRDs installed successfully."
+          else
+            echo "CRDs not installed properly."
+            kubectl get crds || true
+          exit 1
+          fi

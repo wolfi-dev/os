@@ -7,6 +7,7 @@ package:
     - license: BSD-3-Clause
   dependencies:
     runtime:
+      - bash
       - ffmpeg
       - glib
       - libglvnd
@@ -24,20 +25,30 @@ package:
     no-provides: true
 
 vars:
+  # Matching the counterpart image (dyrnq/open-webui:latest) Python version
   py-version: 3.11
 
 environment:
   contents:
     packages:
       - busybox
-      # Does not support NodeJS 23
+      # Does not support NodeJS 23 (as of v0.6.13)
       - nodejs-22
       - npm
       - python-${{vars.py-version}}
       - uv
   environment:
     NODE_OPTIONS: --max_old_space_size=8192
+    RAG_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+    SENTENCE_TRANSFORMERS_HOME: backend/data/cache/embedding/models
     SOURCE_DATE_EPOCH: 315532900
+    TIKTOKEN_CACHE_DIR: backend/data/cache/tiktoken
+    TIKTOKEN_ENCODING_NAME: cl100k_base
+    USE_CUDA: false
+    USE_CUDA_VER: cu128
+    USE_OLLAMA: false
+    WHISPER_MODEL: base
+    WHISPER_MODEL_DIR: backend/data/cache/whisper/models
 
 pipeline:
   - uses: git-checkout
@@ -46,33 +57,38 @@ pipeline:
       repository: https://github.com/open-webui/open-webui
       tag: v${{package.version}}
 
-  - uses: patch
-    with:
-      patches: open-webui-dependency-update.patch
-
   - name: Create venv
     runs: |
       # Create virtual env
-      uv venv venv --seed
-      source venv/bin/activate
+      uv venv --seed
+      source .venv/bin/activate
 
       # Install open-webui
       uv pip install --upgrade pip
       uv pip install .
+      uv pip install torchvision torchaudio
       uv pip uninstall pip
 
+      # Install model data
+      python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')"
+      python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])"
+      python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"
+
+      mkdir -p ${{targets.contextdir}}/usr/share/${{package.name}}/backend/data/cache
+      cp -r backend/data/cache/* ${{targets.contextdir}}/usr/share/${{package.name}}/backend/data/cache
+
       # Cleanup installation
-      find venv -type d -name '__pycache__' -exec rm -rf {} +
-      find venv -type f -name '*.pyc' -exec rm -rf {} +
-      find venv -type d -name "tests" -exec rm -rf {} +
+      find .venv -type d -name '__pycache__' -exec rm -rf {} +
+      find .venv -type f -name '*.pyc' -exec rm -rf {} +
+      find .venv -type d -name "tests" -exec rm -rf {} +
 
       # Use Python in virtual environment
-      sed -i "s|/home/build/venv|/usr/share/${{package.name}}|g" venv/pyvenv.cfg
-      sed -i "s|/home/build/venv|/usr/share/${{package.name}}|g" venv/bin/*
+      sed -i "s|/home/build/.venv|/usr/share/${{package.name}}|g" .venv/pyvenv.cfg
+      sed -i "s|/home/build/.venv|/usr/share/${{package.name}}|g" .venv/bin/*
 
       # Install virtual env
       mkdir -p ${{targets.contextdir}}/usr/share/${{package.name}}/
-      cp -r venv/* ${{targets.contextdir}}/usr/share/${{package.name}}/
+      cp -r .venv/* ${{targets.contextdir}}/usr/share/${{package.name}}/
 
       # Symlink binaries
       mkdir -p ${{targets.contextdir}}/usr/bin
@@ -85,16 +101,66 @@ pipeline:
         fi
       done
 
+      # Copy files from repo
+      cp backend/start.sh ${{targets.contextdir}}/usr/share/${{package.name}}/backend/
+      cp CHANGELOG.md package.json ${{targets.contextdir}}/usr/share/${{package.name}}/
+
+subpackages:
+  - description: Compat package for open-webui
+    name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/app ${{targets.contextdir}}/app/backend
+          ln -sf /usr/share/${{package.name}}/backend/start.sh ${{targets.contextdir}}/app/backend/start.sh
+          ln -sf /usr/share/${{package.name}}/backend/data/ ${{targets.contextdir}}/app/backend/data
+          ln -sf /usr/share/${{package.name}}/lib/python${{vars.py-version}}/site-packages/open_webui ${{targets.contextdir}}/app/backend/open_webui
+          ln -sf /usr/share/${{package.name}}/lib/python${{vars.py-version}}/site-packages/open_webui/frontend" "${{targets.contextdir}}/app/build
+          ln -sf /usr/share/${{package.name}}/package.json ${{targets.contextdir}}/app/package.json
+          ln -sf /usr/share/${{package.name}}/CHANGELOG.md ${{targets.contextdir}}/app/CHANGELOG.md
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - name: Readlink test
+          runs: |
+            readlink -f /app/backend | grep /usr/share/${{package.name}}/backend
+            readlink -f /app/backend/open_webui | grep /usr/share/${{package.name}}/backend/open_webui
+            readlink -f /app/backend/start.sh
+
 test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - curl
+        - jq
+        - wait-for-it
+    environment:
+      PATH: /usr/share/open-webui/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin
   pipeline:
+    - name: Readlink test
+      runs: |
+        for bin in /usr/share/${{package.name}}/bin/*
+        do
+          if [[ $bin != *"python"* ]]
+          then
+            readlink -f "/usr/bin/${bin##*/}" | grep "/usr/share/${{package.name}}/bin/${bin##*/}"
+          fi
+        done
     - uses: test/daemon-check-output
+      working-directory: /app/backend
       with:
         expected_output: |
           Creating knowledge table
           v${{package.version}} - building the best AI user interface.
           Started server process
           Waiting for application startup.
-        start: open-webui serve
+        # post: |-
+        #   wait-for-it -t 180 localhost:8080
+        #   curl localhost:8080/health | jq '.status' | grep true
+        start: bash start.sh
         timeout: 300
 
 update:

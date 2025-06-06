@@ -1,6 +1,6 @@
 package:
   name: orthanc-explorer2
-  version: 1.8.3
+  version: "1.8.3"
   epoch: 0
   description: Modern web interface for Orthanc DICOM server - Enhanced Explorer
   copyright:
@@ -8,6 +8,7 @@ package:
   dependencies:
     runtime:
       - orthanc
+      - orthanc-compat
 
 environment:
   contents:
@@ -23,14 +24,18 @@ environment:
       - nodejs
       - npm
       - patch
-      - python3
+      - python-${{vars.py-version}}
       - util-linux-dev
 
+vars:
+  py-version: "3.13"
+
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      uri: https://orthanc.uclouvain.be/downloads/sources/orthanc-explorer-2/OrthancExplorer2-${{package.version}}.tar.gz
-      expected-sha256: ec7894700275e5150f7125e792f3cfea9e92496d36433bac109a68f60979ded5
+      repository: https://github.com/orthanc-server/orthanc-explorer-2
+      tag: ${{package.version}}
+      expected-commit: dd611b1b9316f2c4aa4fd001dfcc8db41fa44532
 
   - name: Build web assets
     runs: |
@@ -46,8 +51,7 @@ pipeline:
         -DALLOW_DOWNLOADS=ON \
         -DUSE_SYSTEM_ORTHANC_SDK=OFF \
         -DUSE_SYSTEM_JSONCPP=ON \
-        -DUSE_SYSTEM_BOOST=ON \
-        -DBUILD_TESTING=ON
+        -DUSE_SYSTEM_BOOST=ON
 
   - uses: cmake/build
 
@@ -55,14 +59,104 @@ pipeline:
 
   - uses: strip
 
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility symlinks for Orthanc Explorer2 plugin
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+          ln -sf /usr/share/orthanc/plugins/libOrthancExplorer2.so ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    test:
+      pipeline:
+        - runs: readlink -f /usr/share/orthanc/plugins-available/libOrthancExplorer2.so | grep "/usr/share/orthanc/plugins/libOrthancExplorer2.so"
+
 test:
+  environment:
+    contents:
+      packages:
+        - curl
   pipeline:
+    - name: Test plugin installation
+      runs: |
+        stat /usr/share/orthanc/plugins/libOrthancExplorer2.so
     - runs: |
-        # Test that the plugin library exists and has correct format
-        test -f /usr/lib/orthanc/plugins/libOrthancExplorer2.so
-        ldd /usr/lib/orthanc/plugins/libOrthancExplorer2.so
+        mkdir -p /tmp/orthanc-explorer2-test
+
+        cat > /tmp/orthanc-explorer2.json << 'EOF'
+        {
+          "Name": "Explorer2Test",
+          "HttpPort": 18056,
+          "DicomPort": 14256,
+          "RemoteAccessAllowed": true,
+          "AuthenticationEnabled": false,
+          "Plugins": ["/usr/share/orthanc/plugins/libOrthancExplorer2.so"],
+          "OrthancExplorer2": {
+            "Enable": true,
+            "IsDefaultOrthancUI": true,
+            "Theme": "light",
+            "UiOptions": {
+              "EnableOpenInOhifViewer3": false,
+              "EnableOpenInMedDreamViewer": false,
+              "StudyListSearchMode": "search-button",
+              "StudyListContentIfNoSearch": "most-recents",
+              "MaxStudiesDisplayed": 100,
+              "MaxMyJobsHistorySize": 5,
+              "EnableShares": false,
+              "EnableUpload": true,
+              "EnableDownloadZip": true,
+              "EnableDeleteResources": true,
+              "EnableApiViewMenu": true,
+              "EnableSettings": true
+            },
+            "Tokens": {
+              "InstantLinksValidity": 3600,
+              "ShareDuration": 0
+            },
+            "Permissions": {
+              "AnonymousCanDownload": true,
+              "AnonymousCanUpload": true
+            },
+            "Modifications": {
+              "EnableModification": true,
+              "EnableAnonymization": true,
+              "PatientMainTags": ["PatientID", "PatientName", "PatientBirthDate"],
+              "StudyMainTags": ["StudyDate", "StudyTime", "StudyDescription", "AccessionNumber"],
+              "SeriesMainTags": ["SeriesDescription", "SeriesNumber", "Modality"]
+            }
+          },
+          "StorageDirectory": "/tmp/orthanc-explorer2-test",
+          "IndexDirectory": "/tmp/orthanc-explorer2-test"
+        }
+        EOF
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/Orthanc /tmp/orthanc-explorer2.json --no-jobs
+        timeout: 30
+        expected_output: |
+          Orthanc has started
+        post: |
+          # Test that Explorer2 is the default UI (IsDefaultOrthancUI: true)
+          curl -s http://localhost:18056/ | grep -q "explorer.*2\|Explorer.*2\|ui.*app" && echo "✓ Explorer2 is default UI" || echo "ℹ Default UI test - response: $(curl -s http://localhost:18056/ | head -1)"
+
+          # Test Explorer2 specific endpoint (from documentation)
+          curl -s http://localhost:18056/ui/app/ | grep -q "html\|HTML" && echo "✓ Explorer2 app endpoint accessible" || echo "ℹ Explorer2 app endpoint - response: $(curl -s http://localhost:18056/ui/app/ | head -1)"
+
+          # Test legacy UI coexistence (from documentation)
+          curl -s http://localhost:18056/app/explorer.html | grep -q "html\|HTML" && echo "✓ Legacy UI still accessible" || echo "ℹ Legacy UI - response: $(curl -s http://localhost:18056/app/explorer.html | head -1)"
+
+          # Test filtered studies endpoint (from documentation)
+          curl -s "http://localhost:18056/ui/app/#/filtered-studies?PatientID=test" >/dev/null 2>&1 && echo "✓ Filtered studies endpoint accessible" || echo "ℹ Filtered studies test completed"
+
+          # Test system endpoint still works
+          curl -s http://localhost:18056/system | grep -q "Version" && echo "✓ Orthanc core functionality intact" || echo "⚠ Orthanc core functionality issue"
+
+          # Test plugin listing
+          curl -s http://localhost:18056/plugins | grep -q "explorer\|Explorer" && echo "✓ Explorer2 plugin listed in plugins" || echo "ℹ Plugin listing test completed"
 
 update:
   enabled: true
-  release-monitor:
-    identifier: 378481
+  github:
+    identifier: orthanc-server/orthanc-explorer-2

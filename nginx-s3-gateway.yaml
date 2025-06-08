@@ -2,7 +2,7 @@
 package:
   name: nginx-s3-gateway
   version: 0_git20250605
-  epoch: 0
+  epoch: 1
   description: NGINX S3 Gateway
   copyright:
     - license: Apache-2.0
@@ -36,7 +36,6 @@ pipeline:
       NGINX_DIRECTORY=${{targets.destdir}}/etc/nginx
       install -Dpm0644 -t "${NGINX_DIRECTORY}/conf.d/gateway/" ./oss/etc/nginx/conf.d/gateway/server_variables.conf
       install -Dpm0644 -t "${NGINX_DIRECTORY}/templates/" ./oss/etc/nginx/templates/upstreams.conf.template
-
       install -Dpm0644 -t "${NGINX_DIRECTORY}/include/" ./common/etc/nginx/include/*.js
       install -Dpm0644 -t "${NGINX_DIRECTORY}/templates/gateway/" ./common/etc/nginx/templates/gateway/*.template
       install -Dpm0644 -t "${NGINX_DIRECTORY}/templates/" ./common/etc/nginx/templates/*.template
@@ -82,6 +81,80 @@ subpackages:
         - name: Check if module directory exists and is writeable by root
           runs: |
             stat /var/cache/nginx/s3_proxy | grep '0755'
+
+  - name: ${{package.name}}-unprivileged
+    description: Unprivileged configuration for NGINX S3 Gateway
+    dependencies:
+      replaces:
+        - nginx-stable-config
+      runtime:
+        - njs
+        - nginx-stable
+        - nginx-mod-http_xslt_filter
+        - nginx-mod-http_image_filter
+        - nginx-mod-http_geoip
+    pipeline:
+      - name: Copy and modify configurations for unprivileged operation
+        runs: |
+          # Copy the configuration files from the main package build
+          NGINX_DIRECTORY=${{targets.subpkgdir}}/etc/nginx
+          mkdir -p "${NGINX_DIRECTORY}"
+          cp -r ${{targets.destdir}}/etc/nginx/* "${NGINX_DIRECTORY}/"
+
+          # Apply unprivileged modifications
+          sed -i "/^server {/a \    listen       8080;" "${NGINX_DIRECTORY}/templates/default.conf.template"
+          sed -i '/user  nginx;/d' "${NGINX_DIRECTORY}/nginx.conf"
+          sed -i 's#http://127.0.0.1:80#http://127.0.0.1:8080#g' "${NGINX_DIRECTORY}/include/s3gateway.js"
+          sed -i 's,/var/run/nginx.pid,/tmp/nginx.pid,' "${NGINX_DIRECTORY}/nginx.conf"
+          sed -i "/^http {/a \\
+          proxy_temp_path /tmp/proxy_temp;\\
+          client_body_temp_path /tmp/client_temp;\\
+          fastcgi_temp_path /tmp/fastcgi_temp;\\
+          uwsgi_temp_path /tmp/uwsgi_temp;\\
+          scgi_temp_path /tmp/scgi_temp;" \
+          "${NGINX_DIRECTORY}/nginx.conf"
+    test:
+      environment:
+        contents:
+          packages:
+            - nginx-stable
+        accounts:
+          groups:
+            - groupname: nginx
+              gid: 65532
+          users:
+            - username: nginx
+              gid: 65532
+              uid: 65532
+      pipeline:
+        - name: Check directory structure and file permissions
+          runs: |
+            NGINX_DIR="/etc/nginx"
+            check_root_nonexec() {
+              TARGET_DIR="${1}"
+              FILE_TYPE="${2}"
+              shift
+              shift
+              FILES_FOUND="$(mktemp)"
+              find $TARGET_DIR -iname "*.${FILE_TYPE}" -maxdepth 1 -type f -print0 | tee "${FILES_FOUND}"
+              test -s "${TARGET_DIR}" || exit 1
+              cat "${FILES_FOUND}" | xargs -n1 -I{} -0 sh -c 'stat -c "%a-%u-%g" {} | grep "^644-0-0$"'
+            }
+            check_root_nonexec "${NGINX_DIR}/conf.d/gateway/" conf
+            check_root_nonexec "${NGINX_DIR}/templates/" conf.template
+            check_root_nonexec "${NGINX_DIR}/include/" js
+            check_root_nonexec "${NGINX_DIR}/" conf
+        - name: Check if configuration is valid for unprivileged user
+          runs: |
+            mkdir -p /tmp/proxy_temp /tmp/client_temp /tmp/fastcgi_temp /tmp/uwsgi_temp /tmp/scgi_temp /var/log/nginx
+            # Verify unprivileged modifications were applied
+            grep -q "listen       8080;" /etc/nginx/templates/default.conf.template
+            ! grep -q "user  nginx;" /etc/nginx/nginx.conf
+            grep -q "http://127.0.0.1:8080" /etc/nginx/include/s3gateway.js
+            grep -q "/tmp/nginx.pid" /etc/nginx/nginx.conf
+            grep -q "proxy_temp_path /tmp/proxy_temp;" /etc/nginx/nginx.conf
+            nginx -t -c /etc/nginx/nginx.conf
+            nginx -T
 
 update:
   enabled: false

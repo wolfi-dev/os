@@ -100,14 +100,34 @@ clean:
 clean-cache:
 	rm -rf ${CACHEDIR}
 
-${CACHEDIR}/.libraries_token.txt: cache
+${CACHEDIR}/.guarded-repo.token: cache
+	tmpf=$(shell mktemp); \
+	chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev > $${tmpf}; \
+	mv $${tmpf} ${CACHEDIR}/.guarded-repo.token
+
+.PHONY: repo-token
+repo-token: ${CACHEDIR}/.guarded-repo.token
+
+${CACHEDIR}/.libraries.token: cache
 	tmpf=$(shell mktemp); \
 	chainctl auth login --audience libraries.cgr.dev; \
 	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
-	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
+	mv $${tmpf} ${CACHEDIR}/.libraries.token
 
 .PHONY: lib-token
-lib-token: ${CACHEDIR}/.libraries_token.txt
+lib-token: ${CACHEDIR}/.libraries.token
+
+.PHONY: cache-tokens-if-needed/%
+cache-tokens-if-needed/%:
+	auth_needed=$$(yq '.. | select(has("uses")) | select(.uses | test("auth|iamguarded"))' $*); \
+	if [ -n "$$auth_needed" ]; then \
+		$(MAKE) repo-token; \
+		$(MAKE) lib-token; \
+	fi
+
+.PHONY: clean-tokens
+clean-tokens:
+	rm -rf ${CACHEDIR}/*.token
 
 .PHONY: fetch-kernel
 fetch-kernel:
@@ -151,10 +171,12 @@ $(pkg_targets): package/%:
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
+	$(MAKE) cache-tokens-if-needed/$(yamlfile)
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
+	$(MAKE) clean-tokens
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
@@ -165,19 +187,23 @@ dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	$(MAKE) cache-tokens-if-needed/$(yamlfile)
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
+	$(MAKE) clean-tokens
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
 $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	$(MAKE) cache-tokens-if-needed/$(yamlfile)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
+	$(MAKE) clean-tokens
 
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
 $(docker_test_targets): docker-test/%:
@@ -189,13 +215,16 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	$(MAKE) cache-tokens-if-needed/$(yamlfile)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
+	$(MAKE) clean-tokens
 
 .PHONY: dev-container
 dev-container:
 	docker run --pull=always --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
+	    -v "${CACHEDIR}:/tmp/melange-cache" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
 	    ghcr.io/wolfi-dev/sdk:latest

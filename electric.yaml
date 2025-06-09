@@ -1,0 +1,113 @@
+package:
+  name: electric
+  version: "1.0.19"
+  epoch: 0
+  description: General-purpose programming language and runtime environment
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - elixir
+      - erlang
+      - erlang-dev
+      - protoc
+  environment:
+    MIX_ENV: "prod"
+    MIX_TARGET: "application"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 543b20446747ebd9431d7175f4838bd13a7e1779
+      repository: https://github.com/electric-sql/electric
+      tag: "@core/sync-service@${{package.version}}"
+
+  - working-directory: "packages/sync-service"
+    runs: |
+      mix local.hex --force && mix local.rebar --force
+      mix deps.get
+      mix deps.update sentry
+      mix deps.compile
+      mix compile
+      mix release
+      mkdir -p ${{targets.contextdir}}/app
+      cp -r _build/application_prod/rel/electric/* ${{targets.contextdir}}/app/
+      install -Dm0755 _build/application_prod/rel/electric/bin/electric ${{targets.contextdir}}/app/bin/entrypoint
+      install -Dm755 _build/application_prod/rel/electric/bin/electric \
+        ${{targets.contextdir}}/usr/bin/electric
+
+update:
+  enabled: true
+  github:
+    identifier: electric-sql/electric
+    strip-prefix: "@core/sync-service@"
+  ignore-regex-patterns:
+    - "@core/elixir-client"
+    - "@electric-sql/y-electric"
+    - "@electric-sql/react"
+    - "@core/elixir-client"
+    - "@electric-sql/experimental"
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql-client
+        - shadow
+        - sudo-rs
+        - postgresql
+        - curl
+        - wait-for-it
+    environment:
+      PGDATA: /tmp/test_db
+      PGUSER: wolfi
+      DATABASE_URL: "postgresql://wolfi:password@localhost:5432/testdb?sslmode=disable"
+      ELECTRIC_INSECURE: "true"
+      ELECTRIC_PORT: "5000"
+  pipeline:
+    - name: "Test database creation"
+      runs: |
+        useradd $PGUSER
+        sudo -u $PGUSER initdb -D $PGDATA
+        sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/logfile start
+        createdb testdb
+        psql -lqt | cut -d \| -f 1 | grep -qw testdb
+    - name: "Test basic read/write operations"
+      runs: |
+        psql -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, test_value VARCHAR(50));"
+        psql -d testdb -c "INSERT INTO test_table (test_value) VALUES ('Hello, PostgreSQL!');"
+        psql -d testdb -t -A -c "SELECT test_value FROM test_table WHERE id=1;"
+    - working-directory: /app
+      runs: |
+        set -euo pipefail
+        # avoid having error like "Electric requires wal_level >= logical."
+        psql "$DATABASE_URL" -c "ALTER SYSTEM SET wal_level = 'logical';" > /dev/null 2>&1
+        sudo -u $PGUSER pg_ctl -D /tmp/test_db restart > /dev/null 2>&1
+
+        # Run the electric binary with a simple command to ensure it starts correctly
+        bin/electric start > /tmp/electric.log 2>&1 &
+        ELECTRIC_PID=$!
+        echo "Electric service started with PID $ELECTRIC_PID"
+
+        # Wait for electric to be ready
+        wait-for-it --timeout=30 localhost:$ELECTRIC_PORT
+
+        # Check if it's up
+        status_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$ELECTRIC_PORT/v1/shape?table=test_table&offset=-1")
+        if [ "$status_code" -ne 200 ]; then
+          echo "Electric service did not respond with 200 OK (got $status_code)"
+          kill $ELECTRIC_PID
+          exit 1
+        fi
+
+        echo "Electric service is running and responding correctly"
+
+        # Optionally stop the service
+        # Force kill the service immediately
+        kill -9 "$ELECTRIC_PID"
+
+        exit 0

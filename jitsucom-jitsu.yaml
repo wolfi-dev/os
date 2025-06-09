@@ -15,6 +15,7 @@ package:
       - nodejs-18
       - openssl
       - procps
+      - libvips
 
 environment:
   contents:
@@ -83,15 +84,74 @@ subpackages:
           cp -r ./webapps/console/public/* ${{targets.contextdir}}/app/webapps/console/public
 
           # remove musl deps that end up polluting our SCA-generated dependencies with unresolveable deps.
-          rm -rf \
-              ${{targets.contextdir}}/app/node_modules/.pnpm/@img+sharp-libvips-linuxmusl-x64@1.0.4 \
-              ${{targets.contextdir}}/app/node_modules/.pnpm/@img+sharp-linuxmusl-x64@0.33.5
+          find ${{targets.contextdir}}/app/node_modules -type d -name '*musl*' -exec rm -rf {} + 2>/dev/null || true
 
-          find . -type f -name '*musl*.so*'
+          # Remove any musl-related .node files
+          find ${{targets.contextdir}} -type f -name '*.node' -exec sh -c 'ldd "$1" 2>&1 | grep -q musl && rm -f "$1"' _ {} \; 2>/dev/null || true
+
+          # Remove musl shared libraries
+          find ${{targets.contextdir}} -type f -name '*musl*.so*' -delete
+
+          # Remove any files that depend on musl libc
+          find ${{targets.contextdir}} -type f -executable -exec sh -c '
+            if file "$1" | grep -q "ELF" && ldd "$1" 2>&1 | grep -q "musl"; then
+              rm -f "$1"
+            fi
+          ' _ {} \; 2>/dev/null || true
+
 
     dependencies:
       runtime:
         - ${{package.name}}
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+            - procps
+            - wait-for-it
+      pipeline:
+        - uses: test/daemon-check-output
+          with:
+            start: |
+              cd /app
+              # Set required environment variables
+              export DATABASE_URL="postgresql://localhost:5432/jitsu"
+              export CONSOLE_INIT_TOKEN="test123456"
+              export HOSTNAME="::"
+              export SIGNALS_LIFECYCLE=1
+              # Start the console without the database migration
+              cd /app/webapps/console && node server.js
+            timeout: 60
+            expected_output: |
+              Starting the app
+              listening on
+              3000
+            error_strings: |
+              ERROR
+              FAIL
+              FATAL
+              Traceback
+              Exception
+              NullPointerException
+              RuntimeException
+              command not found
+              Cannot find module
+              Module not found
+            post: |
+              #!/bin/sh -ex
+              # Test healthcheck endpoint
+              sleep 5
+              healthcheck_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/healthcheck || echo "000")
+              # We expect it might fail without a proper database, but it should at least respond
+              [ "$healthcheck_response" = "200" ] || [ "$healthcheck_response" = "500" ] || [ "$healthcheck_response" = "503" ] || exit 1
+
+              # Test that the Next.js app is responding
+              home_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/ || echo "000")
+              [ "$home_response" = "200" ] || [ "$home_response" = "302" ] || [ "$home_response" = "307" ] || exit 1
+
+              # Verify prisma CLI is available
+              /usr/local/bin/prisma --version
 
   - name: ${{package.name}}-rotor
     pipeline:
@@ -103,6 +163,26 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+            - nodejs-18
+      pipeline:
+        - name: Verify rotor service files
+          runs: |
+            # Check that rotor service files exist
+            [ -f /app/index.js ] || exit 1
+            [ -f /usr/local/bin/docker-entrypoint.sh ] || exit 1
+            [ -x /usr/local/bin/docker-entrypoint.sh ] || exit 1
+
+            # Check that the rotor app can be loaded
+            cd /app
+            node --check index.js || exit 1
+
+            # Verify basic Node.js functionality
+            node -e "console.log('Rotor service test passed')"
 
 update:
   enabled: true

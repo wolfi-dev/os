@@ -35,22 +35,10 @@ pipeline:
       expected-commit: 95921fa5da93f49ce9eacefb060867b23d942693
 
   - runs: |
+      # Install Turbo & enable PNPM
       npm install turbo@^1.13.4 --global
-
       corepack enable
       corepack prepare pnpm@9.5.0 --activate
-
-      # Configure architecture
-      if [ "${{build.arch}}" = "aarch64" ]; then
-        TARGET_CPU="arm64"
-      else
-        TARGET_CPU="x64"
-      fi
-
-      export npm_config_platform=linux
-      export npm_config_arch=$TARGET_CPU
-      export npm_config_target_arch=$TARGET_CPU
-      export npm_config_libc=glibc
 
       resolutions='{
         "@babel/helpers": "^7.26.10",
@@ -63,11 +51,8 @@ pipeline:
         "undici": "^6.21.2",
         "vite": "^5.4.19",
         "vitest": "^2.1.9",
-        "ws": "^8.17.1",
-        "next": "^15.2.2"
+        "ws": "^8.17.1"
       }'
-
-      # Update the overrides in package.json (pnpm uses overrides, not resolutions)
       jq --argjson overrides "$resolutions" '.pnpm.overrides += $overrides' package.json > temp.json && mv temp.json package.json
 
       turbo prune --scope=worker --docker
@@ -78,29 +63,23 @@ pipeline:
       cp -a out/json/* "${{targets.destdir}}"/app/
 
       SOURCE_DIR=$(pwd)
-
       cd "${{targets.destdir}}"/app
 
+      # Skip migrations & husky hooks in build context
       export SKIP_MIGRATE_DATABASE_SCHEMA=1
       export SKIP_SEED_PRISMA_DATABASE=1
       export HUSKY=0
 
-      pnpm install --no-frozen-lockfile
+      pnpm install --filter=worker... --frozen-lockfile --no-optional
 
-      # Copy full source (preserving symlinks)
       cp -a "${SOURCE_DIR}"/out/full/* .
 
       [ -f worker/entrypoint.sh ] && chmod +x worker/entrypoint.sh
 
-      # Build the worker
       pnpm build --filter=worker
 
-      # Clean up binaries for non-target architectures
-      echo "Cleaning up non-target architecture binaries..."
-
-      # Define patterns to remove based on target architecture
+      # Prune out non-target architectures
       if [ "${{build.arch}}" = "aarch64" ]; then
-        # On ARM64, remove x64/x86_64 binaries
         find node_modules -type f \( \
           -path "*@datadog*/prebuilds/*x64*" -o \
           -path "*@datadog*/prebuilds/*x86_64*" -o \
@@ -111,14 +90,10 @@ pipeline:
           -path "*@esbuild/*x64*" \
         \) -delete 2>/dev/null || true
 
-        # Remove x86_64 specific references
-        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
-          if file "$binary" 2>/dev/null | grep -q "x86-64\|Intel 80386"; then
-            rm -f "$binary"
-          fi
+        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r bin; do
+          file "$bin" 2>/dev/null | grep -q "x86-64\|Intel 80386" && rm -f "$bin"
         done
       else
-        # On x64, remove ARM binaries
         find node_modules -type f \( \
           -path "*@datadog*/prebuilds/*arm64*" -o \
           -path "*@datadog*/prebuilds/*aarch64*" -o \
@@ -130,22 +105,13 @@ pipeline:
           -path "*@esbuild/*arm64*" \
         \) -delete 2>/dev/null || true
 
-        # Remove ARM specific binaries
-        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
-          if file "$binary" 2>/dev/null | grep -q "aarch64\|ARM"; then
-            rm -f "$binary"
-          fi
+        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r bin; do
+          file "$bin" 2>/dev/null | grep -q "aarch64\|ARM" && rm -f "$bin"
         done
       fi
 
-      # Remove all musl variants (since we're using glibc)
-      find node_modules -type f \( \
-        -path "*musl*" -o \
-        -name "*musl*" \
-      \) -delete 2>/dev/null || true
-
-      # Remove test directories that might contain false positives
-      # (like the monorepo-symlink-test vulnerability)
+      # Remove any musl variants and test directories
+      find node_modules -type f \( -path "*musl*" -o -name "*musl*" \) -delete 2>/dev/null || true
       find node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null || true
 
 test:
@@ -213,7 +179,6 @@ test:
       working-directory: /app
       with:
         setup: |
-          # Verify the worker files exist
           if [ ! -f /app/worker/entrypoint.sh ]; then
             echo "ERROR: /app/worker/entrypoint.sh not found"
             ls -la /app/worker/ || echo "worker directory not found"

@@ -1,0 +1,226 @@
+package:
+  name: langfuse-worker
+  version: 3.67.0
+  epoch: 0 
+  description: LLM engineering platform that can be self-hosted
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - dumb-init
+      - glibc
+      - ld-linux
+      - libgcc
+      - libstdc++
+      - nodejs-20
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - corepack
+      - file
+      - jq
+      - nodejs-20
+      - npm
+      - python3
+      - rsync
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/langfuse/langfuse.git
+      tag: v${{package.version}}
+      expected-commit: 1c574b2a5de5feda251fc85e09a9f75299cd9081
+
+  - runs: |
+      npm install turbo@^1.13.4 --global
+
+      corepack enable
+      corepack prepare pnpm@9.5.0 --activate
+
+      resolutions='{
+        "@babel/helpers": "^7.26.10",
+        "@babel/runtime": "^7.26.10",
+        "esbuild": "^0.25.0",
+        "cookie": "^0.7.0",
+        "cross-spawn": "^7.0.5",
+        "path-to-regexp": "^0.1.12",
+        "prismjs": "^1.30.0",
+        "undici": "^6.21.2",
+        "vite": "^5.4.19",
+        "vitest": "^2.1.9",
+        "ws": "^8.17.1", 
+        "brace-expansion": "4.0.1"
+      }'
+
+      # Update the overrides in package.json (pnpm uses overrides, not resolutions)
+      jq --argjson overrides "$resolutions" '.pnpm.overrides += $overrides' package.json > temp.json && mv temp.json package.json
+
+      turbo prune --scope=worker --docker
+
+      mkdir -p "${{targets.destdir}}"/app
+      cp out/pnpm-lock.yaml "${{targets.destdir}}"/app/
+      cp out/pnpm-workspace.yaml "${{targets.destdir}}"/app/
+      cp -a out/json/* "${{targets.destdir}}"/app/
+
+      SOURCE_DIR=$(pwd)
+
+      cd "${{targets.destdir}}"/app
+
+      export SKIP_MIGRATE_DATABASE_SCHEMA=1
+      export SKIP_SEED_PRISMA_DATABASE=1
+      export HUSKY=0
+
+      pnpm install --no-frozen-lockfile
+
+      # Copy full source (preserving symlinks)
+      cp -a "${SOURCE_DIR}"/out/full/* .
+
+      [ -f worker/entrypoint.sh ] && chmod +x worker/entrypoint.sh
+
+      # Build the worker
+      pnpm build --filter=worker
+
+      # Clean up binaries for non-target architectures
+      echo "Cleaning up non-target architecture binaries..."
+
+      # Define patterns to remove based on target architecture
+      if [ "${{build.arch}}" = "aarch64" ]; then
+        # On ARM64, remove x64/x86_64 binaries
+        find node_modules -type f \( \
+          -path "*@datadog*/prebuilds/*x64*" -o \
+          -path "*@datadog*/prebuilds/*x86_64*" -o \
+          -path "*@prisma*/*linux-x64*" -o \
+          -path "*prisma*/*linux-x64*" -o \
+          -path "*msgpackr*/*linux-x64*" -o \
+          -path "*msgpackr*/*x64*" -o \
+          -path "*@esbuild/*x64*" \
+        \) -delete 2>/dev/null || true
+
+        # Remove x86_64 specific references
+        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
+          if file "$binary" 2>/dev/null | grep -q "x86-64\|Intel 80386"; then
+            rm -f "$binary"
+          fi
+        done
+      else
+        # On x64, remove ARM binaries
+        find node_modules -type f \( \
+          -path "*@datadog*/prebuilds/*arm64*" -o \
+          -path "*@datadog*/prebuilds/*aarch64*" -o \
+          -path "*@prisma*/*linux-arm64*" -o \
+          -path "*prisma*/*linux-arm64*" -o \
+          -path "*msgpackr*/*linux-arm64*" -o \
+          -path "*msgpackr*/*arm64*" -o \
+          -path "*msgpackr*/*aarch64*" -o \
+          -path "*@esbuild/*arm64*" \
+        \) -delete 2>/dev/null || true
+
+        # Remove ARM specific binaries
+        find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
+          if file "$binary" 2>/dev/null | grep -q "aarch64\|ARM"; then
+            rm -f "$binary"
+          fi
+        done
+      fi
+
+      # Remove all musl variants (since we're using glibc)
+      find node_modules -type f \( \
+        -path "*musl*" -o \
+        -name "*musl*" \
+      \) -delete 2>/dev/null || true
+
+      # Remove test directories that might contain false positives
+      # (like the monorepo-symlink-test vulnerability)
+      find node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null || true
+
+test:
+  environment:
+    contents:
+      packages:
+        - nodejs-20
+        - npm
+        - dumb-init
+        - curl
+        - procps
+        - redis
+        - postgresql
+        - postgresql-client
+        - ca-certificates-bundle
+        - file
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test"
+      DIRECT_URL: "postgresql://postgres:postgres@localhost:5432/test"
+      NODE_ENV: "production"
+      PORT: "3030"
+      REDIS_HOST: "127.0.0.1"
+      REDIS_PORT: "6379"
+      REDIS_URL: "redis://127.0.0.1:6379"
+      REDIS_AUTH: ""
+      REDIS_CONNECTION_STRING: "redis://127.0.0.1:6379"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "test-bucket"
+      CLICKHOUSE_URL: "http://localhost:8123"
+      CLICKHOUSE_USER: "testuser"
+      CLICKHOUSE_PASSWORD: "testpass"
+      NEXT_PUBLIC_LANGFUSE_CLOUD_REGION: ""
+      LANGFUSE_WORKER_HOST: "0.0.0.0"
+      LANGFUSE_WORKER_PORT: "3030"
+  pipeline:
+    - name: "Start Redis & Postgres, apply Prisma schema"
+      working-directory: /app
+      runs: |
+        redis-server --daemonize yes
+
+        mkdir -p /var/lib/postgresql/data
+        chown build:build /var/lib/postgresql/data
+
+        mkdir -p /var/run/postgresql
+        chown build:build /var/run/postgresql
+
+        su build -c "initdb -D /var/lib/postgresql/data"
+        su build -c "pg_ctl -D /var/lib/postgresql/data -o '-k /var/run/postgresql' start"
+
+        su build -c "/usr/bin/psql \
+          -h /var/run/postgresql \
+          -d postgres \
+          -v ON_ERROR_STOP=1 <<-EOSQL
+            CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'postgres';
+            CREATE DATABASE test OWNER postgres;
+        EOSQL"
+
+        SCHEMA_FILE=$(find . -name "schema.prisma" -type f | head -1)
+        if [ -n "$SCHEMA_FILE" ]; then
+          echo "Found schema at: $SCHEMA_FILE"
+          npx prisma generate --schema="$SCHEMA_FILE" || true
+          npx prisma db push --accept-data-loss --skip-generate --schema="$SCHEMA_FILE"
+        fi
+    - name: "Test worker startup via entrypoint"
+      uses: test/daemon-check-output
+      working-directory: /app
+      with:
+        setup: |
+          # Verify the worker files exist
+          if [ ! -f /app/worker/entrypoint.sh ]; then
+            echo "ERROR: /app/worker/entrypoint.sh not found"
+            ls -la /app/worker/ || echo "worker directory not found"
+            exit 1
+          fi
+          if [ ! -f /app/worker/dist/index.js ]; then
+            echo "ERROR: /app/worker/dist/index.js not found"
+            exit 1
+          fi
+        start: |
+          dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js
+        timeout: 60
+        expected_output: |
+          Listening: http://
+          Finished upserting default model prices
+
+update:
+  enabled: true
+  github:
+    identifier: langfuse/langfuse
+    strip-prefix: v
+    use-tag: true

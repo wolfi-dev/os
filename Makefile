@@ -84,10 +84,6 @@ else
 	MELANGE_OPTS += -r ${WOLFI_REPO}
 endif
 
-# Evaluate all package manifests and packages
-yamls := $(wildcard *.yaml)
-pkgs := $(subst .yaml,,$(yamls))
-
 ${KEY}:
 	${MELANGE} keygen ${KEY}
 
@@ -147,6 +143,8 @@ kernel/%/vmlinuz: kernel/%/linux.apk
 		rc=$$?; rm -Rf $$tmpd; exit $$rc
 	touch $@
 
+yamls := $(wildcard *.yaml)
+pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
 $(pkg_targets): package/%:
 	$(eval yamlfile := $*.yaml)
@@ -307,10 +305,10 @@ endef
 
 define guarded_repo_token
   # iamguarded pipelines use auth/guarded-repo
-  pipelines="auth/github|iamguarded" && \
+  $(eval pipelines := "auth/guarded-repo|iamguarded")
   if yq e -e '.. | select(has("uses")) \
-                 | select(.uses | test("${pipelines}"))' \
-                 $1.yaml > /dev/null; then \
+                 | select(.uses | test($(pipelines)))' \
+                 $1.yaml > /dev/null 2>&1; then \
     echo "Creating guarded repo token for $1…" && \
     mkdir -p $1 && \
     tmpf=$$(mktemp) && \
@@ -324,10 +322,12 @@ define guarded_repo_token
 endef
 
 define guarded_libraries_token
-  pipelines="auth" && \
+  $(eval pipelines := "auth")
+  $(eval ignore_pipelines := "auth/guarded-repo")
   if yq e -e '.. | select(has("uses")) \
-                 | select(.uses | test("${pipelines}"))' \
-                 $1.yaml > /dev/null; then \
+                 | select(.uses | test($(pipelines))) \
+		 | select(.uses != $(ignore_pipelines))' \
+                 $1.yaml > /dev/null 2>&1; then \
     echo "Creating guarded libraries token for $1…" && \
     mkdir -p $1 && \
     tmpf=$$(mktemp) && \

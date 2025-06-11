@@ -1,7 +1,7 @@
 package:
   name: langfuse-worker
   version: 3.66.1
-  epoch: 5
+  epoch: 1
   description: LLM engineering platform that can be self-hosted
   copyright:
     - license: MIT
@@ -40,7 +40,24 @@ pipeline:
       corepack enable
       corepack prepare pnpm@9.5.0 --activate
 
-      resolutions='{
+      # First, prune the monorepo to get only worker dependencies
+      turbo prune --scope=worker --docker
+
+      # Copy the pruned output to the destination
+      mkdir -p "${{targets.destdir}}"/app
+      cp out/pnpm-lock.yaml "${{targets.destdir}}"/app/
+      cp out/pnpm-workspace.yaml "${{targets.destdir}}"/app/
+      cp -a out/json/* "${{targets.destdir}}"/app/
+
+      SOURCE_DIR=$(pwd)
+
+      cd "${{targets.destdir}}"/app
+
+      # CRITICAL: Update package.json files BEFORE running pnpm install
+      # This ensures pnpm sees our overrides from the start
+      
+      # 1. Add pnpm overrides to the root package.json
+      overrides='{
         "@babel/helpers": "^7.26.10",
         "@babel/runtime": "^7.26.10",
         "esbuild": "^0.25.0",
@@ -53,43 +70,56 @@ pipeline:
         "vitest": "^2.1.9",
         "ws": "^8.17.1",
         "resolve": "^1.22.9",
-        "next": "^15.2.2"
+        "next": "15.2.2",
+        "next-auth": "4.24.11"
       }'
 
-      # Update the overrides in package.json (pnpm uses overrides, not resolutions)
-      jq --argjson overrides "$resolutions" '.pnpm.overrides += $overrides' package.json > temp.json && mv temp.json package.json
-
-      # Force update next version in package.json dependencies if it exists
-      if jq -e '.dependencies.next' package.json > /dev/null 2>&1; then
-        jq '.dependencies.next = "^15.2.2"' package.json > temp.json && mv temp.json package.json
+      # Update or create pnpm section with overrides
+      if [ -f package.json ]; then
+        jq --argjson overrides "$overrides" '
+          if .pnpm then
+            .pnpm.overrides = (.pnpm.overrides // {}) + $overrides
+          else
+            .pnpm = { overrides: $overrides }
+          end
+        ' package.json > temp.json && mv temp.json package.json
       fi
 
-      # Also update in devDependencies if it exists
-      if jq -e '.devDependencies.next' package.json > /dev/null 2>&1; then
-        jq '.devDependencies.next = "^15.2.2"' package.json > temp.json && mv temp.json package.json
+      # 2. Update the shared package's peerDependencies to ensure compatibility
+      if [ -f packages/shared/package.json ]; then
+        jq '
+          .peerDependencies = (.peerDependencies // {}) |
+          .peerDependencies.next = "15.2.2" |
+          if .dependencies."next-auth" then
+            .dependencies."next-auth" = "4.24.11"
+          else . end
+        ' packages/shared/package.json > temp.json && mv temp.json packages/shared/package.json
       fi
 
-      turbo prune --scope=worker --docker
+      # 3. Create .npmrc with specific pnpm settings to enforce overrides
+      cat > .npmrc <<EOF
+      node-linker=hoisted
+      strict-peer-dependencies=false
+      auto-install-peers=true
+      resolve-peers-from-workspace-root=true
+      EOF
 
-      mkdir -p "${{targets.destdir}}"/app
-      cp out/pnpm-lock.yaml "${{targets.destdir}}"/app/
-      cp out/pnpm-workspace.yaml "${{targets.destdir}}"/app/
-      cp -a out/json/* "${{targets.destdir}}"/app/
-
-      SOURCE_DIR=$(pwd)
-
-      cd "${{targets.destdir}}"/app
-
+      # 4. Set environment variables
       export SKIP_MIGRATE_DATABASE_SCHEMA=1
       export SKIP_SEED_PRISMA_DATABASE=1
       export HUSKY=0
 
-      echo "node-linker=hoisted" > .npmrc
+      # 5. Install dependencies with --no-frozen-lockfile to allow override resolution
       pnpm install --no-frozen-lockfile
 
+      # 6. Verify Next.js version after install
+      echo "Checking installed Next.js version:"
+      pnpm list next || true
+      
       # Copy full source (preserving symlinks)
       cp -a "${SOURCE_DIR}"/out/full/* .
 
+      # Build the worker
       turbo run build --filter=worker...
 
       [ -f worker/entrypoint.sh ] && chmod +x worker/entrypoint.sh
@@ -147,12 +177,17 @@ pipeline:
       # (like the monorepo-symlink-test vulnerability)
       find node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null || true
 
+      # Final verification of Next.js version
+      echo "Final Next.js version check:"
+      find node_modules -name "package.json" -path "*/next/package.json" -exec grep -H '"version"' {} \; | head -5
+
 test:
   environment:
     contents:
       packages:
         - nodejs-20
         - npm
+        - pnpm
         - dumb-init
         - curl
         - procps

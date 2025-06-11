@@ -104,36 +104,11 @@ clean:
 clean-cache:
 	rm -rf ${CACHEDIR}
 
-%/.guarded-repo.token: cache
+.PHONY: tokens/%
+tokens/%:
 	$(eval pkgname := $*)
-	tmpf=$(shell mktemp) && \
-	chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev > $${tmpf} && \
-	mkdir -p $(pkgname) && \
-	mv $${tmpf} ./$(pkgname)/.guarded-repo.token
-
-guarded_repo_token_targets = $(foreach name,$(pkgs),repo-token/$(name))
-$(guarded_repo_token_targets): repo-token/%: %/.guarded-repo.token
-
-%/.libraries.token: cache
-	$(eval pkgname := $*)
-	tmpf=$(shell mktemp) && \
-	chainctl auth login --audience libraries.cgr.dev && \
-	chainctl auth token --audience libraries.cgr.dev > $${tmpf} && \
-	mkdir -p $(pkgname) && \
-	mv $${tmpf} ./$(pkgname)/.libraries.token
-
-libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
-$(libraries_token_targets): lib-token/%: %/.libraries.token
-
-.PHONY: cache-tokens-if-needed/%
-create-tokens-if-needed/%:
-	$(eval yamlfile := $*.yaml)
-	$(eval pkgname := $*)
-	auth_needed=$$(yq '.. | select(has("uses")) | select(.uses | test("auth|iamguarded"))' $(yamlfile)); \
-	if [ -n "$$auth_needed" ]; then \
-		$(MAKE) repo-token/$(pkgname); \
-		$(MAKE) lib-token/$(pkgname); \
-	fi
+	@$(call guarded_repo_token,$(pkgname))
+	@$(call guarded_libraries_token,$(pkgname))
 
 .PHONY: clean-tokens/%
 clean-tokens/%:
@@ -180,7 +155,7 @@ $(pkg_targets): package/%:
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
-	$(MAKE) create-tokens-if-needed/$(pkgname)
+	$(MAKE) tokens/$(pkgname)
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
@@ -197,7 +172,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) create-tokens-if-needed/$(pkgname)
+	$(MAKE) tokens/$(pkgname)
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
@@ -211,7 +186,7 @@ $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) create-tokens-if-needed/$(pkgname)
+	$(MAKE) tokens/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
@@ -227,7 +202,7 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) create-tokens-if-needed/$*
+	$(MAKE) tokens/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
@@ -321,9 +296,44 @@ check-bootstrap:
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
 
-authget = tok=$$(chainctl auth token --audience=$(1)) || \
+define authget
+  tok=$$(chainctl auth token --audience=$(1)) || \
   { echo "failed token from $(1) for target $@"; exit 1; }; \
   mkdir -p $$(dirname $(2)) && \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
   curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
-	mv "$(2).tmp" "$(2)"
+  mv "$(2).tmp" "$(2)"
+endef
+
+define guarded_repo_token
+  # iamguarded pipelines use auth/guarded-repo
+  pipelines="auth/github|iamguarded" && \
+  if yq e -e '.. | select(has("uses")) \
+                 | select(.uses | test("${pipelines}"))' \
+                 $1.yaml > /dev/null; then \
+    echo "Creating guarded repo token for $1…" && \
+    mkdir -p $1 && \
+    tmpf=$$(mktemp) && \
+    chainctl auth octo-sts \
+      --identity=guarded-package-repos \
+      --scope=chainguard-dev > $${tmpf} && \
+    mv $${tmpf} $1/.guarded-repo.token; \
+  else \
+    echo "$1 does not use a guarded repo. Skipping token creation."; \
+  fi
+endef
+
+define guarded_libraries_token
+  pipelines="auth" && \
+  if yq e -e '.. | select(has("uses")) \
+                 | select(.uses | test("${pipelines}"))' \
+                 $1.yaml > /dev/null; then \
+    echo "Creating guarded libraries token for $1…" && \
+    mkdir -p $1 && \
+    tmpf=$$(mktemp) && \
+    chainctl auth token --audience=libraries.chainguard.dev > $${tmpf} && \
+    mv $${tmpf} $1/.libraries.token; \
+  else \
+    echo "$1 does not use guarded libraries. Skipping token creation."; \
+  fi
+endef

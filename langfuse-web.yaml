@@ -1,0 +1,147 @@
+package:
+  name: langfuse-web
+  version: "3.52.0"
+  epoch: 0
+  description: "Langfuse - a tool for observability in LLM applications"
+  copyright:
+    - license: "MIT"
+  dependencies:
+    runtime:
+      - dumb-init
+      - nodejs-20
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - corepack
+      - libcrypto3
+      - nodejs-20
+      - npm
+      - openssl-dev
+      - pnpm
+      - file
+  environment:
+    LANG: "en_US.UTF-8"
+    LC_ALL: "en_US.UTF-8"
+    NODE_OPTIONS: "--max-old-space-size=4096"
+    NEXTAUTH_SECRET: "test"
+    NEXTAUTH_URL: "http://localhost:3000"
+    CLICKHOUSE_USER: "default"
+    CLICKHOUSE_PASSWORD: "test"
+    SALT: "test"
+    DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/postgres"
+    CLICKHOUSE_URL: "http://localhost:8123"
+    LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse-event-upload-test"
+    NEXT_TELEMETRY_DISABLED: "1"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/langfuse/langfuse.git
+      tag: v${{package.version}}
+      expected-commit: 5b77e5835b10aa20ac3e61411baa7413dbbebc11
+  - name: "Install and bump deps"
+    runs: |
+      npm install turbo@^1.13.4 --global
+      npm install --no-package-lock prisma@6.3.0 dd-trace@5.36.0
+      corepack enable
+      corepack prepare pnpm@latest --activate
+
+      # Configure architecture
+      if [ "${{build.arch}}" = "aarch64" ]; then
+        TARGET_CPU="arm64"
+      else
+        TARGET_CPU="x64"
+      fi
+
+      export npm_config_platform=linux
+      export npm_config_arch=$TARGET_CPU
+      export npm_config_target_arch=$TARGET_CPU
+      export npm_config_libc=glibc
+      pnpm pkg set \
+        "pnpm.overrides.@babel/helpers=^7.26.10" \
+        "pnpm.overrides.@babel/runtime=^7.26.10" \
+        "pnpm.overrides.esbuild=^0.25.0" \
+        "pnpm.overrides.@esbuild/linux-x64=^0.25.0" \
+        "pnpm.overrides.prismjs=^1.30.0"
+        # "pnpm.overrides.next=^15.2.2"
+        # bumping this causes build errors 
+        # Object literal may only specify known properties, but 'instrumentationHook' does not exist in type 'ExperimentalConfig'. Did you mean to write 'clientInstrumentationHook'?
+      pnpm install --ignore-scripts
+
+  - name: "Build"
+    runs: |
+      pnpm run build --filter=web
+
+  - name: "Move build into correct directories"
+    runs: |
+      mkdir -p "${{targets.destdir}}"/app/
+      mkdir -p "${{targets.destdir}}"/app/web/.next/static
+      mkdir -p "${{targets.destdir}}"/app/packages/shared/prisma
+      mkdir -p "${{targets.destdir}}"/app/packages/shared/clickhouse
+      mkdir -p "${{targets.destdir}}"/app/packages/shared/scripts
+
+      # Install or copy files with appropriate permissions
+      cp -r web/.next/standalone/. "${{targets.destdir}}"/app/
+      cp -r web/.next/static "${{targets.destdir}}"/app/web/.next/
+      cp -r web/public "${{targets.destdir}}"/app/web/
+
+      cp -r packages/shared/prisma/. "${{targets.destdir}}"/app/packages/shared/prisma/
+      cp -r packages/shared/clickhouse/. "${{targets.destdir}}"/app/packages/shared/clickhouse/
+
+      install -m755 web/entrypoint.sh "${{targets.destdir}}"/app/web/entrypoint.sh
+      install -Dm755 packages/shared/scripts/cleanup.sql "${{targets.destdir}}"/app/packages/shared/scripts/cleanup.sql
+
+      
+  - name: remove deps that cause compat issues
+    runs: |
+      # Remove musl deps
+      # there are bunch of musl based dependencies in the node_modules directory that are pulled in by @datadog alongside their glibc versions which we can't use
+      find "${{targets.destdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'musl' | cut -d: -f1 | xargs rm -f
+      if [ "${{build.arch}}" = "aarch64" ]; then
+        find "${{targets.destdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'arm64' | cut -d: -f1 | xargs rm -f
+      else
+        find "${{targets.destdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'aarch64' | cut -d: -f1 | xargs rm -f
+      fi
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - coreutils
+        - migrate
+        - nodejs-20
+        - npm
+        - shadow
+        - sudo-rs
+        - postgresql
+        - postgresql-client
+    environment:
+      DATABASE_URL: postgresql://postgres@localhost:5432/langfuse_test?sslmode=disable
+      CLICKHOUSE_URL: http://dummy:1234
+      LANGFUSE_AUTO_CLICKHOUSE_MIGRATION_DISABLED: true
+      PGDATA: /tmp/test_db
+      PGUSER: lfuser
+      PGPASS: lftest
+      PGDB: langfuse_test
+  pipeline:
+    - name: "Start Redis & Postgres, apply Prisma schema"
+      working-directory: /app
+      runs: |
+        npm install turbo
+        npm install dotenv
+
+        useradd postgres
+        sudo -u postgres initdb -D ${PGDATA}
+        sudo -u postgres pg_ctl -D ${PGDATA} -l /tmp/logfile start
+        sudo -u postgres createdb ${PGDB}
+        npm install -g prisma
+
+        /app/web/entrypoint.sh
+update:
+  enabled: true
+  github:
+    identifier: langfuse/langfuse
+    strip-prefix: v

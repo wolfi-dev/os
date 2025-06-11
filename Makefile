@@ -105,35 +105,40 @@ clean-cache:
 	rm -rf ${CACHEDIR}
 
 %/.guarded-repo.token: cache
-	tmpf=$(shell mktemp); \
-	chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev > $${tmpf}; \
-	mkdir -p $*; \
-	mv $${tmpf} $*/.guarded-repo.token
+	$(eval pkgname := $*)
+	tmpf=$(shell mktemp) && \
+	chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev > $${tmpf} && \
+	mkdir -p $(pkgname) && \
+	mv $${tmpf} ./$(pkgname)/.guarded-repo.token
 
 guarded_repo_token_targets = $(foreach name,$(pkgs),repo-token/$(name))
 $(guarded_repo_token_targets): repo-token/%: %/.guarded-repo.token
 
 %/.libraries.token: cache
-	tmpf=$(shell mktemp); \
-	chainctl auth login --audience libraries.cgr.dev; \
-	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
-	mkdir -p $*; \
-	mv $${tmpf} $*/.libraries.token
+	$(eval pkgname := $*)
+	tmpf=$(shell mktemp) && \
+	chainctl auth login --audience libraries.cgr.dev && \
+	chainctl auth token --audience libraries.cgr.dev > $${tmpf} && \
+	mkdir -p $(pkgname) && \
+	mv $${tmpf} ./$(pkgname)/.libraries.token
 
 libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
 $(libraries_token_targets): lib-token/%: %/.libraries.token
 
 .PHONY: cache-tokens-if-needed/%
 create-tokens-if-needed/%:
-	auth_needed=$$(yq '.. | select(has("uses")) | select(.uses | test("auth|iamguarded"))' $*.yaml); \
+	$(eval yamlfile := $*.yaml)
+	$(eval pkgname := $*)
+	auth_needed=$$(yq '.. | select(has("uses")) | select(.uses | test("auth|iamguarded"))' $(yamlfile)); \
 	if [ -n "$$auth_needed" ]; then \
-		$(MAKE) repo-token/$*; \
-		$(MAKE) lib-token/$*; \
+		$(MAKE) repo-token/$(pkgname); \
+		$(MAKE) lib-token/$(pkgname); \
 	fi
 
 .PHONY: clean-tokens/%
 clean-tokens/%:
-	rm -rf $*/.*.token
+	$(eval pkgname := $*)
+	rm -rf ./$(pkgname)/.*.token
 
 .PHONY: fetch-kernel
 fetch-kernel:

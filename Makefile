@@ -184,7 +184,7 @@ packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
-	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
+	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/"
 	$(MAKE) clean-tokens/$(pkgname)
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
@@ -202,7 +202,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
-	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
+	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
@@ -213,7 +213,7 @@ $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	$(MAKE) create-tokens-if-needed/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
+	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
 
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
@@ -229,7 +229,7 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	$(MAKE) create-tokens-if-needed/$*
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
+	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
 
 .PHONY: dev-container

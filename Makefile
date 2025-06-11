@@ -84,6 +84,10 @@ else
 	MELANGE_OPTS += -r ${WOLFI_REPO}
 endif
 
+# Evaluate all package manifests and packages
+yamls := $(wildcard *.yaml)
+pkgs := $(subst .yaml,,$(yamls))
+
 ${KEY}:
 	${MELANGE} keygen ${KEY}
 
@@ -100,34 +104,36 @@ clean:
 clean-cache:
 	rm -rf ${CACHEDIR}
 
-${CACHEDIR}/.guarded-repo.token: cache
+%/.guarded-repo.token: cache
 	tmpf=$(shell mktemp); \
 	chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev > $${tmpf}; \
-	mv $${tmpf} ${CACHEDIR}/.guarded-repo.token
+	mkdir -p $*; \
+	mv $${tmpf} $*/.guarded-repo.token
 
-.PHONY: repo-token
-repo-token: ${CACHEDIR}/.guarded-repo.token
+guarded_repo_token_targets = $(foreach name,$(pkgs),repo-token/$(name))
+$(guarded_repo_token_targets): repo-token/%: %/.guarded-repo.token
 
-${CACHEDIR}/.libraries.token: cache
+%/.libraries.token: cache
 	tmpf=$(shell mktemp); \
 	chainctl auth login --audience libraries.cgr.dev; \
 	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
-	mv $${tmpf} ${CACHEDIR}/.libraries.token
+	mkdir -p $*; \
+	mv $${tmpf} $*/.libraries.token
 
-.PHONY: lib-token
-lib-token: ${CACHEDIR}/.libraries.token
+libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
+$(libraries_token_targets): lib-token/%: %/.libraries.token
 
 .PHONY: cache-tokens-if-needed/%
-cache-tokens-if-needed/%:
-	auth_needed=$$(yq '.. | select(has("uses")) | select(.uses | test("auth|iamguarded"))' $*); \
+create-tokens-if-needed/%:
+	auth_needed=$$(yq '.. | select(has("uses")) | select(.uses | test("auth|iamguarded"))' $*.yaml); \
 	if [ -n "$$auth_needed" ]; then \
-		$(MAKE) repo-token; \
-		$(MAKE) lib-token; \
+		$(MAKE) repo-token/$*; \
+		$(MAKE) lib-token/$*; \
 	fi
 
-.PHONY: clean-tokens
-clean-tokens:
-	rm -rf ${CACHEDIR}/*.token
+.PHONY: clean-tokens/%
+clean-tokens/%:
+	rm -rf $*/.*.token
 
 .PHONY: fetch-kernel
 fetch-kernel:
@@ -161,8 +167,6 @@ kernel/%/vmlinuz: kernel/%/linux.apk
 		rc=$$?; rm -Rf $$tmpd; exit $$rc
 	touch $@
 
-yamls := $(wildcard *.yaml)
-pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
 $(pkg_targets): package/%:
 	$(eval yamlfile := $*.yaml)
@@ -171,7 +175,7 @@ $(pkg_targets): package/%:
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
-	$(MAKE) cache-tokens-if-needed/$(yamlfile)
+	$(MAKE) create-tokens-if-needed/$*
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
@@ -187,23 +191,23 @@ dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) cache-tokens-if-needed/$(yamlfile)
+	$(MAKE) create-tokens-if-needed/$*
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
-	$(MAKE) clean-tokens
+	$(MAKE) clean-tokens/$*
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
 $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) cache-tokens-if-needed/$(yamlfile)
+	$(MAKE) create-tokens-if-needed/$*
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
-	$(MAKE) clean-tokens
+	$(MAKE) clean-tokens/$*
 
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
 $(docker_test_targets): docker-test/%:
@@ -215,10 +219,10 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) cache-tokens-if-needed/$(yamlfile)
+	$(MAKE) create-tokens-if-needed/$*
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
-	$(MAKE) clean-tokens
+	$(MAKE) clean-tokens/$*
 
 .PHONY: dev-container
 dev-container:

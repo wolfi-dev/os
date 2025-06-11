@@ -175,12 +175,12 @@ $(pkg_targets): package/%:
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
-	$(MAKE) create-tokens-if-needed/$*
+	$(MAKE) create-tokens-if-needed/$(pkgname)
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
-	$(MAKE) clean-tokens
+	$(MAKE) clean-tokens/$(pkgname)
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
@@ -190,24 +190,26 @@ $(docker_pkg_targets): docker-package/%:
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
+	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) create-tokens-if-needed/$*
+	$(MAKE) create-tokens-if-needed/$(pkgname)
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
-	$(MAKE) clean-tokens/$*
+	$(MAKE) clean-tokens/$(pkgname)
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
 $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
+	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) create-tokens-if-needed/$*
+	$(MAKE) create-tokens-if-needed/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
-	$(MAKE) clean-tokens/$*
+	$(MAKE) clean-tokens/$(pkgname)
 
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
 $(docker_test_targets): docker-test/%:
@@ -218,11 +220,12 @@ testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
 $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
+	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	$(MAKE) create-tokens-if-needed/$*
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
-	$(MAKE) clean-tokens/$*
+	$(MAKE) clean-tokens/$(pkgname)
 
 .PHONY: dev-container
 dev-container:

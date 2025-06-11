@@ -1,6 +1,6 @@
 package:
   name: airflow-3
-  version: "3.0.1"
+  version: "3.0.2"
   epoch: 0
   description: Platform to programmatically author, schedule, and monitor workflows
   options:
@@ -11,6 +11,7 @@ package:
   dependencies:
     runtime:
       - coreutils # numfmt is required
+      - graphviz
       - keyutils # mysql provider requires libkeyutils.so.1
       - libudev # for libudev.so.1
       - mariadb-connector-c # for libmariadb.so.3
@@ -22,6 +23,8 @@ package:
       - tzdata
       - unixodbc
       - wolfi-baselayout
+    provides:
+      - airflow=${{package.full-version}}
   copyright:
     - license: Apache-2.0
 
@@ -49,6 +52,7 @@ environment:
       - gcc
       - glibc-dev
       - glibc-locales
+      - graphviz
       - localedef
       - mariadb-connector-c-dev
       - mariadb-dev
@@ -63,6 +67,7 @@ environment:
       - python-${{vars.py-version}}
       - python-${{vars.py-version}}-dev
       - rust
+      - uv
       - wget
       - wolfi-base
       - xmlsec-dev
@@ -74,11 +79,7 @@ pipeline:
     with:
       repository: https://github.com/apache/airflow
       tag: ${{package.version}}
-      expected-commit: 4ecebc2973587ebaa2cb12482de82e93d15c092f
-
-  - uses: patch
-    with:
-      patches: urllib3.patch
+      expected-commit: 79838baef32afab08816bba958b4c1622cf162d6
 
   - working-directory: ./airflow-core/src/airflow/ui
     runs: |
@@ -98,7 +99,11 @@ pipeline:
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
 
       python${{vars.py-version}} -m build --wheel
-      pip${{vars.py-version}} install --verbose --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
+      # We need to use uv to avoid `resolution to deep` errors`
+      uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
+
+      # We need to add this additionally  because graphviz is an optional dependency https://github.com/apache/airflow/blob/d2c9563605ca6d3dc40ec0fc2fe6853c86641441/airflow-core/pyproject.toml#L157
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow graphviz
 
   - name: "Build and install the additional provider packages"
     runs: |
@@ -126,7 +131,7 @@ pipeline:
 
         # Build and install the wheel
         python${{vars.py-version}} -m build --wheel
-        pip${{vars.py-version}} install --verbose --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
+        uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
         cd -
       done
 
@@ -140,7 +145,8 @@ pipeline:
       # The first time you run Airflow, it will create a file called `airflow.cfg` in
       # `$AIRFLOW_HOME` directory
       # However, for production case it is advised to generate the configuration
-      export PYTHONPATH=${{targets.destdir}}/opt/airflow/lib/python${{vars.py-version}}/site-packages
+      export PYTHONPATH=${{targets.contextdir}}/opt/airflow:${{targets.contextdir}}/opt/airflow/lib/python${{vars.py-version}}/site-packages
+      export PATH=${{targets.contextdir}}/opt/airflow/bin:$PATH
 
       ${{targets.destdir}}/opt/airflow/bin/airflow config list --defaults > ${{targets.destdir}}/"airflow.cfg"
 
@@ -152,19 +158,21 @@ pipeline:
       install -Dm755 scripts/docker/* ${{targets.destdir}}/scripts/docker
 
 subpackages:
-  - name: airflow-3-compat
+  - name: ${{package.name}}-compat
     dependencies:
       runtime:
         - ${{package.name}}
         - merged-usrsbin
         - wolfi-baselayout
+      provides:
+        - airflow-compat=${{package.full-version}}
     pipeline:
       - runs: |
           # Symlink libstdc++ from usr/lib to /usr/lib/$(uname -m)-linux-gnu/
           mkdir -p ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu
           ln -sf /usr/lib/libstdc++.so.6 ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu/
 
-  - name: airflow-3-bitnami-compat
+  - name: ${{package.name}}-bitnami-compat
     dependencies:
       runtime:
         - ${{package.name}}
@@ -175,6 +183,8 @@ subpackages:
         - merged-usrsbin
         - wait-for-port
         - wolfi-baselayout
+      provides:
+        - airflow-bitnami-compat=${{package.full-version}}
     description: "Compatibility package for Bitnami's Airflow image"
     pipeline:
       - uses: bitnami/compat
@@ -192,9 +202,10 @@ subpackages:
           chmod 0755 ${{targets.subpkgdir}}/opt/airflow/bin/activate
           find ${{targets.subpkgdir}}/opt/bitnami/scripts -type f -exec sed -i 's|/opt/bitnami/scripts/|${{targets.subpkgdir}}/opt/bitnami/scripts/|g' {} +
           sed -i 's/-g "root"//g' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
-          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/add-extra-locales.sh
+          #  bitnami renamed the script
+          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/generate-locales.sh
           ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
-          ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/add-extra-locales.sh
+          ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/generate-locales.sh
           find ${{targets.contextdir}}/opt/bitnami -type f -exec sed -E 's#${{targets.contextdir}}##g' -i {} \;
           sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/entrypoint.sh
 

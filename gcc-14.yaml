@@ -1,0 +1,308 @@
+package:
+  name: gcc-14
+  version: 14.3.0
+  epoch: 0
+  description: "the GNU compiler collection - version 14"
+  copyright:
+    - license: GPL-3.0-or-later WITH GCC-exception-3.1
+  resources:
+    cpu: 16
+    memory: 16Gi
+  dependencies:
+    runtime:
+      - binutils
+      - glibc-dev # Temporary workaround to force build-ordering against new glibc's
+      - libquadmath # This is a temporary workaround for issues with single-arch packages.
+      - libstdc++-14-dev
+      - openssf-compiler-options
+      - posix-cc-wrappers
+
+environment:
+  contents:
+    packages:
+      - bison
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - file
+      - flex-dev
+      - gawk
+      - glibc-iconv
+      - gmp-dev
+      - isl-dev
+      - make
+      - mpc-dev
+      - mpfr-dev
+      - openssf-compiler-options
+      - texinfo
+      - wolfi-baselayout
+      - zlib-dev
+      - zstd-dev
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://ftpmirror.gnu.org/gnu/gcc/gcc-${{package.version}}/gcc-${{package.version}}.tar.xz
+      expected-sha512: cb4e3259640721bbd275c723fe4df53d12f9b1673afb3db274c22c6aa457865dccf2d6ea20b4fd4c591f6152e6d4b87516c402015900f06ce9d43af66d3b7a93
+
+  - working-directory: /home/build/build
+    pipeline:
+      - name: 'Configure GCC'
+        runs: |
+          # Check https://aws.amazon.com/ec2/instance-types/ and
+          # https://cloud.google.com/compute/docs/general-purpose-machines
+          # for most current CPU types on arm64 and x86 to set mtune to
+          # the current generation of CPUs. Other clouds are typically
+          # roughly at the same level (Azure, Oracle, IBM, Linode, etc).
+          case "${{build.arch}}" in
+            "aarch64")
+              march=armv8-a+crc+crypto
+              mtune=neoverse-v2
+              CFLAGS="-mbranch-protection=standard"
+              CXXFLAGS="-mbranch-protection=standard"
+              specs=""
+              ;;
+            "x86_64")
+              march=x86-64-v2
+              mtune=sapphirerapids
+              # Currently hangs on Apple Rosetta 2 emulator
+              specs="-mno-sahf"
+              ;;
+          esac
+          CFLAGS="$CFLAGS" \
+          CXXFLAGS="$CXXFLAGS" \
+          ../configure \
+            --prefix=/usr \
+            --program-suffix="-14" \
+            --disable-nls \
+            --disable-werror \
+            --with-pkgversion='Wolfi ${{package.full-version}}' \
+            --with-glibc-version=2.41 \
+            --enable-initfini-array \
+            --disable-nls \
+            --disable-multilib \
+            --disable-libatomic \
+            --disable-libsanitizer \
+            --enable-host-shared \
+            --enable-shared \
+            --enable-threads \
+            --enable-tls \
+            --enable-default-pie \
+            --enable-default-ssp \
+            --with-system-zlib \
+            --with-arch=$march \
+            --with-tune=$mtune \
+            --with-specs=$specs \
+            --enable-languages=c,c++ \
+            --enable-bootstrap \
+            --enable-gnu-indirect-function \
+            --enable-gnu-unique-object \
+            --enable-cet=auto \
+            --enable-link-mutex \
+            --enable-version-specific-runtime-libs \
+            --with-gcc-major-version-only \
+            --with-linker-hash-style=gnu \
+            --disable-libcc1
+
+          make -j$(nproc)
+          make -j$(nproc) install DESTDIR="${{targets.destdir}}"
+
+  # We don't want to keep the .la files.
+  - runs: |
+      find ${{targets.destdir}} -name '*.la' -print -exec rm \{} \;
+
+  # Remove libffi
+  - runs: |
+      rm -f "${{targets.destdir}}"/usr/lib/libffi* "${{targets.destdir}}"/usr/share/man/man3/ffi*
+      find "${{targets.destdir}}" -name 'ffi*.h' | xargs rm -f
+
+  # For some reason libgcc_s.1 is installed into /lib64/ subdir, which
+  # is not in `gcc -print-search-dirs` libraries location, and thus
+  # link tests fail to find libgcc_s.so linker script. Compiled
+  # binaries at runtime use public libgcc.
+  - name: 'Fix libgcc_s.so location'
+    runs: |
+      cd "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}
+      mv lib64/libgcc_s.* ${{vars.major-version}}/
+      rmdir lib64/
+
+  # Remove stray gcc-tmp (which used to be gcc-M.N.P)
+  - runs: |
+      rm ${{targets.destdir}}/usr/bin/${{host.triplet.gnu}}-gcc-tmp
+
+  # These are outdated and only cause issues with newer glibc.
+  - name: Remove some unneeded include-fixed
+    runs: |
+      rm -f ${{targets.destdir}}/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include-fixed/pthread.h
+
+  - name: 'Clean up documentation'
+    runs: |
+      rm -rf ${{targets.destdir}}/usr/share/info
+
+  - uses: strip
+
+subpackages:
+  - name: 'gcc-14-doc'
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/docs
+
+  - name: 'libstdc++-14'
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/*++.so.* "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+    options:
+      no-provides: true
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: 'libstdc++-14-dev'
+    dependencies:
+      runtime:
+        # libstdc++-14-dev might no longer compatible at link time
+        # with libstdc++ 14 or later, despite being runtime
+        # compatible. Ensure any users of libstdc++-14-dev have access
+        # to link against libstsdc++-14
+        - libstdc++-14
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include/
+          mkdir -p "${{targets.subpkgdir}}"/usr/share/gcc-${{vars.major-version}}/python/libstdcxx
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/*++.a "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/libstdc++.so "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include/*++* "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include/
+          mv "${{targets.destdir}}"/usr/share/gcc-${{vars.major-version}}/python/libstdcxx/* \
+            "${{targets.subpkgdir}}"/usr/share/gcc-${{vars.major-version}}/python/libstdcxx/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: 'gcc-14-default'
+    description: 'Use GCC 14 as system gcc'
+    dependencies:
+      provides:
+        - gcc=${{package.full-version}}
+      runtime:
+        - gcc-14=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+
+          for i in c++ g++ gcc gcc-ar gcc-nm gcc-ranlib; do
+            ln -sf "${{host.triplet.gnu}}-"$i"-14" "${{targets.subpkgdir}}"/usr/bin/"${{host.triplet.gnu}}-"$i
+          done
+
+          for i in c++ g++ cpp gcc gcc-ar gcc-nm gcc-ranlib gcov gcov-dump gcov-tool lto-dump; do
+            ln -sf $i"-14" "${{targets.subpkgdir}}"/usr/bin/$i
+          done
+    test:
+      pipeline:
+        - runs: |
+            c++ --version
+            c++ --help
+            cpp --version
+            cpp --help
+            g++ --version
+            g++ --help
+            gcc --version
+            gcc --help
+            gcc-ar --version
+            gcc-ar --help
+            gcc-nm --version
+            gcc-nm --help
+            gcc-ranlib --version
+            gcc-ranlib --help
+            gcov --version
+            gcov --help
+            gcov-dump --version
+            gcov-dump --help
+            gcov-tool --version
+            gcov-tool --help
+            lto-dump --version
+            lto-dump --help
+
+test:
+  environment:
+    contents:
+      packages:
+        - glibc-dev
+  pipeline:
+    - name: Check basic usage of top level & libexec binaries
+      runs: |
+        # Check C frontend compiler
+        gcc-14 --version | grep ${{package.version}}
+        # Check C++ frontend compiler
+        g++-14 --version | grep ${{package.version}}
+        # Check C empty translation unit compilation
+        : > empty.c
+        gcc-14 -c empty.c
+
+        # Check C++ empty translation unit compilation
+        : > empty.cpp
+        g++-14 -c empty.cpp
+        c++-14 --version
+        c++-14 --help
+        cpp-14 --version
+        cpp-14 --help
+        g++-14 --help
+        gcc-14 --help
+        gcc-ar-14 --version
+        gcc-ar-14 --help
+        gcc-nm-14 --version
+        gcc-nm-14 --help
+        gcc-ranlib-14 --version
+        gcc-ranlib-14 --help
+        gcov-14 --version
+        gcov-14 --help
+        gcov-dump-14 --version
+        gcov-dump-14 --help
+        gcov-tool-14 --version
+        gcov-tool-14 --help
+        lto-dump-14 --version
+        lto-dump-14 --help
+    - name: hello world c
+      runs: |
+        cat >hello.c <<"EOF"
+        #include <stdio.h>
+        int main(int argc, char* argv[]) {
+            printf("hello-c");
+            return 0;
+        }
+        EOF
+
+        gcc-14 -o hello-c hello.c
+        out=$(./hello-c)
+        [ "$out" = "hello-c" ]
+    - name: hello world c++
+      runs: |
+        cat >hello.cpp <<"EOF"
+        #include <iostream>
+        int main() {
+            std::cout << "hello-c++";
+            return 0;
+        }
+        EOF
+
+        g++-14 -o hello-c++ hello.cpp
+        out=$(./hello-c++)
+        [ "$out" = "hello-c++" ]
+    - uses: test/compiler-hardening-check
+      with:
+        cc: gcc-14
+    - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  release-monitor:
+    identifier: 6502
+    version-filter-prefix: "14."

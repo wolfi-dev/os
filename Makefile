@@ -125,7 +125,7 @@ libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
 $(libraries_token_targets): lib-token/%: %/.libraries.token
 
 .PHONY: tokens-if-needed/%
-tokens/%:
+tokens-if-needed/%:
 	$(eval pkgname := $*)
 	@$(call repo_token_if_needed,$(pkgname))
 	@$(call libraries_token_if_needed,$(pkgname))

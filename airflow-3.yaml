@@ -1,6 +1,6 @@
 package:
   name: airflow-3
-  version: "3.0.1"
+  version: "3.0.2"
   epoch: 1
   description: Platform to programmatically author, schedule, and monitor workflows
   options:
@@ -11,6 +11,7 @@ package:
   dependencies:
     runtime:
       - coreutils # numfmt is required
+      - graphviz
       - keyutils # mysql provider requires libkeyutils.so.1
       - libudev # for libudev.so.1
       - mariadb-connector-c # for libmariadb.so.3
@@ -41,6 +42,10 @@ var-transforms:
     match: "/"
     replace: "-"
     to: providers-with-dash
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
 
 environment:
   contents:
@@ -51,6 +56,7 @@ environment:
       - gcc
       - glibc-dev
       - glibc-locales
+      - graphviz
       - localedef
       - mariadb-connector-c-dev
       - mariadb-dev
@@ -77,11 +83,7 @@ pipeline:
     with:
       repository: https://github.com/apache/airflow
       tag: ${{package.version}}
-      expected-commit: 4ecebc2973587ebaa2cb12482de82e93d15c092f
-
-  - uses: patch
-    with:
-      patches: urllib3.patch
+      expected-commit: 79838baef32afab08816bba958b4c1622cf162d6
 
   - working-directory: ./airflow-core/src/airflow/ui
     runs: |
@@ -103,6 +105,9 @@ pipeline:
       python${{vars.py-version}} -m build --wheel
       # We need to use uv to avoid `resolution to deep` errors`
       uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
+
+      # We need to add this additionally  because graphviz is an optional dependency https://github.com/apache/airflow/blob/d2c9563605ca6d3dc40ec0fc2fe6853c86641441/airflow-core/pyproject.toml#L157
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow graphviz
 
   - name: "Build and install the additional provider packages"
     runs: |
@@ -207,6 +212,85 @@ subpackages:
           ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/generate-locales.sh
           find ${{targets.contextdir}}/opt/bitnami -type f -exec sed -E 's#${{targets.contextdir}}##g' -i {} \;
           sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/entrypoint.sh
+
+  - name: ${{package.name}}-iamguarded-compat
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - bash
+        - busybox
+        - coreutils
+        - ini-file
+        - wait-for-port
+        - wolfi-baselayout
+      provides:
+        - airflow-iamguarded-compat=${{package.full-version}}
+    description: "Iamguarded compat for Airflow"
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: airflow
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded
+          ln -sf /opt/airflow /opt/iamguarded
+          mkdir -p ${{targets.contextdir}}/opt/airflow/venv
+          chmod g+rwX /opt/iamguarded
+          ln -sf /opt/airflow/lib /opt/airflow/bin ${{targets.contextdir}}/opt/airflow/venv
+          mkdir -p ${{targets.contextdir}}/opt/airflow/bin
+          touch ${{targets.contextdir}}/opt/airflow/bin/activate
+          chmod 0755 ${{targets.contextdir}}/opt/airflow/bin/activate
+
+          # fix find invocations in scripts to allow copying configuration files
+          sed -i -E 's#find "\$AIRFLOW_BASE_DIR"#find "\$AIRFLOW_BASE_DIR/"#g' /opt/iamguarded/scripts/*.sh
+
+          # prevent certain changes as compat is using symlink
+          sed -i -E 's/configure_permissions_ownership "|ensure_dir_exists "|chmod -R g\+rwX "\$AIRFLOW_BASE_DIR"/true ; # \0/' \
+            /opt/iamguarded/scripts/airflow/postunpack.sh
+
+          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' /opt/iamguarded/scripts/locales/generate-locales.sh
+
+          bash -x /opt/iamguarded/scripts/airflow/postunpack.sh
+          bash -x /opt/iamguarded/scripts/locales/generate-locales.sh
+          sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' /opt/iamguarded/scripts/airflow/entrypoint.sh
+      - uses: iamguarded/finalize-compat
+        with:
+          package: airflow
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        accounts:
+          groups:
+            - groupname: airflow
+              gid: 1001
+          users:
+            - username: airflow
+              gid: 1001
+              uid: 1001
+          run-as: 0
+        contents:
+          packages:
+            - ${{package.name}}
+            - sudo
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: airflow
+            version: ${{vars.major-version}}
+        - working-directory: /
+          pipeline:
+            - name: "Launch the entrypoint / run scripts"
+              uses: test/daemon-check-output
+              with:
+                setup: |
+                  chown 1001:1001 -fR /opt/airflow
+                  mkdir -p /opt/airflow/tmp /opt/airflow/dags
+                start: |
+                  sudo -uairflow -E env PYTHONUSERBASE=/opt/airflow AIRFLOW_HOME=/opt/airflow PATH=/opt/iamguarded/airflow/bin:$PATH /opt/iamguarded/scripts/airflow/entrypoint.sh /opt/iamguarded/scripts/airflow/run.sh
+                timeout: 60
+                expected_output: |
+                  Initializing Airflow
+                  Configuring Airflow URL
 
 update:
   enabled: true

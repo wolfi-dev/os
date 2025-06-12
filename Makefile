@@ -111,8 +111,8 @@ clean-cache:
 	mkdir -p $(pkgname) && \
 	mv $${tmpf} ./$(pkgname)/.guarded-repo.token
 
-guarded_repo_token_targets = $(foreach name,$(pkgs),repo-token/$(name))
-$(guarded_repo_token_targets): repo-token/%: %/.guarded-repo.token
+repo_token_targets = $(foreach name,$(pkgs),repo-token/$(name))
+$(repo_token_targets): repo-token/%: %/.guarded-repo.token
 
 %/.libraries.token:
 	$(eval pkgname := $*)
@@ -124,11 +124,11 @@ $(guarded_repo_token_targets): repo-token/%: %/.guarded-repo.token
 libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
 $(libraries_token_targets): lib-token/%: %/.libraries.token
 
-.PHONY: tokens/%
+.PHONY: tokens-if-needed/%
 tokens/%:
 	$(eval pkgname := $*)
-	@$(call guarded_repo_token,$(pkgname))
-	@$(call guarded_libraries_token,$(pkgname))
+	@$(call repo_token_if_needed,$(pkgname))
+	@$(call libraries_token_if_needed,$(pkgname))
 
 .PHONY: clean-tokens/%
 clean-tokens/%:
@@ -175,7 +175,7 @@ $(pkg_targets): package/%:
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
-	$(MAKE) tokens/$(pkgname)
+	$(MAKE) tokens-if-needed/$(pkgname)
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
@@ -192,7 +192,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) tokens/$(pkgname)
+	$(MAKE) tokens-if-needed/$(pkgname)
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
@@ -206,7 +206,7 @@ $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) tokens/$(pkgname)
+	$(MAKE) tokens-if-needed/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
@@ -222,7 +222,7 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) tokens/$(pkgname)
+	$(MAKE) tokens-if-needed/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
@@ -325,7 +325,7 @@ define authget
   mv "$(2).tmp" "$(2)"
 endef
 
-define guarded_repo_token
+define repo_token_if_needed
   $(eval yamlfile := $1.yaml)
   $(eval pkgname := $1)
   # iamguarded pipelines use auth/guarded-repo
@@ -340,7 +340,7 @@ define guarded_repo_token
   fi
 endef
 
-define guarded_libraries_token
+define libraries_token_if_needed
   $(eval yamlfile := $1.yaml)
   $(eval pkgname := $1)
   $(eval pipelines := "auth")

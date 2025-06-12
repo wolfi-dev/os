@@ -325,7 +325,18 @@ define authget
   mv "$(2).tmp" "$(2)"
 endef
 
+define is_yq_installed
+  $(if $(shell command -v yq),, \
+    $(warning ****************************************************************) \
+    $(warning *** PLEASE INSTALL YQ USING YOUR PREFERRED PACKAGE MANAGER) \
+    $(warning *** YQ IS REQUIRED FOR DETERMINING WHETHER PACKAGES REQUIRE AUTH) \
+    $(warning ****************************************************************) \
+    $(error yq not found - aborting) \
+  )
+endef
+
 define repo_token_if_needed
+  @$(call is_yq_installed)
   $(eval yamlfile := $1.yaml)
   $(eval pkgname := $1)
   # iamguarded pipelines use auth/guarded-repo
@@ -341,6 +352,7 @@ define repo_token_if_needed
 endef
 
 define libraries_token_if_needed
+  @$(call is_yq_installed)
   $(eval yamlfile := $1.yaml)
   $(eval pkgname := $1)
   $(eval pipelines := "auth")

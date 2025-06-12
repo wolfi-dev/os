@@ -127,7 +127,7 @@ $(libraries_token_targets): lib-token/%: %/.libraries.token
 .PHONY: tokens-if-needed/%
 tokens-if-needed/%:
 	$(eval pkgname := $*)
-	@$(call repo_token_if_needed,$(pkgname))
+	@$(call repo_token_if_needed,$(pkgname))	
 	@$(call libraries_token_if_needed,$(pkgname))
 
 .PHONY: clean-tokens/%
@@ -325,25 +325,13 @@ define authget
   mv "$(2).tmp" "$(2)"
 endef
 
-define is_yq_installed
-  $(if $(shell command -v yq),, \
-    $(warning ****************************************************************) \
-    $(warning *** PLEASE INSTALL YQ USING YOUR PREFERRED PACKAGE MANAGER) \
-    $(warning *** YQ IS REQUIRED FOR DETERMINING WHETHER PACKAGES REQUIRE AUTH) \
-    $(warning ****************************************************************) \
-    $(error yq not found - aborting) \
-  )
-endef
-
 define repo_token_if_needed
-  @$(call is_yq_installed)
   $(eval yamlfile := $1.yaml)
   $(eval pkgname := $1)
   # iamguarded pipelines use auth/guarded-repo
-  $(eval pipelines := "auth/guarded-repo|iamguarded")
-  if yq e -e '.. | select(has("uses")) \
-                 | select(.uses | test($(pipelines)))' \
-                 $(yamlfile) > /dev/null 2>&1; then \
+  $(eval pipelines := auth/guarded-repo|iamguarded)
+
+  if grep -qE 'uses:.*($(pipelines))' $(yamlfile); then \
     echo "Creating guarded repo token for $(pkgname)…"; \
     $(MAKE) repo-token/$(pkgname); \
   else \
@@ -352,18 +340,18 @@ define repo_token_if_needed
 endef
 
 define libraries_token_if_needed
-  @$(call is_yq_installed)
   $(eval yamlfile := $1.yaml)
   $(eval pkgname := $1)
-  $(eval pipelines := "auth")
-  $(eval ignore_pipelines := "auth/guarded-repo")
-  if yq e -e '.. | select(has("uses")) \
-                 | select(.uses | test($(pipelines))) \
-		 | select(.uses != $(ignore_pipelines))' \
-                 $(yamlfile) > /dev/null 2>&1; then \
+  $(eval pipelines := auth)
+  $(eval ignore_pipelines := auth/guarded-repo)
+
+  $(eval num_auth_pipelines := $(shell grep -cE 'uses:.*($(pipelines))' $(yamlfile)))
+  $(eval num_ignored_auth_pipelines := $(shell grep -cE 'uses:.*($(ignore_pipelines))' $(yamlfile)))
+
+  if [ $(num_auth_pipelines) -gt $(num_ignored_auth_pipelines) ]; then \
     echo "Creating guarded libraries token for $(pkgname)…"; \
     $(MAKE) lib-token/$(pkgname); \
   else \
-    echo "$1 does not use guarded libraries. Skipping token creation."; \
+    echo "$(pkgname) does not use guarded libraries. Skipping token creation."; \
   fi
 endef

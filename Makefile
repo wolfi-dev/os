@@ -84,6 +84,10 @@ else
 	MELANGE_OPTS += -r ${WOLFI_REPO}
 endif
 
+# Evaluate all package manifests and packages
+yamls := $(wildcard *.yaml)
+pkgs := $(subst .yaml,,$(yamls))
+
 ${KEY}:
 	${MELANGE} keygen ${KEY}
 
@@ -99,6 +103,26 @@ clean:
 .PHONY: clean-cache
 clean-cache:
 	rm -rf ${CACHEDIR}
+
+%/.guarded-repo.token:
+	$(eval pkgname := $*)
+	tmpf=$(shell mktemp) && \
+	chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev > $${tmpf} && \
+	mkdir -p $(pkgname) && \
+	mv $${tmpf} ./$(pkgname)/.guarded-repo.token
+
+guarded_repo_token_targets = $(foreach name,$(pkgs),repo-token/$(name))
+$(guarded_repo_token_targets): repo-token/%: %/.guarded-repo.token
+
+%/.libraries.token:
+	$(eval pkgname := $*)
+	tmpf=$(shell mktemp) && \
+	chainctl auth token --audience libraries.cgr.dev > $${tmpf} && \
+	mkdir -p $(pkgname) && \
+	mv $${tmpf} ./$(pkgname)/.libraries.token
+
+libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
+$(libraries_token_targets): lib-token/%: %/.libraries.token
 
 .PHONY: tokens/%
 tokens/%:
@@ -143,8 +167,6 @@ kernel/%/vmlinuz: kernel/%/linux.apk
 		rc=$$?; rm -Rf $$tmpd; exit $$rc
 	touch $@
 
-yamls := $(wildcard *.yaml)
-pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
 $(pkg_targets): package/%:
 	$(eval yamlfile := $*.yaml)
@@ -304,35 +326,31 @@ define authget
 endef
 
 define guarded_repo_token
+  $(eval yamlfile := $1.yaml)
+  $(eval pkgname := $1)
   # iamguarded pipelines use auth/guarded-repo
   $(eval pipelines := "auth/guarded-repo|iamguarded")
   if yq e -e '.. | select(has("uses")) \
                  | select(.uses | test($(pipelines)))' \
-                 $1.yaml > /dev/null 2>&1; then \
-    echo "Creating guarded repo token for $1…" && \
-    mkdir -p $1 && \
-    tmpf=$$(mktemp) && \
-    chainctl auth octo-sts \
-      --identity=guarded-package-repos \
-      --scope=chainguard-dev > $${tmpf} && \
-    mv $${tmpf} $1/.guarded-repo.token; \
+                 $(yamlfile) > /dev/null 2>&1; then \
+    echo "Creating guarded repo token for $(pkgname)…"; \
+    $(MAKE) repo-token/$(pkgname); \
   else \
     echo "$1 does not use a guarded repo. Skipping token creation."; \
   fi
 endef
 
 define guarded_libraries_token
+  $(eval yamlfile := $1.yaml)
+  $(eval pkgname := $1)
   $(eval pipelines := "auth")
   $(eval ignore_pipelines := "auth/guarded-repo")
   if yq e -e '.. | select(has("uses")) \
                  | select(.uses | test($(pipelines))) \
 		 | select(.uses != $(ignore_pipelines))' \
-                 $1.yaml > /dev/null 2>&1; then \
-    echo "Creating guarded libraries token for $1…" && \
-    mkdir -p $1 && \
-    tmpf=$$(mktemp) && \
-    chainctl auth token --audience=libraries.chainguard.dev > $${tmpf} && \
-    mv $${tmpf} $1/.libraries.token; \
+                 $(yamlfile) > /dev/null 2>&1; then \
+    echo "Creating guarded libraries token for $(pkgname)…"; \
+    $(MAKE) lib-token/$(pkgname); \
   else \
     echo "$1 does not use guarded libraries. Skipping token creation."; \
   fi

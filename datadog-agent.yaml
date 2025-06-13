@@ -2,8 +2,8 @@ package:
   name: datadog-agent
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: "7.64.3"
-  epoch: 0
+  version: "7.66.1"
+  epoch: 1
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -41,6 +41,7 @@ var-transforms:
 environment:
   contents:
     packages:
+      - binutils
       - bison
       - build-base
       - busybox
@@ -98,7 +99,7 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: 0d44e61fa623ef2572ba8d7fbe30e2632540d8aa
+      expected-commit: 7fd1e9afaae664bc382b1a1f18c2336709c6ee11
 
   # Recent commit to the init.go code changed some of the logic of Python path resolving
   # for the embedded Python, causing issues. Let's revert the commit to return to the previous
@@ -106,7 +107,7 @@ pipeline:
   # https://github.com/DataDog/datadog-agent/pull/31426
   - uses: patch
     with:
-      patches: revert-import-python-relatively-instead-of-using-the-patch.patch
+      patches: dont-import-python-relatively.patch fix-7.66.0-ftbfs.patch
 
   # Ensure that we don't run into nvidia GPU issues at runtime.
   - runs: |
@@ -124,9 +125,6 @@ pipeline:
 
   - uses: go/bump
     with:
-      deps: |-
-        golang.org/x/net@v0.36.0
-        github.com/containerd/containerd@v1.7.27
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
 
@@ -183,8 +181,13 @@ pipeline:
 
       # Build once to correctly setup links/generates. The system-probe we end
       # up using will be part of the multicall below.
-      unshare --user --map-root-user \
-        invoke -e system-probe.build
+      if [ "$(id -u)" -gt 0 ]; then
+        # on rootless systems let's use unshare to build
+        unshare --user --map-root-user \
+          invoke -e system-probe.build
+        else
+          invoke -e system-probe.build
+      fi
         #--bundle-ebpf # This makes oom-kill.o to fail because it expects it to be embedded in the Go binary at /build, because
         # of this: https://github.com/DataDog/datadog-agent/blob/eab078f2e713852de8e4f4c168ea009065841903/pkg/ebpf/co_re.go#L71
         # where c.coreDir is by default: /opt/datadog-agent/embedded/share/system-probe/ebpf/co-re
@@ -362,6 +365,9 @@ subpackages:
                 "./datadog_checks_base[deps, http]" \
                 "./datadog_checks_downloader" \
                 $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
+
+              # Remediate GHSA-5rjg-fvgr-3xxf
+              .venv/bin/pip${{vars.py-version}} install --upgrade setuptools
 
               find .venv -name "*.pyc" -delete
               find .venv -name "__pycache__" -exec rm -rf {} +
@@ -595,6 +601,30 @@ subpackages:
             ucspilogd --help
             withstdinas version
             withstdinas help
+
+  - name: dogstatsd
+    dependencies:
+      runtime:
+        - busybox
+        - netcat-openbsd
+    pipeline:
+      - runs: |
+          invoke -e dogstatsd.build
+          strip bin/dogstatsd/dogstatsd
+          install -Dm755 bin/dogstatsd/dogstatsd "${{targets.subpkgdir}}/dogstatsd"
+          mkdir -p ${{targets.subpkgdir}}/etc/conf.d
+          mkdir -p ${{targets.subpkgdir}}/etc/init.d
+      - working-directory: Dockerfiles/dogstatsd/alpine
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp ./install_info ${{targets.subpkgdir}}/etc/datadog-agent/
+          cp ./dogstatsd.yaml ${{targets.subpkgdir}}/etc/datadog-agent/
+          install -Dm755 entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
+          install -Dm755 probe.sh ${{targets.subpkgdir}}/probe.sh
+    test:
+      pipeline:
+        - runs: |
+            /dogstatsd start --help
 
 update:
   enabled: true

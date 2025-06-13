@@ -1,0 +1,375 @@
+package:
+  name: airflow-3
+  version: "3.0.2"
+  epoch: 1
+  description: Platform to programmatically author, schedule, and monitor workflows
+  options:
+    #  There is a dependency on libarrow.so although it
+    #  is provided in the virtual environment. Enabling no-depends
+    #  works around this
+    no-depends: true
+  dependencies:
+    runtime:
+      - coreutils # numfmt is required
+      - graphviz
+      - keyutils # mysql provider requires libkeyutils.so.1
+      - libudev # for libudev.so.1
+      - mariadb-connector-c # for libmariadb.so.3
+      - merged-usrsbin
+      - netcat-openbsd # nc is required
+      - posix-libc-utils # genconf is required
+      - py${{vars.py-version}}-packaging # Airflow uses this at runtime for config loading
+      - python-${{vars.py-version}}
+      - tzdata
+      - unixodbc
+      - wolfi-baselayout
+    provides:
+      - airflow=${{package.full-version}}
+  copyright:
+    - license: Apache-2.0
+
+vars:
+  # As of now (2025/04/28), airflow is primarily available for python 3.12 and will break for python 3.13
+  # For ref: https://airflow.apache.org/blog/airflow-2.9.0
+  py-version: 3.12
+  # This list is based on providers that were part of the 2.x version of this package, as well as manually added dependencies
+  # to ensure we're building dependent providers too (not pulling from PyPi). This is an ordered list.
+  # Use / as a separator
+  providers: "standard amazon sqlite imap smtp ftp fab http celery cncf/kubernetes docker elasticsearch google grpc hashicorp microsoft/azure mysql odbc openlineage postgres redis sendgrid sftp slack snowflake ssh"
+
+var-transforms:
+  - from: ${{vars.providers}}
+    match: "/"
+    replace: "-"
+    to: providers-with-dash
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - cargo-auditable
+      - findutils
+      - gcc
+      - glibc-dev
+      - glibc-locales
+      - graphviz
+      - localedef
+      - mariadb-connector-c-dev
+      - mariadb-dev
+      - nodejs
+      - npm
+      - pkgconf-dev
+      - pnpm
+      - postgresql-dev
+      - py${{vars.py-version}}-build-bin
+      - py${{vars.py-version}}-pip
+      - py${{vars.py-version}}-xmlsec
+      - python-${{vars.py-version}}
+      - python-${{vars.py-version}}-dev
+      - rust
+      - uv
+      - wget
+      - wolfi-base
+      - xmlsec-dev
+      - xmlsec-openssl
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/airflow
+      tag: ${{package.version}}
+      expected-commit: 79838baef32afab08816bba958b4c1622cf162d6
+
+  - working-directory: ./airflow-core/src/airflow/ui
+    runs: |
+      # front-end build
+      yarn install --frozen-lockfile
+      # Update BrowsersList regularly: https://github.com/browserslist/update-db#readme
+      npx update-browserslist-db@latest
+      yarn run build
+      rm -rf node_modules
+
+  - name: "Build and install the main package"
+    runs: |
+      # requires EPOCH to be later that 1980
+      export SOURCE_DATE_EPOCH=315532800
+
+      # To install mysqlclient wheel
+      export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
+
+      python${{vars.py-version}} -m build --wheel
+      # We need to use uv to avoid `resolution to deep` errors`
+      uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
+
+      # We need to add this additionally  because graphviz is an optional dependency https://github.com/apache/airflow/blob/d2c9563605ca6d3dc40ec0fc2fe6853c86641441/airflow-core/pyproject.toml#L157
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow graphviz
+
+  - name: "Build and install the additional provider packages"
+    runs: |
+      # By default, the airflow celery provider is not built, but running the upstream helm chart requires it
+      # There are a few others we want to include by default as well
+
+      cd providers
+      for pkg in ${{vars.providers}}; do
+        cd "$pkg"
+
+        # Python will sometimes pull a 2.x airflow version, we do not want this.
+        if [[ "$pkg" == "celery" ]]; then
+            sed -i 's/"apache-airflow>=2.9.0"/"apache-airflow==${{package.version}}"/' pyproject.toml
+        fi
+
+        # apache-airflow-providers-mysql links against libcrypto.so.1.1 on arm64, and does not provide the
+        # necessary source files to rebuild the package for arm against libcrypto3 (like the x86 version is),
+        # so instead we'll just make sure the provider dependency that does this (mysqlclient) is removed,
+        # and we only use mysql-connector-python instead.
+        if [[ "$pkg" == "mysql" ]]; then
+          if [[ "${{build.arch}}" == "aarch64" ]]; then
+            sed -i '/mysql-connector-python>=/d' pyproject.toml
+          fi
+        fi
+
+        # Build and install the wheel
+        python${{vars.py-version}} -m build --wheel
+        uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
+        cd -
+      done
+
+  - runs: find . -name '__pycache__' -exec rm -rf {} +
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/opt/airflow/dags
+      mkdir -p ${{targets.destdir}}/opt/airflow/logs
+      mkdir -p ${{targets.destdir}}/scripts/docker
+
+      # The first time you run Airflow, it will create a file called `airflow.cfg` in
+      # `$AIRFLOW_HOME` directory
+      # However, for production case it is advised to generate the configuration
+      export PYTHONPATH=${{targets.contextdir}}/opt/airflow:${{targets.contextdir}}/opt/airflow/lib/python${{vars.py-version}}/site-packages
+      export PATH=${{targets.contextdir}}/opt/airflow/bin:$PATH
+
+      ${{targets.destdir}}/opt/airflow/bin/airflow config list --defaults > ${{targets.destdir}}/"airflow.cfg"
+
+      cp airflow-core/src/airflow/config_templates/default_webserver_config.py ${{targets.contextdir}}/
+
+      install -Dm755 scripts/docker/entrypoint_prod.sh ${{targets.destdir}}/entrypoint
+      install -Dm755 scripts/docker/clean-logs.sh ${{targets.destdir}}/clean-logs
+      install -Dm755 scripts/docker/airflow-scheduler-autorestart.sh ${{targets.destdir}}/airflow-scheduler-autorestart
+      install -Dm755 scripts/docker/* ${{targets.destdir}}/scripts/docker
+
+subpackages:
+  - name: ${{package.name}}-compat
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - merged-usrsbin
+        - wolfi-baselayout
+      provides:
+        - airflow-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # Symlink libstdc++ from usr/lib to /usr/lib/$(uname -m)-linux-gnu/
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu
+          ln -sf /usr/lib/libstdc++.so.6 ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu/
+
+  - name: ${{package.name}}-bitnami-compat
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - bash
+        - busybox
+        - coreutils
+        - ini-file
+        - merged-usrsbin
+        - wait-for-port
+        - wolfi-baselayout
+      provides:
+        - airflow-bitnami-compat=${{package.full-version}}
+    description: "Compatibility package for Bitnami's Airflow image"
+    pipeline:
+      - uses: bitnami/compat
+        with:
+          image: airflow
+          version-path: 3/debian-12
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/bitnami
+          ln -sf /opt/airflow ${{targets.subpkgdir}}/opt/bitnami
+          mkdir -p ${{targets.subpkgdir}}/opt/airflow/venv
+          chmod g+rwX ${{targets.subpkgdir}}/opt/bitnami
+          ln -sf /opt/airflow/lib /opt/airflow/bin ${{targets.subpkgdir}}/opt/airflow/venv
+          mkdir -p ${{targets.subpkgdir}}/opt/airflow/bin
+          touch ${{targets.subpkgdir}}/opt/airflow/bin/activate
+          chmod 0755 ${{targets.subpkgdir}}/opt/airflow/bin/activate
+          find ${{targets.subpkgdir}}/opt/bitnami/scripts -type f -exec sed -i 's|/opt/bitnami/scripts/|${{targets.subpkgdir}}/opt/bitnami/scripts/|g' {} +
+          sed -i 's/-g "root"//g' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
+          #  bitnami renamed the script
+          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/generate-locales.sh
+          ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
+          ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/generate-locales.sh
+          find ${{targets.contextdir}}/opt/bitnami -type f -exec sed -E 's#${{targets.contextdir}}##g' -i {} \;
+          sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/entrypoint.sh
+
+  - name: ${{package.name}}-iamguarded-compat
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - bash
+        - busybox
+        - coreutils
+        - ini-file
+        - wait-for-port
+        - wolfi-baselayout
+      provides:
+        - airflow-iamguarded-compat=${{package.full-version}}
+    description: "Iamguarded compat for Airflow"
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: airflow
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded
+          ln -sf /opt/airflow /opt/iamguarded
+          mkdir -p ${{targets.contextdir}}/opt/airflow/venv
+          chmod g+rwX /opt/iamguarded
+          ln -sf /opt/airflow/lib /opt/airflow/bin ${{targets.contextdir}}/opt/airflow/venv
+          mkdir -p ${{targets.contextdir}}/opt/airflow/bin
+          touch ${{targets.contextdir}}/opt/airflow/bin/activate
+          chmod 0755 ${{targets.contextdir}}/opt/airflow/bin/activate
+
+          # fix find invocations in scripts to allow copying configuration files
+          sed -i -E 's#find "\$AIRFLOW_BASE_DIR"#find "\$AIRFLOW_BASE_DIR/"#g' /opt/iamguarded/scripts/*.sh
+
+          # prevent certain changes as compat is using symlink
+          sed -i -E 's/configure_permissions_ownership "|ensure_dir_exists "|chmod -R g\+rwX "\$AIRFLOW_BASE_DIR"/true ; # \0/' \
+            /opt/iamguarded/scripts/airflow/postunpack.sh
+
+          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' /opt/iamguarded/scripts/locales/generate-locales.sh
+
+          bash -x /opt/iamguarded/scripts/airflow/postunpack.sh
+          bash -x /opt/iamguarded/scripts/locales/generate-locales.sh
+          sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' /opt/iamguarded/scripts/airflow/entrypoint.sh
+      - uses: iamguarded/finalize-compat
+        with:
+          package: airflow
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        accounts:
+          groups:
+            - groupname: airflow
+              gid: 1001
+          users:
+            - username: airflow
+              gid: 1001
+              uid: 1001
+          run-as: 0
+        contents:
+          packages:
+            - ${{package.name}}
+            - sudo
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: airflow
+            version: ${{vars.major-version}}
+        - working-directory: /
+          pipeline:
+            - name: "Launch the entrypoint / run scripts"
+              uses: test/daemon-check-output
+              with:
+                setup: |
+                  chown 1001:1001 -fR /opt/airflow
+                  mkdir -p /opt/airflow/tmp /opt/airflow/dags
+                start: |
+                  sudo -uairflow -E env PYTHONUSERBASE=/opt/airflow AIRFLOW_HOME=/opt/airflow PATH=/opt/iamguarded/airflow/bin:$PATH /opt/iamguarded/scripts/airflow/entrypoint.sh /opt/iamguarded/scripts/airflow/run.sh
+                timeout: 60
+                expected_output: |
+                  Initializing Airflow
+                  Configuring Airflow URL
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - 'rc\d+$'
+    - 'helm-chart*'
+  github:
+    identifier: apache/airflow
+    tag-filter-prefix: 3.
+
+test:
+  environment:
+    contents:
+      packages:
+        - py${{vars.py-version}}-pip
+  pipeline:
+    - name: "Ensure no airflow 2.x components are pulled in by mistake"
+      runs: |
+        pip list --path=/opt/airflow/lib/python${{vars.py-version}}/site-packages/ | grep airflow
+        ls -lah /opt/airflow/lib/python${{vars.py-version}}/site-packages/
+
+        # A known bad file example: apache_airflow-2.10.5.dist-info
+        if ls -1 /opt/airflow/lib/python${{vars.py-version}}/site-packages | grep -q "apache_airflow-2.*.dist-info"; then
+            echo "Error: apache_airflow-2.* file(s) found! Please diagnose"
+            exit 1
+        fi
+    - name: "Test Python package import and version"
+      runs: |
+        export PATH=/opt/airflow/bin:$PATH
+        export PYTHONPATH=/opt/airflow/lib/python${{vars.py-version}}/site-packages
+        HOME=/home/build airflow version | grep ${{package.version}}
+        python${{vars.py-version}} -c "import airflow"
+    - name: "List providers"
+      runs: |
+        export PATH=/opt/airflow/bin:$PATH
+        export PYTHONPATH=/opt/airflow/lib/python${{vars.py-version}}/site-packages
+
+        PROVIDERS_LIST=$(airflow providers list)
+        echo $PROVIDERS_LIST
+
+        # Use - as a separator
+        for pkg in ${{vars.providers-with-dash}}; do
+          echo $PROVIDERS_LIST | grep "apache-airflow-providers-$pkg"
+        done
+    - name: "Load and test a DAG"
+      runs: |
+        # Set environment variables
+        export PATH=/opt/airflow/bin:$PATH
+        export PYTHONUSERBASE=/opt/airflow
+        export AIRFLOW_HOME=/opt/airflow
+
+        # Prevents warnings about example dags not being in the right place under /opt/airflow
+        # This is expected as we intentionally put them under /home/airflow, and we use our own test dag
+        export AIRFLOW__CORE__LOAD_EXAMPLES=False
+
+        # Initialize Airflow database
+        airflow db migrate
+
+        # Create and test a simple DAG
+        echo "Creating and testing a simple DAG..."
+        mkdir -p /opt/airflow/dags
+        cat <<EOF > /opt/airflow/dags/test_dag.py
+        from airflow import DAG
+        from airflow.operators.bash import BashOperator
+        from datetime import datetime
+
+        with DAG("test_dag", start_date=datetime(2024, 1, 1), schedule=None) as dag:
+            task = BashOperator(
+                task_id="test_task",
+                bash_command="echo Hello World!"
+            )
+        EOF
+
+        # Reload the db
+        airflow dags reserialize
+
+        # List DAGs
+        airflow dags list | grep test_dag || (echo "DAG not found!" && exit 1)
+
+        # Test Task Execution in DAG
+        airflow tasks test test_dag test_task 2024-01-01 || (echo "Task execution failed!" && exit 1)
+    - uses: test/tw/ldd-check

@@ -1,6 +1,6 @@
 package:
   name: efs-utils
-  version: "2.2.1"
+  version: "2.3.1"
   epoch: 1
   description: Utilities for Amazon Elastic File System (EFS)
   copyright:
@@ -39,7 +39,7 @@ pipeline:
     with:
       repository: https://github.com/aws/efs-utils
       tag: v${{package.version}}
-      expected-commit: e0f8ee5226fd2d5b70a8321b0980fad4e9c0cc70
+      expected-commit: 48cd437bc5212809b1ad546293b3c2931ea79caf
 
   - uses: patch
     with:
@@ -79,6 +79,77 @@ pipeline:
       for p in $d/usr/bin/amazon-efs-mount-watchdog $d/usr/bin/mount.efs ; do
          sed -i -e '1s,^#!.*python3$,#!/usr/bin/python${{vars.py-version}},' "$p"
       done
+
+# This package exists separately because aws-efs-csi-driver requires a custom efs-utils.
+# Upstream moves /etc/amazon/efs to /etc/amazon/efs-static-files
+# (https://github.com/kubernetes-sigs/aws-efs-csi-driver/blob/master/Dockerfile#L91)
+# Since the official deployment mounts a PV at /var/amazon/efs
+# (https://github.com/kubernetes-sigs/aws-efs-csi-driver/blob/66c2106f313d20d97c8a8ca8efc59c957b245ba6/charts/aws-efs-csi-driver/templates/node-daemonset.yaml#L109),
+# modifying efs-utils directly would break its standard usage.
+# To avoid that, we create a separate efs-utils-for-aws-csi-driver package that follows this layout.
+subpackages:
+  - name: ${{package.name}}-for-aws-csi-driver
+    description: compat package for aws-efs-csi-driver
+    dependencies:
+      runtime:
+        - busybox
+        - merged-sbin
+        - nfs-utils
+        - openssl
+        - py${{vars.py-version}}-botocore
+        - stunnel
+        - stunnel-compat
+        - systemd
+        - util-linux
+        - wolfi-baselayout
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/aws/efs-utils
+          tag: v${{package.version}}
+          expected-commit: 48cd437bc5212809b1ad546293b3c2931ea79caf
+      - uses: patch
+        with:
+          patches: GHSA-857q-xmph-p2v5.patch
+      - runs: |
+          # This looks a little funny, but it aims to be easier to maintain, so we just
+          # copy from the upstream `build-deb.sh` script the bits we need.
+          # Ref: https://github.com/aws/efs-utils/blob/master/build-deb.sh
+          cd src/proxy
+          cargo auditable build --release
+          cd ..
+          cd ..
+          export BUILD_ROOT="${{targets.contextdir}}"
+          mkdir -p ${BUILD_ROOT}
+
+          echo 'Creating application directories'
+          mkdir -p ${BUILD_ROOT}/etc/amazon/efs
+          mkdir -p ${BUILD_ROOT}/etc/init/
+          mkdir -p ${BUILD_ROOT}/etc/systemd/system
+          mkdir -p ${BUILD_ROOT}/usr/bin
+          mkdir -p ${BUILD_ROOT}/var/log/amazon/efs
+          mkdir -p ${BUILD_ROOT}/usr/share/man/man8
+
+          echo 'Copying application files'
+          install -p -m 644 dist/amazon-efs-mount-watchdog.conf ${BUILD_ROOT}/etc/init
+          install -p -m 644 dist/amazon-efs-mount-watchdog.service ${BUILD_ROOT}/etc/systemd/system
+          install -p -m 444 dist/efs-utils.crt ${BUILD_ROOT}/etc/amazon/efs
+          install -p -m 644 dist/efs-utils.conf ${BUILD_ROOT}/etc/amazon/efs
+          install -p -m 755 src/mount_efs/__init__.py ${BUILD_ROOT}/usr/bin/mount.efs
+          install -p -m 755 src/proxy/target/release/efs-proxy ${BUILD_ROOT}/usr/bin/efs-proxy
+          install -p -m 755 src/watchdog/__init__.py ${BUILD_ROOT}/usr/bin/amazon-efs-mount-watchdog
+
+          mv ${{targets.contextdir}}/etc/amazon/efs ${{targets.contextdir}}/etc/amazon/efs-static-files
+      - name: edit shbang for python
+        runs: |
+          d=${{targets.destdir}}
+          for p in $d/usr/bin/amazon-efs-mount-watchdog $d/usr/bin/mount.efs ; do
+            sed -i -e '1s,^#!.*python3$,#!/usr/bin/python${{vars.py-version}},' "$p"
+          done
+    test:
+      pipeline:
+        - runs: |
+            efs-proxy --help
 
 update:
   enabled: true

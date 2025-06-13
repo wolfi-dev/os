@@ -1,72 +1,96 @@
 package:
   name: kubevela
-  version: "1.10.2"
+  version: "1.10.3"
   epoch: 5
   description: KubeVela is a modern application delivery platform that makes deploying and operating applications across today's hybrid, multi-cloud environments easier, faster and more reliable
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
+      - ${{package.name}}-vela-cli
       - ca-certificates-bundle
-
-environment:
-  contents:
-    packages:
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go
 
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 424e433963551eac070b4369829c4c674fce7ff1
+      expected-commit: ef9b6f3cc10a4b6871b5698ca41fea3f6b3bcaec
       repository: https://github.com/kubevela/kubevela
       tag: v${{package.version}}
-
-  - runs: |
-      export CGO_ENABLED=0
-      export GO111MODULE=on
 
   - uses: go/bump
     with:
       deps: |-
         go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.46.0
-        go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc@v0.46.0
         go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.21.0
-        github.com/fluxcd/source-controller/api@v0.30.0
-        github.com/hashicorp/go-retryablehttp@v0.7.7
-        golang.org/x/oauth2@v0.27.0
-        golang.org/x/crypto@v0.35.0
-        golang.org/x/net@v0.36.0
-        github.com/containerd/containerd@v1.7.27
       replaces: github.com/docker/docker=github.com/moby/moby@v26.1.0+incompatible
 
-  - uses: go/build
-    with:
-      ldflags: -X github.com/oam-dev/kubevela/version.VelaVersion=${{package.version}}
-      output: manager
-      packages: ./cmd/core/main.go
+subpackages:
+  - name: ${{package.name}}-vela-core
+    description: The KubeVela controller manager is a daemon that embeds the core control loops shipped with KubeVel
+    pipeline:
+      - uses: go/build
+        with:
+          ldflags: -X github.com/oam-dev/kubevela/version.VelaVersion=${{package.version}}
+          output: manager
+          packages: ./cmd/core/main.go
+      - uses: strip
+    test:
+      pipeline:
+        - name: Version information tests
+          runs: |
+            manager --help
 
-  - uses: go/build
-    with:
-      ldflags: -X github.com/oam-dev/kubevela/version.VelaVersion=${{package.version}}
-      output: vela
-      packages: ./references/cmd/cli/main.go
+  - name: ${{package.name}}-vela-core-compat
+    description: Upstream image runs `entrypoint.sh` instead of `/usr/bin/manager`
+    dependencies:
+      runtime:
+        - ${{package.name}}-vela-core
+    pipeline:
+      - runs: |
+          # NOTE: https://github.com/kubevela/kubevela/blob/ef9b6f3cc10a4b6871b5698ca41fea3f6b3bcaec/Dockerfile#L46
+          install -Dpm0755 -t ${{targets.subpkgdir}}/usr/local/bin entrypoint.sh
+          ln -sf /usr/bin/manager ${{targets.subpkgdir}}/usr/local/bin/manager
+    test:
+      pipeline:
+        - name: Run Manager
+          runs: |
+            stat $(which entrypoint.sh)
+            entrypoint.sh --help
+            entrypoint.sh manager --help
+            stat /usr/local/bin/manager
+            /usr/local/bin/manager --help
 
-  - uses: strip
+  - name: ${{package.name}}-vela-cli
+    description: Vela is a Pipeline Automation (CI/CD) framework built on Linux container technology written in Golang.
+    pipeline:
+      - uses: go/build
+        with:
+          ldflags: -X github.com/oam-dev/kubevela/version.VelaVersion=${{package.version}}
+          output: vela
+          packages: ./references/cmd/cli/main.go
+      - uses: strip
+    test:
+      pipeline:
+        - name: Version information tests
+          runs: |
+            VERSION_OUTPUT=$(vela version)
+            echo "$VERSION_OUTPUT" | grep "CLI Version"
+            echo "$VERSION_OUTPUT" | grep "Core Version"
+            echo "$VERSION_OUTPUT" | grep ${{package.version}}
+        - name: Setup KWOK cluster
+          uses: test/kwok/cluster
+        - name: Test if Vela installation is functional
+          runs: |
+            vela env init prod --namespace prod
+            vela install
 
 update:
   enabled: true
-  manual: false
   github:
     identifier: kubevela/kubevela
     strip-prefix: v
 
+# Based on package size if was determined that this origin package is empty apart from its own SBOM and this test was added to confirm it is empty and will fail if the package is not longer empty (contains more than an SBOM)
 test:
   pipeline:
-    - name: version check
-      runs: |
-        vela version
-        vela --help
-        manager --help
+    - uses: test/emptypackage

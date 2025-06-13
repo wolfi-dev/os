@@ -1,0 +1,161 @@
+#!/bin/busybox sh
+set -e
+
+PATH=/usr/bin:/usr/sbin:/sbin:/bin
+
+# Default is 777 which creates problems
+chmod 0755 /
+
+mount -t proc proc -o nodev,nosuid,hidepid=2 /proc
+# Fetch settings from cmdline
+DNS="$(tr ' ' '\n' < /proc/cmdline | grep "dns=" | cut -d'=' -f2-)"
+HOSTNAME="$(tr ' ' '\n' < /proc/cmdline | grep "hostname=" | cut -d'=' -f2-)"
+SSHKEY="$(tr ' ' '\n' < /proc/cmdline | grep "sshkey=" | cut -d'=' -f2- | base64 -d)"
+
+# TODO(mattmoor): Check for debug logging and enable "set -x"
+
+mount -t devtmpfs -o nosuid,noexec devtmpfs /dev
+mount -t sysfs sys -o nodev,nosuid,noexec /sys
+mount -t tmpfs -o nodev,nosuid tmpfs /tmp
+mkdir -p -m 0755 /dev/shm
+mount -t tmpfs -o nodev,nosuid,mode=1777 tmpfs /dev/shm
+
+# Setup tty/pty
+mkdir /dev/pts
+mount -t devpts devpts -o noexec,nosuid,newinstance,ptmxmode=0666,mode=0620,gid=tty /dev/pts/
+mount --bind /dev/pts/ptmx /dev/ptmx
+
+# Fix /dev/fd
+ln -s /proc/kcore /dev/core
+ln -s /proc/self/fd /dev/fd
+ln -s /proc/self/fd/0 /dev/stdin
+ln -s /proc/self/fd/1 /dev/stdout
+ln -s /proc/self/fd/2 /dev/stderr
+
+if [ -z "${SSHKEY}" ]; then
+	echo "Missing default mount for ssh keys"
+	exit 1
+fi
+
+# We can ignore this fail, if we use a kernel with kvm_guest.config, we won't need this
+# and network will work anyway
+# If this fails and we won't have network, the ifconfig command will fail anyway.
+# Also we load cpu accelleration drivers in case those are needed.
+[ -e "/lib/modules/$(uname -r)/" ] && depmod -a
+sort -u /sys/devices/system/cpu/modalias | xargs -n1 modprobe 2>/dev/null || :
+sort -u /sys/devices/pci*/*/virtio*/modalias | xargs -n1 modprobe 2>/dev/null || :
+# modprobe 9p if absent
+if ! grep -q 9p /proc/filesystems; then
+	modprobe virtio
+	modprobe virtio_blk
+	modprobe virtio_gpu
+	modprobe virtio_net
+	modprobe virtio_pci
+	modprobe virtio_pci_legacy_dev
+	modprobe virtio_pci_modern_dev
+	modprobe virtio_pmem
+	modprobe virtio_ring
+	modprobe virtio_rng
+	modprobe virtio_scsi
+	modprobe 9pnet_virtio
+	modprobe 9pnet
+	modprobe 9p
+fi
+
+# If we have an external disk, we want to perform builds in that
+if [ -e /dev/vda ]; then
+	grep -q xfs /proc/filesystems || modprobe xfs
+	mkfs.xfs \
+		-f \
+		-b size=4096 \
+		-s size=4096 \
+		-d agcount=8 \
+		-i size=512 \
+		-l size=64m,lazy-count=1 \
+		/dev/vda
+	mkdir -p /mount
+	mount -o noatime,nodiratime,logbufs=8,logbsize=256k -t xfs /dev/vda /mount
+	# Extract build environment in /mount
+	tar --xattrs --xattrs-include='*' -xpf /dev/vdb -m -k --ignore-zeros --record-size=64K --numeric-owner -C /mount/
+	mkdir -p /mount/mnt
+	# ensure permissions are correct for sshd's ChrootDirectory
+	chown root:root /mount
+	chmod 0755 /mount
+
+	# Make /home/build world writeable under /mount
+	chmod 0777 /mount/home/build
+fi
+
+# Setup default mountpoint for 9p shared dir
+mount -t 9p \
+	-o trans=virtio \
+	-o version=9p2000.L \
+	-o security_model=mapped-xattr \
+	-o posixacl=on \
+	-o msize=104857600 \
+	defaultshare /mount/mnt/
+
+# Allow the user we are running as to copy things to the shared dir
+chmod 0777 /mount/mnt
+
+mount --bin /proc /mount/proc
+mount --bin /dev /mount/dev
+mount --bin /sys /mount/sys
+mount -t cgroup2 -o nsdelegate,memory_recursiveprot,nosuid,nodev,noexec cgroup2 /mount/sys/fs/cgroup
+mkdir -p /mount/dev/pts
+mount -t devpts devpts -o noexec,nosuid,newinstance,ptmxmode=0666,mode=0620,gid=tty /mount/dev/pts/
+mount --bind /mount/dev/pts/ptmx /mount/dev/ptmx
+
+# Set default hard limit of open file descriptors to match systemd init
+# behavior. The pam_limit module uses the settings in /proc/1/limit as
+# its default values.
+if [ -f /proc/sys/fs/nr_open ] ; then
+	nofile_limit=$(ulimit -H -n)
+	kernel_max_limit=$(cat /proc/sys/fs/nr_open)
+	# ensure that we are increasing the hard limit
+	if [[ "${kernel_max_limit}" =~ ^[0-9]+$ ]] &&
+		[ "${nofile_limit}" -lt "${kernel_max_limit}" ] ; then
+
+		ulimit -H -n "$kernel_max_limit"
+	fi
+fi
+
+# ldconfig is run to prime ld.so.cache for glibc packages which require it.
+chroot /mount /bin/sh -c "[ -x /sbin/ldconfig ] && /sbin/ldconfig /lib /usr/lib /usr/lib64"
+
+# Setup default network
+interface_name="$(ip -o link show | grep 'BROADCAST,MULTICAST' | head -n 1 | cut -d':' -f2 | tr -d ' ')"
+ip link set lo up
+ip link set "${interface_name:-"eth0"}" up
+ip addr add 10.0.2.15/24 dev "${interface_name:-"eth0"}"
+ip route add default via 10.0.2.2 dev "${interface_name:-"eth0"}"
+
+hostname "${HOSTNAME:-"wolfi-vm"}"
+echo "${HOSTNAME:-"wolfi-vm"}" > /mount/etc/hostname
+echo "127.0.0.1 ${HOSTNAME:-"wolfi-vm"}" >> /mount/etc/hosts
+echo "nameserver ${DNS:-"10.0.2.3"}" > /mount/etc/resolv.conf
+
+##############
+# Entrypoint #
+##############
+# Setup SSH keys for external access
+mkdir -p -m 0700 /root/.ssh/
+echo "${SSHKEY}" > /root/.ssh/authorized_keys
+chmod 0400 /root/.ssh/authorized_keys
+
+# Copy the user/group files from the guest filesystem to the host
+# and make sure that all the users that have /bin/sh as their shell
+# have their home directory created and the ssh key copied there.
+cp /mount/etc/passwd /etc/passwd
+cp /mount/etc/group /etc/group
+for i in $(awk -F: '$7 == "/bin/sh" {print $1}' /etc/passwd); do
+	home="$(grep "^$i:" /etc/passwd | cut -d':' -f6)"
+	group="$(grep "^$i:" /etc/passwd | cut -d':' -f4)"
+	mkdir -p "$home/.ssh"
+	echo "${SSHKEY}" > "/home/$i/.ssh/authorized_keys"
+	chmod 0400 "/home/$i/.ssh/authorized_keys"
+	chown -R "$i":"$group" "$home"
+done
+
+ssh-keygen -A -a 1
+exec /usr/sbin/sshd -D -e

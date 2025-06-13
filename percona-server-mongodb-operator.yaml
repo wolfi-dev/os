@@ -1,0 +1,122 @@
+package:
+  name: percona-server-mongodb-operator
+  version: "1.20.1"
+  epoch: 0
+  description: Kubernetes Operator which deploys and manages Percona Server for MongoDB on Kubernetes clusters.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bash-binsh
+      - coreutils
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).(\d+).(\d+).*
+    replace: "release-${1}-${2}-${3}"
+    to: flag-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/percona/percona-server-mongodb-operator.git
+      tag: v${{package.version}}
+      expected-commit: 13d2ecb34f3d2857c8f7dfd4760fbf1861ecb83c
+
+  - uses: go/build
+    with:
+      packages: ./cmd/manager/main.go
+      output: percona-server-mongodb-operator
+      ldflags: -X main.GitCommit=$(git rev-parse HEAD) -X main.GitBranch=${{vars.flag-version}}
+
+subpackages:
+  - name: ${{package.name}}-mongodb-healthcheck
+    description: mongodb-healthcheck binary for percona-server-mongodb-operator
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/mongodb-healthcheck/main.go
+          output: mongodb-healthcheck
+          ldflags: -X main.GitCommit=$(git rev-parse HEAD) -X main.GitBranch=${{vars.flag-version}}
+
+  - name: ${{package.name}}-compat
+    description: compatiblity package for percona-server-mongodb-operator
+    pipeline:
+      - runs: |
+          # Setup compat dirs
+          mkdir -p ${{targets.contextdir}}/lib
+          mkdir -p ${{targets.contextdir}}/opt/percona
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+
+          # Copy over related hashicorp/lib files
+          cp -r /var/cache/melange/gomodcache/github.com/hashicorp/.  ${{targets.contextdir}}/lib
+
+          # Copy over related license files
+          install -Dm664 LICENSE ${{targets.contextdir}}/licenses/LICENSE
+
+          # Copy over entrypoint scripts
+          for file in init-entrypoint.sh pbm-entry.sh physical-restore-ps-entry.sh ps-entry.sh; do
+            install -Dm775 build/$file ${{targets.contextdir}}/$file
+          done
+
+          # Looking for all possible License/Notice files and copying them over
+          # REF: https://github.com/percona/percona-server-mongodb-operator/blob/main/build/Dockerfile#L32
+          find "/var/cache/melange/gomodcache" \
+            \( -iname '*license' -o -iname '*license.txt' -o -iname '*license.md' \
+              -o -iname '*notice' -o -iname '*notice.txt' -o -iname '*notice.md' \) \
+            -exec sh -c '
+              for file; do
+                rel_path=$(echo "$file" | sed -e "s#^'"/var/cache/melange/gomodcache"'##" -e "s#/[^/]*\(license\|notice\)[^/]*\$##I")
+                target_dir="${{targets.contextdir}}/licenses/pkg/mod/$rel_path"
+                mkdir -pv "$target_dir"
+                cp -v "$file" "$target_dir"
+              done
+            ' sh {} +
+
+          # symlinks
+          ln -sf /usr/bin/percona-server-mongodb-operator ${{targets.contextdir}}/usr/local/bin/percona-server-mongodb-operator
+          ln -sf /usr/bin/mongodb-healthcheck ${{targets.contextdir}}/mongodb-healthcheck
+
+update:
+  enabled: true
+  github:
+    identifier: percona/percona-server-mongodb-operator
+    strip-prefix: v
+
+test:
+  environment:
+    environment:
+      OPERATOR_NAME: percona-server-mongodb-operator
+      WATCH_NAMESPACE: "*"
+      LOG_STRUCTURED: "false"
+      LOG_LEVEL: INFO
+      RESYNC_PERIOD: 5s
+      DISABLE_TELEMETRY: "false"
+      VERSION: ${{package.version}}
+    contents:
+      packages:
+        - ${{package.name}}-mongodb-healthcheck
+  pipeline:
+    - name: "Basic"
+    - runs: |
+        percona-server-mongodb-operator --help
+        mongodb-healthcheck --help
+    - name: "Setup KWOK cluster"
+      uses: test/kwok/cluster
+    - name: "Install PSMDB CRD that the operator watches"
+      runs: |
+        kubectl apply --server-side -f https://raw.githubusercontent.com/percona/percona-server-mongodb-operator/main/deploy/bundle.yaml
+        kubectl wait --for=condition=Established crd --all --timeout=60s
+    - name: "Verify operator"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          ./psmdb-setup.sh
+        timeout: 60
+        expected_output: |
+          Starting metrics server
+          Serving metrics server
+          starting server
+          Starting EventSource
+          Starting Controller
+          Starting workers

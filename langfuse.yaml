@@ -1,0 +1,278 @@
+package:
+  name: langfuse
+  version: "3.68.0"
+  epoch: 3
+  description: "Langfuse - a tool for observability in LLM applications"
+  copyright:
+    - license: "MIT"
+  dependencies:
+    runtime:
+      - dumb-init
+      - nodejs-20
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - corepack
+      - file
+      - libcrypto3
+      - nodejs-20
+      - npm
+      - openssl-dev
+      - pnpm
+  environment:
+    # Required for langfuse-web
+    CLICKHOUSE_PASSWORD: "test"
+    CLICKHOUSE_USER: "default"
+    CLICKHOUSE_URL: "http://localhost:8123"
+    DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/postgres"
+    LANG: "en_US.UTF-8"
+    LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse-event-upload-test"
+    LC_ALL: "en_US.UTF-8"
+    NODE_OPTIONS: "--max-old-space-size=4096"
+    NEXTAUTH_SECRET: "test"
+    NEXTAUTH_URL: "http://localhost:3000"
+    SALT: "test"
+    NEXT_TELEMETRY_DISABLED: "1"
+    # Required for langfuse-worker
+    SKIP_MIGRATE_DATABASE_SCHEMA: "1"
+    SKIP_SEED_PRISMA_DATABASE: "1"
+    HUSKY: "0"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/langfuse/langfuse.git
+      tag: v${{package.version}}
+      expected-commit: aae1909466a4f676d77621a6349905d16b73873e
+
+  - name: "Bump deps and install"
+    runs: |
+      npm install turbo@^1.13.4 --global
+      corepack enable
+      corepack prepare pnpm@latest --activate
+
+      pnpm pkg set \
+        "pnpm.overrides.@babel/helpers=^7.26.10" \
+        "pnpm.overrides.@babel/runtime=^7.26.10" \
+        "pnpm.overrides.esbuild=^0.25.0" \
+        "pnpm.overrides.cookie=^0.7.0" \
+        "pnpm.overrides.cross-spawn=^7.0.5" \
+        "pnpm.overrides.path-to-regexp=^0.1.12" \
+        "pnpm.overrides.prismjs=^1.30.0" \
+        "pnpm.overrides.undici=^6.21.2" \
+        "pnpm.overrides.vite=^5.4.19" \
+        "pnpm.overrides.vitest=^2.1.9" \
+        "pnpm.overrides.ws=^8.17.1" \
+        "pnpm.overrides.brace-expansion=4.0.1"
+
+        # "pnpm.overrides.next=^15.2.2"
+        # bumping this causes build errors in web
+
+      pnpm install --ignore-scripts --no-frozen-lockfile
+
+subpackages:
+  - name: ${{package.name}}-web
+    description: langfuse webapp
+    dependencies:
+      runtime:
+        - dumb-init
+        - nodejs-20
+        - migrate
+    pipeline:
+      - name: "Build"
+        runs: |
+          pnpm run build --filter=web
+      - name: "Move output into directories"
+        runs: |
+          mkdir -p "${{targets.contextdir}}"/app/
+          mkdir -p "${{targets.contextdir}}"/app/web/.next/static
+          mkdir -p "${{targets.contextdir}}"/app/packages/shared/prisma
+          mkdir -p "${{targets.contextdir}}"/app/packages/shared/clickhouse
+          mkdir -p "${{targets.contextdir}}"/app/packages/shared/scripts
+
+          cp -r web/.next/standalone/. "${{targets.contextdir}}"/app/
+          cp -r web/.next/static "${{targets.contextdir}}"/app/web/.next/
+          cp -r web/public "${{targets.contextdir}}"/app/web/
+
+          cp -r packages/shared/prisma/. "${{targets.contextdir}}"/app/packages/shared/prisma/
+          cp -r packages/shared/clickhouse/. "${{targets.contextdir}}"/app/packages/shared/clickhouse/
+
+          install -m755 web/entrypoint.sh "${{targets.contextdir}}"/app/web/entrypoint.sh
+          install -Dm755 packages/shared/scripts/cleanup.sql "${{targets.contextdir}}"/app/packages/shared/scripts/cleanup.sql
+      - name: remove deps that cause compat issues
+        runs: |
+          # Remove all musl variants (since we're using glibc)
+          find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'musl' | cut -d: -f1 | xargs rm -f
+          if [ "${{build.arch}}" = "aarch64" ]; then
+            find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'x86-64' | cut -d: -f1 | xargs rm -f
+          else
+            find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'aarch64|arm64' | cut -d: -f1 | xargs rm -f
+          fi
+    test:
+      environment:
+        contents:
+          packages:
+            - bash
+            - coreutils
+            - nodejs-20
+            - npm
+            - shadow
+            - sudo-rs
+            - postgresql
+            - postgresql-client
+        environment:
+          DATABASE_URL: postgresql://postgres@localhost:5432/langfuse_test?sslmode=disable
+          CLICKHOUSE_URL: http://dummy:1234
+          LANGFUSE_AUTO_CLICKHOUSE_MIGRATION_DISABLED: true
+          PGDATA: /tmp/test_db
+          PGUSER: lfuser
+          PGPASS: lftest
+          PGDB: langfuse_test
+      pipeline:
+        - name: "Start Redis & Postgres, apply Prisma schema"
+          working-directory: /app
+          runs: |
+            npm install turbo
+            npm install dotenv
+
+            useradd postgres
+            sudo -u postgres initdb -D ${PGDATA}
+            sudo -u postgres pg_ctl -D ${PGDATA} -l /tmp/logfile start
+            sudo -u postgres createdb ${PGDB}
+            npm install -g prisma
+
+            /app/web/entrypoint.sh
+
+  - name: ${{package.name}}-worker
+    description: langfuse worker background service
+    dependencies:
+      runtime:
+        - dumb-init
+        - glibc
+        - ld-linux
+        - libgcc
+        - libstdc++
+        - nodejs-20
+    pipeline:
+      - name: "Build"
+        runs: |
+          pnpm run build --filter=worker
+      - name: "Move output into directories"
+        runs: |
+          mkdir -p "${{targets.contextdir}}"/app/
+
+          turbo prune --scope=worker --docker
+          cp out/pnpm-lock.yaml "${{targets.contextdir}}"/app/
+          cp out/pnpm-workspace.yaml "${{targets.contextdir}}"/app/
+          cp -r node_modules "${{targets.contextdir}}"/app/
+          cp -a out/full/* "${{targets.contextdir}}"/app/
+          chmod +x "${{targets.contextdir}}"/app/worker/entrypoint.sh
+      - name: remove deps that cause compat issues
+        runs: |
+          # Remove all musl variants (since we're using glibc)
+          find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'musl' | cut -d: -f1 | xargs rm -f
+          if [ "${{build.arch}}" = "aarch64" ]; then
+            find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'x86-64' | cut -d: -f1 | xargs rm -f
+          else
+            find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'aarch64|arm64' | cut -d: -f1 | xargs rm -f
+          fi
+      - name: remove unneeded packages and tests that may introduce CVE's
+        runs: |
+          # monorepo-symlink-test vulnerability
+          find ${{targets.contextdir}}/app/node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null || true
+
+          #CVE-2025-27789 and CVE-2025-48068
+          find ${{targets.contextdir}}/app/node_modules -type d \( \
+            -name "next" -o \
+            -name "@next" \
+          \) -exec rm -rf {} + 2>/dev/null || true
+    test:
+      environment:
+        contents:
+          packages:
+            - nodejs-20
+            - npm
+            - dumb-init
+            - curl
+            - procps
+            - redis
+            - postgresql
+            - postgresql-client
+            - ca-certificates-bundle
+            - file
+        environment:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/test"
+          DIRECT_URL: "postgresql://postgres:postgres@localhost:5432/test"
+          NODE_ENV: "production"
+          PORT: "3030"
+          REDIS_HOST: "127.0.0.1"
+          REDIS_PORT: "6379"
+          REDIS_URL: "redis://127.0.0.1:6379"
+          REDIS_AUTH: ""
+          REDIS_CONNECTION_STRING: "redis://127.0.0.1:6379"
+          LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "test-bucket"
+          CLICKHOUSE_URL: "http://localhost:8123"
+          CLICKHOUSE_USER: "testuser"
+          CLICKHOUSE_PASSWORD: "testpass"
+          NEXT_PUBLIC_LANGFUSE_CLOUD_REGION: ""
+          LANGFUSE_WORKER_HOST: "0.0.0.0"
+          LANGFUSE_WORKER_PORT: "3030"
+      pipeline:
+        - name: "Start Redis & Postgres, apply Prisma schema"
+          working-directory: /app
+          runs: |
+            redis-server --daemonize yes > /dev/null 2>&1
+
+            mkdir -p /var/lib/postgresql/data
+            chown build:build /var/lib/postgresql/data
+
+            mkdir -p /var/run/postgresql
+            chown build:build /var/run/postgresql
+
+            su build -c "initdb -D /var/lib/postgresql/data" > /dev/null 2>&1
+            su build -c "pg_ctl -D /var/lib/postgresql/data -o '-k /var/run/postgresql' start" > /dev/null 2>&1
+
+            su build -c "/usr/bin/psql \
+              -h /var/run/postgresql \
+              -d postgres \
+              -v ON_ERROR_STOP=1 <<-EOSQL
+                CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'postgres';
+                CREATE DATABASE test OWNER postgres;
+            EOSQL" > /dev/null 2>&1
+
+            SCHEMA_FILE=$(find . -name "schema.prisma" -type f | head -1)
+            if [ -n "$SCHEMA_FILE" ]; then
+              echo "Found schema at: $SCHEMA_FILE"
+              npx prisma generate --schema="$SCHEMA_FILE" > /dev/null 2>&1 || true
+              npx prisma db push --accept-data-loss --skip-generate --schema="$SCHEMA_FILE" > /dev/null 2>&1
+            fi
+        - name: "Test worker startup via entrypoint"
+          uses: test/daemon-check-output
+          working-directory: /app
+          with:
+            setup: |
+              # Verify the worker files exist
+              if [ ! -f /app/worker/entrypoint.sh ]; then
+                echo "ERROR: /app/worker/entrypoint.sh not found"
+                ls -la /app/worker/ || echo "worker directory not found"
+                exit 1
+              fi
+              if [ ! -f /app/worker/dist/index.js ]; then
+                echo "ERROR: /app/worker/dist/index.js not found"
+                exit 1
+              fi
+            start: |
+              dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js
+            timeout: 60
+            expected_output: |
+              Listening: http://
+              Finished upserting default model prices
+
+update:
+  enabled: true
+  github:
+    identifier: langfuse/langfuse
+    strip-prefix: v

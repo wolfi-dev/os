@@ -1,0 +1,99 @@
+package:
+  name: cert-manager-csi-driver
+  version: 0.10.3
+  epoch: 0
+  description: Kubernetes CSI plugin to automatically mount signed certificates to Pods using ephemeral volumes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - libeconf
+      - mount
+      - umount
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 88ea30bad0e8ea30e10c7227b6f882a8b7908386
+      repository: https://github.com/cert-manager/csi-driver
+      tag: v${{package.version}}
+
+  - uses: go/build
+    with:
+      packages: ./cmd
+      output: cert-manager-csi-driver
+      ldflags: |
+        -X github.com/cert-manager/csi-driver/internal/version.AppVersion=${{package.version}}
+        -X github.com/cert-manager/csi-driver/internal/version.GitCommit=$(git rev-parse HEAD)
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility package for cert-manager CSI driver
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/ko-app/
+          ln -sf /usr/bin/cert-manager-csi-driver ${{targets.contextdir}}/ko-app/cmd
+    test:
+      pipeline:
+        - runs: test "$(readlink /ko-app/cmd)" = "/usr/bin/cert-manager-csi-driver"
+
+capabilities:
+  add:
+    - CAP_SYS_ADMIN # needed for mount("tmpfs", ...)
+
+test:
+  environment:
+    contents:
+      packages:
+        - wait-for-it
+        - curl
+        - helm
+    accounts:
+      groups:
+        - groupname: nonroot
+          gid: 65532
+      users:
+        - username: nonroot
+          gid: 65532
+          uid: 65532
+      run-as: 0
+    environment:
+      CSI_ENDPOINT: unix://plugin/csi.sock
+      NODE_ID: node-000000
+      DATA_ROOT: /var/run/cert-manager-csi-driver
+  pipeline:
+    - name: Check version
+      runs: |
+        cert-manager-csi-driver version -h
+    - uses: test/kwok/cluster
+    - name: Install cert-manager
+      runs: |
+        helm repo add jetstack https://charts.jetstack.io --force-update
+        helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --set crds.enabled=true --wait
+    - name: "Test clamdcheck"
+      uses: test/daemon-check-output
+      with:
+        # Process panics with the following error:
+        # "panic: failed to start manager: listing existing volumes: listing volumes: readdir /var/run/cert-manager-csi-driver/inmemfs: invalid argument"
+        # This is expected, as the inmemfs is not mounted. And we can't mount it in Melange test environment even though we have CAP_SYS_ADMIN capability set.
+        # So let's have a negative-test here instead, and omit post script.
+        start: "cert-manager-csi-driver --metrics-bind-address=8080 --data-root=$DATA_ROOT --endpoint=$CSI_ENDPOINT --node-id=$NODE_ID --driver-name=cert-manager.io/csi-driver --log-level=5"
+        timeout: 60
+        error_strings: |
+          FAIL
+          FATAL
+          ERROR
+          executable file not found
+          command not found
+          No such file or directory
+          failed to start manager
+        expected_output: |
+          Mounted new tmpfs
+          Listing and watching
+          ${{package.version}}
+
+update:
+  enabled: true
+  github:
+    identifier: cert-manager/csi-driver
+    strip-prefix: v

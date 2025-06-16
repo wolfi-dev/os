@@ -1,7 +1,7 @@
 package:
   name: langfuse
   version: "3.68.0"
-  epoch: 3
+  epoch: 0
   description: "Langfuse - a tool for observability in LLM applications"
   copyright:
     - license: "MIT"
@@ -73,6 +73,16 @@ pipeline:
         # bumping this causes build errors in web
 
       pnpm install --ignore-scripts --no-frozen-lockfile
+
+  - name: "Clean up problematic paths"
+    runs: |
+      # Remove deep nested paths that cause tar issues
+      find node_modules -type d -name ".pnpm" -exec rm -rf {} + 2>/dev/null || true
+      find . -path "*/node_modules/.pnpm/*" -type d -exec rm -rf {} + 2>/dev/null || true
+      # Remove broken symlinks
+      find . -xtype l -delete 2>/dev/null || true
+      # Remove excessively deep paths
+      find . -type d -exec sh -c 'echo "$1" | wc -c' _ {} \; | awk '$1 > 200 {print $2}' | head -50 | xargs rm -rf 2>/dev/null || true
 
 subpackages:
   - name: ${{package.name}}-web
@@ -157,39 +167,105 @@ subpackages:
         - libgcc
         - libstdc++
         - nodejs-20
+    environment:
+      contents:
+        packages:
+          - build-base
+          - busybox
+          - corepack
+          - file
+          - jq
+          - nodejs-20
+          - npm
+          - pnpm
     pipeline:
-      - name: "Build"
+      - name: "Build and package worker"
         runs: |
-          pnpm run build --filter=worker
-      - name: "Move output into directories"
-        runs: |
-          mkdir -p "${{targets.contextdir}}"/app/
-
+          npm install turbo@^1.13.4 --global
+          corepack enable
+          corepack prepare pnpm@9.5.0 --activate
+          
+          # Set up overrides
+          resolutions='{
+            "@babel/helpers": "^7.26.10",
+            "@babel/runtime": "^7.26.10",
+            "esbuild": "^0.25.0",
+            "cookie": "^0.7.0",
+            "cross-spawn": "^7.0.5",
+            "path-to-regexp": "^0.1.12",
+            "prismjs": "^1.30.0",
+            "undici": "^6.21.2",
+            "vite": "^5.4.19",
+            "vitest": "^2.1.9",
+            "ws": "^8.17.1",
+            "brace-expansion": "4.0.1"
+          }'
+          jq --argjson overrides "$resolutions" '.pnpm.overrides += $overrides' package.json > temp.json && mv temp.json package.json
+          
+          # Prune and prepare worker
           turbo prune --scope=worker --docker
-          cp out/pnpm-lock.yaml "${{targets.contextdir}}"/app/
-          cp out/pnpm-workspace.yaml "${{targets.contextdir}}"/app/
-          cp -r node_modules "${{targets.contextdir}}"/app/
-          cp -a out/full/* "${{targets.contextdir}}"/app/
-          chmod +x "${{targets.contextdir}}"/app/worker/entrypoint.sh
-      - name: remove deps that cause compat issues
-        runs: |
-          # Remove all musl variants (since we're using glibc)
-          find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'musl' | cut -d: -f1 | xargs rm -f
+          mkdir -p "${{targets.subpkgdir}}"/app
+          cp out/pnpm-lock.yaml "${{targets.subpkgdir}}"/app/
+          cp out/pnpm-workspace.yaml "${{targets.subpkgdir}}"/app/
+          cp -a out/json/* "${{targets.subpkgdir}}"/app/
+          
+          SOURCE_DIR=$(pwd)
+          cd "${{targets.subpkgdir}}"/app
+          
+          export SKIP_MIGRATE_DATABASE_SCHEMA=1
+          export SKIP_SEED_PRISMA_DATABASE=1
+          export HUSKY=0
+          
+          echo "node-linker=hoisted" > .npmrc
+          pnpm install --no-frozen-lockfile
+          
+          # Copy full source
+          cp -a "${SOURCE_DIR}"/out/full/* .
+          [ -f worker/entrypoint.sh ] && chmod +x worker/entrypoint.sh
+          
+          # Build the worker
+          pnpm build --filter=worker
+          
+          # Clean up architecture-specific binaries
           if [ "${{build.arch}}" = "aarch64" ]; then
-            find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'x86-64' | cut -d: -f1 | xargs rm -f
+            find node_modules -type f \( \
+              -path "*@datadog*/prebuilds/*x64*" -o \
+              -path "*@datadog*/prebuilds/*x86_64*" -o \
+              -path "*@prisma*/*linux-x64*" -o \
+              -path "*prisma*/*linux-x64*" -o \
+              -path "*msgpackr*/*linux-x64*" -o \
+              -path "*msgpackr*/*x64*" -o \
+              -path "*@esbuild/*x64*" \
+            \) -delete 2>/dev/null || true
+            find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
+              if file "$binary" 2>/dev/null | grep -q "x86-64\|Intel 80386"; then
+                rm -f "$binary"
+              fi
+            done
           else
-            find "${{targets.contextdir}}"/app/node_modules -type f -exec file {} \; | grep ELF | grep -E 'aarch64|arm64' | cut -d: -f1 | xargs rm -f
+            find node_modules -type f \( \
+              -path "*@datadog*/prebuilds/*arm64*" -o \
+              -path "*@datadog*/prebuilds/*aarch64*" -o \
+              -path "*@prisma*/*linux-arm64*" -o \
+              -path "*prisma*/*linux-arm64*" -o \
+              -path "*msgpackr*/*linux-arm64*" -o \
+              -path "*msgpackr*/*arm64*" -o \
+              -path "*msgpackr*/*aarch64*" -o \
+              -path "*@esbuild/*arm64*" \
+            \) -delete 2>/dev/null || true
+            find node_modules -type f \( -name "*.node" -o -name "*.so" \) | while read -r binary; do
+              if file "$binary" 2>/dev/null | grep -q "aarch64\|ARM"; then
+                rm -f "$binary"
+              fi
+            done
           fi
-      - name: remove unneeded packages and tests that may introduce CVE's
-        runs: |
-          # monorepo-symlink-test vulnerability
-          find ${{targets.contextdir}}/app/node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null || true
-
-          #CVE-2025-27789 and CVE-2025-48068
-          find ${{targets.contextdir}}/app/node_modules -type d \( \
-            -name "next" -o \
-            -name "@next" \
-          \) -exec rm -rf {} + 2>/dev/null || true
+          
+          # Remove musl variants
+          find node_modules -type f \( -path "*musl*" -o -name "*musl*" \) -delete 2>/dev/null || true
+          
+          # Remove test directories and CVE-prone packages
+          find node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null || true
+          find node_modules -type d \( -name "next" -o -name "@next" \) -exec rm -rf {} + 2>/dev/null || true
     test:
       environment:
         contents:

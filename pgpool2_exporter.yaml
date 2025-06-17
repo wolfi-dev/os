@@ -65,14 +65,29 @@ test:
     - name: "Set up PostgreSQL"
       runs: |
         useradd -m $PG_USER
-        sudo -u $PG_USER initdb -D $PG_DATA --username=$PG_USER
+
+        # Initialize DB
+        sudo -u $PG_USER initdb -D $PG_DATA --username=$PG_USER > useradd.log 2>&1
+
+        cat <<EOF >> $PG_DATA/postgresql.conf
+        listen_addresses = '*'
+        port = $PG_PORT
+        EOF
+
+        cat <<EOF >> $PG_DATA/pg_hba.conf
+        host all all 127.0.0.1/32 trust
+        host all all ::1/128 trust
+        EOF
+
         # Start PostgreSQL in the background
-        sudo -u $PG_USER pg_ctl -D $PG_DATA -o "-p $PG_PORT" -w start
-        # Grant privileges to DB
-        psql -U $PG_USER -h "$PGHOST" -p "$PG_PORT" -d ${PG_DB} -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB TO $PG_USER;"
+        sudo -u $PG_USER pg_ctl -D $PG_DATA -w start > pgstart.log 2>&1
+
+        # Grant privileges
+        psql -U $PG_USER -h localhost -p "$PG_PORT" -d ${PG_DB} -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB TO $PG_USER;" > pggrant.log 2>&1
     - name: "Start Pgpool2"
       runs: |
         mkdir -p /etc/pgpool2 /var/log/pgpool /tmp/pgpool
+        touch /tmp/pgpool_status
         # Pgpool config
         cat <<EOF > /etc/pgpool2/pgpool.conf
         backend_hostname0 = 'localhost'
@@ -93,14 +108,14 @@ test:
       uses: test/daemon-check-output
       with:
         start: |
-          sh -c 'DATA_SOURCE_NAME="postgres://${PG_USER}:${PG_PASSWORD}@localhost:${PGPOOL_PORT}/${PG_DB}?sslmode=disable" pgpool2_exporter --web.listen-address=":${EXPORTER_PORT}" --log.level=debug'
+          sh -c 'DATA_SOURCE_NAME="postgres://${PG_USER}:${PG_PASSWORD}@localhost:${PGPOOL_PORT}/${PG_DB}?sslmode=disable" pgpool2_exporter --web.listen-address=":${EXPORTER_PORT}" --log.level=debug' 2>&1
         expected_output: |
           Querying namespace
           Starting pgpool2_exporter
           Listening on address
         timeout: 10
         post: |
-          curl -sf http://localhost:${EXPORTER_PORT}/metrics 2>&1 | tee metrics.txt
+          curl -sf http://localhost:${EXPORTER_PORT}/metrics > metrics.txt 2>&1 &
           grep -q "pgpool2_backend_used 1" metrics.txt
           grep -q "pgpool2_frontend_total 32" metrics.txt
           grep -q "pgpool2_up 1" metrics.txt
@@ -108,7 +123,7 @@ test:
           echo "Updating DB by running 5 queries through Pgpool"
           for i in $(seq 1 5); do
             echo "- Running query $i"
-            PGPASSWORD=$PG_PASSWORD psql -U $PG_USER -h localhost -p ${PGPOOL_PORT} -d $PG_DB -c "SELECT generate_series(1, 100);" > /dev/null 2>&1
+            PGPASSWORD=$PG_PASSWORD psql -U $PG_USER -h localhost -p ${PGPOOL_PORT} -d $PG_DB -c "SELECT generate_series(1, 100);" > /dev/null 2>&1 &
             sleep 1
           done
           echo "Validating updated Pgpool metrics (5 queries)"

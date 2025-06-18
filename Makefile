@@ -16,10 +16,17 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
-ifneq (${MELANGE_RUNNER},)
-	MELANGE_OPTS += --runner=${MELANGE_RUNNER}
-	MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
+ifeq (${MELANGE_RUNNER},)
+MELANGE_RUNNER = qemu
+$(warning ****************************** WARNING ******************************)
+$(warning *** MELANGE_RUNNER is unset. The default runner is now qemu, which)
+$(warning *** requires chainctl authentication to access the Chainguard kernel.)
+$(warning *** See `melange build --help` for a list of other runner options.)
+$(warning ****************************** WARNING ******************************)
 endif
+
+MELANGE_OPTS += --runner=${MELANGE_RUNNER}
+MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
 QEMU_KERNEL_IMAGE ?= kernel/$(ARCH)/vmlinuz
 ifeq (${MELANGE_RUNNER},qemu)
 	QEMU_KERNEL_DEP = ${QEMU_KERNEL_IMAGE}
@@ -115,9 +122,9 @@ kernel/%/APKINDEX: kernel/%/APKINDEX.tar.gz
 	touch $@
 
 kernel/%/chosen: kernel/%/APKINDEX
-	# Extract lines with 'P:linux' and the following line that contains the version
+	# Extract lines with 'P:linux-qemu-generic' and the following line that contains the version
 	# This approach is compatible with both GNU and BSD sed
-	awk '/^P:linux$$/ {print; getline; print}' $< > kernel/$*/available
+	awk '/^P:linux-qemu-generic$$/ {print; getline; print}' $< > kernel/$*/available
 	grep '^V:' kernel/$*/available | sed 's/V://' | \
 	  sort -V | tail -n1 > $@.tmp
 	# Sanity check that this looks like an apk version
@@ -125,7 +132,7 @@ kernel/%/chosen: kernel/%/APKINDEX
 	mv $@.tmp $@
 
 kernel/%/linux.apk: kernel/%/chosen
-	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$*/linux-$(shell cat kernel/$*/chosen).apk)
+	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$*/linux-qemu-generic-$(shell cat kernel/$*/chosen).apk)
 
 kernel/%/vmlinuz: kernel/%/linux.apk
 	tmpd=kernel/.$$$$ && mkdir -p $$tmpd $(dir $@) && \
@@ -277,5 +284,5 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
   { echo "failed token from $(1) for target $@"; exit 1; }; \
   mkdir -p $$(dirname $(2)) && \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
-  curl -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
+  curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
 	mv "$(2).tmp" "$(2)"

@@ -1,0 +1,911 @@
+package:
+  name: calico-3.30
+  version: "3.30.1"
+  epoch: 1
+  description: "Cloud native networking and network security"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - calico=${{package.full-version}}
+    runtime:
+      - merged-bin
+      - merged-usrsbin
+      - wolfi-baselayout
+  resources:
+    cpu: 4
+    memory: 12Gi
+  checks:
+    disabled:
+      - empty
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: short-package-version
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - bash
+      - bison
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      # - llvm18-tools
+      - clang-18
+      - clang-18-dev
+      # TODO: Can remove this when cni-plugins are built from source
+      - curl
+      # for felix
+      - elfutils-dev
+      # for BIRD
+      - flex
+      - go
+      - iproute2
+      - libbpf
+      - libbpf-dev
+      - libpcap-dev
+      - linux-headers
+      - llvm-18
+      - nodejs
+      - yarn
+      - zlib-dev
+      - zstd-dev
+
+# The calico build process is heavily tailored towards using Makefiles to
+# orchestrate docker commands. This makes for a less than ideal
+# experience replicating it in melange. To try to maintain some level of
+# sanity while packaging and updating calico, the approach here chooses to
+# use the upstream Makefile whenever possible, and only when necessary,
+# use the equivalent evaluated `docker run ...` commands within
+# independent pipeline blocks. Throughout this file you'll see the relevant
+# comments denoting the equivalent Makefile targets that each pipeline
+# block is trying to match, if applicable.
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/projectcalico/calico
+      tag: v${{package.version}}
+      expected-commit: 393b14e729a67f9bc9a96eba65ff0be5f2f7b94a
+  # Because we are using tigera-operator during image test we are reliant on tigera-operator setting
+  # up all the required rbac rules that are needed for calico-apiserver to run. Currently it does not and
+  # this is a temporary solution until https://github.com/tigera/operator/issues/3780 is resolved upstream with a new
+  # release of tigera-operator. This issue was highlighed in calico-apiserver 3.29.2 when Validating Admission Policy
+  # became enabled by default. This patch disables the Validating Admission Policy in calico-apiserver until
+  # the issue is resolved.
+  - uses: patch
+    with:
+      patches: calico-apiserver-disable-validating-admission-policy.patch
+  # Upstream build libbpf as part of their build, but we want to use our system
+  # libraries.
+  - uses: patch
+    with:
+      patches: fix-bpf-includes.patch
+  - working-directory: felix
+    pipeline:
+      # Equivalent to target: "build-bpf"
+      - runs: |
+          # NOTE: This forces 64bit compilation (and the __x86_64__ macro) to bypasses the following error:
+          #   /usr/include/gnu/stubs.h:7:11: fatal error: 'gnu/stubs-32.h' file not found
+          # This is a hack, but feels safe enough given we already assume and restrict this package to 64bit archs
+          # NOTE: This disables Wolfi's default host level CFLAGS since this is BPF bytecode, instead, we pick up the defaults specified in the Makefiles
+          export CFLAGS="-O2 -Wno-error=unused-but-set-variable -D__x86_64__"
+
+          if [ "${{build.arch}}" = "x86_64" ]; then
+            export CFLAGS="-O2 -Wno-error=unused-but-set-variable -m64 -D__x86_64__"
+          fi
+          # Build the two BPF trees with the extra backend flag
+          make -C bpf-gpl    CC="clang-18 -mllvm -bpf-stack-size=1024" LD=llc -j$(nproc)
+          make -C bpf-apache CC="clang-18 -mllvm -bpf-stack-size=1024" LD=llc -j$(nproc)
+  # This fetches and builds the statically compiled calico fork of BIRD
+  - working-directory: bird
+    pipeline:
+      - uses: fetch
+        with:
+          # Reference: https://github.com/projectcalico/calico/blob/master/metadata.mk#L26
+          # TODO: Build this from source and load in as a package runtime dependency
+          uri: https://github.com/projectcalico/bird/tarball/v0.3.3-202-g7a77fb73
+          expected-sha512: 87d03464163459154dce11952025f4a0de316dbfe0d1f6a3f19a82e951dfca2eb5d0cd18d95eda3abd38d44a9967fbb4b017158d8a5f48951683e3dc87dcd914
+      - runs: |
+          ARCH=${{build.arch}} DIST=dist/ ./create_binaries.sh
+  - working-directory: node
+    pipeline:
+      # Equivalent to target: "filesystem/etc/calico/confd/conf.d"
+      - runs: |
+          _target="filesystem/etc/calico/confd/conf.d"
+          rm -rf $_target && cp -r ../confd/etc/calico/confd/conf.d $_target
+          chmod +w $_target
+      # Equivalent to target: "filesystem/etc/calico/confd/templates"
+      - runs: |
+          _target="filesystem/etc/calico/confd/templates"
+          rm -rf $_target && cp -r ../confd/etc/calico/confd/templates $_target
+          chmod +w $_target
+      # Equivalent to target: "filesystem/usr/lib/calico/bpf"
+      - runs: |
+          _target="filesystem/usr/lib/calico/bpf"
+          rm -rf $_target && mkdir -p $_target
+
+          # This is handled in the felix build pipeline above
+          # make -C ../felix build-bpf ARCH=$(ARCH)
+          cp -r ../felix/bpf-gpl/bin/* $_target
+          cp -r ../felix/bpf-apache/bin/* $_target
+  - uses: strip
+
+subpackages:
+  - name: "calico-node-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-node=${{package.full-version}}
+      runtime:
+        - bash # required for logging functionality to work since `start_runit` logging script uses #!/bin/bash
+        - conntrack-tools
+        - glibc
+        - ip6tables
+        - iproute2
+        - ipset
+        - iptables
+        - libbpf
+        # listed in Dockerfile, but not sure if they're build dependencies (for iptables) or runtime
+        - libelf
+        - libmnl
+        - libnetfilter_conntrack
+        - libnetfilter_cthelper
+        - libnetfilter_cttimeout
+        - libnetfilter_queue
+        - libnfnetlink
+        - libpcap
+        - merged-bin
+        - merged-usrsbin
+        - procps
+        - runit
+        - wolfi-baselayout
+        - zlib
+    pipeline:
+      - assertions:
+          required-steps: 2
+        pipeline:
+          # Equivalent to target: "$(NODE_CONTAINER_BINARY)"
+          - if: ${{build.arch}} == 'x86_64' || ${{build.arch}} == 'aarch64' # Essentially a guard to make sure we never try to build beyond x86_64 and aarch64
+            runs: |
+              _arch=${{build.goarch}}
+
+              LIBBPF_INCLUDE_PATH=/usr/include/bpf
+
+              CGO_LDFLAGS="-L$LIBBPF_INCLUDE_PATH/$_arch -lbpf -lelf -lz"
+              CGO_CFLAGS="-I$LIBBPF_INCLUDE_PATH"
+
+              LDFLAGS="-w"
+              LDFLAGS="$LDFLAGS -X node/pkg/lifecycle/startup.VERSION=${{package.version}}"
+              LDFLAGS="$LDFLAGS -X node/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+              LDFLAGS="$LDFLAGS -X node/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+              LDFLAGS="$LDFLAGS -X node/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+
+              CGO_ENABLED=1 \
+                CGO_LDFLAGS="$CGO_LDFLAGS" \
+                CGO_CFLAGS="$CGO_CFLAGS" \
+                go build -v -tags cgo -v -buildvcs=false \
+                -ldflags "$LDFLAGS" \
+                -o "${{targets.subpkgdir}}"/usr/bin/calico-node \
+                ./node/cmd/calico-node
+          # Equivalent to target: "$(TOOLS_MOUNTNS_BINARY)"
+          - runs: |
+              _arch=${{build.goarch}}
+
+              LIBBPF_INCLUDE_PATH=/usr/include/bpf
+
+              CGO_LDFLAGS="-L$LIBBPF_INCLUDE_PATH/$_arch -lbpf -lelf -lz"
+              CGO_CFLAGS="-I$LIBBPF_INCLUDE_PATH"
+              CGO_ENABLED=1 \
+                CGO_LDFLAGS="$CGO_LDFLAGS" \
+                CGO_CFLAGS="$CGO_CFLAGS" \
+                go build -v -tags cgo -v -buildvcs=false \
+                -o "${{targets.subpkgdir}}"/usr/bin/mountns \
+                ./node/cmd/mountns
+      # Equivalent to target: "$(FELIX_GPL_SOURCE)"
+      - working-directory: node
+        runs: |
+          _target="filesystem/included-source/felix-ebpf-gpl.tar.gz"
+
+          rm -rf filesystem/included-source/felix*
+          mkdir -p filesystem/included-source/
+
+          tar cf $_target ../felix/bpf-gpl
+          touch $_target
+      # Filesystem prep
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          find bird/dist -type f -name 'bird*' -exec cp {} "${{targets.subpkgdir}}"/usr/bin \;
+
+          mkdir -p "${{targets.subpkgdir}}"/etc \
+                   "${{targets.subpkgdir}}"/included-source \
+                   "${{targets.subpkgdir}}"/licenses \
+                   "${{targets.subpkgdir}}"/usr/bin
+
+          cp -avR ./node/filesystem/etc "${{targets.subpkgdir}}"/
+          cp -avR ./node/filesystem/included-source "${{targets.subpkgdir}}"/
+          cp -avR ./node/filesystem/usr "${{targets.subpkgdir}}"/
+          cp -avR ./node/filesystem/sbin/* "${{targets.subpkgdir}}"/usr/bin/
+          cp ./node/LICENSE "${{targets.subpkgdir}}"/licenses/
+
+          # TODO: Proper fix for this
+          rm -f "${{targets.subpkgdir}}"/etc/nsswitch.conf
+    test:
+      pipeline:
+        - name: Test calico-node
+          runs: |
+            /usr/bin/calico-node && exit 0;
+        - uses: test/tw/ldd-check
+
+  # The felix binaries aren't actually shipped, but they contain some useful testing utilities
+  - name: "calico-felix-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-felix=${{package.full-version}}
+      runtime:
+        - glibc
+        - iproute2
+        - libbpf
+        - libelf
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+        - zlib
+    pipeline:
+      - working-directory: felix
+      - runs: |
+          _arch=${{build.goarch}}
+
+          LIBBPF_INCLUDE_PATH=/usr/include/bpf
+
+          CGO_LDFLAGS="-L$LIBBPF_INCLUDE_PATH/$_arch -lbpf -lelf -lz"
+          CGO_CFLAGS="-I$LIBBPF_INCLUDE_PATH"
+
+          LDFLAGS="-w"
+          LDFLAGS="$LDFLAGS -X node/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -X node/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+          LDFLAGS="$LDFLAGS -X node/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/felix \
+            ./felix/cmd/calico-felix
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/calico-bpf \
+            ./felix/cmd/calico-bpf
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/pktgen \
+            ./felix/fv/pktgen
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/iptables-locker \
+            ./felix/fv/iptables-locker
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/test-connection \
+            ./felix/fv/test-connection
+
+          CGO_ENABLED=1 \
+            CGO_LDFLAGS="$CGO_LDFLAGS" \
+            CGO_CFLAGS="$CGO_CFLAGS" \
+            go build -v -tags cgo -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -o "${{targets.subpkgdir}}"/usr/bin/test-workload \
+            ./felix/fv/test-workload
+    test:
+      pipeline:
+        - name: Test calico-felix
+          runs: |
+            felix --help
+            felix --version
+        - uses: test/tw/ldd-check
+
+  - name: "calico-cni-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-cni=${{package.full-version}}
+      runtime:
+        - cni-plugins-bandwidth
+        - cni-plugins-host-local
+        - cni-plugins-loopback
+        - cni-plugins-portmap
+        - cni-plugins-tuning
+        - flannel-cni-plugin
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      # NOTE: cni is a multicall binary: https://github.com/projectcalico/calico/blob/master/cni-plugin/cmd/calico/calico.go
+      # install is not a part of that multicall binary anymore (as of calico 3.27.1)
+      - runs: |
+          # On boot (of calico-node) the CNI is installed/copied onto the host
+          # node and run when pod network sandboxes are created. Since it runs on
+          # the host, we explicitly statically compile this to ensure it doesn't
+          # conflict with the hosts GLIBC, which is often a much more outdated
+          # version than what we build with.
+          LDFLAGS="-w -X main.VERSION=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+          CGO_ENABLED=1 \
+            go build -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -tags osusergo,netgo \
+            -o cni-plugin/out/calico \
+            ./cni-plugin/cmd/calico
+
+          CGO_ENABLED=1 \
+            go build -v -buildvcs=false \
+            -ldflags "$LDFLAGS" \
+            -tags osusergo,netgo \
+            -o cni-plugin/out/install \
+            ./cni-plugin/cmd/install
+      - runs: |
+          install -Dm755 cni-plugin/out/calico "${{targets.subpkgdir}}"/usr/bin/calico
+          ln -sf /usr/bin/calico "${{targets.subpkgdir}}"/usr/bin/calico-ipam
+
+          install -Dm755 cni-plugin/out/install "${{targets.subpkgdir}}"/usr/bin/calico-cni-install
+    test:
+      pipeline:
+        - name: test calico-ipam
+          runs: |
+            calico-ipam
+            calico-ipam -v
+            calico-ipam -h
+        - name: test running calico-cni-install
+          runs: |
+            # this is a installer package so it will during test to install since the directory isn't writeable
+            # it will succeed during image install
+            calico-cni-install && exit 0;
+        - uses: test/tw/ldd-check
+
+  - name: "calico-cni-compat-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-cni-compat=${{package.full-version}}
+      runtime:
+        - calico-cni
+        - cni-plugins-bandwidth-compat
+        - cni-plugins-host-local-compat
+        - cni-plugins-loopback-compat
+        - cni-plugins-portmap-compat
+        - cni-plugins-tuning-compat
+        - flannel-cni-plugin-compat
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/opt/cni/bin
+          ln -s /usr/bin/calico "${{targets.subpkgdir}}"/opt/cni/bin/calico
+          ln -s /usr/bin/calico "${{targets.subpkgdir}}"/opt/cni/bin/calico-ipam
+          ln -s /usr/bin/calico-cni-install "${{targets.subpkgdir}}"/opt/cni/bin/install
+    test:
+      pipeline:
+        - name: testing symlinks for packages
+          runs: |
+            /opt/cni/bin/calico -v
+            /opt/cni/bin/calico-ipam -v
+            /opt/cni/bin/install && exit 0;
+        - uses: test/tw/ldd-check
+
+  - name: "calico-apiserver-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-apiserver=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./apiserver/cmd/apiserver
+          output: calico-apiserver
+          ldflags: "-X github.com/projectcalico/calico/cmd/apiserver/server.VERSION=${{package.version}}) -X github.com/projectcalico/calico/cmd/apiserver/server.BUILD_DATE=$(date -u +'%FT%T%z') -X github.com/projectcalico/calico/cmd/apiserver/server.GIT_DESCRIPTION=$(git describe --tags) -X github.com/projectcalico/calico/cmd/apiserver/server.GIT_REVISION=$(git rev-parse --short HEAD)"
+    test:
+      pipeline:
+        - name: testing calico-apiserver
+          runs: |
+            calico-apiserver --help
+        - uses: test/tw/ldd-check
+
+  # https://github.com/projectcalico/calico/blob/master/apiserver/Dockerfile#L8
+  - name: "calico-apiserver-compat-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-apiserver-compat=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/code
+          ln -sf /usr/bin/calico-apiserver "${{targets.subpkgdir}}"/code/apiserver
+    test:
+      environment:
+        contents:
+          packages:
+            - calico-apiserver=${{package.full-version}}
+      pipeline:
+        - name: testing calico-apiserver
+          runs: |
+            /code/apiserver --help
+        - uses: test/tw/ldd-check
+
+  - name: "calico-key-cert-provisioner-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-key-cert-provisioner=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./key-cert-provisioner/cmd/
+          output: calico-key-cert-provisioner
+    test:
+      pipeline:
+        - name: testing calico-apiserver
+          runs: |
+            calico-key-cert-provisioner --help
+        - uses: test/tw/ldd-check
+
+  - name: "calico-app-policy-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-app-policy=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./app-policy/cmd/dikastes
+          output: calico-dikastes
+          ldflags: "-X github.com/projectcalico/calico/app-policy/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>') -X github.com/projectcalico/calico/app-policy/buildinfo.BuildDate=$(date -u +'%FT%T%z') -X github.com/projectcalico/calico/app-policy/GitRevision=$(git rev-parse HEAD || echo '<unknown>') -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./app-policy/cmd/healthz
+          output: calico-healthz
+    test:
+      pipeline:
+        - name: testing calico-healthz
+          runs: |
+            calico-healthz --help
+        - uses: test/tw/ldd-check
+
+  - name: "calico-kube-controllers-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-kube-controllers=${{package.full-version}}
+      runtime:
+        - glibc-dev
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./kube-controllers/cmd/kube-controllers
+          output: calico-kube-controllers
+          ldflags: "-X main.VERSION=$(git describe --tags --dirty --always --abbrev=12)"
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./kube-controllers/cmd/check-status
+          output: check-status # keep naming convention as "check-status" is usually harded to /usr/bin/check-status
+          ldflags: "-X main.VERSION=$(git describe --tags --dirty --always --abbrev=12)"
+    test:
+      pipeline:
+        - name: testing calico-healthz
+          runs: |
+            check-status -v
+            calico-kube-controllers -version
+        - uses: test/tw/ldd-check
+
+  - name: "calico-pod2daemon-${{vars.short-package-version}}"
+    description: "The calico pod2daemon components"
+    dependencies:
+      provides:
+        - calico-pod2daemon=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./pod2daemon/flexvol
+          output: calico-pod2daemon-flexvol
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./pod2daemon/csidriver
+          output: calico-pod2daemon-csidriver
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./pod2daemon/nodeagent
+          output: calico-pod2daemon-nodeagent
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          install -m755 ./pod2daemon/flexvol/docker-image/flexvol.sh "${{targets.subpkgdir}}"/usr/bin/flexvol.sh
+    test:
+      pipeline:
+        - name: testing calico-pod2daemon packages
+          runs: |
+            calico-pod2daemon-flexvol --help
+            calico-pod2daemon-csidriver --help
+            calico-pod2daemon-nodeagent && exit 0;
+        - uses: test/tw/ldd-check
+
+  - name: "calico-pod2daemon-flexvol-compat-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calico-pod2daemon-flexvol-compat=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/local/bin
+          ln -sf /usr/bin/calico-pod2daemon-flexvol "${{targets.subpkgdir}}"/usr/local/bin/flexvol
+          ln -sf /usr/bin/flexvol.sh "${{targets.subpkgdir}}"/usr/local/bin/flexvol.sh
+
+  - name: "calicoctl-${{vars.short-package-version}}"
+    dependencies:
+      provides:
+        - calicoctl=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./calicoctl/calicoctl
+          output: calicoctl
+          ldflags: "-X github.com/projectcalico/calico/calicoctl/commands.VERSION=$(git describe --tags --dirty --always --abbrev=12) -X github.com/projectcalico/calico/calicoctl/commands.GIT_REVISION=$(git rev-parse --short HEAD) -X github.com/projectcalico/calico/calicoctl/commands/common.VERSION=$(git describe --tags --dirty --always --abbrev=12) -X main.VERSION=$(git describe --tags --dirty --always --abbrev=12)"
+    test:
+      pipeline:
+        - name: testing calico-pod2daemon-compat
+          runs: |
+            calicoctl --help
+
+  - name: "calico-typhad-${{vars.short-package-version}}"
+    description: "The calico typha daemon"
+    dependencies:
+      provides:
+        - calico-typhad=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      # TODO: I'm not sure yet if this actually needs CGO, or is just enabled upstream because of go-fips
+      - runs: |
+          LDFLAGS="-w"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin/
+          CGO_ENABLED=1 \
+            go build -v -tags cgo -v -buildvcs=false \
+            -o "${{targets.subpkgdir}}"/usr/bin/calico-typha \
+            ./typha/cmd/calico-typha
+
+          mkdir -p "${{targets.subpkgdir}}"/etc/calico
+          cp ./typha/docker-image/typha.cfg "${{targets.subpkgdir}}"/etc/calico/typha.cfg
+
+          mkdir -p "${{targets.subpkgdir}}"/licenses
+          cp ./typha/LICENSE "${{targets.subpkgdir}}"/licenses
+    test:
+      pipeline:
+        - name: testing calico-typhad daemon
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              echo "LogSeveritySys=None" >> /etc/calico/typha.cfg
+            start: "/usr/bin/calico-typha"
+            timeout: 10
+            expected_output: |
+              Successfully loaded configuration
+        - name: Verify license exists
+          runs: |
+            if [ ! -f /licenses/LICENSE ]; then
+              echo "License file not found"
+              exit 1
+            fi
+
+  - name: "calico-typha-client-${{vars.short-package-version}}"
+    description: "The calico typha client"
+    dependencies:
+      provides:
+        - calico-typha-client=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      # TODO: I'm not sure yet if this actually needs CGO, or is just enabled upstream because of go-fips
+      - runs: |
+          LDFLAGS="-w"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitVersion=$(git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.BuildDate=$(date -u +'%FT%T%z')"
+          LDFLAGS="$LDFLAGS -X github.com/projectcalico/calico/typha/pkg/buildinfo.GitRevision=$(git rev-parse HEAD || echo '<unknown>')"
+          LDFLAGS="$LDFLAGS -B 0x$(git rev-parse HEAD || uuidgen | sed 's/-//g')"
+
+          CGO_ENABLED=1 \
+            go build -v -tags osusergo,netgo,cgo -v -buildvcs=false \
+            -o "${{targets.subpkgdir}}"/usr/bin/typha-client \
+            ./typha/cmd/typha-client
+    test:
+      pipeline:
+        - name: testing calico-typha-client
+          runs: |
+            typha-client --help
+
+  - name: "calico-goldmane-${{vars.short-package-version}}"
+    description: "Goldmane"
+    dependencies:
+      provides:
+        - calico-goldmane=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./goldmane/cmd
+          output: goldmane
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./goldmane/cmd/flowgen
+          output: flowgen
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./goldmane/cmd/stream
+          output: stream
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./goldmane/cmd/health
+          output: health
+      - runs: |
+          # Upstream expects the executables to be in `/` dir: https://github.com/projectcalico/calico/blob/master/goldmane/docker/Dockerfile
+          mkdir -p "${{targets.subpkgdir}}"/
+          ln -sf /usr/bin/goldmane "${{targets.subpkgdir}}"/goldmane
+          ln -sf /usr/bin/health "${{targets.subpkgdir}}"/health
+          ln -sf /usr/bin/flowgen "${{targets.subpkgdir}}"/flowgen
+          ln -sf /usr/bin/stream "${{targets.subpkgdir}}"/stream
+    test:
+      environment:
+        contents:
+          packages:
+            - wait-for-it
+      pipeline:
+        - name: Test binaries
+          runs: |
+            test "$(readlink /goldmane)" = "/usr/bin/goldmane"
+            test "$(readlink /health)" = "/usr/bin/health"
+            test "$(readlink /flowgen)" = "/usr/bin/flowgen"
+            test "$(readlink /stream)" = "/usr/bin/stream"
+        - name: "start daemon on localhost"
+          uses: test/daemon-check-output
+          with:
+            start: "/goldmane"
+            timeout: 30
+            expected_output: |
+              Health enabled
+              Starting flow collector
+              Listening on
+            post: |
+              wait-for-it -t 10 --strict localhost:8080 -- echo "Server is up"
+              wait-for-it -t 10 --strict localhost:443 -- echo "Server is up"
+
+  - name: "calico-whisker-${{vars.short-package-version}}"
+    description: "Tigera OSS-UI (Whisker)"
+    dependencies:
+      replaces:
+        - nginx-mainline-config
+      provides:
+        - calico-whisker=${{package.full-version}}
+      runtime:
+        - nginx-mainline
+        - coreutils
+        - dash-binsh
+        - sed
+        - libcap
+        - ncurses
+        - zlib
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - working-directory: whisker
+        pipeline:
+          - name: Build the UI
+            runs: |
+              yarn install --frozen-lockfile
+              yarn build
+          - name: Install the files
+            runs: |
+              # https://github.com/projectcalico/calico/blob/master/whisker/docker-image/Dockerfile
+              mkdir -p "${{targets.contextdir}}"/etc/nginx/
+              mkdir -p "${{targets.contextdir}}"/etc/nginx/conf.d/
+              install -Dm755 docker-image/nginx-start.sh "${{targets.contextdir}}"/usr/bin/nginx-start.sh # 644 fails on tests
+              install -Dm644 docker-image/nginx.conf ${{targets.contextdir}}/etc/nginx/
+              install -Dm644 docker-image/default.conf ${{targets.contextdir}}/etc/nginx/conf.d/
+              install -Dm644 LICENSE "${{targets.contextdir}}"/licenses/LICENSE
+              mkdir -p "${{targets.contextdir}}"/usr/share/nginx/html
+              cp -avR dist/* "${{targets.contextdir}}"/usr/share/nginx/html/
+    test:
+      environment:
+        contents:
+          packages:
+            - wait-for-it
+            - grep
+            - curl
+            - shadow
+      pipeline:
+        - name: Test important files
+          runs: |
+            #test "$(readlink /usr/sbin/nginx)" = "/usr/bin/nginx"
+            stat /usr/bin/nginx-start.sh
+            if [ -z "$(ls -A /usr/share/nginx/html/)" ]; then
+              echo "/usr/share/nginx/html/ is empty"
+              exit 1
+            fi
+        - name: Extract the SO files from the Dockerfile and check if they exist
+          runs: |
+            #!/bin/bash
+            dockerfile=$(curl -fsSL "https://raw.githubusercontent.com/projectcalico/calico/refs/tags/v${{package.version}}/whisker/docker-image/Dockerfile")
+            so_files=$(echo "$dockerfile" | grep -oP '/lib64/lib\w+\.so(\.\d+)*' | xargs -n1 basename | sed -E 's/\.so(\..*)*/.so/')
+            so_files=$(echo "$so_files" | sort -u)
+            echo "Checking .so files:"
+            for so in $so_files; do
+              if ldconfig -p | grep -q "$so"; then
+                echo "[OK] $so found"
+              else
+                echo "[MISSING] $so not found"
+                exit 1
+              fi
+            done
+        - name: "start daemon on localhost"
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              useradd nginx
+              mkdir -p /var/lib/nginx/tmp
+              mkdir -p /var/run
+            start: "/usr/bin/nginx-start.sh"
+            timeout: 30
+            expected_output: |
+              start worker processes
+            post: |
+              wait-for-it -t 10 --strict localhost:8081 -- echo "NGINX is up"
+              curl -sfL --retry 3 http://localhost:8081 | grep -qi "Calico Whisker"
+
+  - name: "calico-whisker-backend-${{vars.short-package-version}}"
+    description: "Whisker backend"
+    dependencies:
+      provides:
+        - calico-whisker-backend=${{package.full-version}}
+      runtime:
+        - glibc
+        - merged-bin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - uses: go/build
+        with:
+          modroot: .
+          packages: ./whisker-backend/cmd
+          output: whisker-backend
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/
+          ln -sf /usr/bin/whisker-backend "${{targets.subpkgdir}}"/whisker-backend
+    test:
+      environment:
+        contents:
+          packages:
+            - wait-for-it
+      pipeline:
+        - name: Test binaries
+          runs: |
+            test "$(readlink /whisker-backend)" = "/usr/bin/whisker-backend"
+            set -e
+            # Same behavior as upstream: docker container run --rm -it calico/whisker-backend:v3.30.0-arm64
+            /whisker-backend -h 2>&1 | grep -qi 'Failed to create goldmane TLS credentials'
+
+update:
+  enabled: true
+  github:
+    identifier: projectcalico/calico
+    strip-prefix: v
+    tag-filter: v3.30.
+
+test:
+  environment:
+    contents:
+      packages:
+        - calico-apiserver-${{vars.short-package-version}}
+        - calico-apiserver-compat-${{vars.short-package-version}}
+        - calico-cni-${{vars.short-package-version}}
+        - calico-cni-compat-${{vars.short-package-version}}
+        - calico-pod2daemon-${{vars.short-package-version}}
+        - calico-pod2daemon-flexvol-compat-${{vars.short-package-version}}
+        - calico-kube-controllers-${{vars.short-package-version}}
+        - calico-node-${{vars.short-package-version}}
+        - calico-typhad-${{vars.short-package-version}}
+        - calico-typha-client-${{vars.short-package-version}}
+        - calico-goldmane-${{vars.short-package-version}}
+        - calico-whisker-${{vars.short-package-version}}
+        - calico-whisker-backend-${{vars.short-package-version}}
+  pipeline:
+    - name: Test binaries
+      runs: |
+        /usr/bin/calico-apiserver --help
+        /usr/bin/calico-cni-install 2>&1 | grep -q 'cni-installer'
+        /usr/bin/calico-pod2daemon-csidriver --help
+        /usr/bin/calico-pod2daemon-flexvol  --help
+        /usr/bin/calico-kube-controllers --help
+        /usr/bin/start_runit 2>&1 | grep -q 'no configuration has been provided'
+        /usr/bin/calico-typha --help
+        /usr/bin/typha-client --help
+        /usr/bin/health -h
+        /usr/bin/stream --help
+    - name: Test compat package paths
+      runs: |
+        /code/apiserver --help
+        /opt/cni/bin/install 2>&1 | grep -q 'cni-installer'
+        /usr/local/bin/flexvol --help

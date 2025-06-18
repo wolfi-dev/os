@@ -286,3 +286,9 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
   curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
 	mv "$(2).tmp" "$(2)"
+
+cue_targets = $(foreach name,$(yamls),cue_vet/$(name))
+$(cue_targets): cue_vet/%:
+	$(MELANGE) compile --arch ${ARCH} --pipeline-dir ./pipelines/ $* > /tmp/$*.json
+	cue vet /tmp/$*.json schema.cue
+	rm /tmp/$*.json

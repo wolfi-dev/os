@@ -1,0 +1,115 @@
+package:
+  name: kubernetes-reflector
+  version: "9.1.12"
+  epoch: 0
+  description: Custom Kubernetes controller that can be used to replicate secrets, configmaps and certificates.
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - icu-libs
+
+# Should be bumped according to https://github.com/emberstack/kubernetes-reflector/blob/6e7a64250c49058266d75be822e9417a06f53856/src/ES.Kubernetes.Reflector/ES.Kubernetes.Reflector.csproj#L4
+vars:
+  dotnet_version: 9
+
+environment:
+  contents:
+    packages:
+      - aspnet-${{vars.dotnet_version}}-runtime
+      - busybox
+      - dotnet-${{vars.dotnet_version}}-sdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/emberstack/${{package.name}}.git
+      tag: v${{package.version}}
+      expected-commit: 6e7a64250c49058266d75be822e9417a06f53856
+
+  - runs: |
+      runtime_arch="$(arch | sed -e 's/x86_64/x64/ ; s/aarch64/arm64/')"
+
+      dotnet publish "src/ES.Kubernetes.Reflector/ES.Kubernetes.Reflector.csproj" \
+        -c Release \
+        -o publish \
+        -p:DebugSymbols=false \
+        -p:DebugType=none \
+        --self-contained true \
+        --runtime linux-$runtime_arch \
+
+      mkdir -p "${{targets.contextdir}}"/usr/lib
+      cp -dr publish "${{targets.contextdir}}"/usr/lib/${{package.name}}
+
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      ln -s /usr/lib/${{package.name}}/ES.Kubernetes.Reflector "${{targets.contextdir}}"/usr/bin/${{package.name}}
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility entrypoint from upstream image
+    pipeline:
+      - runs: |
+          install -d ${{targets.contextdir}}
+          ln -s /usr/lib/${{package.name}}/ ${{targets.contextdir}}/app
+    test:
+      pipeline:
+        - name: Check if symlinks are being correctly applied
+          runs: |
+            stat /app
+            test -L /app
+            test "$(readlink /app)" = "/usr/lib/${{package.name}}/"
+            test "$(realpath /app)/ES.Kubernetes.Reflector.dll" = "/usr/lib/${{package.name}}/ES.Kubernetes.Reflector.dll"
+
+test:
+  environment:
+    environment:
+      ASPNETCORE_URLS: http://localhost:8080
+      ES_Serilog__MinimumLevel__Default: Verbose
+      ES_Serilog__MinimumLevel__Override__System: Information
+      ES_Serilog__MinimumLevel__Override__Microsoft: Information
+      ES_Serilog__WriteTo__0__Name: Console
+      ES_KubernetesClientConfiguration__VerifyConnection: false
+      ES_KubernetesClientConfiguration__SkipTlsVerify: true
+      ES_KubernetesClientConfiguration__WatchReconnectTimeoutSeconds: 5
+      ES_KubernetesClientConfiguration__ConnectionRetryIntervalMs: 1000
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
+  pipeline:
+    - name: Validate kubernetes-reflector package contents
+      runs: |
+        # Verify the required files exist
+        if [ -f /usr/lib/${{package.name}}/ES.Kubernetes.Reflector.dll ] && \
+           [ -f /usr/lib/${{package.name}}/ES.Kubernetes.Reflector.deps.json ] && \
+           [ -f /usr/lib/${{package.name}}/ES.Kubernetes.Reflector.runtimeconfig.json ]; then
+          echo "All required files found in the package"
+        else
+          echo "Some required files are missing"
+          exit 1
+        fi
+    - uses: test/kwok/cluster
+    - name: Verify the reflector...reflects...a properly annotated ConfigMap
+      uses: test/daemon-check-output
+      with:
+        expected_output: |
+          Requesting V1ConfigMap resources
+          Requesting V1Namespace resources
+          Handling Added ConfigMap source-ns/test-configmap
+          Processing auto-reflection source source-ns/test-configmap
+          Reflecting source-ns/test-configmap to target-ns/test-configmap
+          Created target-ns/test-configmap as a reflection of source-ns/test-configmap
+          Auto-reflected source-ns/test-configmap where permitted. Created 1 - Updated 0 - Deleted 0 - Validated 0
+          Handling Added ConfigMap target-ns/test-configmap
+        post: |
+          kubectl get all --all-namespaces
+        timeout: 20
+        setup: |
+          kubectl create namespace source-ns
+          kubectl create namespace target-ns
+          kubectl apply -f configmap.yaml
+        start: /usr/bin/${{package.name}}
+
+update:
+  enabled: true
+  github:
+    identifier: emberstack/kubernetes-reflector
+    strip-prefix: v

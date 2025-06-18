@@ -1,0 +1,118 @@
+package:
+  name: aws-otel-collector
+  version: 0.43.3
+  epoch: 1
+  description: AWS distro for OpenTelemetry Collector
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 3a9f6a23632ff047170cf94506d5089fce2f046d
+      repository: https://github.com/aws-observability/aws-otel-collector
+      tag: v${{package.version}}
+
+  - uses: go/build
+    with:
+      packages: ./cmd/awscollector
+      output: awscollector
+      ldflags: |
+        -X github.com/aws-observability/aws-otel-collector/tools/version.GitHash=$(git rev-parse HEAD)
+        -X github.com/aws-observability/aws-otel-collector/tools/version.Version=${{package.version}}
+        -X github.com/aws-observability/aws-otel-collector/tools/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  - runs: |
+      # Copies the default config.
+      # https://github.com/aws-observability/aws-otel-collector/blob/main/cmd/awscollector/Dockerfile#L101
+      mkdir -p ${{targets.destdir}}/etc
+      cp config.yaml ${{targets.destdir}}/etc/otel-config.yaml
+
+      # Copy all the example configs for different AWS services (ECS, EKS, App Runner)
+      # https://github.com/aws-observability/aws-otel-collector/blob/main/cmd/awscollector/Dockerfile#L92
+      cp -r config/* ${{targets.destdir}}/etc/
+
+subpackages:
+  - name: ${{package.name}}-healthcheck
+    description: Health check utility for AWS OTel Collector
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/healthcheck
+          output: healthcheck
+          ldflags: |
+            -X github.com/aws-observability/aws-otel-collector/tools/version.GitHash=$(git rev-parse HEAD)
+            -X github.com/aws-observability/aws-otel-collector/tools/version.Version=${{package.version}}
+            -X github.com/aws-observability/aws-otel-collector/tools/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    test:
+      pipeline:
+        - name: Test healthcheck binary exists
+          runs: |
+            healthcheck --help
+            /usr/bin/healthcheck --help
+
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf /usr/bin/awscollector ${{targets.contextdir}}/awscollector
+          ln -sf /usr/bin/healthcheck ${{targets.contextdir}}/healthcheck
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+            - ${{package.name}}-healthcheck
+      pipeline:
+        - name: Test root-level symlinks
+          runs: |
+            /awscollector version 2>&1 | grep "${{package.version}}"
+            /healthcheck --help
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-healthcheck
+        - wget
+    environment:
+      AWS_REGION: us-east-1
+  pipeline:
+    - name: Verify binary exists and returns the correct package version.
+      runs: |
+        awscollector version 2>&1 | grep "${{package.version}}"
+        /usr/bin/awscollector version 2>&1 | grep "${{package.version}}"
+    - name: Verify default config exists
+      runs: |
+        test -f /etc/otel-config.yaml
+        test -f /etc/ecs/ecs-default-config.yaml
+        test -f /etc/eks/prometheus/config-all.yaml
+        test -f /etc/apprunner/apprunner-default-config.yaml
+    - name: Start collector and test functionality
+      runs: |
+        # Start collector with default config in background
+        awscollector --config=/etc/otel-config.yaml > collector.log 2>&1 &
+        COLLECTOR_PID=$!
+        sleep 3
+
+        # Verify collector started correctly
+        grep -q "Starting aws-otel-collector" collector.log
+        grep -q "Starting GRPC server.*0.0.0.0:4317" collector.log
+        grep -q "Starting HTTP server.*0.0.0.0:4318" collector.log
+        grep -q "Listening on endpoint.*X-Ray.*0.0.0.0:2000" collector.log
+        grep -q "Extension started.*health_check" collector.log
+        grep -q "Health Check state change.*ready" collector.log
+
+        # Test the health check endpoint
+        HEALTH_JSON=$(wget -qO- http://localhost:13133/)
+        echo "$HEALTH_JSON" | grep -q '"status":"Server available"'
+        echo "$HEALTH_JSON" | grep -q '"upSince":'
+
+        # Use the 'healthcheck' binary to check the endpoint
+        healthcheck -port 13133
+
+update:
+  enabled: true
+  github:
+    identifier: aws-observability/aws-otel-collector
+    strip-prefix: v

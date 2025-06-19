@@ -1,0 +1,127 @@
+package:
+  name: haproxy-3.2
+  version: "3.2.1"
+  epoch: 3
+  description: "A TCP/HTTP reverse proxy for high availability environments"
+  copyright:
+    - license: GPL-2.0-or-later
+  dependencies:
+    runtime:
+      - libgcc
+      - merged-usrsbin
+      - wolfi-baselayout
+    provides:
+      - haproxy=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - libcap-utils
+      - linux-headers
+      - lua5.3-dev
+      - openssl-dev
+      - pcre2-dev
+
+pipeline:
+  # Using this git to get the correct version using GitMonitor
+  - uses: git-checkout
+    with:
+      repository: https://git.haproxy.org/git/haproxy-${{vars.major-minor-version}}.git
+      tag: v${{package.version}}
+      expected-commit: f4d1a4e279bcb00f758dfbf037e3808512df113b
+      destination: /home/build/nothing
+
+  - runs: rm -rf /home/build/nothing # we do not use this source to build
+
+  # We have to use fetch, as there are issues cloning from: 'https://git.haproxy.org/git/haproxy-3.0.git'.
+  # Namely: 'failed to validate pipeline git-checkout: failed to list refs for https://git.haproxy.org/git/haproxy-3.0.git/: pkt-line 1: invalid hash text: encoding/hex: invalid byte'
+  - uses: fetch
+    with:
+      uri: https://www.haproxy.org/download/${{vars.major-minor-version}}/src/haproxy-${{package.version}}.tar.gz
+      expected-sha256: bb3f967a797c8851d08683ec43dfafe4ad7bf5ad86fa6b0721cad033ea9e5ae5
+
+  - uses: autoconf/make
+    with:
+      opts: |
+        TARGET=linux-glibc \
+        USE_THREAD=1 \
+        USE_PCRE2=1 \
+        USE_PCRE2_JIT=1 \
+        USE_OPENSSL=1 \
+        USE_LUA=1 \
+        USE_NS=1 \
+        USE_PROMEX=1 \
+        LUA_LIB=/usr/lib/lua5.3 \
+        LUA_INC=/usr/include/lua5.3 \
+        USE_GETADDRINFO=1 \
+        SBINDIR=/usr/bin
+
+  - runs: |
+      make install DESTDIR="${{targets.destdir}}" PREFIX=/usr DOCDIR=/usr/share/doc/haproxy
+      install -d "${{targets.destdir}}"/var/lib/haproxy
+      mkdir -p "${{targets.destdir}}"/usr/bin
+      mv "${{targets.destdir}}"/usr/sbin/* "${{targets.destdir}}"/usr/bin
+      rmdir "${{targets.destdir}}"/usr/sbin
+
+  - uses: strip
+
+  # This MUST run after strip, which strips capabilities too!
+  - runs: setcap cap_net_bind_service=+eip "${{targets.destdir}}/usr/bin/haproxy"
+
+subpackages:
+  - name: "${{package.name}}-doc"
+    description: "haproxy documentation"
+    pipeline:
+      - uses: split/manpages
+    dependencies:
+      provides:
+        - haproxy-doc=${{package.full-version}}
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/docs
+
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint for using HAProxy in OCI containers
+    dependencies:
+      runtime:
+        - busybox
+        - merged-usrsbin
+        - posix-libc-utils # `getent` is required for certain helm chart startups
+        - wolfi-baselayout
+      provides:
+        - haproxy-oci-entrypoint=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin/
+          cp docker-entrypoint.sh ${{targets.subpkgdir}}/usr/local/bin/
+          chmod +x ${{targets.subpkgdir}}/usr/local/bin/docker-entrypoint.sh
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: v3.2
+
+test:
+  environment:
+    contents:
+      packages:
+        - libcap-utils
+  pipeline:
+    - runs: |
+        haproxy -v
+    - name: Test file capabilities
+      runs: |
+        getcap /usr/bin/haproxy | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=eip$'

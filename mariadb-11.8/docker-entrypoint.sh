@@ -628,7 +628,7 @@ EOSQL
 		mysql_note "Temporary server stopped"
 
 		if _check_if_upgrade_is_needed; then
-			# need a restart as FLUSH PRIVILEGES isn't reversable
+			# need a restart as FLUSH PRIVILEGES isn't reversible
 			mysql_note "Restarting temporary server for upgrade"
 			docker_temp_server_start "$@" --skip-grant-tables \
 				--loose-innodb_buffer_pool_dump_at_shutdown=0 \

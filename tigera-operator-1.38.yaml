@@ -1,0 +1,114 @@
+package:
+  name: tigera-operator-1.38
+  version: "1.38.2"
+  epoch: 0
+  description: Kubernetes operator for installing Calico and Calico Enterprise
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - tigera-operator=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - go
+  environment:
+    CGO_ENABLED: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/tigera/operator
+      tag: v${{package.version}}
+      expected-commit: 1c004c15bd7f3a4b2d8d1d46038a980f9b0df78f
+
+  - uses: go/build
+    with:
+      packages: ./cmd/main.go
+      output: operator
+      ldflags: |
+        -X github.com/tigera/operator/version.VERSION=v${{package.version}}
+        -X github.com/tigera/operator/version.GitCommit=$(git rev-parse HEAD)
+        -X github.com/tigera/operator/version.BuildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
+
+update:
+  enabled: true
+  github:
+    identifier: tigera/operator
+    use-tag: true
+    strip-prefix: v
+    tag-filter: v1.38.
+
+test:
+  environment:
+    contents:
+      packages:
+        - k3s
+        - tini
+  pipeline:
+    - name: Check if binary exists
+      runs: |
+        if [ ! -x "$(command -v operator)" ]; then
+          echo "Error: operator binary not found!"
+          exit 1
+        fi
+        echo "Operator binary found."
+    - name: Verify version output
+      runs: |
+        EXPECTED_VERSION="Operator: v${{package.version}}"
+        if ! operator --version 2>&1 | grep -q "$EXPECTED_VERSION"; then
+          echo "Error: Version mismatch! Expected '$EXPECTED_VERSION' in output."
+          operator --version 2>&1  # Print full output for debugging
+          exit 1
+        fi
+        echo "Version check passed."
+    - name: Validate basic execution
+      runs: |
+        if ! operator --help > /dev/null 2>&1; then
+          echo "Error: Operator help command failed!"
+          exit 1
+        fi
+        echo "Operator help command executed successfully."
+    - name: "Launch operator and check for readiness"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # NOTE: While test/kwok/cluster was initially considered for this test it failed to capture the required logs.
+          # due to which we prefer using k3s ensures the operator starts reliably, logs are captured as expected.
+
+          k3s server --disable-agent > /dev/null 2>&1 &
+          K3S_PID=$!
+          for i in {1..20}; do
+            if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+              export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+              if kubectl get nodes >/dev/null 2>&1; then
+                echo "k3s is ready"
+                break
+              fi
+            fi
+            echo "Waiting for k3s to become ready..."
+            sleep 2
+          done
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+          mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+          echo "default" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+        start: tini -s -- operator -kubeconfig /tmp/kubeconfig.yaml -enable-leader-election=false -manage-crds -bootstrap-crds -variant Calico
+        timeout: 40
+        expected_output: |
+          Active operator: proceeding
+          CRDs installed successfully
+        post: |
+          echo "Verifying that Tigera CRDs have been installed..."
+
+          if kubectl get crds | grep -q tigera; then
+            echo "Tigera CRDs installed successfully."
+          else
+            echo "CRDs not installed properly."
+            kubectl get crds || true
+          exit 1
+          fi

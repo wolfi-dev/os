@@ -1,0 +1,244 @@
+package:
+  name: orthanc
+  version: "1.12.8"
+  epoch: 0
+  description: "Orthanc - a lightweight DICOM server for medical imaging"
+  copyright:
+    - license: "AGPL-3.0-or-later"
+  dependencies:
+    runtime:
+      - tzdata
+
+vars:
+  lua-version: "5.4"
+  py-version: "3.13"
+
+environment:
+  contents:
+    packages:
+      - boost-dev
+      - build-base
+      - busybox
+      - curl-dev
+      - dcmtk-dev
+      - doxygen
+      - gtest-dev
+      - jsoncpp-dev
+      - libjpeg-turbo-dev
+      - libpng-dev
+      - lua${{vars.lua-version}}-dev
+      - ninja
+      - openssl-dev
+      - patch
+      - protobuf-dev
+      - pugixml-dev
+      - python-${{vars.py-version}}
+      - sqlite-dev
+      - tzdata
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://orthanc.uclouvain.be/downloads/sources/orthanc/Orthanc-${{package.version}}.tar.gz
+      expected-sha256: 7e2e6c27284e2893eaf09f99484c579921dabab51ab6aa91eead96234406ec03
+
+  - uses: cmake/configure
+    with:
+      opts: |
+        -DCMAKE_BUILD_TYPE=Release \
+        -DALLOW_DOWNLOADS=ON \
+        -DSTANDALONE_BUILD=ON \
+        -DUSE_SYSTEM_PUGIXML=ON \
+        -DUSE_SYSTEM_DCMTK=ON \
+        -DUSE_SYSTEM_OPENSSL=ON \
+        -DUSE_SYSTEM_CURL=ON \
+        -DUSE_BUNDLED_JSONCPP=ON \
+        -DUSE_SYSTEM_CIVETWEB=OFF \
+        -DUSE_GOOGLE_TEST_DEBIAN_PACKAGE=OFF \
+        -DLUA_LIBRARIES=/usr/lib/lua${{vars.lua-version}}/liblua.so \
+        -DPUGIXML_DIR=/usr/lib/cmake/pugixml \
+        -S ./OrthancServer/
+
+  - uses: cmake/build
+
+  - uses: cmake/install
+
+  - runs: |
+      mv ${{targets.destdir}}/usr/sbin/* ${{targets.destdir}}/usr/bin/
+      rmdir ${{targets.destdir}}/usr/sbin
+
+      # Create timezone symlink to /etc/localtime
+      mkdir -p ${{targets.destdir}}/etc
+      ln -sf /usr/share/zoneinfo/UTC ${{targets.destdir}}/etc/localtime
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: Development files for Orthanc
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-compat
+    description: Symlinks for Orthanc
+    pipeline:
+      - runs: |
+          # Upstream image installs it to /usr/local/bin
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          ln -sf /usr/bin/Orthanc ${{targets.subpkgdir}}/usr/local/bin/Orthanc
+
+          # Compatibility symlinks for plugins
+          mkdir -p ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+          ln -sf /usr/share/orthanc/plugins/libModalityWorklists.so ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+          ln -sf /usr/share/orthanc/plugins/libServeFolders.so ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+          ln -sf /usr/share/orthanc/plugins/libHousekeeper.so ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+          ln -sf /usr/share/orthanc/plugins/libConnectivityChecks.so ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+          ln -sf /usr/share/orthanc/plugins/libMultitenantDicom.so ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    test:
+      pipeline:
+        - runs: |
+            readlink -f /usr/local/bin/Orthanc | grep "/usr/bin/Orthanc"
+            readlink -f /etc/localtime | grep "/usr/share/zoneinfo/UTC"
+            readlink -f /usr/share/orthanc/plugins-available/libModalityWorklists.so | grep "/usr/share/orthanc/plugins/libModalityWorklists.so"
+            readlink -f /usr/share/orthanc/plugins-available/libServeFolders.so | grep "/usr/share/orthanc/plugins/libServeFolders.so"
+            readlink -f /usr/share/orthanc/plugins-available/libHousekeeper.so | grep "/usr/share/orthanc/plugins/libHousekeeper.so"
+            readlink -f /usr/share/orthanc/plugins-available/libConnectivityChecks.so | grep "/usr/share/orthanc/plugins/libConnectivityChecks.so"
+            readlink -f /usr/share/orthanc/plugins-available/libMultitenantDicom.so | grep "/usr/share/orthanc/plugins/libMultitenantDicom.so"
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - openssl
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Test installation
+      runs: |
+        /usr/bin/Orthanc --version
+        /usr/bin/Orthanc --help
+    - name: Test server startup
+      runs: |
+        mkdir -p /tmp/orthanc-test
+
+        cat > /tmp/orthanc-test.json << 'EOF'
+        {
+          "Name": "TestOrthanc",
+          "HttpPort": 18042,
+          "DicomPort": 14242,
+          "RemoteAccessAllowed": true,
+          "AuthenticationEnabled": false,
+          "Plugins": [],
+          "StorageDirectory": "/tmp/orthanc-test",
+          "IndexDirectory": "/tmp/orthanc-test"
+        }
+        EOF
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/Orthanc /tmp/orthanc-test.json --no-jobs
+        timeout: 30
+        expected_output: |
+          Orthanc has started
+    - name: Test REST API
+      runs: |
+        mkdir -p /tmp/orthanc-api-test
+
+        cat > /tmp/orthanc-api.json << 'EOF'
+        {
+          "Name": "APITestOrthanc",
+          "HttpPort": 18043,
+          "DicomPort": 14243,
+          "RemoteAccessAllowed": true,
+          "AuthenticationEnabled": false,
+          "Plugins": [],
+          "StorageDirectory": "/tmp/orthanc-api-test",
+          "IndexDirectory": "/tmp/orthanc-api-test"
+        }
+        EOF
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/Orthanc /tmp/orthanc-api.json --no-jobs
+        timeout: 30
+        expected_output: |
+          Orthanc has started
+        post: |
+          curl -s http://localhost:18043/system | grep -q '"Name" : "APITestOrthanc"' && echo "REST API test passed"
+    - name: Test DICOM protocol
+      runs: |
+        mkdir -p /tmp/orthanc-dicom-test
+
+        cat > /tmp/orthanc-dicom.json << 'EOF'
+        {
+          "Name": "DICOMTestOrthanc",
+          "HttpPort": 18044,
+          "DicomPort": 14244,
+          "RemoteAccessAllowed": true,
+          "AuthenticationEnabled": false,
+          "DicomAet": "ORTHANC_TEST",
+          "DicomCheckCalledAet": false,
+          "Plugins": [],
+          "StorageDirectory": "/tmp/orthanc-dicom-test",
+          "IndexDirectory": "/tmp/orthanc-dicom-test"
+        }
+        EOF
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/Orthanc /tmp/orthanc-dicom.json --no-jobs
+        timeout: 30
+        expected_output: |
+          DICOM server listening with AET ORTHANC_TEST on port: 14244
+    - name: Test basic TLS support
+      runs: |
+        mkdir -p /tmp/orthanc-tls
+
+        # Generate simple self-signed certificate
+        openssl req -x509 -nodes -days 1 -newkey rsa:2048 \
+          -keyout /tmp/orthanc-tls/server.key \
+          -out /tmp/orthanc-tls/server.crt \
+          -subj "/CN=localhost"
+
+        # Create combined PEM file for Orthanc
+        cat /tmp/orthanc-tls/server.key /tmp/orthanc-tls/server.crt > /tmp/orthanc-tls/server.pem
+
+        # Basic Orthanc TLS configuration
+        cat > /tmp/orthanc-tls.json << 'EOF'
+        {
+          "Name": "TLSTest",
+          "DicomAet": "TLSTEST",
+          "HttpPort": 18045,
+          "DicomPort": 14245,
+          "SslEnabled": true,
+          "SslCertificate": "/tmp/orthanc-tls/server.pem",
+          "RemoteAccessAllowed": true,
+          "AuthenticationEnabled": false,
+          "StorageDirectory": "/tmp/orthanc-tls",
+          "IndexDirectory": "/tmp/orthanc-tls"
+        }
+        EOF
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/Orthanc /tmp/orthanc-tls.json --no-jobs
+        timeout: 20
+        expected_output: |
+          HTTPS encryption is enabled, remote access is allowed
+        post: |
+          # Basic TLS connectivity test
+          curl -k -f https://localhost:18045/system && echo "Basic TLS connection works"
+          # Test statistics endpoint over TLS
+          curl -k -f https://localhost:18045/statistics && echo "TLS statistics endpoint working"
+          # Test plugins endpoint over TLS
+          curl -k -f https://localhost:18045/plugins && echo "TLS plugins endpoint working"
+
+update:
+  enabled: true
+  release-monitor:
+    identifier: 18629

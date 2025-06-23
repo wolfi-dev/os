@@ -1,0 +1,137 @@
+package:
+  name: orthanc-python
+  version: 5.0
+  epoch: 0
+  description: Python plugin for Orthanc DICOM server
+  copyright:
+    - license: AGPL-3.0-or-later
+  dependencies:
+    runtime:
+      - orthanc
+
+vars:
+  py-version: "3.13"
+
+environment:
+  contents:
+    packages:
+      - boost-dev
+      - build-base
+      - busybox
+      - e2fsprogs-dev
+      - gtest-dev
+      - jsoncpp-dev
+      - libuuid
+      - orthanc-dev
+      - patch
+      - python-${{vars.py-version}}
+      - python-${{vars.py-version}}-dev
+      - util-linux-dev
+      - zlib-dev
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://orthanc.uclouvain.be/downloads/sources/orthanc-python/OrthancPython-${{package.version}}.tar.gz
+      expected-sha256: a0df1ba5082b0dab558b70ec9447c5954cb7d9b568bcb9e4a7a4d1b86fb103f6
+
+  - uses: cmake/configure
+    with:
+      opts: |
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DALLOW_DOWNLOADS=ON \
+        -DUSE_SYSTEM_ORTHANC_SDK=ON \
+        -DUSE_SYSTEM_JSONCPP=ON \
+        -DUSE_SYSTEM_BOOST=ON \
+        -DPYTHON_VERSION=${{vars.py-version}}
+
+  - uses: cmake/build
+
+  - uses: cmake/install
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility symlinks for Orthanc Python plugin
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+          ln -sf /usr/share/orthanc/plugins/libOrthancPython.so ${{targets.subpkgdir}}/usr/share/orthanc/plugins-available/
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    test:
+      pipeline:
+        - runs: readlink -f /usr/share/orthanc/plugins-available/libOrthancPython.so | grep "/usr/share/orthanc/plugins/libOrthancPython.so"
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - python-${{vars.py-version}}
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: stat /usr/share/orthanc/plugins/libOrthancPython.so
+    - runs: |
+        mkdir -p /tmp/orthanc-python-test
+        cat > /tmp/hello-python.py << 'EOF'
+        import orthanc
+
+        def OnChange(changeType, level, resource):
+            if changeType == orthanc.ChangeType.ORTHANC_STARTED:
+                orthanc.LogWarning('Python plugin initialized successfully!')
+            elif changeType == orthanc.ChangeType.ORTHANC_STOPPED:
+                orthanc.LogWarning('Python plugin shutting down')
+
+        def OnRest(output, uri, **request):
+            import json
+            result = {
+                "message": "Python plugin working",
+                "python_version": "3.13",
+                "method": request.get('method', 'UNKNOWN')
+            }
+            output.AnswerBuffer(json.dumps(result, indent=2), 'application/json')
+
+        # Register callbacks
+        orthanc.RegisterOnChangeCallback(OnChange)
+        orthanc.RegisterRestCallback('/python-test', OnRest)
+        EOF
+
+        # Create Orthanc configuration with Python plugin
+        cat > /tmp/orthanc-python.json << 'EOF'
+        {
+          "Name": "PythonTest",
+          "HttpPort": 18051,
+          "DicomPort": 14251,
+          "RemoteAccessAllowed": true,
+          "AuthenticationEnabled": false,
+          "Plugins": ["/usr/share/orthanc/plugins/libOrthancPython.so"],
+          "PythonScript": "/tmp/hello-python.py",
+          "PythonVerbose": true,
+          "StorageDirectory": "/tmp/orthanc-python-test",
+          "IndexDirectory": "/tmp/orthanc-python-test"
+        }
+        EOF
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/Orthanc /tmp/orthanc-python.json --no-jobs
+        timeout: 30
+        expected_output: |
+          Python plugin initialized successfully!
+        post: |
+          # Test Python REST callback
+          curl -s http://localhost:18051/python-test | grep -q "Python plugin working" && echo "Python REST callback working"
+
+          # Test system endpoint still works
+          curl -s http://localhost:18051/system | grep -q "Version" && echo "Orthanc system endpoint working"
+
+          # Test Python plugin integration
+          curl -s http://localhost:18051/python-test | python${{vars.py-version}} -m json.tool > /dev/null && echo "Python plugin JSON response valid"
+
+update:
+  enabled: true
+  release-monitor:
+    identifier: 378477

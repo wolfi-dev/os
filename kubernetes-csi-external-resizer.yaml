@@ -1,7 +1,7 @@
 package:
   name: kubernetes-csi-external-resizer
-  version: "1.13.2"
-  epoch: 5
+  version: "1.14.0"
+  epoch: 0
   description: Sidecar container that watches Kubernetes PersistentVolumeClaims objects and triggers controller side expansion operation against a CSI endpoint
   copyright:
     - license: Apache-2.0
@@ -11,13 +11,7 @@ pipeline:
     with:
       repository: https://github.com/kubernetes-csi/external-resizer
       tag: v${{package.version}}
-      expected-commit: b6a8cbb17613f6c4016367396d3e34102a67ae78
-
-  - uses: go/bump
-    with:
-      deps: |-
-        golang.org/x/oauth2@v0.27.0
-        golang.org/x/net@v0.38.0
+      expected-commit: c82d78bf133263d5aae6c53f05a466f00c79a7cc
 
   - uses: go/build
     with:
@@ -42,6 +36,32 @@ test:
     - uses: test/kwok/cluster
     - runs: |
         mkdir -p /csi
-        hostpathplugin --v=5 --endpoint="unix:///csi/csi.sock" --nodeid="node-000000" & sleep 5
-        csi-resizer --v=5 --csi-address "/csi/csi.sock" --kubeconfig ~/.kube/config --http-endpoint ":8080" & sleep 10
-        curl -vfLI localhost:8080/metrics
+
+        # Start the CSI driver plugin that provides storage operations
+        # This creates a Unix socket at /csi/csi.sock that csi-resizer will connect to
+        hostpathplugin --v=5 --endpoint="unix:///csi/csi.sock" --nodeid="node-000000" &
+        HOSTPATH_PID=$!
+        sleep 5
+
+        # Verify the CSI socket was created
+        if [ ! -S /csi/csi.sock ]; then
+          echo "ERROR: CSI socket not created"
+          exit 1
+        fi
+
+        # Start the csi-resizer controller
+        csi-resizer --v=5 --csi-address "/csi/csi.sock" --kubeconfig ~/.kube/config --http-endpoint ":8080" &
+        CSI_PID=$!
+        sleep 10
+
+        # Verify that csi-resizer is running and serving metrics correctly
+        curl -fLI localhost:8080/metrics
+
+        # Check for specific CSI resizer metrics
+        curl -fs localhost:8080/metrics | grep -E "^(csi_sidecar_operations_seconds|workqueue_depth|process_start_time_seconds)" || {
+          echo "ERROR: Expected metrics not found"
+          exit 1
+        }
+
+        # Kill both background processes so the test can complete. Was hanging previously here.
+        kill $HOSTPATH_PID $CSI_PID

@@ -1,0 +1,90 @@
+package:
+  name: juicefs
+  version: "1.2.3"
+  epoch: 0
+  description: JuiceFS is a distributed POSIX file system built on top of Redis and S3.
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  environment:
+    CGO_ENABLED: "1"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/juicedata/juicefs
+      tag: v${{package.version}}
+      expected-commit: 4f2aba8f2e6233a5bb274201aa312b39b26555b7
+
+  - uses: go/build
+    with:
+      packages: .
+      output: juicefs
+      ldflags: |
+        -s -w
+        -X github.com/juicedata/juicefs/pkg/version.version=${{package.version}}
+        -X github.com/juicedata/juicefs/pkg/version.revision=$(git rev-parse HEAD)
+        -X github.com/juicedata/juicefs/pkg/version.revisionDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
+        -linkmode external -extldflags '-static'
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/juicefs "${{targets.contextdir}}"/usr/local/bin/juicefs
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - .*-beta.*
+  github:
+    identifier: juicedata/juicefs
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - redis
+        - minio
+        - mc
+        - umount
+  pipeline:
+    - name: "Version test"
+      runs: |
+        juicefs --version 2>&1 | grep ${{package.version}}
+    - name: "Start redis for metadata"
+      runs: |
+        redis-server --daemonize yes
+        sleep 2
+    - name: "Start MinIO"
+      runs: |
+        export MINIO_ACCESS_KEY=minioadmin
+        export MINIO_SECRET_KEY=minioadmin
+        mkdir -p /data/minio
+        minio server /data/minio --address :9000 --console-address :9001 > /tmp/minio.log 2>&1 &
+        # wait for minio to start
+        sleep 5
+    - name: "Create test bucket using mc"
+      runs: |
+        export MINIO_ACCESS_KEY=minioadmin
+        export MINIO_SECRET_KEY=minioadmin
+        mc alias set local http://localhost:9000 minioadmin minioadmin > /tmp/mc.log 2>&1
+        mc mb local/juicefs-bucket
+    - name: "Format juicefs volume"
+      runs: |
+        export ACCESS_KEY=minioadmin
+        export SECRET_KEY=minioadmin
+        juicefs format --bucket http://localhost:9000/juicefs-bucket --access-key $ACCESS_KEY --secret-key $SECRET_KEY redis://localhost testvolume
+    - name: "Mount volume and run file tests"
+      runs: |
+        mkdir -p /mnt/jfs
+        juicefs mount -d redis://localhost /mnt/jfs &
+        sleep 3
+        touch /mnt/jfs/test.txt
+        echo "hello juicefs" > /mnt/jfs/test.txt
+        grep "hello" /mnt/jfs/test.txt
+        umount /mnt/jfs

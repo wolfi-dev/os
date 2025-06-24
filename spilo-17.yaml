@@ -10,17 +10,20 @@ package:
   dependencies:
     runtime:
       - cronie
+      - curl
       - dumb-init
       - etcd
       - glibc
       - openssl
       - patroni
+      - pgbouncer
       - postgresql
       - py3-psutil
       - py3-pyyaml
       - py3-requests
       - py3-six
       - py3.13-pystache
+      - python-3.13
       - runit
 
 environment:
@@ -31,20 +34,21 @@ environment:
       - busybox
       - c-ares-dev
       - ca-certificates-bundle
+      - curl
       - etcd
-      - gdal
       - libarchive-tools # bsdtar
+      - libcap-dev
       - libcap-utils
+      - lzo-dev
       - openssl-dev
       - patroni
       - perl
-      - postgis
-      - postgresql-dev
-      - py3-pystache
+      # - postgis
+      - py3.11-pystache
+      - util-linux-dev
       - wal-g-pg
   environment:
     RW_DIR: /run
-    PGHOME: /home/postgres
 
 vars:
   python-version: "3.11"
@@ -60,15 +64,29 @@ pipeline:
       mkdir -p ${{targets.destdir}}/usr/bin
       mkdir -p ${{targets.destdir}}/etc/service
       mkdir -p ${{targets.destdir}}/scripts
+      mkdir -p ${{targets.destdir}}/var/spool
+      mkdir -p ${{targets.destdir}}${RW_DIR}/supervise
+      ln -s "$RW_DIR/tmp" ${{targets.destdir}}/var/tmp
+
+      # launch.sh holds the original “exec env …” line
+      sed -i -E \
+        's|\$\([^)]+\) /bin/etcd --data-dir /run/etcd\.data|$(apk --print-arch) /usr/bin/etcd --data-dir /run/etcd.data|' \
+        postgres-appliance/runit/etcd/run
+
+
       install -m755 postgres-appliance/launch.sh ${{targets.contextdir}}/usr/bin/
       cp -r postgres-appliance/scripts/* postgres-appliance/bootstrap/* postgres-appliance/major_upgrade/* ${{targets.destdir}}/scripts/
-      cp postgres-appliance/motd ${{targets.destdir}}/etc/motd
-      cp -r postgres-appliance/runit ${{targets.destdir}}/etc/service
-      ln -snf "$RW_DIR/service" ${{targets.contextdir}}/etc/service
+      cp postgres-appliance/motd ${{targets.destdir}}/etc/
+      cp postgres-appliance/pgq_ticker.ini ${{targets.destdir}}/
+      cp -r postgres-appliance/runit/* ${{targets.destdir}}/etc/service
+      for d in ${{targets.destdir}}/etc/service/*; do
+        chmod 755 "$d"/*
+        ln -s /run/supervise/"$(basename "$d")" "$d/supervise"
+      done
 
 subpackages:
   - name: ${{package.name}}-compat
-    description: "compat package with bitnami/spilo image"
+    description: "${{package.name}} compat package"
     dependencies:
       runtime:
         - bash
@@ -78,22 +96,36 @@ subpackages:
           mkdir -p ${{targets.contextdir}}/run/
           mkdir -p ${{targets.contextdir}}/.config/patroni
           mkdir -p ${{targets.contextdir}}/$PGHOME
+          mkdir -p ${{targets.subpkgdir}}/etc/postgresql-common
+          mkdir -p ${{targets.subpkgdir}}/usr/local/lib
           ln -s /usr/bin/launch.sh ${{targets.contextdir}}/
           ln -s "$RW_DIR/postgres.yml" "${{targets.contextdir}}/$PGHOME/postgres.yml"
           ln -s "$RW_DIR/etc" "${{targets.contextdir}}/$PGHOME/etc"
           ln -s "$PGHOME/postgres.yml" "${{targets.contextdir}}/.config/patroni/patronictl.yaml"
-          mv postgres-appliance/cron_unprivileged.c ${{targets.contextdir}}/
+          ln -s /home/postgres/pgq_ticker.ini "/pgq_ticker.ini"
+          touch ${{targets.subpkgdir}}/etc/postgresql-common/createcluster.conf
+          sed -ri 's/#(create_main_cluster) .*$/\1 = false/' ${{targets.subpkgdir}}/etc/postgresql-common/createcluster.conf
+          gcc -s -shared -fPIC -o ${{targets.subpkgdir}}/usr/local/lib/cron_unprivileged.so postgres-appliance/cron_unprivileged.c
+          ln -s "/etc/service" ${{targets.contextdir}}/$RW_DIR/service
+
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+capabilities:
+  add:
+    - cap_sys_nice
 
 test:
   environment:
     contents:
       packages:
-        - busybox
         - ca-certificates-bundle
         - libarchive-tools # bsdtar
         - spilo-17-compat
-        - python-3.13
         - sudo-rs
+        - curl
+        - libcap-utils
     accounts:
       groups:
         - groupname: postgres
@@ -105,7 +137,7 @@ test:
       run-as: 100
     environment:
       SPILO_PROVIDER: "local"
-      DEBUG: "1"
+      DEMO: "true"
       PGVERSION: "17"
       RW_DIR: /run
       SPILO_CONFIGURATION: |
@@ -116,15 +148,20 @@ test:
       PGROOT: /home/postgres/pgdata/pgroot
       WAL_SWIFT_BUCKET: False
       PATRONIVERSION: "4.0.5"
+      PGBOUNCER_CONFIGURATION: |
+        [pgbouncer]
   pipeline:
     - name: Run and test ${{package.name}}
       runs: |
         echo "127.0.0.1 $(hostname)" >> /etc/hosts
         mkdir -p "$RW_DIR"/{tmp,certs}
+        mkdir -p /var/run
         mkdir -p "$PGDATA"
+        ln -s chpst /usr/bin/envdir
         chown postgres:postgres "/launch.sh"
         chown postgres:postgres /usr/bin/launch.sh
-
+        ln -s /usr/bin/crond /usr/sbin/cron
+        # exit 1
         /launch.sh init
 
 update:

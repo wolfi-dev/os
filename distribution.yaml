@@ -1,26 +1,10 @@
 package:
   name: distribution
   version: 3.0.0
-  epoch: 39
+  epoch: 40
   description: The toolkit to pack, ship, store, and deliver container content
   copyright:
     - license: Apache-2.0
-  dependencies:
-    # REMOVE_POST_USRMERGE - https://github.com/orgs/wolfi-dev/discussions/40270
-    provides:
-      - ${{package.name}}-compat=${{package.full-version}}
-    runtime:
-      - merged-bin
-      - wolfi-baselayout
-
-environment:
-  contents:
-    packages:
-      - busybox
-      - ca-certificates-bundle
-      - go
-  environment:
-    CGO_ENABLED: "0"
 
 pipeline:
   - uses: git-checkout
@@ -56,16 +40,11 @@ pipeline:
       packages: ./cmd/registry-api-descriptor-template
       vendor: true
 
-  - runs: |
-      mkdir -p ${{targets.contextdir}}/
-      mkdir -p ${{targets.contextdir}}/etc/docker/registry
-      mkdir -p ${{targets.contextdir}}/etc/distribution
-      mkdir -p ${{targets.contextdir}}/var/lib/registry
-      cp ./config-example.yml ${{targets.contextdir}}/etc/docker/registry/config.yml
-      cp ./config-example.yml ${{targets.contextdir}}/etc/distribution/config.yml
-      cp ./entrypoint.sh ${{targets.contextdir}}/entrypoint.sh
-
-  - uses: strip
+  - name: Install example configuration
+    runs: |
+      install -Dpm0644 ./config-example.yml "${{targets.destdir}}/etc/distribution/config.yml"
+      install -Dpm0644 ./config-example.yml "${{targets.destdir}}/etc/docker/registry/config.yml"
+      install -Dpm0644 -t "${{targets.destdir}}/" ./entrypoint.sh
 
 update:
   enabled: true
@@ -78,84 +57,39 @@ test:
     contents:
       packages:
         - crane
+        - wait-for-it
+        - bash
   pipeline:
-    - runs: |
-        #!/bin/bash
-
-        # Define image names and registry
-        SOURCE_IMAGE="cgr.dev/chainguard/busybox:latest"
+    - name: Smoke tests
+      runs: |
+        set -o pipefail
+        digest --version | grep -F -e "${{package.version}}"
+        digest --help 2>&1 | grep -F -e "Calculate the digest of one or more input files"
+        registry --version | grep -F -e "${{package.version}}"
+        registry --help | grep -F -e "stores and distributes Docker images"
+    - name: Ensure digest functionality works
+      runs: |
+        #!/bin/sh
+        set -o pipefail
+        TEXT="Linkyyyyyy "
+        TARGET_SHA256="$(echo "${TEXT}" | digest -a sha256)"
+        EXPECTED_SHA256="sha256:cf4cf8729abb16fa7c6384b664c41707be2a786b1d71e99edd8bc8634f211d98"
+        # https://pubs.opengroup.org/onlinepubs/009695399/utilities/xcu_chap02.html#tag_02_06_02
+        test "${TARGET_SHA256#*"$EXPECTED_SHA256"}" != "$TARGET_SHA256"
+        test "${TARGET_SHA512#*"$EXPECTED_SHA512"}" != "$TARGET_SHA512"
+    - name: Ensure registry functionality works
+      runs: |
+        set -euo pipefail
         LOCAL_REGISTRY="localhost:5000"
+        SOURCE_IMAGE="cgr.dev/chainguard/busybox:latest"
         TARGET_IMAGE="${LOCAL_REGISTRY}/busybox:latest"
 
-        # Function to check if the previous command was successful
-        check_success() {
-            if [ $? -ne 0 ]; then
-                echo "Error: $1"
-                exit 1
-            fi
-        }
-
-        # Start the local Docker registry using the binary
-        echo "Starting local Docker registry..."
-        mkdir -p /etc/docker/registry
-        mkdir -p /var/lib/registry
-        cat <<'EOF' > /etc/docker/registry/config.yml
-        version: 0.1
-        log:
-          level: debug
-          fields:
-            service: registry
-            environment: development
-        storage:
-            delete:
-              enabled: true
-            cache:
-                blobdescriptor: inmemory
-            filesystem:
-                rootdirectory: /var/lib/registry
-            tag:
-              concurrencylimit: 5
-        http:
-            addr: :5000
-            debug:
-                addr: :5001
-                prometheus:
-                    enabled: true
-                    path: /metrics
-        health:
-          storagedriver:
-            enabled: true
-            interval: 10s
-            threshold: 3
-        EOF
-        registry serve /etc/docker/registry/config.yml > /dev/null 2>&1 &
+        registry serve /etc/docker/registry/config.yml &>/dev/null &
         REGISTRY_PID=$!
-        check_success "Failed to start local Docker registry"
+        trap 'kill -9 ${REGISTRY_PID}' EXIT
+        wait-for-it --strict -t 10 "${LOCAL_REGISTRY}"
 
-        # Wait for the registry to be ready
-        echo "Waiting for the registry to become ready..."
-        sleep 5
-
-        # Pull the source image
-        echo "Pulling image ${SOURCE_IMAGE}..."
-        crane pull ${SOURCE_IMAGE} ./busybox.tar
-        check_success "Failed to pull image ${SOURCE_IMAGE}"
-
-        # Push the image to the local registry
-        echo "Pushing image to ${TARGET_IMAGE}..."
-        crane push ./busybox.tar ${TARGET_IMAGE}
-        check_success "Failed to push image to ${TARGET_IMAGE}"
-
-        # Clean up the tar file
-        rm ./busybox.tar
-
-        # Stop the local Docker registry
-        echo "Stopping the local Docker registry..."
-        kill $REGISTRY_PID
-        check_success "Failed to stop local Docker registry"
-
-        echo "Test completed successfully!"
-        digest --version
-        digest --help
-        registry --version
-        registry --help
+        BUSYBOX_TAR="$(mktemp)"
+        crane pull "${SOURCE_IMAGE}" "${BUSYBOX_TAR}"
+        trap 'rm ${BUSYBOX_TAR}' EXIT
+        crane push "${BUSYBOX_TAR}" "${TARGET_IMAGE}"

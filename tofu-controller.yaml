@@ -1,0 +1,164 @@
+package:
+  name: tofu-controller
+  version: "0.16.0_rc5"
+  epoch: 0
+  description: A GitOps OpenTofu and Terraform controller for Flux
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - git
+      - gnupg
+      - libcrypto3
+      - libretls
+      - libssl3
+      - openssh-client
+      - tini
+
+# using apk-v2 friendly spec version format for package version string
+# need to transform version to match upstream rc tag: '0.16.0-rc.5'
+# this is only needed because of the rc tag, once we're not using that we can remove this
+# and change package version string to conventional 'X.Y.Z' format
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.(\d+)\.(\d+)_([a-zA-Z]+)(\d+)$
+    replace: ${1}.${2}.${3}-${4}.${5}
+    to: rc-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/flux-iac/tofu-controller.git
+      tag: v${{vars.rc-package-version}}
+      expected-commit: 01bbcd1540eb90d6f453739756ab43d092f241e4
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/net@v0.38.0
+        golang.org/x/oauth2@v0.27.0
+
+  - uses: go/build
+    with:
+      extra-args: -gcflags="-N -l"
+      packages: ./cmd/manager/main.go
+      output: tofu-controller
+      ldflags: |
+        -X main.BuildSHA=$(git rev-parse HEAD)
+        -X main.BuildVersion=${{vars.rc-package-version}}
+
+subpackages:
+  - name: ${{package.name}}-runner
+    description: tf-runner binary for tofu-controller
+    pipeline:
+      - uses: go/build
+        with:
+          extra-args: -gcflags="-N -l"
+          packages: ./cmd/runner/main.go
+          output: tf-runner
+          ldflags: |
+            -X main.BuildSHA=$(git rev-parse HEAD)
+            -X main.BuildVersion=${{vars.rc-package-version}}
+
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/tofu-controller "${{targets.contextdir}}"/usr/local/bin/tofu-controller
+
+  - name: ${{package.name}}-runner-compat
+    description: Compat package for ${{package.name}} runner
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/tf-runner "${{targets.contextdir}}"/usr/local/bin/tf-runner
+
+update:
+  enabled: true
+  github:
+    identifier: flux-iac/tofu-controller
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    environment:
+      POD_NAMESPACE: default
+    contents:
+      packages:
+        - openssl
+        - ${{package.name}}-runner
+  pipeline:
+    - uses: test/kwok/cluster
+    - name: "Install required CRD for tofu controller to pick up"
+      runs: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        metadata:
+          name: terraforms.infra.contrib.fluxcd.io
+        spec:
+          group: infra.contrib.fluxcd.io
+          names:
+            kind: Terraform
+            listKind: TerraformList
+            plural: terraforms
+            singular: terraform
+          scope: Namespaced
+          versions:
+            - name: v1alpha2
+              served: true
+              storage: true
+              schema:
+                openAPIV3Schema:
+                  type: object
+        EOF
+    - name: "Start tofu-controller"
+      runs: |
+        tofu-controller > /tmp/tofu-controller.log 2>&1 &
+        sleep 3
+        ps aux | grep -q tofu-controller
+    - name: "Validations"
+      runs: |
+        grep -q "Starting manager" /tmp/tofu-controller.log
+        grep -q "starting server" /tmp/tofu-controller.log
+        grep -q "Starting EventSource" /tmp/tofu-controller.log
+        grep -q "Starting Controller" /tmp/tofu-controller.log
+    - name: "Startup tf-runner"
+      runs: |
+        # Generating a self-signed TLS cert key for use with tf-runner.
+        # Upstream code for tf-runner attempts to parse the private key using 'x509.ParsePKCS1PrivateKey', which
+        # only supports traditional PKCS#1 (RSA) key format.
+        # REF: https://github.com/flux-iac/tofu-controller/blob/67198a27f35b97119492965ea1fe7a9034cc4476/mtls/rotator.go#L521
+        #
+        # If the key is provided in PKCS#8 format (default in OpenSSL 3.x),
+        # tf-runner will fail at startup with:
+        #     "failed to parse private key (use ParsePKCS8PrivateKey instead for this key format)"
+        #
+        # To avoid this error, we convert the PKCS#8 key to to PKCS#1
+
+        CERTDIR="$(mktemp -d)"
+        openssl genpkey -algorithm RSA -out "${CERTDIR}/tmp.key" -pkeyopt rsa_keygen_bits:2048
+        openssl pkey -in "${CERTDIR}/tmp.key" -out "${CERTDIR}/tls.key" -traditional
+
+        openssl req -new -x509 -sha256 -days 365 \
+        -key "${CERTDIR}/tls.key" \
+        -out "${CERTDIR}/tls.crt" \
+        -subj "/CN=localhost/O=Test tfrunner./C=US"
+
+        # Create secret for tf-runner
+        kubectl create secret generic tf-runner-tls \
+        --from-file=tls.crt="${CERTDIR}/tls.crt" \
+        --from-file=tls.key="${CERTDIR}/tls.key" \
+        --from-file=ca.crt="${CERTDIR}/tls.crt" \
+        --from-file=ca.key="${CERTDIR}/tls.key"
+
+        # Startup tf-runner
+        tf-runner --tls-secret-name="tf-runner-tls" > /tmp/tf-runner.log 2>&1 &
+        sleep 3
+        ps aux | grep -q tf-runner
+    - name: "TF-Runner Validations"
+      runs: |
+        grep -q "Starting the runner" /tmp/tf-runner.log

@@ -1,0 +1,87 @@
+package:
+  name: custom-pod-autoscaler-operator
+  version: "1.4.2"
+  epoch: 0
+  description: Operator for managing Kubernetes Custom Pod Autoscalers (CPA).
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 657d0a3a829e596404e4f5c09e71071237721d35
+      repository: https://github.com/jthomperoo/custom-pod-autoscaler-operator
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.38.0
+        golang.org/x/oauth2@v0.27.0
+        google.golang.org/protobuf@v1.33.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: custom-pod-autoscaler-operator
+      vendor: true
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/app"
+          ln -s /usr/bin/custom-pod-autoscaler-operator "${{targets.contextdir}}/operator"
+    test:
+      pipeline:
+        - runs: test "$(readlink /operator)" = "/usr/bin/custom-pod-autoscaler-operator"
+
+update:
+  enabled: true
+  github:
+    identifier: jthomperoo/custom-pod-autoscaler-operator
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - curl
+        - wait-for-it
+        - helm
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/kwok/cluster
+    - name: Fix SA token
+      runs: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        # Workaround fix for: "Fail to create in-cluster Kubernetes config: open /var/run/secrets/kubernetes.io/serviceaccount/token: no such file or directory"
+        # InClusterConfig() parses the file and insists it contain a real PEM-encoded CA certificate.
+        DIR=/var/run/secrets/kubernetes.io/serviceaccount
+        mkdir -p "$DIR"
+        kwokctl --name kwok kubectl create serviceaccount cpa
+        kwokctl --name kwok kubectl -n default create token cpa --duration=8760h > "$DIR/token"
+        if ! kwokctl get kubeconfig --name kwok | awk '/certificate-authority-data:/ {print $2; exit}' | base64 -d > "$DIR/ca.crt" 2>/dev/null; then
+          ca_path=$(kwokctl get kubeconfig --name kwok | awk '/certificate-authority: /{print $2; exit}')
+          cp "$ca_path" "$DIR/ca.crt"
+        fi
+        echo default > "$DIR/namespace"
+    - name: "start daemon on localhost"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          helm install custom-pod-autoscaler-operator https://github.com/jthomperoo/custom-pod-autoscaler-operator/releases/download/v${{package.version}}/custom-pod-autoscaler-operator-v${{package.version}}.tgz
+        start: "/operator"
+        timeout: 10
+        expected_output: |
+          starting manager
+          Serving metrics server
+          Starting Controller
+        post: |
+          wait-for-it -t 5 --strict localhost:8000 -- echo "Server is up"
+          kubectl apply -f https://raw.githubusercontent.com/jthomperoo/custom-pod-autoscaler/refs/heads/master/example/python-custom-autoscaler/cpa.yaml

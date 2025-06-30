@@ -1,0 +1,94 @@
+package:
+  name: custom-pod-autoscaler
+  version: "2.12.2"
+  epoch: 0
+  description: Custom Pod Autoscaler program and base images, allows creation of Custom Pod Autoscalers
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 5f8a6ca8c4af396e5e9a6af6fad4b78caf7fc1d6
+      repository: https://github.com/jthomperoo/custom-pod-autoscaler
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.38.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: custom-pod-autoscaler
+      ldflags: |
+        -X main.Version=${{package.version}}
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/app"
+          ln -s /usr/bin/custom-pod-autoscaler "${{targets.contextdir}}/operator"
+    test:
+      pipeline:
+        - runs: test "$(readlink /operator)" = "/usr/bin/custom-pod-autoscaler"
+
+update:
+  enabled: true
+  github:
+    identifier: jthomperoo/custom-pod-autoscaler
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - curl
+        - wait-for-it
+        - helm
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: custom-pod-autoscaler -h
+    - uses: test/kwok/cluster
+    - name: Fix SA token
+      runs: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        # Workaround fix for: "Fail to create in-cluster Kubernetes config: open /var/run/secrets/kubernetes.io/serviceaccount/token: no such file or directory"
+        # InClusterConfig() parses the file and insists it contain a real PEM-encoded CA certificate.
+        DIR=/var/run/secrets/kubernetes.io/serviceaccount
+        mkdir -p "$DIR"
+        kwokctl --name kwok kubectl create serviceaccount cpa
+        kwokctl --name kwok kubectl -n default create token cpa --duration=8760h > "$DIR/token"
+        if ! kwokctl get kubeconfig --name kwok | awk '/certificate-authority-data:/ {print $2; exit}' | base64 -d > "$DIR/ca.crt" 2>/dev/null; then
+          ca_path=$(kwokctl get kubeconfig --name kwok | awk '/certificate-authority: /{print $2; exit}')
+          cp "$ca_path" "$DIR/ca.crt"
+        fi
+        echo default > "$DIR/namespace"
+    - name: "start daemon on localhost"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          for f in config.yaml metric.py evaluate.py; do
+            curl -sfL \
+              https://raw.githubusercontent.com/jthomperoo/custom-pod-autoscaler/refs/heads/master/example/python-custom-autoscaler/$f \
+              -o /$f
+          done
+        start: "/operator"
+        timeout: 10
+        expected_output: |
+          ${{package.version}}
+          Starting API using HTTP
+          Starting autoscaler
+        post: |
+          wait-for-it -t 5 --strict localhost:5000 -- echo "Server is up"
+          # KWOK fake cluster dont implement the '/scale' sub-resource, so calling /api/v1/* endpoints
+          # resulting app panics as expected (since it returns nil).
+          # https://github.com/jthomperoo/custom-pod-autoscaler/blob/5f8a6ca8c4af396e5e9a6af6fad4b78caf7fc1d6/internal/api/v1/api.go#L94
+          # https://github.com/jthomperoo/custom-pod-autoscaler/blob/5f8a6ca8c4af396e5e9a6af6fad4b78caf7fc1d6/internal/scaling/scaling.go#L174

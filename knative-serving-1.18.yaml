@@ -9,6 +9,15 @@ package:
     provides:
       - knative-serving=${{package.full-version}}
 
+data:
+  - name: components
+    items:
+      queue: queue
+      activator: activator
+      autoscaler: autoscaler
+      controller: controller
+      webhook: webhook
+
 pipeline:
   - uses: git-checkout
     with:
@@ -22,23 +31,20 @@ pipeline:
         github.com/golang-jwt/jwt/v4@v4.5.2
 
 subpackages:
-  - name: ${{package.name}}-queue
-    description: "Queue component for Knative serving"
+  - range: components
+    name: "${{package.name}}-${{range.key}}"
     dependencies:
       provides:
-        - knative-serving-queue=${{package.full-version}}
+        - knative-serving-${{range.key}}=${{package.full-version}}
     pipeline:
       - uses: go/build
         with:
-          output: queue
-          packages: ./cmd/queue
+          output: ${{range.value}}
+          packages: ./cmd/${{range.value}}
     test:
       environment:
-        contents:
-          packages:
-            - wait-for-it
         environment:
-          ## dummy environment variables for testing copied over: https://github.com/knative/serving/blob/d4766bee6f56bbcde9af538230562b8cf5a6751b/pkg/reconciler/revision/resources/deploy_test.go#L112
+          WEBHOOK_NAME: test
           SERVING_NAMESPACE: foo
           SERVING_SERVICE: ""
           SERVING_CONFIGURATION: ""
@@ -62,7 +68,7 @@ subpackages:
           TRACING_CONFIG_DEBUG: false
           TRACING_CONFIG_SAMPLE_RATE: 0
           USER_PORT: 8080
-          SYSTEM_NAMESPACE: default-system-namespace
+          SYSTEM_NAMESPACE: knative-serving
           METRICS_DOMAIN: default-metrics-domain
           SERVING_READINESS_PROBE: '{"tcpSocket":{"port":8080,"host":"127.0.0.1"}}'
           ENABLE_PROFILING: false
@@ -73,578 +79,60 @@ subpackages:
           ENABLE_HTTP_FULL_DUPLEX: false
           ROOT_CA: ""
           ENABLE_MULTI_CONTAINER_PROBES: false
-      pipeline:
-        - runs: |
-            # Define the log file path
-            # Start the queue and redirect logs to the file
-            echo "Starting the queue and redirecting logs to /tmp/queue.log"
-            queue > "/tmp/queue.log" 2>&1 &
-            wait-for-it -t 30 localhost:8012
-            grep -q "Starting http server main:8012" /tmp/queue.log
-
-  - name: ${{package.name}}-queue-compat
-    description: "To match with the upstream image entrypoint"
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.contextdir}}/ko-app
-          ln -sf /usr/bin/queue ${{targets.contextdir}}/ko-app/queue
-    dependencies:
-      provides:
-        - knative-serving-queue-compat=${{package.full-version}}
-
-  - name: ${{package.name}}-activator
-    description: "Activator component for Knative serving"
-    dependencies:
-      provides:
-        - knative-serving-activator=${{package.full-version}}
-    pipeline:
-      - uses: go/build
-        with:
-          output: activator
-          packages: ./cmd/activator
-    test:
-      environment:
-        environment:
-          SYSTEM_NAMESPACE: default-system-namespace
           POD_NAME: default-pod
           POD_IP: 192.168.1.200
       pipeline:
+        - runs: |
+            # queue binary just runs the server on help
+            [[ ${{range.key}} != 'queue' ]] && ${{range.value}} --help
         - uses: test/kwok/cluster
-        - runs: |
-            kubectl apply -f - <<EOF
-            apiVersion: apiextensions.k8s.io/v1
-            kind: CustomResourceDefinition
-            metadata:
-              name: revisions.serving.knative.dev
-            spec:
-              group: serving.knative.dev
-              names:
-                kind: Revision
-                listKind: RevisionList
-                plural: revisions
-                singular: revision
-              scope: Namespaced
-              versions:
-                - name: v1
-                  served: true
-                  storage: true
-                  schema:
-                    openAPIV3Schema:
-                      type: object
-            EOF
-        - runs: |
-            kubectl create namespace default-system-namespace || true
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-network
-            data:
-              ingress.class: "istio.ingress.networking.knative.dev"
-              domainTemplate: "{{.Name}}.{{.Namespace}}.example.com"
-              tagTemplate: "{{.Tag}}-{{.Name}}"
-              urlTemplate: ""
-              defaultExternalScheme: "http"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-logging
-            data:
-              loglevel.controller: "info"
-              loglevel.webhook: "info"
-              zap-logger-config: |
-                {
-                  "level": "info",
-                  "development": false,
-                  "sampling": {
-                    "initial": 100,
-                    "thereafter": 100
-                  },
-                  "outputPaths": ["stdout"],
-                  "errorOutputPaths": ["stderr"],
-                  "encoding": "json",
-                  "encoderConfig": {
-                    "timeKey": "timestamp",
-                    "levelKey": "severity",
-                    "nameKey": "logger",
-                    "callerKey": "caller",
-                    "messageKey": "message",
-                    "stacktraceKey": "stacktrace",
-                    "lineEnding": "",
-                    "levelEncoder": "lowercase",
-                    "timeEncoder": "rfc3339nano",
-                    "durationEncoder": "string",
-                    "callerEncoder": "short"
-                  }
-                }
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-observability
-            data:
-              metrics.backend-destination: "prometheus"
-              profiling.enable: "false"
-              request-metrics-backend-destination: "prometheus"
-              logging.enable-var-log-collection: "false"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-tracing
-            data:
-              backend: "none"
-              debug: "false"
-              sample-rate: "0.0"
-            EOF
-        - runs: |
-            mkdir -p /tmp
-            activator > /tmp/activator.log 2>&1 &
-            ACTIVATOR_PID=$!
-            sleep 2
-            grep -q "Starting the knative activator" /tmp/activator.log
-            grep -q "Profiling enabled: false" /tmp/activator.log
-            grep -q "Updated the request log template" /tmp/activator.log
-            # Needs complete deployment via knative operator to be tested properly, these logs will contain error and retries
-            grep -q "Websocket connection could not be established" /tmp/activator.log
+        - name: Fix SA token
+          runs: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+            # Workaround fix for: "Fail to create in-cluster Kubernetes config: open /var/run/secrets/kubernetes.io/serviceaccount/token: no such file or directory"
+            DIR=/var/run/secrets/kubernetes.io/serviceaccount
+            mkdir -p "$DIR"
+            kwokctl --name kwok kubectl create serviceaccount cpa
+            kwokctl --name kwok kubectl -n default create token cpa --duration=8760h > "$DIR/token"
+            CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+            cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            echo default > "$DIR/namespace"
+        - name: "start daemon on localhost for ${{range.key}}"
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              kubectl create namespace knative-serving || true
+              kubectl apply -f https://github.com/knative/serving/releases/download/knative-v${{package.version}}/serving-crds.yaml
+              kubectl apply -f https://github.com/knative/serving/releases/download/knative-v${{package.version}}/serving-core.yaml
+              kubectl wait --for=condition=Available deploy/autoscaler -n knative-serving --timeout=90s
+            start: "${{range.value}}"
+            timeout: 10
+            # Omit 'ERROR':
+            # * webhook: throws "please apply your changes to the latest version and try again" FP error
+            # * activator: throws "Websocket connection could not be established" error, possibly due to kwok or some other issue
+            error_strings: |
+              FATAL
+              FAIL
+              Traceback.*most.recent.call
+              Exception in thread
+              panic
+              command not found
+            expected_output: |
+              Starting
 
-  - name: ${{package.name}}-activator-compat
-    description: "To match with the upstream image entrypoint"
+  - range: components
+    name: "${{package.name}}-${{range.key}}-compat"
+    dependencies:
+      provides:
+        - knative-serving-${{range.key}}-compat=${{package.full-version}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/ko-app
-          ln -sf /usr/bin/activator ${{targets.contextdir}}/ko-app/activator
-    dependencies:
-      provides:
-        - knative-serving-activator-compat=${{package.full-version}}
-
-  - name: ${{package.name}}-autoscaler
-    description: "Autoscaler component for Knative serving"
-    dependencies:
-      provides:
-        - knative-serving-autoscaler=${{package.full-version}}
-    pipeline:
-      - uses: go/build
-        with:
-          output: autoscaler
-          packages: ./cmd/autoscaler
+          ln -sf /usr/bin/${{range.value}} ${{targets.contextdir}}/ko-app/${{range.value}}
     test:
-      environment:
-        environment:
-          SYSTEM_NAMESPACE: default-system-namespace
-          POD_NAME: default-pod
-          POD_IP: 192.168.1.200
       pipeline:
-        - uses: test/kwok/cluster
-        - runs: |
-            kubectl create namespace default-system-namespace || true
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-network
-            data:
-              ingress.class: "istio.ingress.networking.knative.dev"
-              domainTemplate: "{{.Name}}.{{.Namespace}}.example.com"
-              tagTemplate: "{{.Tag}}-{{.Name}}"
-              urlTemplate: ""
-              defaultExternalScheme: "http"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-logging
-            data:
-              loglevel.controller: "info"
-              loglevel.webhook: "info"
-              zap-logger-config: |
-                {
-                  "level": "info",
-                  "development": false,
-                  "sampling": {
-                    "initial": 100,
-                    "thereafter": 100
-                  },
-                  "outputPaths": ["stdout"],
-                  "errorOutputPaths": ["stderr"],
-                  "encoding": "json",
-                  "encoderConfig": {
-                    "timeKey": "timestamp",
-                    "levelKey": "severity",
-                    "nameKey": "logger",
-                    "callerKey": "caller",
-                    "messageKey": "message",
-                    "stacktraceKey": "stacktrace",
-                    "lineEnding": "",
-                    "levelEncoder": "lowercase",
-                    "timeEncoder": "rfc3339nano",
-                    "durationEncoder": "string",
-                    "callerEncoder": "short"
-                  }
-                }
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-observability
-            data:
-              metrics.backend-destination: "prometheus"
-              profiling.enable: "false"
-              request-metrics-backend-destination: "prometheus"
-              logging.enable-var-log-collection: "false"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-autoscaler
-            data:
-              enable-scale-to-zero: "true"
-              allow-zero-initial-scale: "true"
-              container-concurrency-target-default: "100.0"
-              scale-to-zero-grace-period: "30s"
-              stable-window: "60s"
-              panic-window-percentage: "10.0"
-              panic-threshold-percentage: "200.0"
-              pod-autoscaler-class: "kpa.autoscaling.knative.dev"
-              enable-legacy-scale-boundary: "false"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-deployment
-            data:
-              queueSidecarImage: gcr.io/knative-releases/knative.dev/serving/cmd/queue@sha256:dummy
-              registriesSkippingTagResolving: "ko.local,dev.local"
-            EOF
-        - runs: |
-            mkdir -p /tmp
-            autoscaler > /tmp/autoscaler.log 2>&1 &
-            AUTOSCALER_PID=$!
-            sleep 2
-            # Needs complete deployment via knative operator to be tested properly, these logs will contain error and retries
-            grep -q "Profiling enabled: false" /tmp/autoscaler.log
-            grep -q "Setting up ConfigMap receivers" /tmp/autoscaler.log
-            kill -9 $AUTOSCALER_PID
-
-  - name: ${{package.name}}-autoscaler-compat
-    description: "To match with the upstream image entrypoint"
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.contextdir}}/ko-app
-          ln -sf /usr/bin/autoscaler ${{targets.contextdir}}/ko-app/autoscaler
-    dependencies:
-      provides:
-        - knative-serving-autoscaler-compat=${{package.full-version}}
-
-  - name: ${{package.name}}-controller
-    description: "Controller component for Knative serving"
-    dependencies:
-      provides:
-        - knative-serving-controller=${{package.full-version}}
-    pipeline:
-      - uses: go/build
-        with:
-          output: controller
-          packages: ./cmd/controller
-    test:
-      environment:
-        environment:
-          SYSTEM_NAMESPACE: default-system-namespace
-          POD_NAME: default-pod
-          POD_IP: 192.168.1.200
-      pipeline:
-        - uses: test/kwok/cluster
-        - runs: |
-            kubectl create namespace default-system-namespace || true
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-network
-            data:
-              ingress.class: "istio.ingress.networking.knative.dev"
-              domainTemplate: "{{.Name}}.{{.Namespace}}.example.com"
-              tagTemplate: "{{.Tag}}-{{.Name}}"
-              urlTemplate: ""
-              defaultExternalScheme: "http"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-logging
-            data:
-              loglevel.controller: "info"
-              loglevel.webhook: "info"
-              zap-logger-config: |
-                {
-                  "level": "info",
-                  "development": false,
-                  "sampling": {
-                    "initial": 100,
-                    "thereafter": 100
-                  },
-                  "outputPaths": ["stdout"],
-                  "errorOutputPaths": ["stderr"],
-                  "encoding": "json",
-                  "encoderConfig": {
-                    "timeKey": "timestamp",
-                    "levelKey": "severity",
-                    "nameKey": "logger",
-                    "callerKey": "caller",
-                    "messageKey": "message",
-                    "stacktraceKey": "stacktrace",
-                    "lineEnding": "",
-                    "levelEncoder": "lowercase",
-                    "timeEncoder": "rfc3339nano",
-                    "durationEncoder": "string",
-                    "callerEncoder": "short"
-                  }
-                }
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-gc
-            data:
-              retain-since-create-time: "48h"
-              retain-since-last-active-time: "15h"
-              min-non-active-revisions: "20"
-              max-non-active-revisions: "1000"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-deployment
-            data:
-              queueSidecarImage: gcr.io/knative-releases/knative.dev/serving/cmd/queue@sha256:dummy
-              registriesSkippingTagResolving: "ko.local,dev.local"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-autoscaler
-            data:
-              enable-scale-to-zero: "true"
-              allow-zero-initial-scale: "true"
-              container-concurrency-target-default: "100.0"
-              scale-to-zero-grace-period: "30s"
-              stable-window: "60s"
-              panic-window-percentage: "10.0"
-              panic-threshold-percentage: "200.0"
-              pod-autoscaler-class: "kpa.autoscaling.knative.dev"
-              enable-legacy-scale-boundary: "false"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-features
-            data:
-              kubernetes.podspec-persistent-volume-claim: "enabled"
-              kubernetes.podspec-init-containers: "enabled"
-              kubernetes.podspec-host-aliases: "enabled"
-              kubernetes.podspec-topology-spread-constraints: "enabled"
-              kubernetes.podspec-nodeselector: "enabled"
-              kubernetes.podspec-affinity: "enabled"
-              kubernetes.podspec-dnsconfig: "enabled"
-              kubernetes.podspec-runtime-class: "enabled"
-              kubernetes.podspec-tolerations: "enabled"
-              kubernetes.podspec-priority-class-name: "enabled"
-              kubernetes.podspec-security-context: "enabled"
-              kubernetes.podspec-empty-dir-volume: "enabled"
-              kubernetes.podspec-configmap-volume: "enabled"
-              kubernetes.podspec-secret-volume: "enabled"
-              kubernetes.podspec-downward-api-volume: "enabled"
-              kubernetes.podspec-projected-volume: "enabled"
-              kubernetes.podspec-volume-mounts: "enabled"
-              kubernetes.podspec-containers: "enabled"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-tracing
-            data:
-              backend: "none"
-              debug: "false"
-              sample-rate: "0.0"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-observability
-            data:
-              metrics.backend-destination: "prometheus"
-              profiling.enable: "false"
-              request-metrics-backend-destination: "prometheus"
-              logging.enable-var-log-collection: "false"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-domain
-            data:
-              example.com: ""
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-defaults
-            data:
-              revision-timeout-seconds: "300"
-              max-revision-timeout-seconds: "600"
-              container-concurrency: "0"
-              enable-service-links: "false"
-              service-type: "ClusterIP"
-              autoscaler-class: "kpa.autoscaling.knative.dev"
-            EOF
-        - runs: |
-            controller > /tmp/controller.log 2>&1 &
-            CONTROLLER_PID=$!
-            sleep 2
-            # Needs complete deployment via knative operator to be tested properly, these logs will contain error and retries
-            grep -q "Registering 9 controllers" /tmp/controller.log
-            grep -q "Running with Standard leader election" /tmp/controller.log
-            grep -q "Starting configuration manager" /tmp/controller.log
-            kill -9 $CONTROLLER_PID
-
-  - name: ${{package.name}}-controller-compat
-    description: "To match with the upstream image entrypoint"
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.contextdir}}/ko-app
-          ln -sf /usr/bin/controller ${{targets.contextdir}}/ko-app/controller
-    dependencies:
-      provides:
-        - knative-serving-controller-compat=${{package.full-version}}
-
-  - name: ${{package.name}}-webhook
-    description: "Webhook component for Knative serving"
-    dependencies:
-      provides:
-        - knative-serving-webhook=${{package.full-version}}
-    pipeline:
-      - uses: go/build
-        with:
-          output: webhook
-          packages: ./cmd/webhook
-    test:
-      environment:
-        contents:
-          packages:
-            - curl
-        environment:
-          SYSTEM_NAMESPACE: default-system-namespace
-          POD_NAME: default-pod
-          POD_IP: 192.168.1.200
-      pipeline:
-        - uses: test/kwok/cluster
-        - runs: |
-            kubectl create namespace default-system-namespace || true
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: Secret
-            metadata:
-              name: webhook-certs
-            data:
-              tls.crt: dGVzdA==  # "test" base64 encoded dummy
-              tls.key: dGVzdA==  # "test" base64 encoded dummy
-            EOF
-        - runs: |
-            kubectl create namespace default-system-namespace || true
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-features
-            data:
-              kubernetes.podspec-init-containers: "enabled"
-              kubernetes.podspec-empty-dir-volume: "enabled"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-defaults
-            data:
-              revision-timeout-seconds: "300"
-              max-revision-timeout-seconds: "600"
-              container-concurrency: "0"
-              enable-service-links: "false"
-              service-type: "ClusterIP"
-              autoscaler-class: "kpa.autoscaling.knative.dev"
-            EOF
-        - runs: |
-            kubectl apply -n default-system-namespace -f - <<EOF
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: config-autoscaler
-            data:
-              enable-scale-to-zero: "true"
-              allow-zero-initial-scale: "true"
-              container-concurrency-target-default: "100.0"
-              scale-to-zero-grace-period: "30s"
-              stable-window: "60s"
-              panic-window-percentage: "10.0"
-              panic-threshold-percentage: "200.0"
-              pod-autoscaler-class: "kpa.autoscaling.knative.dev"
-              enable-legacy-scale-boundary: "false"
-            EOF
-        - runs: |
-            mkdir -p /tmp
-            export WEBHOOK_NAME=test-webhook
-            webhook > /tmp/webhook.log 2>&1 &
-            WEBHOOK_PID=$!
-            sleep 2
-            grep -q "Starting configuration manager" /tmp/webhook.log
-            grep -q "Failed to start configuration manager" /tmp/webhook.log && exit 1
-            grep -q "Profiling enabled: false" /tmp/webhook.log
-            grep -q "Running with Standard leader election" /tmp/webhook.log
-            grep -q "Registering [0-9]* informers" /tmp/webhook.log
-            kill -9 $WEBHOOK_PID
-
-  - name: ${{package.name}}-webhook-compat
-    description: "To match with the upstream image entrypoint"
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.contextdir}}/ko-app
-          ln -sf /usr/bin/webhook ${{targets.contextdir}}/ko-app/webhook
-    dependencies:
-      provides:
-        - knative-serving-webhook-compat=${{package.full-version}}
+        - runs: test "$(readlink /ko-app/${{range.value}})" = "/usr/bin/${{range.value}}"
 
 update:
   enabled: true

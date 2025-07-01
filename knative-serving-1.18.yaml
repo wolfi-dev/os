@@ -199,12 +199,11 @@ subpackages:
               debug: "false"
               sample-rate: "0.0"
             EOF
-
         - runs: |
             mkdir -p /tmp
             activator > /tmp/activator.log 2>&1 &
             ACTIVATOR_PID=$!
-            sleep 5
+            sleep 2
             grep -q "Starting the knative activator" /tmp/activator.log
             grep -q "Profiling enabled: false" /tmp/activator.log
             grep -q "Updated the request log template" /tmp/activator.log
@@ -327,12 +326,11 @@ subpackages:
               queueSidecarImage: gcr.io/knative-releases/knative.dev/serving/cmd/queue@sha256:dummy
               registriesSkippingTagResolving: "ko.local,dev.local"
             EOF
-
         - runs: |
             mkdir -p /tmp
             autoscaler > /tmp/autoscaler.log 2>&1 &
             AUTOSCALER_PID=$!
-            sleep 5
+            sleep 2
             # Needs complete deployment via knative operator to be tested properly, these logs will contain error and retries
             grep -q "Profiling enabled: false" /tmp/autoscaler.log
             grep -q "Setting up ConfigMap receivers" /tmp/autoscaler.log
@@ -526,11 +524,10 @@ subpackages:
               service-type: "ClusterIP"
               autoscaler-class: "kpa.autoscaling.knative.dev"
             EOF
-
         - runs: |
             controller > /tmp/controller.log 2>&1 &
             CONTROLLER_PID=$!
-            sleep 5
+            sleep 2
             # Needs complete deployment via knative operator to be tested properly, these logs will contain error and retries
             grep -q "Registering 9 controllers" /tmp/controller.log
             grep -q "Running with Standard leader election" /tmp/controller.log
@@ -559,6 +556,9 @@ subpackages:
           packages: ./cmd/webhook
     test:
       environment:
+        contents:
+          packages:
+            - curl
         environment:
           SYSTEM_NAMESPACE: default-system-namespace
           POD_NAME: default-pod
@@ -566,18 +566,70 @@ subpackages:
       pipeline:
         - uses: test/kwok/cluster
         - runs: |
-            kubectl create namespace default-system-SERVING_NAMESPACE
-            # Minimal required configmaps for startup
-            for cm in config-logging config-observability config-defaults config-network config-deployment; do
-              kubectl create configmap $cm -n default-system-namespace
-            done
+            kubectl create namespace default-system-namespace || true
+            kubectl apply -n default-system-namespace -f - <<EOF
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: webhook-certs
+            data:
+              tls.crt: dGVzdA==  # "test" base64 encoded dummy
+              tls.key: dGVzdA==  # "test" base64 encoded dummy
+            EOF
+        - runs: |
+            kubectl create namespace default-system-namespace || true
+            kubectl apply -n default-system-namespace -f - <<EOF
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: config-features
+            data:
+              kubernetes.podspec-init-containers: "enabled"
+              kubernetes.podspec-empty-dir-volume: "enabled"
+            EOF
+        - runs: |
+            kubectl apply -n default-system-namespace -f - <<EOF
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: config-defaults
+            data:
+              revision-timeout-seconds: "300"
+              max-revision-timeout-seconds: "600"
+              container-concurrency: "0"
+              enable-service-links: "false"
+              service-type: "ClusterIP"
+              autoscaler-class: "kpa.autoscaling.knative.dev"
+            EOF
+        - runs: |
+            kubectl apply -n default-system-namespace -f - <<EOF
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: config-autoscaler
+            data:
+              enable-scale-to-zero: "true"
+              allow-zero-initial-scale: "true"
+              container-concurrency-target-default: "100.0"
+              scale-to-zero-grace-period: "30s"
+              stable-window: "60s"
+              panic-window-percentage: "10.0"
+              panic-threshold-percentage: "200.0"
+              pod-autoscaler-class: "kpa.autoscaling.knative.dev"
+              enable-legacy-scale-boundary: "false"
+            EOF
         - runs: |
             mkdir -p /tmp
+            export WEBHOOK_NAME=test-webhook
             webhook > /tmp/webhook.log 2>&1 &
             WEBHOOK_PID=$!
-            sleep 5
-            cat /tmp/webhook.log
-            exit 1
+            sleep 2
+            grep -q "Starting configuration manager" /tmp/webhook.log
+            grep -q "Failed to start configuration manager" /tmp/webhook.log && exit 1
+            grep -q "Profiling enabled: false" /tmp/webhook.log
+            grep -q "Running with Standard leader election" /tmp/webhook.log
+            grep -q "Registering [0-9]* informers" /tmp/webhook.log
+            kill -9 $WEBHOOK_PID
 
   - name: ${{package.name}}-webhook-compat
     description: "To match with the upstream image entrypoint"
@@ -588,7 +640,6 @@ subpackages:
     dependencies:
       provides:
         - knative-serving-webhook-compat=${{package.full-version}}
-
 
 update:
   enabled: true

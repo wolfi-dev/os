@@ -1,10 +1,14 @@
 package:
   name: gitleaks
   version: "8.27.2"
-  epoch: 0
+  epoch: 1
   description: SAST tool for detecting and preventing hardcoded secrets like passwords, api keys, and tokens in git repos
   copyright:
     - license: MIT
+  dependencies:
+    runtime:
+      - git # Required for scanning git repositories and using protect mode
+      - openssh-client # Required for git operations over SSH (e.g., git@github.com:... URLs)
 
 environment:
   contents:
@@ -43,8 +47,228 @@ update:
     tag-filter: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - jq # For validating JSON report format
   pipeline:
     - runs: |
         gitleaks version
         gitleaks --version
         gitleaks --help
+    - name: Test secret detection in files
+      runs: |
+        # Create test directory with sample secrets
+        mkdir -p test-secrets
+        cd test-secrets
+
+        # Create files with different types of secrets
+        echo 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE' > aws_config.txt
+        echo 'private_key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA..."' > private_key.txt
+        echo 'github_token = ghp_wWPw5k4aXcaajCqbDsLRnJZZzVLgLO0M' > github_secrets.txt
+        echo 'stripe_key = sk_test_4eC39HqLyjWDarjtT1zdp7dc' > payment.conf
+        echo 'password = "supersecret123!"' > db_config.yml
+
+        # Test directory scanning - gitleaks should find secrets and exit with code 1
+        gitleaks detect --source . --no-git --exit-code 1 || true
+
+        # Verify gitleaks found secrets
+        OUTPUT=$(gitleaks detect --source . --no-git 2>&1 || true)
+        if ! echo "$OUTPUT" | grep -q "leaks found"; then
+          echo "ERROR: Gitleaks should have reported finding leaks"
+          exit 1
+        fi
+
+        cd ..
+        rm -rf test-secrets
+    - name: Test stdin detection
+      runs: |
+        # Test secret detection via stdin
+        echo 'api_key = "sk_live_abcdef123456"' | gitleaks detect --source - --no-git || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to detect secret in stdin and exit with code 1"
+          exit 1
+        fi
+
+        # Test with multiple secrets via stdin
+        cat << 'EOF' | gitleaks detect --source - --no-git || EXIT_CODE=$?
+        aws_access_key_id = AKIAIOSFODNN7EXAMPLE
+        github_token = ghp_wWPw5k4aXcaajCqbDsLRnJZZzVLgLO0M
+        EOF
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to detect secrets in stdin"
+          exit 1
+        fi
+    - name: Test git repository scanning
+      runs: |
+        # Create a test git repository with secrets
+        mkdir -p test-repo
+        cd test-repo
+        git init
+        git config user.email "test@example.com"
+        git config user.name "Test User"
+
+        # Initial commit without secrets
+        echo "# Test Repository" > README.md
+        git add README.md
+        git commit -m "Initial commit"
+
+        # Commit with secrets
+        echo 'slack_webhook = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"' > config.json
+        git add config.json
+        git commit -m "Add configuration"
+
+        # Test git repository scanning
+        gitleaks detect --exit-code 1 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to find secrets in git history"
+          exit 1
+        fi
+
+        cd ..
+        rm -rf test-repo
+    - name: Test configuration options
+      runs: |
+        # Create custom config
+        cat > test-config.toml << 'EOF'
+        title = "test config"
+
+        [[rules]]
+        id = "test-rule"
+        description = "Test rule for API keys"
+        regex = '''test_api_key\s*=\s*['"]?([A-Za-z0-9]{32})['"]?'''
+        keywords = ["test_api_key"]
+        EOF
+
+        # Create file with custom secret pattern
+        echo 'test_api_key = "abcdef1234567890abcdef1234567890"' > test_secret.txt
+
+        # Test with custom config
+        gitleaks detect --source test_secret.txt --config test-config.toml --no-git --exit-code 1 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Custom rule should have detected the secret"
+          exit 1
+        fi
+
+        rm -f test-config.toml test_secret.txt
+    - name: Test report formats
+      runs: |
+        # Create test file with known secret that will be detected
+        echo 'github_token = ghp_wWPw5k4aXcaajCqbDsLRnJZZzVLgLO0M' > test_secret.txt
+
+        # Test JSON report
+        gitleaks detect --source test_secret.txt --no-git --report-format json --report-path report.json --exit-code 1 || true
+        if [ ! -f report.json ]; then
+          echo "ERROR: JSON report was not created"
+          exit 1
+        fi
+
+        # Validate JSON format
+        if ! jq . report.json > /dev/null 2>&1; then
+          echo "ERROR: JSON report is not valid JSON"
+          exit 1
+        fi
+
+        # Verify JSON contains expected fields
+        if ! jq -e '.[0] | has("Description") and has("File") and has("Secret")' report.json > /dev/null; then
+          echo "ERROR: JSON report missing expected fields"
+          exit 1
+        fi
+
+        # Test CSV report
+        gitleaks detect --source test_secret.txt --no-git --report-format csv --report-path report.csv --exit-code 1 || true
+        if [ ! -f report.csv ]; then
+          echo "ERROR: CSV report was not created"
+          exit 1
+        fi
+
+        # Validate CSV has header and data
+        LINE_COUNT=$(wc -l < report.csv)
+        if [ "$LINE_COUNT" -lt 2 ]; then
+          echo "ERROR: CSV report should have header and at least one data row"
+          exit 1
+        fi
+
+        # Check CSV header contains expected columns
+        HEADER=$(head -n1 report.csv)
+        if ! echo "$HEADER" | grep -q "RuleID"; then
+          echo "ERROR: CSV header missing RuleID column"
+          exit 1
+        fi
+        if ! echo "$HEADER" | grep -q "Secret"; then
+          echo "ERROR: CSV header missing Secret column"
+          exit 1
+        fi
+        if ! echo "$HEADER" | grep -q "File"; then
+          echo "ERROR: CSV header missing File column"
+          exit 1
+        fi
+
+        # Test SARIF report
+        gitleaks detect --source test_secret.txt --no-git --report-format sarif --report-path report.sarif --exit-code 1 || true
+        if [ ! -f report.sarif ]; then
+          echo "ERROR: SARIF report was not created"
+          exit 1
+        fi
+
+        # Validate SARIF format
+        if ! jq . report.sarif > /dev/null 2>&1; then
+          echo "ERROR: SARIF report is not valid JSON"
+          exit 1
+        fi
+
+        # Verify SARIF schema version and structure
+        if ! jq -e '.version == "2.1.0" and has("runs")' report.sarif > /dev/null; then
+          echo "ERROR: SARIF report does not match expected schema"
+          exit 1
+        fi
+
+        rm -f test_secret.txt report.json report.csv report.sarif
+    - name: Test allowlist functionality
+      runs: |
+        # Create file with secret
+        echo 'api_key = "AKIAIOSFODNN7EXAMPLE" # gitleaks:allow' > allowed_secret.txt
+
+        # This should pass because of the gitleaks:allow comment
+        gitleaks detect --source allowed_secret.txt --no-git
+
+        # Create .gitleaksignore file
+        echo 'allowed_secret2.txt' > .gitleaksignore
+        echo 'aws_key = "AKIAIOSFODNN7EXAMPLE"' > allowed_secret2.txt
+
+        # This should pass because file is in .gitleaksignore
+        gitleaks detect --source . --no-git
+
+        rm -f allowed_secret.txt allowed_secret2.txt .gitleaksignore
+    - name: Test baseline functionality
+      runs: |
+        # Create initial scan with secrets
+        echo 'token = "ghp_1234567890abcdef"' > baseline_test.txt
+        gitleaks detect --source baseline_test.txt --no-git --report-path baseline.json --report-format json --exit-code 1 || true
+
+        # Using baseline should not report the same findings
+        gitleaks detect --source baseline_test.txt --no-git --baseline-path baseline.json
+
+        rm -f baseline_test.txt baseline.json
+    - name: Test protect mode
+      runs: |
+        # Create a git repo for testing protect mode
+        mkdir -p protect-test
+        cd protect-test
+        git init
+        git config user.email "test@example.com"
+        git config user.name "Test User"
+
+        # Stage a file with secrets
+        echo 'github_token = ghp_wWPw5k4aXcaajCqbDsLRnJZZzVLgLO0M' > staged_secret.txt
+        git add staged_secret.txt
+
+        # Protect mode should detect staged secrets
+        gitleaks protect --staged --exit-code 1 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Protect mode should have detected staged secret"
+          exit 1
+        fi
+
+        cd ..
+        rm -rf protect-test

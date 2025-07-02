@@ -1,0 +1,239 @@
+package:
+  name: cerbos
+  version: "0.45.1"
+  epoch: 0
+  description: Cerbos is the open core, language-agnostic, scalable authorization solution that makes user permissions and authorization simple to implement and manage by writing context-aware access control policies for your application resources.
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 47732be991a580ad905960a94028d4153668e4cb
+      repository: https://github.com/cerbos/cerbos
+      tag: v${{package.version}}
+
+  - uses: go/build
+    with:
+      ldflags: |-
+        -X github.com/cerbos/cerbos/internal/util.Version=${{package.version}}
+        -X github.com/cerbos/cerbos/internal/util.Commit=$(git rev-parse HEAD)
+        -X github.com/cerbos/cerbos/internal/util.BuildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+      output: cerbos
+      packages: ./cmd/cerbos
+
+  - uses: go/build
+    with:
+      ldflags: |-
+        -X github.com/cerbos/cerbos/internal/util.Version=${{package.version}}
+        -X github.com/cerbos/cerbos/internal/util.Commit=$(git rev-parse HEAD)
+        -X github.com/cerbos/cerbos/internal/util.BuildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+      output: cerbosctl
+      packages: ./cmd/cerbosctl
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Cerbos compatibility package
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          # The upstream helm chart assumes the binary is in /.
+          ln -sf /usr/bin/cerbos ${{targets.contextdir}}/cerbos
+          ln -sf /usr/bin/cerbosctl ${{targets.contextdir}}/cerbosctl
+    test:
+      pipeline:
+        - runs: test "$(readlink /cerbos)" = "/usr/bin/cerbos"
+        - runs: test "$(readlink /cerbosctl)" = "/usr/bin/cerbosctl"
+
+update:
+  enabled: true
+  github:
+    identifier: cerbos/cerbos
+    strip-prefix: v
+
+test:
+  environment:
+    environment:
+      CERBOS_USERNAME: "cerbos"
+      CERBOS_PASSWORD: "cerbosAdmin"
+      CERBOS_SERVER: "localhost:3592"
+    contents:
+      packages:
+        - curl
+        - jq
+  pipeline:
+    - name: "start daemon on localhost"
+      uses: test/daemon-check-output
+      with:
+        start: cerbos server --set=server.adminAPI.enabled=true --set=storage.driver=sqlite3 --set=storage.sqlite3.dsn=':memory:'
+        timeout: 30
+        expected_output: |
+          Starting gRPC server at
+          Starting HTTP server at
+          Starting admin service
+        post: |-
+          curl -sf http://localhost:3592/_cerbos/health | grep -i "SERVING"
+
+          # Check OpenAPI schema endpoint
+          curl -sf http://localhost:3592/schema/swagger.json | jq -e ".openapi != null"
+
+          # Check main page returns 200
+          curl -sf -o /dev/null -w "%{http_code}" http://localhost:3592 | grep "200"
+    - name: "test authorization checks with curl"
+      runs: |
+        # Start server with test policies
+        mkdir -p /tmp/policies
+
+        # Create a derived roles policy
+        cat > /tmp/policies/derived_roles_common.yaml << 'EOF'
+        apiVersion: "api.cerbos.dev/v1"
+        derivedRoles:
+          name: common_roles
+          definitions:
+            - name: owner
+              parentRoles: ["user"]
+              condition:
+                match:
+                  expr: request.resource.attr.owner == request.principal.id
+        EOF
+
+        # Create a resource policy
+        cat > /tmp/policies/resource_album.yaml << 'EOF'
+        apiVersion: api.cerbos.dev/v1
+        resourcePolicy:
+          version: "default"
+          importDerivedRoles:
+            - common_roles
+          resource: "album:object"
+          rules:
+            - actions: ['*']
+              effect: EFFECT_ALLOW
+              derivedRoles:
+                - owner
+            - actions: ['view:public']
+              effect: EFFECT_ALLOW
+              roles:
+                - user
+              condition:
+                match:
+                  expr: request.resource.attr.public == true
+        EOF
+
+        cerbos server --set=storage.driver=disk --set=storage.disk.directory=/tmp/policies > /dev/null 2>&1 &
+        SERVER_PID=$!
+        sleep 5
+
+        # Test authorization check - owner can do everything
+        RESPONSE=$(curl -sf -X POST http://localhost:3592/api/check/resources \
+          -H "Content-Type: application/json" \
+          -d '{
+            "requestId": "test-owner",
+            "principal": {
+              "id": "bugs_bunny",
+              "roles": ["user"]
+            },
+            "resources": [
+              {
+                "actions": ["view:public", "comment", "delete"],
+                "resource": {
+                  "kind": "album:object",
+                  "id": "BUGS001",
+                  "attr": {
+                    "owner": "bugs_bunny",
+                    "public": false
+                  }
+                }
+              }
+            ]
+          }')
+
+        # Check that owner has all permissions
+        echo "$RESPONSE" | jq -e '.results[0].actions["view:public"] == "EFFECT_ALLOW"'
+        echo "$RESPONSE" | jq -e '.results[0].actions.comment == "EFFECT_ALLOW"'
+        echo "$RESPONSE" | jq -e '.results[0].actions.delete == "EFFECT_ALLOW"'
+
+        # Test non-owner on private album - should be denied
+        RESPONSE=$(curl -sf -X POST http://localhost:3592/api/check/resources \
+          -H "Content-Type: application/json" \
+          -d '{
+            "requestId": "test-non-owner",
+            "principal": {
+              "id": "daffy_duck",
+              "roles": ["user"]
+            },
+            "resources": [
+              {
+                "actions": ["view:public", "delete"],
+                "resource": {
+                  "kind": "album:object",
+                  "id": "BUGS001",
+                  "attr": {
+                    "owner": "bugs_bunny",
+                    "public": false
+                  }
+                }
+              }
+            ]
+          }')
+
+        # Non-owner should be denied
+        echo "$RESPONSE" | jq -e '.results[0].actions["view:public"] == "EFFECT_DENY"'
+        echo "$RESPONSE" | jq -e '.results[0].actions.delete == "EFFECT_DENY"'
+
+        # Test public album access
+        RESPONSE=$(curl -sf -X POST http://localhost:3592/api/check/resources \
+          -H "Content-Type: application/json" \
+          -d '{
+            "requestId": "test-public",
+            "principal": {
+              "id": "daffy_duck",
+              "roles": ["user"]
+            },
+            "resources": [
+              {
+                "actions": ["view:public"],
+                "resource": {
+                  "kind": "album:object",
+                  "id": "PUBLIC001",
+                  "attr": {
+                    "owner": "bugs_bunny",
+                    "public": true
+                  }
+                }
+              }
+            ]
+          }')
+
+        # User should be able to view public album
+        echo "$RESPONSE" | jq -e '.results[0].actions["view:public"] == "EFFECT_ALLOW"'
+
+        kill $SERVER_PID
+    - name: "test cerbosctl basic commands"
+      runs: |
+        # Start a server for cerbosctl tests
+        mkdir -p /tmp/ctl-policies
+        cat > /tmp/ctl-policies/simple.yaml << 'EOF'
+        apiVersion: api.cerbos.dev/v1
+        resourcePolicy:
+          version: "default"
+          resource: "document"
+          rules:
+            - actions: ["read"]
+              effect: EFFECT_ALLOW
+              roles: ["user"]
+        EOF
+
+        cerbos server --set=server.adminAPI.enabled=true --set=storage.driver=disk --set=storage.disk.directory=/tmp/ctl-policies > /dev/null 2>&1 &
+        SERVER_PID=$!
+        sleep 5
+
+        # Test version command
+        cerbosctl version --plaintext
+
+        # Test cerbosctl get schemas (should work even with no schemas)
+        cerbosctl get schemas --plaintext || [ $? -eq 0 ]
+
+        # Test cerbosctl get policies
+        cerbosctl get resource_policies --plaintext | grep "document"
+
+        kill $SERVER_PID

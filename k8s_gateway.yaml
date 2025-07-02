@@ -1,0 +1,66 @@
+package:
+  name: k8s_gateway
+  version: "1.4.0"
+  epoch: 0
+  description: A CoreDNS plugin to resolve all types of external Kubernetes resources
+  copyright:
+    - license: Apache-2.0
+
+update:
+  enabled: true
+  github:
+    identifier: k8s-gateway/k8s_gateway
+    strip-prefix: v
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/k8s-gateway/k8s_gateway
+      tag: v${{package.version}}
+      expected-commit: 1e90901b8f14b13ac5d9c64595267fc9a9236552
+
+  - uses: go/build
+    with:
+      packages: cmd/coredns.go
+      ldflags: -X github.com/coredns/coredns/coremain.GitCommit=$(git rev-parse --short HEAD) -X main.pluginVersion=${{package.version}}
+      output: coredns
+
+test:
+  environment:
+    contents:
+      packages:
+        - bind-tools
+        - wait-for-port
+  pipeline:
+    - name: Smoke tests
+      runs: |
+        set -o pipefail
+        coredns -help 2>&1 | grep -F -e "Usage of coredns"
+        coredns -version 2>&1 | grep -F -e "+k8s_gateway-${{package.version}}"
+        coredns -plugins | grep -F -e "k8s_gateway"
+    - name: "setup kwok cluster"
+      uses: test/kwok/cluster
+    - name: Ensure plugin functionality works
+      runs: |
+        COREDNS_PORT=9999
+        KUBECONFIG="$(mktemp)"
+        kubectl config view --minify --raw > "${KUBECONFIG}"
+
+        tee Corefile <<EOF
+        .:$COREDNS_PORT {
+          k8s_gateway localhost {
+              resources Ingress
+              ttl 30
+              kubeconfig ${KUBECONFIG}
+          }
+        }
+        EOF
+        coredns &> /dev/null &
+        COREDNS_PID=$!
+        trap 'kill -9 ${COREDNS_PID}' EXIT
+
+        wait-for-port "${COREDNS_PORT}"
+        # This test is not completely functional since kwok does not have the GatewayAPI
+        # so the k8s_gateway plugin fails to find valid CRDs for it
+        # Lets just dig and get the fail output
+        dig @localhost -p "${COREDNS_PORT}" | grep -F -e "->>HEADER<<- opcode: QUERY, status: SERVFAIL"

@@ -3,3 +3,6 @@
 
 *link:
 + --as-needed -O1 --sort-common -z noexecstack -z relro -z now
+
+%include_noerr </usr/lib/oldglibc/gcc.spec>
+%include_noerr </home/build/.melange.gcc.spec>

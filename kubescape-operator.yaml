@@ -1,0 +1,125 @@
+package:
+  name: kubescape-operator
+  version: "0.2.92"
+  epoch: 0
+  description: Kubescape-Operator is an in-cluster component of the Kubescape security platform.
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 81602c62580d67a78f30ff4670087392d39842c9
+      repository: https://github.com/kubescape/operator
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        github.com/go-viper/mapstructure/v2@v2.3.0
+        github.com/inspektor-gadget/inspektor-gadget@v0.40.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: operator
+
+update:
+  enabled: true
+  github:
+    identifier: kubescape/operator
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - wait-for-it
+        - helm
+        - curl
+    environment:
+      NODE_NAME: node-000000
+  pipeline:
+    - runs: operator --help
+    - uses: test/kwok/cluster
+    - name: Patch Node to Impersonate OpenStack Node
+      runs: |
+        # Fixes: "[error] error getting cloud metadata. error: failed to get node : resource name may not be empty" error:
+        # https://github.com/kubescape/k8s-interface/blob/65097e623f3bff950e7fd890f34c56b51d7a1c9a/cloudmetadata/metadata.go#L38
+        kubectl patch node "$NODE_NAME" --type merge --patch '{
+          "spec": {
+            "providerID": "openstack:///fake-instance-id"
+          },
+          "metadata": {
+            "labels": {
+              "node.kubernetes.io/instance-type": "m1.large",
+              "topology.kubernetes.io/region": "RegionOne",
+              "topology.kubernetes.io/zone": "nova",
+              "project.openstack.org/project-id": "demo-project"
+            }
+          }
+        }'
+    - name: Install Helm Chart
+      runs: |
+        # Install the CRDs to test the binary as Helm Chart installs them.
+        # Otherwise, the operator doesn't open port 4002 and fails to start with:
+        # "watch. error: failed to get commands watcher: the server could not find the requested resource; resource: commands"
+        # Using the latest version should be fine as the CRDs are stable, and Helm Chart version is different than the package version.
+        helm repo add kubescape https://kubescape.github.io/helm-charts
+        helm install kubescape kubescape/kubescape-operator -n kubescape --create-namespace
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          # Create required configuration directories
+          mkdir -p /etc/config /etc/credentials
+          echo "test-access-key" > /etc/credentials/access-key
+          echo "test-account-id" > /etc/credentials/account
+
+          # Creating STANDALONE configuration with empty service URLs
+          # https://github.com/kubescape/operator/blob/2620336b23f2d803395780d8b87506895950665c/README.md#running-operator-as-stand-alone
+          cat > /etc/config/clusterData.json << 'EOF'
+          {
+            "kubevulnURL": "",
+            "kubescapeURL": "",
+            "accountID": "test-account-id",
+            "clusterName": "test-cluster"
+          }
+          EOF
+
+          # Create minimal capabilities for standalone mode
+          cat > /etc/config/capabilities << 'EOF'
+          {
+            "capabilities": {
+              "configurationScan": "enable",
+              "vulnerabilityScan": "disable",
+              "nodeScan": "disable",
+              "continuousScan": "disable",
+              "runtimeObservability": "disable"
+            }
+          }
+          EOF
+
+          # Create minimal config for standalone
+          cat > /etc/config/config << 'EOF'
+          {
+            "namespace": "default",
+            "port": "4002",
+            "triggersecurityframework": false,
+            "workerconcurrency": 1,
+            "httpExporterConfig": {
+              "enabled": "true",
+              "url": "localhost:4002"
+            }
+          }
+          EOF
+        start: operator
+        timeout: 30
+        expected_output: |
+          credentials loaded
+          cloud metadata retrieved successfully
+          starting OperatorCommandsHandler
+          start watching CommandWatchHandler
+          Waiting for REST API to receive notifications
+        post: |
+          wait-for-it -t 10 localhost:4002 -- echo "Port is up"
+          curl http://localhost:4002 | grep -i "page not found" # No /health endpoints, lets have a negative test (returns 404)

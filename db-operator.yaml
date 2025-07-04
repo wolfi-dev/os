@@ -1,0 +1,101 @@
+package:
+  name: db-operator
+  version: "2.12.1"
+  epoch: 0
+  description: The DB Operator creates databases and make them available in the cluster via Custom Resource.
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  # Note: Although this repository is a fork, but the official development has moved to this repository. REF: https://github.com/kloeckner-i/db-operator/issues/190
+  - uses: git-checkout
+    with:
+      repository: https://github.com/db-operator/db-operator
+      tag: v${{package.version}}
+      expected-commit: 0690ca35f5d0ce4c3301224edc0b3e6182e592e1
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/net@v0.38.0
+        golang.org/x/oauth2@v0.27.0
+
+  - uses: go/build
+    with:
+      packages: cmd/main.go
+      output: db-operator
+      ldflags: -X "github.com/db-operator/db-operator/v2/internal/helpers/common.OperatorVersion=${{package.version}}"
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/db-operator "${{targets.contextdir}}"/usr/local/bin/db-operator
+
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint files for upstream db-operator image
+    dependencies:
+      runtime:
+        - busybox # Based on entrypoint Scripts
+        - coreutils
+        - shadow
+    pipeline:
+      - runs: |
+          install -Dm755 build/bin/user_setup ${{targets.contextdir}}/usr/local/bin/user_setup
+          install -Dm755 build/bin/entrypoint ${{targets.contextdir}}/usr/local/bin/entrypoint
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/local/bin/entrypoint
+            stat /usr/local/bin/user_setup
+
+update:
+  enabled: true
+  github:
+    identifier: db-operator/db-operator
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+  pipeline:
+    - uses: test/kwok/cluster
+    - name: "Apply CRDs"
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/db-operator/db-operator/main/config/crd/bases/kinda.rocks_databases.yaml
+        kubectl apply -f https://raw.githubusercontent.com/db-operator/db-operator/main/config/crd/bases/kinda.rocks_dbusers.yaml
+        kubectl apply -f https://raw.githubusercontent.com/db-operator/db-operator/main/config/crd/bases/kinda.rocks_dbinstances.yaml
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /srv/config/
+          cat >> /srv/config/config.yaml <<EOF
+          logLevel: debug
+
+          database:
+            type: postgres
+            host: localhost
+            port: 5432
+            username: dbuser
+            password: dbpass
+            name: testdb
+            sslmode: disable
+          EOF
+        start: db-operator
+        timeout: 30
+        expected_output: |
+          Starting controller
+          starting manager
+          Serving
+          health probe
+        post: |
+          curl -sf http://localhost:60000/metrics | tee metrics.txt
+          grep -q "dbuser" metrics.txt
+          grep -q "database" metrics.txt
+          cat  metrics.txt | grep 'controller_runtime_max_concurrent_reconciles' | grep "database" | grep -q "1" # Only 1 database instance in metrics

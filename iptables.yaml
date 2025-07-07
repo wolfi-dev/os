@@ -1,7 +1,7 @@
 package:
   name: iptables
   version: 1.8.11
-  epoch: 22
+  epoch: 23
   description: Linux kernel firewall, NAT and packet mangling tools
   copyright:
     - license: GPL-2.0-or-later
@@ -9,6 +9,77 @@ package:
     runtime:
       - merged-sbin
       - wolfi-baselayout
+
+vars:
+  old-iptables-cmds: |
+    arptables arptables-restore arptables-save arptables-translate \
+    arptables-nft arptables-nft-restore arptables-nft-save \
+    ebtables ebtables-restore ebtables-save ebtables-translate \
+    ebtables-nft ebtables-nft-restore ebtables-nft-save \
+    iptables iptables-restore iptables-save iptables-xml \
+    iptables-translate iptables-restore-translate \
+    iptables-legacy iptables-legacy-restore iptables-legacy-save \
+    iptables-nft iptables-nft-restore iptables-nft-save \
+    xtables-legacy-multi xtables-monitor xtables-nft-multi
+  old-ip6tables-cmds: |
+    ip6tables ip6tables-apply ip6tables-restore ip6tables-save \
+    ip6tables-translate ip6tables-restore-translate \
+    ip6tables-nft ip6tables-nft-restore ip6tables-nft-save \
+    ip6tables-legacy ip6tables-legacy-restore ip6tables-legacy-save
+  define-test-funcs: |
+    help_version() {
+      cmd="$1"
+      test -x "$(command -v $cmd)"
+      for arg in "--help" "--version"; do
+        case $cmd in
+          *-save|*-restore|*-multi)
+          ;;
+          arptables*|ip*tables-nft|ip*tables-translate)
+            $cmd $arg || $cmd $arg 2>&1 | grep "Protocol not supported"
+          ;;
+          ebtables*)
+            $cmd $arg || $cmd $arg 2>&1 | grep "Could not initialize nftables layer"
+          ;;
+          iptables-xml|*-restore-translate)
+            if [ "$arg" = "--help" ]; then
+              $cmd $arg 2>&1 | grep Usage:
+            else
+              $cmd $arg
+            fi
+          ;;
+          xtables-monitor)
+            if [ "$arg" = "--help" ]; then
+              $cmd $arg 2>&1 | grep "Protocol not supported" ||
+                $cmd $arg 2>&1 | grep "Usage"
+            else
+              $cmd $arg || $cmd $arg 2>&1 | grep "Protocol not supported"
+            fi
+            ;;
+          *)
+            $cmd $arg
+            ;;
+        esac
+      done
+    }
+
+    no_other_commands() {
+      # Make sure we covered all the commands in the package
+      # This should be removed after the refactor - it's not
+      # a regression if commands get added.
+      pkg="$1"; shift
+      pkg_cmds="$(mktemp)"
+      trap "rm $pkg_cmds" EXIT
+      apk info -qL "$pkg" | grep ^usr/bin/ | \
+        cut -d/ -f3 > "$pkg_cmds"
+      for cmd in $@; do
+        sed -i "/^${cmd}$/d" "$pkg_cmds"
+      done
+      if [ -s "$pkg_cmds" ]; then
+        echo "ERROR: Unexpected commands:" >&2
+        cat "$pkg_cmds" >&2
+        exit 1
+      fi
+    }
 
 environment:
   contents:
@@ -86,8 +157,23 @@ subpackages:
           setcap cap_net_raw,cap_net_admin+eip ${{targets.contextdir}}/usr/bin/xtables-legacy-multi
           setcap cap_net_raw,cap_net_admin+eip ${{targets.contextdir}}/usr/bin/xtables-nft-multi
     test:
+      environment:
+        contents:
+          packages:
+            - libcap-utils
       pipeline:
         - uses: test/tw/ldd-check
+        - name: no regression after package re-org
+          runs: |
+            old_ixp_cmds="${{vars.old-iptables-cmds}}"
+            old_ixp_cmds="$old_ixp_cmds ${{vars.old-ip6tables-cmds}}"
+            old_ixp_cmds="$old_ixp_cmds iptables-apply"
+            ${{vars.define-test-funcs}}
+            for cmd in $old_ixp_cmds; do
+              # currently fails on in elastic on ARM due to capabilities
+              [ "${{build.arch}}" = "aarch64" ] || help_version "$cmd"
+            done
+            no_other_commands "${{context.name}}" "$old_ixp_cmds"
     dependencies:
       runtime:
         - merged-sbin
@@ -102,9 +188,14 @@ subpackages:
           mv ${{targets.destdir}}/usr/bin/iptables-apply "$spd/usr/bin"
     test:
       pipeline:
-        - runs: |
-            iptables-apply --help
-            iptables-apply --version
+        - name: no regression after package re-org
+          runs: |
+            cmds="iptables-apply"
+            ${{vars.define-test-funcs}}
+            for cmd in $cmds; do
+              help_version "$cmd"
+            done
+            no_other_commands "${{context.name}}" "$cmds"
 
   - name: iptables-doc
     description: iptables documentation
@@ -145,26 +236,15 @@ subpackages:
           mv "${{targets.destdir}}"/usr/lib/xtables/libip6* usr/lib/xtables/
     test:
       pipeline:
-        - uses: test/tw/ldd-check
-        - runs: |
-            ip6tables --version
-            ip6tables --help
-            ip6tables-legacy --version
-            ip6tables-legacy --help
-            ip6tables-legacy-restore --version
-            ip6tables-legacy-restore --help
-            ip6tables-legacy-save --version
-            ip6tables-nft --version
-            ip6tables-nft --help
-            ip6tables-nft-restore --version
-            ip6tables-nft-restore --help
-            ip6tables-nft-save --version
-            ip6tables-restore --version
-            ip6tables-restore --help
-            ip6tables-restore-translate --version
-            ip6tables-save --version
-            ip6tables-translate --version
-            ip6tables-translate --help
+        - name: no regression after package re-org
+          runs: |
+            old_ip6tables_cmds="${{vars.old-ip6tables-cmds}}"
+            ${{vars.define-test-funcs}}
+            for cmd in $old_ip6tables_cmds; do
+              # iptables-apply is currently a broken symlink
+              [ "$cmd" = "ip6tables-apply" ] || help_version "$cmd"
+            done
+            no_other_commands "${{context.name}}" "$old_ip6tables_cmds"
     dependencies:
       runtime:
         - merged-sbin
@@ -177,46 +257,12 @@ update:
 
 test:
   pipeline:
-    # AUTOGENERATED
-    - runs: |
-        arptables --version
-        arptables-nft --version
-        arptables-nft-restore --version
-        arptables-nft-save --version
-        arptables-restore --version
-        arptables-save --version
-        ebtables --version
-        ebtables-nft --version
-        ebtables-nft-restore version
-        ebtables-nft-save --version
-        ebtables-restore version
-        ebtables-save --version
-        ebtables-translate --version
-        iptables --version
-        iptables-legacy --version
-        iptables-legacy-restore --version
-        iptables-legacy-save --version
-        iptables-nft --version
-        iptables-nft-restore --version
-        iptables-nft-save --version
-        iptables-restore --version
-        iptables-restore-translate --version
-        iptables-save --version
-        iptables-translate --version
-        xtables-monitor --version
-        iptables-xml --version
-        arptables --help
-        arptables-nft --help
-        arptables-nft-restore --help
-        arptables-restore --help
-        ebtables-nft-restore help
-        ebtables-restore help
-        ebtables-translate --help
-        iptables --help
-        iptables-legacy --help
-        iptables-legacy-restore --help
-        iptables-nft --help
-        iptables-nft-restore --help
-        iptables-restore --help
-        iptables-translate --help
+    - name: no regression after package re-org
+      runs: |
+        old_iptables_cmds="${{vars.old-iptables-cmds}}"
+        ${{vars.define-test-funcs}}
+        for cmd in $old_iptables_cmds; do
+          help_version "$cmd"
+        done
+        no_other_commands "${{context.name}}" "$old_iptables_cmds"
     - uses: test/tw/ldd-check

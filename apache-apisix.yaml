@@ -424,6 +424,8 @@ subpackages:
       - working-directory: ${{vars.BUILD_DIRECTORY}}/openresty-${{vars.OPENRESTY_VERSION}}/apache-apisix
         runs: |
           install -d "${{targets.contextdir}}"/usr/local/apisix/logs/
+          install -d "${{targets.contextdir}}"/usr/local/openresty/bin/
+          ln -sf /usr/bin/openresty "${{targets.contextdir}}"/usr/local/openresty/bin/openresty
           ln -sf /dev/stdout "${{targets.contextdir}}"/usr/local/apisix/logs/access.log
           ln -sf /dev/stdout "${{targets.contextdir}}"/usr/local/apisix/logs/access.log
           install docker/debian-dev/docker-entrypoint.sh "${{targets.contextdir}}"/
@@ -441,10 +443,95 @@ test:
     contents:
       packages:
         - etcd
+        - curl
+        - yq
+        - jq
+        - nodejs
+    environment:
+      PROXY_URL: "http://127.0.0.1:9080"
+      ADMIN_URL: "http://127.0.0.1:9180"
   pipeline:
     - runs: |
         apisix version | grep ${{package.version}}
         apisix test | grep "configuration test is successful"
-    - name: "Test setup and run apisix"
+    - name: "Setup and run apisix, run simple http endpoint with python"
       runs: |
         nohup etcd >/tmp/etcd.log 2>&1 &
+        apisix start
+    - name: "Spin up a simple nodejs web app."
+      runs: |
+        nohup node <<'JS' > server.log 2>&1 &
+        const http = require('http');
+        http.createServer((req, res) => {
+          if (req.url === '/get') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ secure: 'yes' }));
+          } else {
+            res.writeHead(404);
+            res.end();
+          }
+        }).listen(8000, () => console.log('Listening on http://0.0.0.0:8000'));
+        JS
+    - name: "Test routes endpoint"
+      runs: |
+        ADMIN_KEY=$(yq e -r '.deployment.admin.admin_key[] | .key' /usr/local/apisix/conf/config.yaml)
+        curl -s -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes" | jq .total | grep 0
+        payload=$(cat <<EOF
+        {
+          "uri": "/hello",
+          "plugins": {
+            "response-rewrite": {
+              "body": "hello world",
+              "status_code": 200
+            }
+          }
+        }
+        EOF
+        )
+        curl -X PUT -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes/100" -d "$payload"
+        # wait for route to be available
+        sleep 2
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:9080/hello")
+        BODY=$(curl -s --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40  "http://127.0.0.1:9080/hello")
+        if [[ "$HTTP_CODE" -ne 200 || "$BODY" != "hello world" ]]; then
+          echo "ERROR: Expected 200 and body 'hello world', got code=$HTTP_CODE, body=$BODY"
+          exit 1
+        fi
+        curl -s -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes" | jq .total | grep 1
+    - name: "Test key-auth plugin"
+      runs: |
+        ADMIN_KEY=$(yq e -r '.deployment.admin.admin_key[] | .key' /usr/local/apisix/conf/config.yaml)
+        # Create consumer with key-auth plugin
+        consumer_payload=$(cat <<EOF
+        { "username": "test-consumer", "plugins": {"key-auth": {"key": "consumer-key"}}}
+        EOF
+        )
+        curl -s -H "Content-Type: application/json" -H "X-API-KEY: ${ADMIN_KEY}" -X PUT "${ADMIN_URL}/apisix/admin/consumers/test-consumer" -d "$consumer_payload" | jq
+        # Create route with key-auth plugin and mock upstream
+        ROUTE_KA=101
+        route_payload=$(cat <<EOF
+        {
+          "uri": "/secure",
+          "plugins": {"key-auth": {}, "proxy-rewrite": {"uri": "/get"}},
+          "upstream": {"type": "roundrobin", "nodes": {"127.0.0.1:8000": 1}, "scheme": "http"}
+        }
+        EOF
+        )
+        curl -s -H "Content-Type: application/json" -H "X-API-KEY: ${ADMIN_KEY}" -X PUT "${ADMIN_URL}/apisix/admin/routes/${ROUTE_KA}" -d "$route_payload" | jq
+        # Wait for route to be loaded
+        sleep 2
+        # Test without key
+        CODE_NO_KEY=$(curl -s -o /dev/null -w "%{http_code}" "${PROXY_URL}/secure")
+        if [[ "$CODE_NO_KEY" -ne 401 ]]; then
+          echo "ERROR: Expected 401 without key, got $CODE_NO_KEY"
+          exit 1
+        fi
+        # Test with key - should get 200 (proxied to upstream)
+        CODE_KEY=$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: consumer-key" "${PROXY_URL}/secure")
+        if [[ "$CODE_KEY" -ne 200 ]]; then
+          echo "ERROR: Expected 200 with key, got $CODE_KEY"
+          exit 1
+        fi
+        # Cleanup
+        curl -s -H "X-API-KEY: ${ADMIN_KEY}" -X DELETE "${ADMIN_URL}/apisix/admin/routes/${ROUTE_KA}" >/dev/null
+        curl -s -H "X-API-KEY: ${ADMIN_KEY}" -X DELETE "${ADMIN_URL}/apisix/admin/consumers/test-consumer" >/dev/null

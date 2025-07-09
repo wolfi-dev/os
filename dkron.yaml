@@ -1,0 +1,170 @@
+package:
+  name: dkron
+  version: "4.0.5"
+  epoch: 0
+  description: Distributed job scheduler for microservices
+  copyright:
+    - license: LGPL-3.0
+  dependencies:
+    runtime:
+      - tzdata
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - bun
+      - ca-certificates-bundle
+      - corepack
+      - go-1.23
+      - nodejs-20
+      - protobuf
+      - protobuf-dev
+      - protoc
+      - protoc-gen-go
+      - protoc-gen-go-grpc
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/distribworks/dkron
+      tag: v${{package.version}}
+      expected-commit: 03c680d562187d6837fdb4ab1c4cf4d0e67b9fd5
+
+  - name: Generate protobuf files
+    runs: |
+      # Generate protobuf files as per Makefile - protobuf-dev should provide Google well-known types
+      protoc -I proto/ \
+        --go_out=types --go_opt=paths=source_relative \
+        --go-grpc_out=types --go-grpc_opt=paths=source_relative \
+        proto/*.proto
+
+  - name: Build UI components
+    runs: |
+      cd ui
+      corepack enable
+      yarn install --frozen-lockfile
+      yarn build --out-dir ../dkron/ui-dist
+      cd ..
+
+      echo "UI build output for debugging:"
+      ls -la dkron/ui-dist/
+
+  - name: Install builtin plugins
+    runs: |
+      GOBIN=$PWD go install ./builtin/...
+      go mod tidy
+
+  - uses: go/bump
+    with:
+      deps: |-
+        github.com/go-viper/mapstructure/v2@v2.3.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: dkron
+      ldflags: |
+        -X github.com/distribworks/dkron/v4/dkron.Version=${{package.version}}
+        -X github.com/distribworks/dkron/v4/dkron.Codename=Apat
+        -X github.com/distribworks/dkron/v4/dkron.BuildDate=$(date -u "+%Y-%m-%dT%H:%M:%SZ" ${SOURCE_DATE_EPOCH:+-d @$SOURCE_DATE_EPOCH})
+      tags: builtinassets
+
+data:
+  - name: plugins
+    items:
+      # Executors
+      executor-gcppubsub: "Dkron Google Cloud Pub/Sub executor plugin"
+      executor-grpc: "Dkron gRPC executor plugin"
+      executor-kafka: "Dkron Kafka executor plugin"
+      executor-nats: "Dkron NATS executor plugin"
+      executor-rabbitmq: "Dkron RabbitMQ executor plugin"
+      # Processors
+      processor-files: "Dkron files processor plugin"
+      processor-fluent: "Dkron Fluent processor plugin"
+      processor-log: "Dkron log processor plugin"
+      processor-syslog: "Dkron syslog processor plugin"
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package for container environments"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+          ln -sf /usr/bin/dkron ${{targets.contextdir}}/usr/local/bin/dkron
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - runs: test "$(readlink /usr/local/bin/dkron)" = "/usr/bin/dkron"
+
+  - range: plugins
+    name: ${{package.name}}-${{range.key}}
+    description: ${{range.value}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./builtin/bins/dkron-${{range.key}}
+          output: dkron-${{range.key}}
+
+  - range: plugins
+    name: ${{package.name}}-${{range.key}}-compat
+    description: "Compatibility symlink for ${{range.key}} plugin in /usr/local/bin"
+    dependencies:
+      runtime:
+        - ${{package.name}}-${{range.key}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+          ln -sf /usr/bin/dkron-${{range.key}} ${{targets.contextdir}}/usr/local/bin/dkron-${{range.key}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-${{range.key}}
+      pipeline:
+        - runs: test "$(readlink /usr/local/bin/dkron-${{range.key}})" = "/usr/bin/dkron-${{range.key}}"
+
+update:
+  enabled: true
+  github:
+    identifier: distribworks/dkron
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - netcat-openbsd
+        - procps
+        - coreutils
+        - wait-for-it
+        - nodejs
+  pipeline:
+    - name: Verify dkron version
+      runs: |
+        dkron version | grep -q "${{package.version}}"
+    - name: Verify dkron help and commands
+      runs: dkron agent --help | grep -q "Start a dkron agent"
+    - runs: |
+        mkdir -p /tmp/dkron-test
+        cat > /tmp/dkron-test/dkron.json <<EOF
+        {
+          "bind-addr": "127.0.0.1:8946",
+          "http-addr": "127.0.0.1:8080",
+          "node-name": "test-node",
+          "server": true,
+          "bootstrap-expect": 1,
+          "data-dir": "/tmp/dkron-test/data"
+        }
+        EOF
+        dkron agent --config /tmp/dkron-test/dkron.json > /tmp/dkron-agent.log 2>&1 & sleep 2
+        grep -qE "(agent: Dkron agent starting|agent: Listen for events)" /tmp/dkron-agent.log
+        wait-for-it 127.0.0.1:8080 -t 15
+        curl -sf http://127.0.0.1:8080/v1/ | grep -q '"server":"true"'
+        curl -Ls http://127.0.0.1:8080/ui/ | grep -i "<title>Dkron</title>"

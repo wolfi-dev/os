@@ -1,7 +1,7 @@
 package:
   name: cert-manager-webhook-pdns
   version: "2.5.2"
-  epoch: 7
+  epoch: 8
   description: A PowerDNS webhook for cert-manager
   copyright:
     - license: MIT
@@ -38,11 +38,46 @@ update:
   ignore-regex-patterns:
     - 'cert-manager-webhook-pdns-'
 
-# https://github.com/zachomedia/cert-manager-webhook-pdns/blob/bf4d525dca7345538aaad8840f6315a73c27f38b/README.md?plain=1#L45
 test:
   environment:
     environment:
       GROUP_NAME: "acme.zacharyseguin.ca"
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
+    contents:
+      packages:
+        - mkcert
   pipeline:
+    - uses: test/kwok/cluster
     - runs: |
-        webhook -h
+        # wait until you have a serviceaccount default
+        while ! kubectl get serviceaccount default -n kube-system; do
+          echo "Waiting for serviceaccount default in kube-system namespace..."
+          sleep 1
+        done
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        kubectl create token default > /var/run/secrets/kubernetes.io/serviceaccount/token
+        CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+        cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+        kubectl create rolebinding default-get-configmap \
+        --clusterrole=view \
+        --serviceaccount=default:default \
+        --namespace=kube-system
+
+        mkcert example.com
+        export CA_OTHER="$(cat ~/.local/share/mkcert/rootCA.pem)"
+        kubectl create configmap extension-apiserver-authentication \
+        --from-literal=client-ca-file="$CA_OTHER" \
+        --from-literal=requestheader-client-ca-file="$CA_OTHER" \
+        -n kube-system \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+        webhook > /tmp/webhook.log 2>&1 &
+        sleep 5
+        if ! grep -q "Starting controller" /tmp/webhook.log; then
+          echo "Webhook server did not start correctly"
+          exit 1
+        fi
+
+        echo "Webhook server started successfully"

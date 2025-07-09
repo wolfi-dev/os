@@ -1,0 +1,113 @@
+package:
+  name: iptables-wrappers
+  version: 2
+  epoch: 0
+  description: Wrapper scripts for using iptables in containers
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - xtables
+
+vars:
+  wrapped-commands: |
+    iptables  iptables-restore  iptables-save \
+    ip6tables ip6tables-restore ip6tables-save
+
+environment:
+  contents:
+    packages:
+      - busybox
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kubernetes-sigs/iptables-wrappers
+      tag: v${{package.version}}
+      expected-commit: e139a115350974aac8a82ec4b815d2845f86997e
+      cherry-picks: |
+        master/680003b3c6e93b471a59ecc9ae87a8f9054b82f3: Convert iptables-wrapper to a static go program
+
+  - uses: go/build
+    with:
+      packages: .
+      output: ${{context.name}}
+
+  - name: Rename go binary to use upstream name
+    working-directory: ${{targets.contextdir}}
+    runs: |
+      mv usr/bin/iptables-wrappers usr/bin/iptables-wrapper
+
+  - working-directory: ${{targets.contextdir}}
+    runs: |
+      wrapped_cmds="${{vars.wrapped-commands}}"
+      for cmd in $wrapped_cmds; do
+        ln -s iptables-wrapper "usr/bin/$cmd"
+      done
+
+test:
+  pipeline:
+    - runs: |
+        check_target() {
+          local cmd="$1"
+          local symlinks_point_to="$2"
+          local target="$(readlink /usr/bin/$cmd)"
+
+          case "$symlinks_point_to" in
+            "wrapper")
+              [ "$target" = "iptables-wrapper" ]
+              ;;
+            "detected")
+              # wrapper will point to binaries in /usr/sbin, which
+              # relies on our usrmerge sbin->bin compat symlinks. We should
+              # submit a fix upstream.
+              target="$(echo $target | sed 's,^/usr/sbin/,,')"
+              [ "$target" = "xtables-nft-multi" ] || \
+                [ "$target" = "xtables-legacy-multi" ]
+              ;;
+            *)
+              echo "ERROR: Invalid parameter: [$2]" 1>&2
+              exit 1
+              ;;
+          esac
+          test -x "/usr/bin/$target"
+        }
+
+        wrapped_cmds="${{vars.wrapped-commands}}"
+        # on a fresh install, the symlink should point to the wrapper
+        symlinks_point_to="wrapper"
+        for cmd in $wrapped_cmds; do
+          check_target "$cmd" "$symlinks_point_to"
+          test -x "/usr/bin/$target"
+          # when invoked, the wrapper will detect the in-use variant
+          # (legacy | nft) and call its command instead. then, as an
+          # optimization, it will update the symlink to point directly
+          # to that command, bypassing the wrapper in subsequent calls
+          case "$cmd" in
+            ip*tables|ip*tables-restore)
+              for arg in "--help" "--version"; do
+                "$cmd" "$arg" || "$cmd" "$arg" 2>&1 | \
+                  grep "Protocol not supported"
+              done
+              ;;
+            ip*tables-save)
+              # has no help/version, but run it to trigger the wrapper's
+              # symlink replacement as a side-effect
+              "$cmd" || /bin/true
+              ;;
+            *)
+              echo "ERROR: Unknown command $cmd" 1>&2
+              exit 1
+          esac
+          # Once the wrapper has been called once, all symlinks should
+          # point to the detected variant
+          symlinks_point_to="detected"
+          check_target "$cmd" "$symlinks_point_to"
+        done
+
+update:
+  enabled: true
+  github:
+    identifier: kubernetes-sigs/iptables-wrappers
+    use-tag: true
+    strip-prefix: v

@@ -1,13 +1,15 @@
 package:
   name: tshark-4.4
   version: "4.4.7"
-  epoch: 1
+  epoch: 2
   description: "TShark is a network protocol analyzer to dump and analyze network traffic"
   copyright:
     - license: GPL-2.0-only
   dependencies:
     provides:
       - tshark=${{package.full-version}}
+    runtime:
+      - ${{package.name}}-libs
 
 environment:
   contents:
@@ -45,6 +47,67 @@ pipeline:
   - uses: strip
 
 subpackages:
+  - name: ${{package.name}}-libs
+    dependencies:
+      provides:
+        - tshark-libs=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/* "${{targets.subpkgdir}}"/usr/lib
+    description: ${{package.name}} libraries
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: editcap
+    # This is meant to be used as a standalone package for users who want to use editcap without installing all of tshark.
+    description: Editcap is used to edit and/or translate the format of capture files.
+    dependencies:
+      runtime:
+        - ${{package.name}}-libs
+    pipeline:
+      - runs: |
+          install -Dm755 "${{targets.destdir}}/usr/bin/editcap" "${{targets.contextdir}}/usr/bin/editcap"
+    test:
+      environment:
+        contents:
+          packages:
+            - tcpdump
+            - curl
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: Verify installation
+          runs: |
+            set -o pipefail
+            editcap --help | grep -F -e "Usage: editcap"
+            editcap --version | grep -F -e "${{package.version}}"
+        - name: Download a sample .pcap file
+          runs: |
+            PCAP_FILE_URL="https://gitlab.com/wireshark/wireshark/-/raw/release-4.4/test/captures/http-ooo2.pcap?ref_type=heads&inline=false"
+            curl "$PCAP_FILE_URL" -o /tmp/test.pcap
+        - name: Verify packet split
+          runs: |
+            cd /tmp
+            no_of_packets=$(tcpdump -r test.pcap | wc -l)
+            echo "Splitting test.pcap into individual packet files (split*.pcap)..."
+            editcap -c 1 test.pcap split.pcap
+            no_of_files=$(find . -type f -iname 'split*' | wc -l)
+            if [[ "$no_of_packets" -ne "$no_of_files" ]]; then
+              echo "Error: Number of packets ($no_of_packets) does not match number of files ($no_of_files)."
+              exit 1
+            fi
+            echo "Successfully verified packet split."
+            echo "Discarding the first 3 packets from test.pcap into remaining.pcap..."
+            editcap test.pcap remaining.pcap 1-3
+            expected_packets=$((no_of_packets - 3))
+            actual_packets=$(tcpdump -r remaining.pcap | wc -l)
+            if [[ "$actual_packets" -ne "$expected_packets" ]]; then
+              echo "Error: Expected $expected_packets packets in remaining.pcap, but got $actual_packets packets."
+              exit 1
+            fi
+            echo "Successfully verified discarding packets."
+
   - name: tshark-4.4-privileged
     description: tshark with cap_net_raw and cap_net_admin capabilities set for running as nonroot user
     pipeline:
@@ -77,9 +140,16 @@ test:
       packages:
         - curl
   pipeline:
-    - name: dump some packets
+    - name: Verify installation
       runs: |
-        tshark -w /tmp/out.pcap -c 10 host example.com&
+        set -o pipefail
+        tshark --help | grep -F -e "Usage: tshark"
+        tshark --version | grep -F -e "${{package.version}}"
+    - name: Test packet capture
+      runs: |
+        tshark -w /tmp/out.pcap -c 20 host example.com &
+        PID=$!
         sleep 1; curl -sI http://example.com; sleep 1
         tshark -r /tmp/out.pcap -Y "http" |grep '200 OK'
+        kill $PID
     - uses: test/tw/ldd-check

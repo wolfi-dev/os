@@ -1,0 +1,106 @@
+package:
+  name: mariadb-operator
+  version: "0.38.1"
+  epoch: 0
+  description: A Go operator that automates the deployment and management of MariaDB databases on Kubernetes
+  copyright:
+    - license: MIT
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/mariadb-operator/mariadb-operator.git
+      tag: v${{package.version}}
+      expected-commit: 1d616a2c931a115f503f7cfb5a08ae0aa608799d
+
+  - uses: go/bump
+    with:
+      deps: |
+        golang.org/x/net@v0.38.0
+        golang.org/x/oauth2@v0.27.0
+        github.com/go-chi/chi/v5@v5.2.2
+
+  - uses: go/build
+    with:
+      packages: ./cmd/controller
+      output: mariadb-operator
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+  github:
+    identifier: mariadb-operator/mariadb-operator
+    use-tag: true
+    strip-prefix: v
+    tag-filter: ^v\d+\.\d+\.\d+$
+
+vars:
+  bin-name: mariadb-operator
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}
+        - cmd:mkcert
+        - curl
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "8080"
+      MARIADB_OPERATOR_NAME: "mariadb-operator"
+      MARIADB_OPERATOR_NAMESPACE: "default"
+      MARIADB_OPERATOR_SA_PATH: "/var/run/secrets/kubernetes.io/serviceaccount"
+      MARIADB_OPERATOR_IMAGE: "cgr.dev/chainguard/mariadb-operator:latest"
+      RELATED_IMAGE_MARIADB: "docker-registry1.mariadb.com/library/mariadb:11.4.5"
+      RELATED_IMAGE_MAXSCALE: "docker-registry2.mariadb.com/mariadb/maxscale:23.08.5"
+      RELATED_IMAGE_EXPORTER: "prom/mysqld-exporter:v0.15.1"
+      RELATED_IMAGE_EXPORTER_MAXSCALE: "docker-registry2.mariadb.com/mariadb/maxscale-prometheus-exporter-ubi:v0.0.1"
+      MARIADB_GALERA_LIB_PATH: "/usr/lib/galera/libgalera_smm.so"
+      MARIADB_DEFAULT_VERSION: "11.4"
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: |
+        ${{vars.bin-name}} --help 2>&1 | grep -E "Run and operate MariaDB in a cloud native way."
+    - uses: test/kwok/cluster
+    - name: Install MariaDB operator CRDs
+      runs: |
+        # Install MariaDB operator CRDs from upstream
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_mariadbs.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_connections.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_backups.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_restores.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_sqljobs.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_databases.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_users.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_grants.yaml
+        kubectl apply -f https://raw.githubusercontent.com/mariadb-operator/mariadb-operator/v${{package.version}}/config/crd/bases/k8s.mariadb.com_maxscales.yaml
+        kubectl wait --for=condition=Established crd --all --timeout=60s
+    - name: Launch operator with dummy kubeconfig
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+          # Create webhook certificates
+          mkcert example.com mariadb.local localhost 127.0.0.1 ::1
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          mv example.com+4-key.pem /tmp/k8s-webhook-server/serving-certs/tls.key
+          mv example.com+4.pem /tmp/k8s-webhook-server/serving-certs/tls.crt
+          # Create service account directory structure
+          mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+          echo "default" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+          echo "dummy-token" > /var/run/secrets/kubernetes.io/serviceaccount/token
+          echo "dummy-ca-cert" > /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        start: env KUBECONFIG=/tmp/kubeconfig.yaml ${{vars.bin-name}}
+        timeout: 30
+        expected_output: |
+          Watching all namespaces
+          Discovery info
+          Resources
+          Starting manager
+          Starting metrics server
+          Starting EventSource
+          Starting Controller
+          Starting workers
+        post: |
+          echo "Verifying metrics endpoint"
+          curl -sf http://127.0.0.1:8080/metrics | grep -E "go_goroutines|process_cpu_seconds_total" || exit 1

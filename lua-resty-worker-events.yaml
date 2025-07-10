@@ -31,5 +31,91 @@ update:
     use-tag: true
 
 test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - openresty
   pipeline:
     - uses: test/tw/ldd-check
+    - name: "Check lua-resty-worker-events Installation"
+      runs: |
+        echo "Verifying lua-resty-worker-events installation..."
+        if [ -f "/usr/local/lib/lua/resty/worker/events.lua" ]; then
+          echo "lua-resty-worker-events module found."
+        else
+          echo "lua-resty-worker-events module not found!" && exit 1
+        fi
+    - name: "Test lua-resty-worker-events with ngx Mock"
+      runs: |
+        echo "Running a simple Lua script with resty.events..."
+
+        # Create a simple ngx mock for tests to avoid errors
+        cat <<EOF > test_events.lua
+        #!/usr/bin/env resty
+
+        -- 1) Make sure your lualib tree is on package.path
+        package.path = "/usr/local/lib/lua/?.lua;/usr/local/lib/lua/?/init.lua;;" .. package.path
+
+        -- 2) Stub out enough of ngx for a standalone CLI test
+        _G.ngx = {
+          worker = {
+            pid     = function() return 12345 end,
+            exiting = function() return false end,
+          },
+          shared = {
+            process_events = {
+              get  = function(_)      return 0 end,
+              add  = function(_,_,_)  return true end,
+              incr = (function()
+                local n = 0
+                return function(_,_) n = n + 1; return n end
+              end)(),
+            },
+          },
+          log          = function(...) end,
+          ERR          = 3,
+          WARN         = 2,
+          DEBUG        = 4,
+          timer        = {
+            -- ngx.timer.at(delay, fn, ...) ⇒ true on success, err on failure
+            at = function(_, fn, ...)
+              -- (you could invoke fn here if you wanted to simulate callbacks)
+              return true
+            end,
+          },
+          sleep        = function(_) end,
+          now          = function() return 0 end,
+          update_time  = function() end,
+        }
+
+        -- 3) Load the module
+        local ev = require "resty.worker.events"                  -- :contentReference[oaicite:0]{index=0}
+
+        -- 4) Use the event_list helper to avoid magic strings
+        local events = ev.event_list("cli-test", "hello", "world") -- :contentReference[oaicite:1]{index=1}
+        assert(events._source == "cli-test" and events.hello == "hello" and events.world == "world")
+
+        -- 5) Configure the shared‐dict (must match ngx.shared key above)
+        local ok, err = ev.configure {
+          shm           = "process_events",  -- from lua_shared_dict process_events 1m
+          timeout       = 2,
+          interval      = 0,      -- disable background polling
+          wait_interval = 0.01,
+          wait_max      = 0.1,
+          shm_retries   = 1,
+        }
+        assert(ok, err)                                           -- :contentReference[oaicite:2]{index=2}
+
+        -- 6) Test posting a “global” event
+        local posted, perr = ev.post("cli-test", events.hello, { msg = "world" })
+        assert(posted, perr)                                      -- :contentReference[oaicite:3]{index=3}
+
+        -- 7) Test posting a “local” event
+        assert(ev.post_local("cli-test", events.world, { msg = "local-only" }))
+
+        print("lua-resty-worker-events basic API smoke test passed")
+        EOF
+
+        # Run the Lua script
+        resty test_events.lua

@@ -457,7 +457,7 @@ test:
     - name: "Setup and run apisix, run simple http endpoint with python"
       runs: |
         nohup etcd >/dev/null 2>&1 &
-        curl --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 1 --retry-max-time 40 http://127.0.01:2379/health
+        curl --fail --retry 5 --retry-delay 2 --retry-connrefused --retry-max-time 15 http://127.0.0.1:2379/health
     - name: "Apisix server start"
       uses: test/daemon-check-output
       with:
@@ -465,24 +465,10 @@ test:
         expected_output: "trying to initialize the data of etcd"
         error_strings: |
           "all etcd nodes are unavailable"
-    - name: "Spin up a simple nodejs web app."
-      runs: |
-        nohup node <<'JS' > server.log 2>&1 &
-        const http = require('http');
-        http.createServer((req, res) => {
-          if (req.url === '/get') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ secure: 'yes' }));
-          } else {
-            res.writeHead(404);
-            res.end();
-          }
-        }).listen(8000, () => console.log('Listening on http://0.0.0.0:8000'));
-        JS
     - name: "Test routes endpoint"
       runs: |
         ADMIN_KEY=$(yq e -r '.deployment.admin.admin_key[] | .key' /usr/local/apisix/conf/config.yaml)
-        curl -s -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes" | jq .total | grep 0
+        curl --fail -s -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes" | jq .total | grep 0
         payload=$(cat <<EOF
         {
           "uri": "/hello",
@@ -495,25 +481,39 @@ test:
         }
         EOF
         )
-        curl -X PUT -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes/100" -d "$payload"
-        # wait for route to be available
-        sleep 2
-        HTTP_CODE=$(curl -s -connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40 -o /dev/null -w "%{http_code}" "http://127.0.0.1:9080/hello")
-        BODY=$(curl -s --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40  "http://127.0.0.1:9080/hello")
+        curl --fail -X PUT -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes/100" -d "$payload"
+        HTTP_CODE=$(curl --fail -s --retry 5 --retry-delay 2 --retry-connrefused --retry-max-time 15 -o /dev/null -w "%{http_code}" "http://127.0.0.1:9080/hello")
+        BODY=$(curl --fail -s  "http://127.0.0.1:9080/hello")
         if [[ "$HTTP_CODE" -ne 200 || "$BODY" != "hello world" ]]; then
           echo "ERROR: Expected 200 and body 'hello world', got code=$HTTP_CODE, body=$BODY"
           exit 1
         fi
-        curl -s -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes" | jq .total | grep 1
+        curl --fail -s -H "X-API-KEY: ${ADMIN_KEY}" "http://127.0.0.1:9180/apisix/admin/routes" | jq .total | grep 1
     - name: "Test key-auth plugin"
       runs: |
+        # Start a simple nodejs webserver
+        cat <<'EOF' > server.js
+        const http = require('http');
+        http.createServer((req, res) => {
+          if (req.url === '/get') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ secure: 'yes' }));
+          } else {
+            res.writeHead(404);
+            res.end();
+          }
+        }).listen(8000, () => console.log('Listening on http://0.0.0.0:8000'));
+        EOF
+        nohup node server.js &
+        curl --fail --retry 5 --retry-delay 2 --retry-connrefused --retry-max-time 15 http://127.0.0.1:8000/get
+        # Get the API key
         ADMIN_KEY=$(yq e -r '.deployment.admin.admin_key[] | .key' /usr/local/apisix/conf/config.yaml)
         # Create consumer with key-auth plugin
         consumer_payload=$(cat <<EOF
         { "username": "test-consumer", "plugins": {"key-auth": {"key": "consumer-key"}}}
         EOF
         )
-        curl -s -H "Content-Type: application/json" -H "X-API-KEY: ${ADMIN_KEY}" -X PUT "${ADMIN_URL}/apisix/admin/consumers/test-consumer" -d "$consumer_payload" | jq
+        curl --fail -s -H "Content-Type: application/json" -H "X-API-KEY: ${ADMIN_KEY}" -X PUT "${ADMIN_URL}/apisix/admin/consumers/test-consumer" -d "$consumer_payload" | jq
         # Create route with key-auth plugin and mock upstream
         ROUTE_KA=101
         route_payload=$(cat <<EOF
@@ -524,17 +524,15 @@ test:
         }
         EOF
         )
-        curl -s --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40 -H "Content-Type: application/json" -H "X-API-KEY: ${ADMIN_KEY}" -X PUT "${ADMIN_URL}/apisix/admin/routes/${ROUTE_KA}" -d "$route_payload" | jq
-        # Wait for route to be loaded
-        sleep 2
+        curl --fail -s -H "Content-Type: application/json" -H "X-API-KEY: ${ADMIN_KEY}" -X PUT "${ADMIN_URL}/apisix/admin/routes/${ROUTE_KA}" -d "$route_payload" | jq
         # Test without key
-        CODE_NO_KEY=$(curl --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40 -s -o /dev/null -w "%{http_code}" "${PROXY_URL}/secure")
+        CODE_NO_KEY=$(curl -s --retry 5 --retry-delay 2 --retry-connrefused --retry-max-time 15 -o /dev/null -w "%{http_code}" "${PROXY_URL}/secure")
         if [[ "$CODE_NO_KEY" -ne 401 ]]; then
           echo "ERROR: Expected 401 without key, got $CODE_NO_KEY"
           exit 1
         fi
         # Test with key - should get 200 (proxied to upstream)
-        CODE_KEY=$(curl --connect-timeout 5 --max-time 10 --retry 5 --retry-delay 0 --retry-max-time 40 -s -o /dev/null -w "%{http_code}" -H "apikey: consumer-key" "${PROXY_URL}/secure")
+        CODE_KEY=$(curl --fail -s -o /dev/null -w "%{http_code}" -H "apikey: consumer-key" "${PROXY_URL}/secure")
         if [[ "$CODE_KEY" -ne 200 ]]; then
           echo "ERROR: Expected 200 with key, got $CODE_KEY"
           exit 1

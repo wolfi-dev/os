@@ -1,0 +1,107 @@
+package:
+  name: infinispan-operator
+  version: "2.4.13"
+  epoch: 0
+  description: Kubernetes operator for deploying and managing Infinispan clusters
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/infinispan/infinispan-operator
+      tag: ${{package.version}}.Final
+      expected-commit: 24537d6e7727fa4c1353fc7e05d5a11a740692e8
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: infinispan-operator
+      ldflags: -X 'github.com/infinispan/infinispan-operator/launcher.Version=${{package.version}}'
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: compat package for ${{package.name}}
+    dependencies:
+      runtime:
+        - infinispan-operator
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          ln -sf /usr/bin/infinispan-operator ${{targets.subpkgdir}}/usr/local/bin/infinispan-operator
+    test:
+      pipeline:
+        - name: Verify symlink created correctly
+          runs: |
+            readlink /usr/local/bin/infinispan-operator
+            test "$(readlink /usr/local/bin/infinispan-operator)" = "/usr/bin/infinispan-operator"
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - ^CSV.*
+    - ^RH.*
+    - ^OLM.*
+  github:
+    identifier: infinispan/infinispan-operator
+    strip-suffix: .Final
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+        - cmd:mkcert
+    environment:
+      SYSTEM_NAMESPACE: default
+      WATCH_NAMESPACE: default
+  pipeline:
+    - name: Check infinispan-operator help
+      runs: |
+        infinispan-operator operator --help
+    - uses: test/kwok/cluster
+    - name: Install Infinispan operator CRDs
+      runs: |
+        # Install Infinispan operator CRDs from upstream
+        kubectl apply -f https://raw.githubusercontent.com/infinispan/infinispan-operator/${{package.version}}.Final/config/crd/bases/infinispan.org_infinispans.yaml
+        kubectl apply -f https://raw.githubusercontent.com/infinispan/infinispan-operator/${{package.version}}.Final/config/crd/bases/infinispan.org_caches.yaml
+        kubectl apply -f https://raw.githubusercontent.com/infinispan/infinispan-operator/${{package.version}}.Final/config/crd/bases/infinispan.org_backups.yaml
+        kubectl apply -f https://raw.githubusercontent.com/infinispan/infinispan-operator/${{package.version}}.Final/config/crd/bases/infinispan.org_restores.yaml
+        kubectl apply -f https://raw.githubusercontent.com/infinispan/infinispan-operator/${{package.version}}.Final/config/crd/bases/infinispan.org_batches.yaml
+        kubectl wait --for=condition=Established crd --all --timeout=60s
+    - name: Test operator daemon startup
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+          # Create service account directory structure
+          mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+          echo "default" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
+          echo "dummy-token" > /var/run/secrets/kubernetes.io/serviceaccount/token
+          echo "dummy-ca-cert" > /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          # Create webhook certificates
+          # operator requires webhook certificates for its Kubernetes admission webhooks, not for HTTPS traffic
+          mkcert example.com infinispan.local localhost 127.0.0.1 ::1
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          mv example.com+4-key.pem /tmp/k8s-webhook-server/serving-certs/tls.key
+          mv example.com+4.pem /tmp/k8s-webhook-server/serving-certs/tls.crt
+        start: |
+          env KUBECONFIG=/tmp/kubeconfig.yaml \
+              INFINISPAN_OPERAND_VERSIONS='[{"upstream-version":"15.1.6","image":"quay.io/infinispan/server:15.1.6.Final"}]' \
+              infinispan-operator operator --metrics-bind-address=127.0.0.1:8080
+        timeout: 30
+        expected_output: |
+          Metrics server is starting to listen
+          Starting server
+          "worker count": 1
+        post: |
+          echo "Verifying metrics endpoint"
+          wait-for-it 127.0.0.1:8080 -t 15
+          curl -sf http://127.0.0.1:8080/metrics | grep -E "controller_runtime_active_workers|controller_runtime_max_concurrent_reconciles"

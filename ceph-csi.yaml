@@ -41,7 +41,69 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
   pipeline:
     - name: "Verify installation"
       runs: |
+        set -o pipefail
         cephcsi --version | grep -F -e "${{package.version}}"
+        cephcsi --help 2>&1 | grep "Usage of cephcsi"
+    - name: "Test cephcsi RBD driver & liveness probe"
+      runs: |
+        cleanup() {
+            kill "$RBD_PID"
+            kill "$LIVENESS_PID"
+            rm -f /tmp/rbd.log /tmp/liveness.log
+        }
+        fail() {
+          echo "[FAIL] $*"
+          exit 1
+        }
+        grep_and_retry() {
+          local pattern="$1"
+          local file_name="$2"
+          local max_attempts=10
+          local current_attempt=0
+          echo "Attempting to find '$pattern' in '$file_name'..."
+          while [ "$current_attempt" -lt "$max_attempts" ]; do
+            if grep -q "$pattern" "$file_name"; then
+              echo "Successfully found '$pattern'"
+              return 0
+            fi
+            current_attempt=$((current_attempt + 1))
+            echo "  Attempt $current_attempt/$max_attempts failed. Retrying..."
+            sleep 1
+          done
+          fail "Not found '$pattern'"
+        }
+        trap cleanup EXIT
+
+        echo "Starting Ceph-CSI RBD driver..."
+        cephcsi --nodeid=test-node --type=rbd \
+            --endpoint=unix:///tmp/csi.sock \
+            --drivername=rbd.csi.ceph.com --v=5 \
+            --logtostderr=false --log_file=/tmp/rbd.log &
+        RBD_PID=$!
+
+        echo "Verifying RBD driver logs..."
+        grep_and_retry "Starting driver type: rbd with name: rbd.csi.ceph.com" /tmp/rbd.log
+        grep_and_retry "Listening for connections" /tmp/rbd.log
+
+        echo "Starting Ceph-CSI liveness probe..."
+        cephcsi --type=liveness --metricsport=9080 \
+            --polltime=1s --timeout=1s --v=5 \
+            --logtostderr=false --log_file=/tmp/liveness.log &
+        LIVENESS_PID=$!
+
+        echo "Verifying liveness probe logs..."
+        grep_and_retry "Starting driver type: liveness with name: liveness.csi.ceph.com" /tmp/liveness.log
+        grep_and_retry "Health check succeeded" /tmp/liveness.log
+        echo "Checking liveness probe metrics endpoint..."
+        if curl -s http://localhost:9080/metrics | grep -q "csi_liveness 1"; then
+            echo "Liveness probe metrics endpoint is available"
+        else
+            fail "Metrics endpoint is not ready"
+        fi

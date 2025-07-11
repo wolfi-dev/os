@@ -1,0 +1,142 @@
+package:
+  name: infinispan-15.2
+  version: "15.2.4"
+  epoch: 0
+  description: Infinispan is an open source data grid platform and highly scalable NoSQL cloud data store.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - infinispan=${{package.full-version}}
+
+vars:
+  java-version: "21" # https://github.com/infinispan/infinispan/blob/main/documentation/src/main/asciidoc/topics/contributing/basics.adoc#pre-requisites
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - maven
+      - openjdk-${{vars.java-version}}-default-jdk
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/infinispan/infinispan
+      tag: ${{package.version}}.Final
+      expected-commit: 8b37ebc2e515d31625f591e1850b0d9556a1fcaf
+
+  - name: Create dirs
+    runs: |
+      mkdir -p ${{targets.contextdir}}/usr/share/java/infinispan
+      mkdir -p ${{targets.contextdir}}/usr/share/java/gossiprouter
+      mkdir -p ${{targets.contextdir}}/deployments/data
+
+  # - uses: auth/maven
+
+  - name: Build
+    runs: |
+      mvn clean install -B -T$(nproc)C \
+        -am \
+        -Pdistribution \
+        -DskipTests \
+        --no-transfer-progress \
+        --fail-fast
+
+  - name: Install
+    runs: |
+      dest="${{targets.contextdir}}/usr/share/java/infinispan"
+      mkdir -p "$dest"
+
+      tmpdir=$(mktemp -d)
+      unzip -q ./distribution/target/distribution/infinispan-server-${{package.version}}.Final.zip -d "$tmpdir"
+      mv "$tmpdir"/infinispan-server-${{package.version}}.Final/* "$dest"
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility package for the ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt
+          ln -sf /usr/share/java/infinispan ${{targets.contextdir}}/opt/infinispan
+          ln -sf /usr/share/java/gossiprouter ${{targets.contextdir}}/opt/gossiprouter
+    test:
+      pipeline:
+        - runs: |
+            test "$(readlink /opt/infinispan)" = "/usr/share/java/infinispan"
+            test "$(readlink /opt/gossiprouter)" = "/usr/share/java/gossiprouter"
+
+  - name: ${{package.name}}-images
+    description: Contains various artifacts to create Infinispan server and CLI images
+    dependencies:
+      runtime:
+        - bash
+      provides:
+        - infinispan-images=${{package.full-version}}
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/infinispan/infinispan-images
+          expected-commit: 305f828fe586e82a2cba7383604010a9eab71231
+          branch: ${{vars.major-minor-version}}.x # No tags matching to the package version, so use branch
+      # https://github.com/infinispan/infinispan-images/tree/main/modules/org/infinispan
+      - name: Copy runtime files
+        working-directory: modules/org/infinispan/runtime
+        runs: |
+          cp -ar ./added/bin/* ${{targets.contextdir}}/usr/share/java/infinispan/bin/
+          cp -ar ./added/gossiprouter/bin/* ${{targets.contextdir}}/usr/share/java/gossiprouter/bin/
+      - name: Copy distribution files
+        working-directory: modules/org/infinispan/distribution/jvm
+        runs: |
+          cp -ar ./added/bin/* ${{targets.contextdir}}/usr/share/java/infinispan/bin/
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/share/java/infinispan/bin/launch.sh
+            stat /usr/share/java/infinispan/bin/java-opts.sh
+            stat /usr/share/java/infinispan/bin/server.conf
+            stat /usr/share/java/gossiprouter/bin/launch.sh
+
+update:
+  enabled: true
+  github:
+    identifier: infinispan/infinispan
+    use-tag: true
+    tag-filter: v15.2.
+    strip-prefix: v
+    strip-suffix: .Final
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-${{vars.java-version}}-default-jdk
+        - wait-for-it
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+  pipeline:
+    - name: "start daemon on localhost"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/share/java/infinispan/bin/server.sh"
+        timeout: 30
+        expected_output: |
+          server listening on
+          Infinispan Server ${{package.version}}.Final started
+        post: |
+          wait-for-it -t 3 --strict localhost:57800 -- echo ":57800 is up"
+          wait-for-it -t 3 --strict localhost:11222 -- echo ":11222 is up"

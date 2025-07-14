@@ -28,6 +28,52 @@ subpackages:
           packages: ./cmd/mcp/
           output: flux-operator-mcp
           ldflags: -X main.VERSION=${{package.version}}
+    test:
+      environment:
+        environment:
+          KUBECONFIG: "~/.kube/config"
+        contents:
+          packages:
+            - coreutils
+            - curl
+      pipeline:
+        - runs: |
+            /usr/bin/flux-operator-mcp -v | grep "${{package.version}}"
+        - name: "MCP Server API test"
+          runs: |
+            flux-operator-mcp serve --transport sse --port 9090 --read-only &
+            MCP_PID=$!
+            sleep 3
+
+            stdbuf -oL curl -s http://localhost:9090/sse >/tmp/sse_output 2>&1 &
+            PID1=$!
+            sleep 2
+
+            # Extract and sanitize session ID
+            SESSION_ID=$(grep "sessionId=" /tmp/sse_output | cut -d'=' -f2 | head -n1 | tr -d '\r\n ')
+            echo "Session ID: $SESSION_ID"
+
+            # Allow brief delay to ensure session is active
+            sleep 1
+
+            # Send RPC requests
+            curl -s -X POST "http://localhost:9090/message?sessionId=$SESSION_ID" \
+              -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}},"id":1}'
+
+            curl -s -X POST "http://localhost:9090/message?sessionId=$SESSION_ID" \
+              -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}'
+
+            # Give the SSE stream time to receive the response
+            sleep 1
+
+            # Validate the SSE output includes expected tool
+            grep -q "get_flux_instance" /tmp/sse_output
+
+            # Now it's safe to kill the background SSE listener
+            kill $PID1
+            kill $MCP_PID
 
   - name: ${{package.name}}-compat
     description: compat package for ${{package.name}}
@@ -66,23 +112,8 @@ test:
         - helm
         - curl
   pipeline:
-    # - name: "Functional test for operator-mcp"
-    #   uses: test/daemon-check-output
-    #   with:
-    #     setup: |
-    #       helm install flux-operator oci://ghcr.io/controlplaneio-fluxcd/charts/flux-operator-mcp --namespace flux-system --create-namespace
-    #     start: |
-    #       flux-operator-mcp --enable-leader-election=false
-    #     timeout: 30
-    #     expected_output: |
-    #       Starting EventSource
-    #       Starting workers
-    #       Starting Controller
-    #     post: |-
-    #       curl -fsSL localhost:8080/metrics | grep -i "workqueue_work_duration_seconds_bucket"
     - runs: |
         /usr/bin/flux-operator --help 2>&1 | grep metrics-addr
-        /usr/bin/flux-operator-mcp -v | grep "${{package.version}}"
     - uses: test/kwok/cluster
     - name: "Functional test for operator"
       uses: test/daemon-check-output

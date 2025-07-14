@@ -1,17 +1,10 @@
 package:
   name: spegel
   version: "0.3.0"
-  epoch: 1
+  epoch: 2
   description: Stateless cluster local OCI registry mirror.
   copyright:
     - license: MIT
-
-environment:
-  contents:
-    packages:
-      - busybox
-      - ca-certificates-bundle
-      - go
 
 pipeline:
   - uses: git-checkout
@@ -28,8 +21,20 @@ pipeline:
   - uses: go/build
     with:
       packages: ./
-      ldflags: "-extldflags '-static'"
       output: spegel
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf /usr/bin/spegel ${{targets.contextdir}}/spegel
+    test:
+      pipeline:
+        - name: "Verify the symlink"
+          runs: |
+            test "$(readlink /spegel)" = "/usr/bin/spegel"
 
 update:
   enabled: true
@@ -37,9 +42,147 @@ update:
     identifier: spegel-org/spegel
     strip-prefix: v
 
-# This is a statically compiled go app, we don't need to get crazy here.
 test:
+  environment:
+    contents:
+      packages:
+        - containerd
+        - iptables
+        - curl
+        - coreutils
+        - distribution
+        - crane
+        - jq
+        - wait-for-it
   pipeline:
-    - name: Verify spegel is present and runs
+    - name: "Test spegel comprehensive functionality"
       runs: |
+        # Test spegel help
         spegel --help
+
+        # Configure and start containerd
+        mkdir -p /etc/containerd
+        cat > /etc/containerd/config.toml << EOF
+        version = 2
+
+        [plugins."io.containerd.grpc.v1.cri"]
+          snapshotter = "overlayfs"
+
+        [plugins."io.containerd.grpc.v1.cri".registry]
+          config_path = "/etc/containerd/certs.d"
+
+        [plugins."io.containerd.grpc.v1.cri".containerd]
+          discard_unpacked_layers = false
+        EOF
+
+        # Start containerd
+        containerd > /tmp/containerd.log 2>&1 &
+        CONTAINERD_PID=$!
+
+        # Wait for containerd to be ready
+        for i in $(seq 1 30); do
+          if ctr version > /dev/null 2>&1; then
+            echo "Containerd is ready"
+            break
+          fi
+          sleep 1
+        done
+
+        # Verify containerd is running
+        ctr version
+
+        echo "Starting local Docker registry..."
+        # Define image names and registry
+        SOURCE_IMAGE="cgr.dev/chainguard/busybox:latest"
+        LOCAL_REGISTRY="localhost:5000"
+        TARGET_IMAGE="${LOCAL_REGISTRY}/busybox:latest"
+        mkdir -p /etc/docker/registry
+        mkdir -p /var/lib/registry
+        cat <<'EOF' > /etc/docker/registry/config.yml
+        version: 0.1
+        log:
+          level: debug
+          fields:
+            service: registry
+            environment: development
+        storage:
+            delete:
+              enabled: true
+            cache:
+                blobdescriptor: inmemory
+            filesystem:
+                rootdirectory: /var/lib/registry
+            tag:
+              concurrencylimit: 5
+        http:
+            addr: :5000
+            debug:
+                addr: :5002
+                prometheus:
+                    enabled: true
+                    path: /metrics
+        health:
+          storagedriver:
+            enabled: true
+            interval: 10s
+            threshold: 3
+        EOF
+        registry serve /etc/docker/registry/config.yml > /dev/null 2>&1 &
+        REGISTRY_PID=$!
+
+        # Wait for the registry to be ready
+        echo "Waiting for the registry to become ready..."
+        sleep 5
+
+        # Pull the source image
+        echo "Pulling image ${SOURCE_IMAGE}..."
+        crane pull ${SOURCE_IMAGE} ./busybox.tar
+
+        # Push the image to the local registry
+        echo "Pushing image to ${TARGET_IMAGE}..."
+        crane push ./busybox.tar ${TARGET_IMAGE}
+
+        # Create the registry config directory
+        mkdir -p /etc/containerd/certs.d
+
+        # Test spegel command help
+        spegel configuration --help
+        spegel registry --help
+        spegel cleanup --help || true
+        spegel cleanup-wait --help || true
+
+        # First run configuration to set up mirror targets
+        spegel configuration --mirror-targets http://localhost:5000 \
+        --containerd-registry-config-path /etc/containerd/certs.d
+
+        # Verify configuration was created
+        ls -la /etc/containerd/certs.d/
+
+        # Then start the registry service in background for a short time
+        # It will likely fail without a full Kubernetes environment, but we can test basic functionality
+        spegel registry --containerd-sock=/run/containerd/containerd.sock \
+         --registry-addr=:5005 \
+         --bootstrap-kind=http \
+         --router-addr=:5006 \
+         --http-bootstrap-addr=:5007 \
+         --mirrored-registries=http://localhost:5000 > /tmp/spegel.log 2>&1 &
+        REGISTRY_SERVICE_PID=$!
+
+        # Wait for the registry service to start
+        wait-for-it localhost:5005 --timeout=30 || {
+            echo "Registry service did not start in time"
+            exit 1
+        }
+        # Verify the registry service is running
+        if ps $REGISTRY_SERVICE_PID > /dev/null; then
+            echo "Registry service is running"
+            cat /tmp/spegel.log | grep -i "running Spegel" || {
+                echo "Registry service log does not indicate successful start"
+                exit 1
+            }
+        fi
+
+        # Cleanup
+        pkill containerd || true
+        rm -rf /etc/containerd/certs.d /etc/spegel /tmp/containerd.log || true
+        echo "Spegel comprehensive test completed successfully"

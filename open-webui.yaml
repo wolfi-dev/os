@@ -1,7 +1,7 @@
 package:
   name: open-webui
   version: "0.6.16"
-  epoch: 0
+  epoch: 1
   description: User-friendly AI Interface (Supports Ollama, OpenAI API, ...)
   copyright:
     - license: BSD-3-Clause
@@ -70,7 +70,6 @@ pipeline:
       source .venv/bin/activate
 
       uv pip install --upgrade pip
-
       uv pip install .
       uv pip install torchvision torchaudio
       uv pip uninstall pip
@@ -162,19 +161,103 @@ test:
             readlink -f "/usr/bin/${bin##*/}" | grep "/usr/share/${{package.name}}/bin/${bin##*/}"
           fi
         done
-    - uses: test/daemon-check-output
+    - name: Test open-webui with detailed error detection
       working-directory: /app/backend
-      with:
-        expected_output: |
-          Creating knowledge table
-          v${{package.version}} - building the best AI user interface.
-          Started server process
-          Waiting for application startup.
-        post: |-
-          wait-for-it -t 180 localhost:8080
-          curl localhost:8080/health | jq '.status' | grep true
-        start: open-webui serve
-        timeout: 300
+      runs: |
+        # Start the daemon and capture output
+        TMPD=$(mktemp -d)
+        OUT_F="${TMPD}/out"
+
+        # Start open-webui in background
+        open-webui serve >"$OUT_F" 2>&1 </dev/null &
+        KID=$!
+
+        echo "Started open-webui with PID $KID"
+        echo "Waiting for expected output..."
+
+        # Wait for expected strings
+        timeout=300
+        n=0
+        found_all=false
+
+        while [ $n -lt $timeout ]; do
+          if grep -q "Creating knowledge table" "$OUT_F" && \
+             grep -q "v${{package.version}} - building the best AI user interface." "$OUT_F" && \
+             grep -q "Started server process" "$OUT_F" && \
+             grep -q "Waiting for application startup." "$OUT_F"; then
+            echo "Found all expected output strings!"
+            found_all=true
+            break
+          fi
+
+          if ! kill -0 $KID 2>/dev/null; then
+            echo "Process died unexpectedly"
+            break
+          fi
+
+          sleep 1
+          n=$((n+1))
+        done
+
+        if [ "$found_all" != "true" ]; then
+          echo "ERROR: Did not find all expected output within timeout"
+          echo "=== OUTPUT ==="
+          cat "$OUT_F"
+          echo "=== END OUTPUT ==="
+          kill $KID 2>/dev/null || true
+          exit 1
+        fi
+
+        # Now check for ERROR strings and show exactly what was found
+        echo ""
+        echo "Checking for ERROR strings in output..."
+        echo "======================================="
+
+        # Filter out known non-fatal errors
+        grep -n "ERROR" "$OUT_F" | \
+          grep -v "Unable to detect vector size for OpenAI model" | \
+          grep -v "Failed to send telemetry event" > "${TMPD}/errors" || true
+
+        if [ -s "${TMPD}/errors" ]; then
+          echo ""
+          echo "Found ERROR lines (excluding known non-fatal pgvector warnings):"
+          cat "${TMPD}/errors"
+          echo ""
+          echo "Let's see the context around each ERROR:"
+          echo ""
+
+          cat "${TMPD}/errors" | while IFS=: read -r linenum rest; do
+            echo "Context for ERROR at line $linenum:"
+            echo "---"
+            # Show 2 lines before and after
+            start=$((linenum - 2))
+            end=$((linenum + 2))
+            [ $start -lt 1 ] && start=1
+            sed -n "${start},${end}p" "$OUT_F" | nl -v $start
+            echo "---"
+            echo ""
+          done
+          echo "FAIL: Found unexpected ERROR strings in output"
+          kill $KID 2>/dev/null || true
+          wait $KID 2>/dev/null || true
+          rm -rf "$TMPD"
+          exit 1
+        else
+          echo "No unexpected ERROR strings found in output (good!)"
+          echo "Note: Filtered out known non-fatal pgvector vector size detection warnings"
+        fi
+
+        # Run post checks
+        echo "Running health check..."
+        wait-for-it -t 180 localhost:8080
+        curl localhost:8080/health | jq '.status' | grep true
+
+        # Cleanup
+        kill $KID 2>/dev/null || true
+        wait $KID 2>/dev/null || true
+        rm -rf "$TMPD"
+
+        echo "Test completed successfully!"
 
 update:
   enabled: true

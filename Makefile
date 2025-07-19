@@ -156,10 +156,10 @@ packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
-podman_pkg_targets = $(foreach name,$(pkgs),podman-package/$(name))
-$(podman_pkg_targets): podman-package/%:
-	@echo "Building using podman runner"
-	MELANGE_RUNNER=podman make package/$*
+docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
+$(docker_pkg_targets): docker-package/%:
+	@echo "Building using docker runner"
+	MELANGE_RUNNER=docker make package/$*
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
@@ -179,10 +179,10 @@ $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
 
-podman_test_targets = $(foreach name,$(pkgs),podman-test/$(name))
-$(podman_test_targets): podman-test/%:
-	@echo "Testing using podman runner"
-	MELANGE_RUNNER=podman make test/$*
+docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
+$(docker_test_targets): docker-test/%:
+	@echo "Testing using docker runner"
+	MELANGE_RUNNER=docker make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
 $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
@@ -194,14 +194,14 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 
 .PHONY: dev-container
 dev-container:
-	podman run --pull=always --privileged --rm -it \
+	docker run --pull=always --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
 	    ghcr.io/wolfi-dev/sdk:latest
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
-# This target spins up a podman container that is helpful for testing local
+# This target spins up a docker container that is helpful for testing local
 # changes to the packages. It mounts the local packages folder as a read-only,
 # and sets up the necessary keys for you to run `apk add` commands, and then
 # test the packages however you see fit.
@@ -212,7 +212,7 @@ local-wolfi: $(KEY)
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	podman run --pull=always --rm -it \
+	docker run --pull=always --rm -it \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
@@ -221,7 +221,7 @@ local-wolfi: $(KEY)
 	rm "$(TMP_REPOS_FILE)"
 	rmdir "$(TMP_REPOS_DIR)"
 
-# This target spins up a podman container that is helpful for building images
+# This target spins up a docker container that is helpful for building images
 # using local packages.
 # It mounts the:
 #  - local packages dir (default: pwd) as a read-only, as /work/packages. This
@@ -249,8 +249,8 @@ local-wolfi: $(KEY)
 # /work/os/conda-IMAGE.yaml conda-test:test /work/out/conda-test.tar
 #
 # Then from the host you can run:
-# podman load -i /tmp/out/conda-test.tar
-# podman run -it
+# docker load -i /tmp/out/conda-test.tar
+# docker run -it
 OUT_LOCAL_DIR ?= /work/out
 OS_LOCAL_DIR ?= /work/os
 OS_DIR ?= ${PWD}
@@ -262,7 +262,7 @@ dev-container-wolfi: $(KEY)
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	podman run --pull=always --rm -it \
+	docker run --pull=always --rm -it \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \

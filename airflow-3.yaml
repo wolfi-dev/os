@@ -1,7 +1,7 @@
 package:
   name: airflow-3
-  version: "3.0.1"
-  epoch: 0
+  version: "3.0.3"
+  epoch: 2
   description: Platform to programmatically author, schedule, and monitor workflows
   options:
     #  There is a dependency on libarrow.so although it
@@ -11,6 +11,7 @@ package:
   dependencies:
     runtime:
       - coreutils # numfmt is required
+      - graphviz
       - keyutils # mysql provider requires libkeyutils.so.1
       - libudev # for libudev.so.1
       - mariadb-connector-c # for libmariadb.so.3
@@ -22,6 +23,8 @@ package:
       - tzdata
       - unixodbc
       - wolfi-baselayout
+    provides:
+      - airflow=${{package.full-version}}
   copyright:
     - license: Apache-2.0
 
@@ -39,6 +42,10 @@ var-transforms:
     match: "/"
     replace: "-"
     to: providers-with-dash
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
 
 environment:
   contents:
@@ -49,6 +56,7 @@ environment:
       - gcc
       - glibc-dev
       - glibc-locales
+      - graphviz
       - localedef
       - mariadb-connector-c-dev
       - mariadb-dev
@@ -63,6 +71,7 @@ environment:
       - python-${{vars.py-version}}
       - python-${{vars.py-version}}-dev
       - rust
+      - uv
       - wget
       - wolfi-base
       - xmlsec-dev
@@ -74,11 +83,7 @@ pipeline:
     with:
       repository: https://github.com/apache/airflow
       tag: ${{package.version}}
-      expected-commit: 4ecebc2973587ebaa2cb12482de82e93d15c092f
-
-  - uses: patch
-    with:
-      patches: urllib3.patch
+      expected-commit: 71b03470da2d104a07a68da2d496fa9ed253f335
 
   - working-directory: ./airflow-core/src/airflow/ui
     runs: |
@@ -98,7 +103,17 @@ pipeline:
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
 
       python${{vars.py-version}} -m build --wheel
-      pip${{vars.py-version}} install --verbose --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
+      # We need to use uv to avoid `resolution to deep` errors`
+      uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
+
+      # We need to add this additionally  because graphviz is an optional dependency https://github.com/apache/airflow/blob/d2c9563605ca6d3dc40ec0fc2fe6853c86641441/airflow-core/pyproject.toml#L157
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow graphviz
+
+      # CVE-2025-50181 CVE-2025-50182
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow urllib3==2.5.0
+
+      # GHSA-9548-qrrj-x5pj
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow aiohttp==3.12.14
 
   - name: "Build and install the additional provider packages"
     runs: |
@@ -126,9 +141,24 @@ pipeline:
 
         # Build and install the wheel
         python${{vars.py-version}} -m build --wheel
-        pip${{vars.py-version}} install --verbose --prefix="/opt/airflow" --root=${{targets.contextdir}} dist/*.whl
+        uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
         cd -
       done
+
+  - name: "bump snowflake provider to remediate CVE-2025-50213"
+    runs: |
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow apache-airflow-providers-snowflake>=6.4.0
+
+  # Flask >2.2.5 is not supported. Using Flask > 2.2.5 causes the same issue
+  # as the one documented here:
+  # - https://github.com/spec-first/connexion/issues/1699#issuecomment-1524042812
+  # Upstream is working on supporting Flask 2.2.5+, as documented in the issue
+  # and PR below:
+  # - https://github.com/apache/airflow/issues/52509
+  # - https://github.com/apache/airflow/pull/50960
+  - name: "Downgrade Flask 2.2.5"
+    runs: |
+      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow Flask==2.2.5
 
   - runs: find . -name '__pycache__' -exec rm -rf {} +
 
@@ -140,7 +170,8 @@ pipeline:
       # The first time you run Airflow, it will create a file called `airflow.cfg` in
       # `$AIRFLOW_HOME` directory
       # However, for production case it is advised to generate the configuration
-      export PYTHONPATH=${{targets.destdir}}/opt/airflow/lib/python${{vars.py-version}}/site-packages
+      export PYTHONPATH=${{targets.contextdir}}/opt/airflow:${{targets.contextdir}}/opt/airflow/lib/python${{vars.py-version}}/site-packages
+      export PATH=${{targets.contextdir}}/opt/airflow/bin:$PATH
 
       ${{targets.destdir}}/opt/airflow/bin/airflow config list --defaults > ${{targets.destdir}}/"airflow.cfg"
 
@@ -152,19 +183,21 @@ pipeline:
       install -Dm755 scripts/docker/* ${{targets.destdir}}/scripts/docker
 
 subpackages:
-  - name: airflow-3-compat
+  - name: ${{package.name}}-compat
     dependencies:
       runtime:
         - ${{package.name}}
         - merged-usrsbin
         - wolfi-baselayout
+      provides:
+        - airflow-compat=${{package.full-version}}
     pipeline:
       - runs: |
           # Symlink libstdc++ from usr/lib to /usr/lib/$(uname -m)-linux-gnu/
           mkdir -p ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu
           ln -sf /usr/lib/libstdc++.so.6 ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu/
 
-  - name: airflow-3-bitnami-compat
+  - name: ${{package.name}}-bitnami-compat
     dependencies:
       runtime:
         - ${{package.name}}
@@ -175,6 +208,8 @@ subpackages:
         - merged-usrsbin
         - wait-for-port
         - wolfi-baselayout
+      provides:
+        - airflow-bitnami-compat=${{package.full-version}}
     description: "Compatibility package for Bitnami's Airflow image"
     pipeline:
       - uses: bitnami/compat
@@ -192,11 +227,91 @@ subpackages:
           chmod 0755 ${{targets.subpkgdir}}/opt/airflow/bin/activate
           find ${{targets.subpkgdir}}/opt/bitnami/scripts -type f -exec sed -i 's|/opt/bitnami/scripts/|${{targets.subpkgdir}}/opt/bitnami/scripts/|g' {} +
           sed -i 's/-g "root"//g' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
-          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/add-extra-locales.sh
+          #  bitnami renamed the script
+          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/generate-locales.sh
           ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/postunpack.sh
-          ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/add-extra-locales.sh
+          ${{targets.subpkgdir}}/opt/bitnami/scripts/locales/generate-locales.sh
           find ${{targets.contextdir}}/opt/bitnami -type f -exec sed -E 's#${{targets.contextdir}}##g' -i {} \;
           sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' ${{targets.subpkgdir}}/opt/bitnami/scripts/airflow/entrypoint.sh
+
+  - name: ${{package.name}}-iamguarded-compat
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - bash
+        - busybox
+        - coreutils
+        - ini-file
+        - wait-for-port
+        - wolfi-baselayout
+      provides:
+        - airflow-iamguarded-compat=${{package.full-version}}
+    description: "Iamguarded compat for Airflow"
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: airflow
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded
+          ln -sf /opt/airflow /opt/iamguarded
+          mkdir -p ${{targets.contextdir}}/opt/airflow/venv
+          chmod g+rwX /opt/iamguarded
+          ln -sf /opt/airflow/lib /opt/airflow/bin ${{targets.contextdir}}/opt/airflow/venv
+          mkdir -p ${{targets.contextdir}}/opt/airflow/bin
+          touch ${{targets.contextdir}}/opt/airflow/bin/activate
+          chmod 0755 ${{targets.contextdir}}/opt/airflow/bin/activate
+
+          # fix find invocations in scripts to allow copying configuration files
+          sed -i -E 's#find "\$AIRFLOW_BASE_DIR"#find "\$AIRFLOW_BASE_DIR/"#g' /opt/iamguarded/scripts/*.sh
+
+          # prevent certain changes as compat is using symlink
+          sed -i -E 's/configure_permissions_ownership "|ensure_dir_exists "|chmod -R g\+rwX "\$AIRFLOW_BASE_DIR"/true ; # \0/' \
+            /opt/iamguarded/scripts/airflow/postunpack.sh
+
+          sed -i 's/locale-gen/localedef -i en_US -f UTF-8 en_US.UTF-8/g' /opt/iamguarded/scripts/locales/generate-locales.sh
+
+          bash -x /opt/iamguarded/scripts/airflow/postunpack.sh
+          bash -x /opt/iamguarded/scripts/locales/generate-locales.sh
+          sed -i '/if ! am_i_root && \[\[ -e "$LIBNSS_WRAPPER_PATH" \]\]; then/,/fi/d' /opt/iamguarded/scripts/airflow/entrypoint.sh
+      - uses: iamguarded/finalize-compat
+        with:
+          package: airflow
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        accounts:
+          groups:
+            - groupname: airflow
+              gid: 1001
+          users:
+            - username: airflow
+              gid: 1001
+              uid: 1001
+          run-as: 0
+        contents:
+          packages:
+            - ${{package.name}}
+            - sudo
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: airflow
+            version: ${{vars.major-version}}
+        - working-directory: /
+          pipeline:
+            - name: "Launch the entrypoint / run scripts"
+              uses: test/daemon-check-output
+              with:
+                setup: |
+                  chown 1001:1001 -fR /opt/airflow
+                  mkdir -p /opt/airflow/tmp /opt/airflow/dags
+                start: |
+                  sudo -uairflow -E env PYTHONUSERBASE=/opt/airflow AIRFLOW_HOME=/opt/airflow PATH=/opt/iamguarded/airflow/bin:$PATH /opt/iamguarded/scripts/airflow/entrypoint.sh /opt/iamguarded/scripts/airflow/run.sh
+                timeout: 60
+                expected_output: |
+                  Initializing Airflow
+                  Configuring Airflow URL
 
 update:
   enabled: true
@@ -229,6 +344,11 @@ test:
         export PYTHONPATH=/opt/airflow/lib/python${{vars.py-version}}/site-packages
         HOME=/home/build airflow version | grep ${{package.version}}
         python${{vars.py-version}} -c "import airflow"
+    - name: "Test Flask is at the supported version"
+      runs: |
+        set -e
+        export PYTHONPATH=/opt/airflow/lib/python${{vars.py-version}}/site-packages
+        python -c "from flask.json import JSONEncoder"
     - name: "List providers"
       runs: |
         export PATH=/opt/airflow/bin:$PATH

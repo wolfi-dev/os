@@ -110,7 +110,7 @@ You typically need a `go mod tidy` at the end of a series of `go get` invocation
 
 If the app uses a `vendor` directory (this is rare), you'll need to run `go mod vendor` instead of `go mod tidy`.
 
-These steps usually work, but occassionaly dependencies can become tangled and you'll need to bump a few more before you can bump the one you want to get a build to work.
+These steps usually work, but occasionally dependencies can become tangled and you'll need to bump a few more before you can bump the one you want to get a build to work.
 
 In these cases it's best to clone the app and test it all locally outside of melange.
 

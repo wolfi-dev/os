@@ -124,11 +124,27 @@ $(repo_token_targets): repo-token/%: %/.guarded-repo.token
 libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
 $(libraries_token_targets): lib-token/%: %/.libraries.token
 
+.PHONY: is-google-service-account
+is-google-service-account:
+	@if ! curl -f -H "Metadata-Flavor: Google" \
+			  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=issuer.enforce.dev \
+			  -o /dev/null; then \
+		echo "Google SA token not found."; \
+		exit 1; \
+	fi
+	@echo "Google SA token found."
+
+.PHONY: _tokens-if-needed
+_tokens-if-needed:
+	$(call repo_token_if_needed,$(PKGNAME))
+	$(call libraries_token_if_needed,$(PKGNAME))
+
 .PHONY: tokens-if-needed/%
 tokens-if-needed/%:
 	$(eval pkgname := $*)
-	@$(call repo_token_if_needed,$(pkgname))	
-	@$(call libraries_token_if_needed,$(pkgname))
+	@if ! $(MAKE) is-google-service-account 2>/dev/null; then \
+		$(MAKE) _tokens-if-needed PKGNAME=$(pkgname); \
+	fi
 
 .PHONY: clean-tokens/%
 clean-tokens/%:
@@ -317,41 +333,37 @@ check-bootstrap:
 		-r ${BOOTSTRAP_REPO}
 
 define authget
-  tok=$$(chainctl auth token --audience=$(1)) || \
-  { echo "failed token from $(1) for target $@"; exit 1; }; \
-  mkdir -p $$(dirname $(2)) && \
-  echo "auth-download[$(1)] to $(2) from $(3)" && \
-  curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
-  mv "$(2).tmp" "$(2)"
+tok=$$(chainctl auth token --audience=$(1)) || \
+{ echo "failed token from $(1) for target $@"; exit 1; }; \
+mkdir -p $$(dirname $(2)) && \
+echo "auth-download[$(1)] to $(2) from $(3)" && \
+curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
+mv "$(2).tmp" "$(2)"
 endef
 
 define repo_token_if_needed
-  $(eval yamlfile := $1.yaml)
-  $(eval pkgname := $1)
-  # iamguarded pipelines use auth/guarded-repo
-  $(eval pipelines := auth/guarded-repo|iamguarded)
+$(eval yamlfile := $1.yaml)
+$(eval pkgname := $1)
 
-  if grep -qE 'uses:.*($(pipelines))' $(yamlfile); then \
-    echo "Creating guarded repo token for $(pkgname)…"; \
-    $(MAKE) repo-token/$(pkgname); \
-  else \
-    echo "$1 does not use a guarded repo. Skipping token creation."; \
-  fi
+@if grep -qE 'uses:.*(auth/guarded-repo|iamguarded/)' $(yamlfile); then \
+	echo "Creating guarded repo token for $(pkgname)…"; \
+	$(MAKE) repo-token/$(pkgname); \
+else \
+	echo "$(pkgname) does not use a guarded repo. Skipping token creation."; \
+fi
 endef
 
 define libraries_token_if_needed
-  $(eval yamlfile := $1.yaml)
-  $(eval pkgname := $1)
-  $(eval pipelines := auth)
-  $(eval ignore_pipelines := auth/guarded-repo)
+$(eval yamlfile := $1.yaml)
+$(eval pkgname := $1)
 
-  $(eval num_auth_pipelines := $(shell grep -cE 'uses:.*($(pipelines))' $(yamlfile)))
-  $(eval num_ignored_auth_pipelines := $(shell grep -cE 'uses:.*($(ignore_pipelines))' $(yamlfile)))
+$(eval num_auth_pipelines := $(shell grep -cE 'uses:.*auth/' $(yamlfile)))
+$(eval num_ignored_auth_pipelines := $(shell grep -cE 'uses:.*(auth/guarded-repo|iamguarded/)' $(yamlfile)))
 
-  if [ $(num_auth_pipelines) -gt $(num_ignored_auth_pipelines) ]; then \
-    echo "Creating guarded libraries token for $(pkgname)…"; \
-    $(MAKE) lib-token/$(pkgname); \
-  else \
-    echo "$(pkgname) does not use guarded libraries. Skipping token creation."; \
-  fi
+@if [ $(num_auth_pipelines) -gt $(num_ignored_auth_pipelines) ]; then \
+	echo "Creating guarded libraries token for $(pkgname)…"; \
+	$(MAKE) lib-token/$(pkgname); \
+else \
+	echo "$(pkgname) does not use guarded libraries. Skipping token creation."; \
+fi
 endef

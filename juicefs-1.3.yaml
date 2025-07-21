@@ -39,7 +39,7 @@ subpackages:
   - name: ${{package.name}}-compat
     description: Compat package for ${{package.name}}
     dependencies:
-      runtime:
+      runtime: # Minimum set of tools as per upstream image required to debug JuiceFS
         - lsof
         - procps
         - strace
@@ -72,6 +72,15 @@ update:
 
 test:
   environment:
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      ACCESS_KEY: minioadmin
+      SECRET_KEY: minioadmin
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      WEBDAV_USER: minioadmin
+      WEBDAV_PASSWORD: minioadmin
     contents:
       packages:
         - redis
@@ -82,52 +91,47 @@ test:
   pipeline:
     - name: "Version test"
       runs: |
-        juicefs --version 2>&1 | grep ${{package.version}}
+        juicefs --version 2>&1 | grep -q ${{package.version}}
     - name: "Start redis for metadata"
       runs: |
         redis-server --daemonize yes > /tmp/redis.logs 2>&1 &
         sleep 2
     - name: "Start MinIO"
       runs: |
-        export MINIO_ACCESS_KEY=minioadmin
-        export MINIO_SECRET_KEY=minioadmin
         mkdir -p /data/minio
         minio server /data/minio --address :9000 --console-address :9001 > /tmp/minio.log 2>&1 &
         wait-for-it localhost:9000 -t 30
     - name: "Create test bucket using mc"
       runs: |
-        export MINIO_ACCESS_KEY=minioadmin
-        export MINIO_SECRET_KEY=minioadmin
         mc alias set local http://localhost:9000 minioadmin minioadmin > /tmp/mc.log 2>&1
-        mc mb local/juicefs-bucket
-        sleep 2 # Wait for juicefs bucket to show up
+        mc mb local/juicefs-bucket 2>&1 | grep -q "Bucket created successfully"
     - name: "Format juicefs volume and dump logs"
       runs: |
-        export ACCESS_KEY=minioadmin
-        export SECRET_KEY=minioadmin
         juicefs format --bucket http://localhost:9000/juicefs-bucket --access-key $ACCESS_KEY --secret-key $SECRET_KEY redis://localhost testvolume 2>&1 | grep -q "Volume is formatted"
         juicefs dump redis://localhost /tmp/dump.json
         grep -q "Sustained" /tmp/dump.json
         grep -q "DelFiles" /tmp/dump.json
         grep -q "FSTree" /tmp/dump.json
-    - name: "Test service commands"
+    - name: "Test S3 Gateway setup"
       runs: |
-        # Creds needed for JuiceFS's built in S3 gateway
-        export MINIO_ROOT_USER=minioadmin
-        export MINIO_ROOT_PASSWORD=minioadmin
-        export WEBDAV_USER=minioadmin
-        export WEBDAV_PASSWORD=minioadmin
         # Setup S3 Gateway
         juicefs gateway redis://localhost localhost:9002 > gateway.logs 2>&1 &
         wait-for-it localhost:9002
+        # Validate logs
+        grep -q "Create session 1 OK" gateway.logs
+        grep -q "listening" gateway.logs
+        grep -q "initialization complete" gateway.logs
         # Validate endpoint health
         curl -v http://localhost:9002/minio/health/ready 2>&1 | grep -q "200 OK"
-        # Validate
+        # Validate connection
         mc alias set jfs http://localhost:9002 minioadmin minioadmin
         mc mb jfs/testvolume
-        mc ls jfs 2>&1 | grep "testvolume/"
+        mc ls jfs 2>&1 | grep -q "testvolume/"
+    - name: "Test WebDAV Server"
+      runs: |
         # Start WebDAV server
         juicefs webdav redis://localhost localhost:9003 > webdav.logs 2>&1 &
         wait-for-it localhost:9003
+        grep -q "WebDAV listening" webdav.logs
         # Validate
         curl -sf -u minioadmin:minioadmin http://localhost:9003 | grep -q "200 OK"

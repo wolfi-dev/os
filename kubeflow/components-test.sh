@@ -19,7 +19,7 @@ kubeflow.org/creator: kubeflow
 environment: test
 EOF
 
-  /usr/bin/access-management &
+  /usr/bin/access-management --kubeconfig ${HOME}/.kube/config &
   pid=$!
   sleep 10
 

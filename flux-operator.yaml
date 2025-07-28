@@ -1,15 +1,18 @@
 package:
   name: flux-operator
-  version: "0.24.1"
+  version: "0.25.0"
   epoch: 0
   description: Flux Operator creates and manages Flux instances running in Kubernetes
+  dependencies:
+    runtime:
+      - tzdata
   copyright:
     - license: AGPL-3.0-or-later
 
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 09d991b9168009d84a3ebef203a60d4af18ec3ab
+      expected-commit: 222a24c1beaadba9fe8e7656f4a194d7de054512
       repository: https://github.com/controlplaneio-fluxcd/flux-operator.git
       tag: v${{package.version}}
 
@@ -19,7 +22,66 @@ pipeline:
       output: flux-operator
       ldflags: -X main.VERSION=${{package.version}}
 
+  - runs: |
+      mkdir -p "${{targets.contextdir}}"/data
+      cp -R config/data/* ${{targets.contextdir}}/data
+
 subpackages:
+  - name: ${{package.name}}-mcp
+    description: mcp server for ${{package.name}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/mcp/
+          output: flux-operator-mcp
+          ldflags: -X main.VERSION=${{package.version}}
+    test:
+      environment:
+        environment:
+          KUBECONFIG: "~/.kube/config"
+        contents:
+          packages:
+            - coreutils
+            - curl
+      pipeline:
+        - runs: |
+            /usr/bin/flux-operator-mcp -v | grep "${{package.version}}"
+        - name: "MCP Server API test"
+          runs: |
+            flux-operator-mcp serve --transport sse --port 9090 --read-only &
+            MCP_PID=$!
+            sleep 3
+
+            stdbuf -oL curl -s http://localhost:9090/sse >/tmp/sse_output 2>&1 &
+            PID1=$!
+            sleep 2
+
+            # Extract and sanitize session ID
+            SESSION_ID=$(grep "sessionId=" /tmp/sse_output | cut -d'=' -f2 | head -n1 | tr -d '\r\n ')
+            echo "Session ID: $SESSION_ID"
+
+            # Allow brief delay to ensure session is active
+            sleep 1
+
+            # Send RPC requests
+            curl -s -X POST "http://localhost:9090/message?sessionId=$SESSION_ID" \
+              -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}},"id":1}'
+
+            curl -s -X POST "http://localhost:9090/message?sessionId=$SESSION_ID" \
+              -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}'
+
+            # Give the SSE stream time to receive the response
+            sleep 1
+
+            # Validate the SSE output includes expected tool
+            grep -q "get_flux_instance" /tmp/sse_output
+
+            # Now it's safe to kill the background SSE listener
+            kill $PID1
+            kill $MCP_PID
+
   - name: ${{package.name}}-compat
     description: compat package for ${{package.name}}
     pipeline:
@@ -28,7 +90,19 @@ subpackages:
           ln -sf /usr/bin/flux-operator ${{targets.contextdir}}/flux-operator
     test:
       pipeline:
-        - runs: stat /flux-operator
+        - runs: |
+            stat /flux-operator
+
+  - name: ${{package.name}}-mcp-compat
+    description: compat package for flux-operator-mcp
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"
+          ln -sf /usr/bin/flux-operator-mcp ${{targets.contextdir}}/flux-operator-mcp
+    test:
+      pipeline:
+        - runs: |
+            test "$(readlink /flux-operator-mcp)" = "/usr/bin/flux-operator-mcp"
 
 update:
   enabled: true
@@ -47,8 +121,9 @@ test:
   pipeline:
     - runs: |
         /usr/bin/flux-operator --help 2>&1 | grep metrics-addr
+        stat /data/flux
     - uses: test/kwok/cluster
-    - name: "Functional test"
+    - name: "Functional test for operator"
       uses: test/daemon-check-output
       with:
         setup: |

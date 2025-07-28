@@ -52,6 +52,13 @@ When updating packages part of base images (i.e. cgr.dev/chainguard/wolfi-base o
 <!-- remove if unrelated -->
 - [ ] The security fix is recorded in the [advisories](https://github.com/wolfi-dev/advisories) repo
 
+**CVE Scanning:** This PR will fail if ANY CVEs are found (fail-any mode). To customize:
+- **Must-fix specific CVEs only:** Add `<!--ci-cve-scan:must-fix: CVE-ID-->` markers and remove the line below
+- **Fail on any CVEs (default):** Keep the marker below
+```
+<!--ci-cve-scan:fail-any-->
+```
+
 #### For version bump PRs
 <!-- remove if unrelated -->
 - [ ] The `epoch` field is reset to 0

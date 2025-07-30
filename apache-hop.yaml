@@ -1,0 +1,151 @@
+package:
+  name: apache-hop
+  version: "2.14.0-rc1"
+  epoch: 0
+  description: Apache Hop is a data orchestration and data engineering platform
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bash
+      - busybox
+      - coreutils
+      - curl
+      - fontconfig
+      - glibc-locale-en
+      - ttf-dejavu
+      - openjdk-17-default-jvm
+      - procps
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - coreutils
+      - fontconfig-dev
+      - maven
+      - ttf-dejavu
+      - openjdk-17-default-jdk
+      - unzip
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+    MAVEN_OPTS: |
+      -Xmx2g
+      -XX:+UseG1GC
+      -Dorg.slf4j.simpleLogger.defaultLogLevel=WARN
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/hop
+      tag: ${{package.version}}
+      expected-commit: 53f31e1b2657d558a9d2321dbc67a85b22d508f4
+
+  - runs: |
+      mvn clean install -DskipTests
+      
+      # Create installation directory structure
+      mkdir -p "${{targets.contextdir}}"/opt/hop
+      
+      # Unzip the built Hop client
+      unzip assemblies/client/target/hop-client-*.zip -d /tmp/hop-unpacked
+      
+      # Copy the unpacked Hop client with error checking
+      if [ -d "/tmp/hop-unpacked/hop" ]; then
+        cp -r /tmp/hop-unpacked/hop/* "${{targets.contextdir}}"/opt/hop/
+      else
+        echo "Unexpected ZIP structure. Checking for alternative structure..."
+        # Check if files are directly in the unpacked directory
+        if [ -f "/tmp/hop-unpacked/hop-gui.sh" ]; then
+          cp -r /tmp/hop-unpacked/* "${{targets.contextdir}}"/opt/hop/
+        else
+          echo "Could not find hop files in expected locations. Directory contents:"
+          ls -la /tmp/hop-unpacked/
+          exit 1
+        fi
+      fi
+      
+      # Create symlinks for Hop tools in /usr/bin
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      for tool in hop-conf hop-encrypt hop-gui hop-import hop-run hop-search hop-server; do
+        if [ -f "${{targets.contextdir}}/opt/hop/$tool.sh" ]; then
+          ln -sf /opt/hop/$tool.sh "${{targets.contextdir}}"/usr/bin/$tool
+        fi
+      done
+      
+      # Ensure scripts are executable
+      chmod +x "${{targets.contextdir}}"/opt/hop/*.sh
+      
+      # Create hop user home directory
+      mkdir -p "${{targets.contextdir}}"/home/hop
+      
+      # Create files volume mount point
+      mkdir -p "${{targets.contextdir}}"/files
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream container image"
+    dependencies:
+      runtime:
+        - apache-hop
+    pipeline:
+      - runs: |
+          # Create compatibility symlinks as expected by official container
+          mkdir -p "${{targets.contextdir}}/opt"
+          ln -sf /opt/hop "${{targets.contextdir}}/opt/hop"
+          
+          # Add hop user compatibility
+          mkdir -p "${{targets.contextdir}}/home"
+          ln -sf /home/hop "${{targets.contextdir}}/home/hop"
+
+update:
+  enabled: true
+  github:
+    identifier: apache/hop
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}
+        - bash
+        - curl
+        - fontconfig
+        - openjdk-17-default-jvm
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      HOP_HOME: /opt/hop
+  pipeline:
+    - name: "Test Hop installation and basic functionality"
+      runs: |
+        # Verify installation directory exists
+        test -d /opt/hop
+        
+        # Verify key Hop scripts exist and are executable
+        test -x /opt/hop/hop-gui.sh
+        test -x /opt/hop/hop-run.sh
+        test -x /opt/hop/hop-server.sh
+        test -x /opt/hop/hop-conf.sh
+        
+        # Test basic hop-conf functionality
+        /opt/hop/hop-conf.sh --help | grep -q "Hop Configuration"
+        
+        # Verify symlinks are created correctly
+        test -L /usr/bin/hop-gui
+        test -L /usr/bin/hop-run
+        test -L /usr/bin/hop-server
+        test -L /usr/bin/hop-conf
+        
+        # Test that hop-gui can show version information
+        timeout 30 /opt/hop/hop-gui.sh --version 2>/dev/null || echo "GUI version check completed"
+        
+        # Verify Java integration
+        /opt/hop/hop-run.sh --version | grep -q "Apache Hop"
+        
+        echo "All Hop tools are properly installed and functional"

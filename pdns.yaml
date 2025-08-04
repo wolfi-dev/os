@@ -14,6 +14,10 @@ package:
       adduser -S -D -H -h /var/empty -s /bin/false -G pdns -g pdns pdns 2>/dev/null
       exit 0
 
+vars:
+  py-version: 3.12 # Pinning 3.12 due to imghdr. See: https://peps.python.org/pep-0594/#imghdr
+  lua-version: 5.4 # Pinning latest lua version to pass cmake
+
 environment:
   contents:
     packages:
@@ -21,6 +25,7 @@ environment:
       - autoconf
       - automake
       - automake
+      - bind-dev
       - binutils
       - bison
       - boost-dev
@@ -30,26 +35,33 @@ environment:
       - curl-dev
       - file
       - flex
+      - fstrm-dev
       - geoip-dev
       - krb5-dev
+      - libcap-dev
       - libmaxminddb-dev
       - libsodium-dev
+      - libsystemd
       - libtool
       - lmdb-dev
-      - lua5.4-dev
+      - lua${{vars.lua-version}}-dev
       - luajit-dev
       - mariadb-connector-c-dev
       - mariadb-dev
       - mtdev-dev
+      - net-snmp-dev
       - openldap-dev
       - openssl-dev
       - pkgconf-dev
       - postgresql-dev
       - protobuf-dev
-      - py3-virtualenv
-      - python-3.12 # pinning due to imghdr ; see https://peps.python.org/pep-0594/#imghdr
+      - py${{vars.py-version}}-virtualenv
+      - python-${{vars.py-version}}
       - ragel
+      - rust
       - sqlite-dev
+      - systemd
+      - systemd-dev
       - unixodbc-dev
       - util-linux-dev
       - yaml-cpp-dev
@@ -104,24 +116,23 @@ pipeline:
   - uses: autoconf/configure
     with:
       opts: |
+        --sbindir=/usr/bin \
         --with-modules="" \
         --with-dynmodules="bind geoip ldap lmdb lua2 gmysql godbc pipe gpgsql remote gsqlite3" \
         --enable-tools \
         --enable-unit-tests \
+        --enable-systemd \
         --disable-static \
         --enable-remotebackend-zeromq \
-        --with-libcrypto=/usr
+        --with-libcrypto=/usr \
+        --enable-ixfrdist \
+        --enable-reproducible
 
   - uses: autoconf/make
 
   - uses: autoconf/make-install
 
   - runs: PDNS_TEST_NO_IPV6=1 make check
-
-  - name: Fix usrmerge violation
-    runs: |
-      mv ${{targets.destdir}}/usr/sbin/* ${{targets.destdir}}/usr/bin
-      rm -rf ${{targets.destdir}}/usr/sbin
 
   - name: Install files
     runs: |
@@ -132,6 +143,92 @@ pipeline:
   - uses: strip
 
 subpackages:
+  - name: pdns-recursor
+    description: PowerDNS Recursive Server
+    scriptlets:
+      pre-install: |
+        #!/bin/sh
+        addgroup -S recursor 2>/dev/null
+        adduser -S -D -H -h /var/empty -s /bin/false -G recursor -g recursor recursor 2>/dev/null
+        exit 0
+    pipeline:
+      - working-directory: ./pdns/recursordist
+        pipeline:
+          - uses: autoconf/configure
+            with:
+              opts: |
+                --sbindir=/usr/bin \
+                --enable-dns-over-tls \
+                --enable-unit-tests \
+                --enable-snmp \
+                --enable-dnstap \
+                --enable-nod \
+                --enable-libsodium \
+                --with-lua=lua${{vars.lua-version}} \
+                --with-libcrypto=/usr \
+                --with-libcap
+          - uses: autoconf/make
+          - uses: autoconf/make-install
+          - runs: PDNS_TEST_NO_IPV6=1 make check
+      - name: Install files
+        runs: |
+          mkdir -p ${{targets.contextdir}}/etc/init.d/
+          install -Dm755 pdns-recursor.initd ${{targets.contextdir}}/etc/init.d/pdns-recursor
+          install -Dm644 recursor.conf ${{targets.contextdir}}/etc/pdns/recursor.conf
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - pdns-recursor-dockerdata
+            - wait-for-it
+        accounts:
+          groups:
+            - groupname: pdns
+              gid: 953
+          users:
+            - username: pdns
+              gid: 953
+              uid: 953
+          run-as: 953
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: |
+            pdns_recursor --help
+            pdns_control --help
+            pdns_notify --help
+        - name: "start daemon on localhost"
+          uses: test/daemon-check-output
+          with:
+            start: "/usr/bin/tini -- /usr/local/sbin/pdns_recursor-startup"
+            timeout: 30
+            expected_output: |
+              a
+            post: |
+              wait-for-it -t 5 --strict localhost:8082 -- echo ":8082 is up"
+              wait-for-it -t 5 --strict localhost:53 -- echo ":53 is up"
+
+  - name: pdns-recursor-dockerdata
+    description: PowerDNS Recursive Server dockerdata
+    dependencies:
+      runtime:
+        - python-${{vars.py-version}}
+        - py${{vars.py-version}}-jinja2
+        - tini
+        - libcap-utils
+    pipeline:
+      - working-directory: ./dockerdata
+        pipeline:
+          - runs: |
+              # https://github.com/PowerDNS/pdns/blob/master/Dockerfile-recursor
+              mkdir -p ${{targets.contextdir}}/etc/powerdns
+              mkdir -p ${{targets.contextdir}}/usr/local/sbin/
+              mkdir -p ${{targets.contextdir}}/etc/powerdns/recursor.d
+              mkdir -p ${{targets.contextdir}}/var/run/pdns-recursor
+              mkdir -p ${{targets.contextdir}}/etc/powerdns/templates.d
+              install -Dm644 startup.py ${{targets.contextdir}}/usr/local/sbin/pdns_recursor-startup
+              install -Dm644 recursor.conf ${{targets.contextdir}}/etc/powerdns/recursor.conf
+
   - range: backends
     name: pdns-backend-${{range.key}}
     description: PowerDNS ${{range.key}} backend
@@ -252,27 +349,7 @@ test:
   pipeline:
     - uses: test/tw/ldd-check
     - runs: |
-        calidns --help
-        dnsbulktest --help
-        dnsgram --help
-        dnspcap2calidns --help
-        dnspcap2protobuf --help
-        dnsreplay --help
-        dnsscan --help
-        dnsscope --help
-        dnstcpbench --help
-        dnswasher --help
-        dumresp --help
-        ixplore --help
-        nproxy --help
-        nsec3dig --help
         pdns_control --help
         pdns_notify --help
         pdns_server --help
         pdnsutil --help
-        saxfr 127.0.0.1 53 example.com
-        sdig --help
-        stubquery --help
-        zone2json --help
-        zone2ldap --help
-        zone2sql --help

@@ -1,7 +1,7 @@
 package:
   name: postgresql-17
   version: "17.5"
-  epoch: 8
+  epoch: 9
   description: A sophisticated object-relational DBMS
   copyright:
     - license: BSD-3-Clause
@@ -13,11 +13,18 @@ package:
       - ecpg=${{package.full-version}}
       - tzdata
 
+data:
+  - name: py-versions
+    items:
+      3.10: "310"
+      3.11: "311"
+      3.12: "312"
+      3.13: "313"
+
 environment:
   environment:
     # Used to fetch docker scripts
     ALPINE_VERSION: "3.21"
-    PYTHON: "python3.13"
   contents:
     packages:
       - autoconf
@@ -44,16 +51,15 @@ environment:
       - net-tools
       - openldap-dev
       - openssl-dev
-      - py${{vars.py-version}}-build-base-dev
+      - py3-supported-build-base-dev
       - tzdata
       - util-linux-dev
       - zlib-dev
       - zstd-dev
 
 vars:
-  py-version: 3.13
   client-tools: clusterdb createdb createuser dropdb dropuser pg_amcheck pg_basebackup pg_dump pg_dumpall pg_isready pg_receivewal pg_recvlogical pg_restore pg_verifybackup psql reindexdb vacuumdb
-  py-test-version: 3.13
+  pypi-package: plpython
 
 var-transforms:
   - from: ${{package.name}}
@@ -99,7 +105,6 @@ pipeline:
         --with-gssapi \
         --with-ldap \
         --with-llvm \
-        --with-python \
         --enable-thread-safety
 
   - uses: autoconf/make
@@ -199,68 +204,6 @@ subpackages:
       provider-priority: 17
       provides:
         - libpq=${{package.full-version}}
-
-  - name: plpython3
-    description: PostgreSQL Python libraries
-    dependencies:
-      provider-priority: 17
-      provides:
-        - plpython=${{package.full-version}}
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/lib/postgresql${{vars.major-version}}
-          mkdir -p ${{targets.subpkgdir}}/usr/share/postgresql${{vars.major-version}}/extension
-      - runs: |
-          mv $(echo ${{targets.destdir}}/usr/share/postgresql${{vars.major-version}}/extension/plpython*) ${{targets.subpkgdir}}/usr/share/postgresql${{vars.major-version}}/extension/
-          mv $(echo ${{targets.destdir}}/usr/lib/postgresql${{vars.major-version}}/plpython*) ${{targets.subpkgdir}}/usr/lib/postgresql${{vars.major-version}}/
-    test:
-      environment:
-        contents:
-          packages:
-            - postgresql-${{vars.major-version}}-client
-            - postgresql-${{vars.major-version}}
-            - shadow
-            - sudo-rs
-            - wait-for-it
-            - python-${{vars.py-test-version}}
-        environment:
-          PGDATA: /tmp/plpython_test_db
-          PGUSER: testuser
-      pipeline:
-        - uses: test/tw/ldd-check
-        - name: "Test plpython database functionality"
-          runs: |
-            echo "=== Setting up test database for plpython ==="
-            useradd $PGUSER
-            sudo -u $PGUSER initdb -D $PGDATA 2>&1
-            sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/plpython_logfile start 2>&1
-            wait-for-it localhost:5432 -t 5 2>&1
-            createdb plpython_testdb 2>&1
-
-            psql -d plpython_testdb -c "CREATE EXTENSION plpython3u;"
-
-            psql -d plpython_testdb -c "
-            CREATE OR REPLACE FUNCTION test_plpython_basic() RETURNS text AS \$\$
-            return 'Hello from plpython3!'
-            \$\$ LANGUAGE plpython3u;" 2>&1
-
-
-            # Create a function that returns Python version info
-            psql -d plpython_testdb -c "
-            CREATE OR REPLACE FUNCTION py_version() RETURNS text AS \$\$
-            import sys
-            return f'Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'
-            \$\$ LANGUAGE plpython3u;" 2>&1
-
-            # Get the Python version from plpython
-            PLPYTHON_VERSION=$(psql -t -A -d plpython_testdb -c "SELECT py_version();")
-
-            # Get the system Python version
-            SYSTEM_VERSION=$(python --version)
-
-            [ "$PLPYTHON_VERSION" = "$SYSTEM_VERSION" ]
-
-            sudo -u $PGUSER pg_ctl -D $PGDATA stop 2>&1
 
   - name: libecpg-17
     description: Embedded PostgreSQL libraries
@@ -473,6 +416,92 @@ subpackages:
     test:
       pipeline:
         - uses: test/tw/ldd-check
+
+  # This subpackage essentially rebuilds postgres with python and should therefore be the very last package built!!!
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+    pipeline:
+      - runs: |
+          PYTHON=python${{range.key}}  PYTHON3=python${{range.key}}  ./configure \
+            --host=${{host.triplet.gnu}} \
+            --build=${{host.triplet.gnu}} \
+            --prefix=/usr \
+            --bindir=/usr/libexec/${{vars.mangled-package-name}} \
+            --datadir=/usr/share/${{vars.mangled-package-name}} \
+            --docdir=/usr/share/doc/${{vars.mangled-package-name}} \
+            --mandir=/usr/share/${{vars.mangled-package-name}}/man \
+            --with-openssl \
+            --with-libedit-preferred \
+            --with-uuid=e2fs \
+            --with-libxml \
+            --with-libxslt \
+            --with-icu \
+            --with-lz4 \
+            --with-zstd \
+            --with-gssapi \
+            --with-ldap \
+            --with-llvm \
+            --with-python \
+            --enable-thread-safety
+      - uses: autoconf/make
+      - uses: autoconf/make-install
+      - runs: |
+          savedir="${{targets.contextdir}}.sav"
+          mkdir -p $savedir/usr/lib/postgresql${{vars.major-version}}
+          mkdir -p $savedir/usr/share/postgresql${{vars.major-version}}/extension
+          mv ${{targets.contextdir}}/usr/share/postgresql${{vars.major-version}}/extension/plpython* $savedir/usr/share/postgresql${{vars.major-version}}/extension/
+          mv ${{targets.contextdir}}/usr/lib/postgresql${{vars.major-version}}/plpython* $savedir/usr/lib/postgresql${{vars.major-version}}/
+          rm -rf "${{targets.contextdir}}"
+          mv "$savedir" "${{targets.contextdir}}"
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - postgresql-${{vars.major-version}}-client
+            - postgresql-${{vars.major-version}}
+            - shadow
+            - sudo-rs
+            - wait-for-it
+            - python-${{range.key}}
+        environment:
+          PGDATA: /tmp/plpython_test_db
+          PGUSER: testuser
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "Test plpython database functionality"
+          runs: |
+            echo "=== Setting up test database for plpython ==="
+            useradd $PGUSER
+            sudo -u $PGUSER initdb -D $PGDATA 2>&1
+            sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/plpython_logfile start 2>&1
+            wait-for-it localhost:5432 -t 5 2>&1
+            createdb plpython_testdb 2>&1
+
+            psql -d plpython_testdb -c "CREATE EXTENSION plpython3u;"
+            psql -d plpython_testdb -c "
+            CREATE OR REPLACE FUNCTION test_plpython_basic() RETURNS text AS \$\$
+            return 'Hello from plpython3!'
+            \$\$ LANGUAGE plpython3u;" 2>&1
+            PLPYTHON_STATEMENT=$(psql -t -A -d plpython_testdb -c "SELECT test_plpython_basic();")
+            [ "$PLPYTHON_STATEMENT" = "Hello from plpython3!" ]
+
+            sudo -u $PGUSER pg_ctl -D $PGDATA stop 2>&1
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/emptypackage
 
 update:
   version-separator: _

@@ -1,0 +1,139 @@
+package:
+  name: cnpg-plugin-barman-cloud
+  version: "0.5.0"
+  epoch: 0
+  description: CloudNativePG Barman Cloud Plugin - Kubernetes operator for cloud-native PostgreSQL backup capabilities
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - ca-certificates-bundle
+      - controller-gen
+      - make
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/cloudnative-pg/plugin-barman-cloud
+      tag: v${{package.version}}
+      expected-commit: c42bdfe455097af27ea37ad60faf5c7989bd020e
+
+  - runs: |
+      # Generate manifests (CRDs, RBAC, etc.)
+      controller-gen rbac:roleName=plugin-barman-cloud crd webhook paths="./api/..." output:crd:artifacts:config=config/crd/bases
+
+      # Generate DeepCopy methods
+      controller-gen object:headerFile="hack/boilerplate.go.txt" paths="./api/..."
+
+  - uses: go/build
+    with:
+      packages: ./cmd/manager
+      output: manager
+
+subpackages:
+  - name: cnpg-plugin-barman-cloud-compat
+    description: Compatibility package for cnpg-plugin-barman-cloud
+    pipeline:
+      - runs: |
+          # Create directories expected by the operator
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -s /usr/bin/manager "${{targets.contextdir}}"/usr/local/bin/manager
+
+update:
+  enabled: true
+  github:
+    identifier: cloudnative-pg/plugin-barman-cloud
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - git
+    environment:
+      SIDECAR_IMAGE: "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:test"
+      NAMESPACE: "default"
+      CLUSTER_NAME: "test-cluster"
+      POD_NAME: "test-pod"
+  pipeline:
+    - name: Check manager binary and help output
+      runs: |
+        set -o pipefail
+        # Test that the binary runs and shows expected help content
+        manager --help 2>&1 | grep -F -e "Available Commands"
+        manager --help 2>&1 | grep -F -e "instance"
+        manager --help 2>&1 | grep -F -e "operator"
+        manager --help 2>&1 | grep -F -e "restore"
+        manager --help 2>&1 | grep -F -e "healthcheck"
+    - name: Verify all subcommands help output
+      runs: |
+        set -o pipefail
+        # Each subcommand should show help without errors and have expected content
+        manager instance --help 2>&1 | grep -F -e "Starts the Barman Cloud CNPG-I sidecar plugin"
+        manager operator --help 2>&1 | grep -F -e "Starts the BarmanObjectStore reconciler"
+        manager restore --help 2>&1 | grep -F -e "Starts the Barman Cloud CNPG-I sidecar plugin"
+        manager healthcheck --help 2>&1 | grep -F -e "healthcheck commands"
+    - uses: test/kwok/cluster
+    - name: Install CRDs
+      runs: |
+        set -o pipefail
+        # Apply the CRD directly from the built binary's embedded config
+        # The CRD is embedded in the config/crd/bases directory
+        CRD_FILE=$(mktemp)
+        cat > "${CRD_FILE}" <<'EOF'
+        apiVersion: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        metadata:
+          name: objectstores.barmancloud.cnpg.io
+        spec:
+          group: barmancloud.cnpg.io
+          names:
+            kind: ObjectStore
+            listKind: ObjectStoreList
+            plural: objectstores
+            singular: objectstore
+          scope: Namespaced
+          versions:
+          - name: v1
+            served: true
+            storage: true
+            schema:
+              openAPIV3Schema:
+                type: object
+                properties:
+                  spec:
+                    type: object
+                  status:
+                    type: object
+        EOF
+
+        kubectl apply -f "${CRD_FILE}"
+        kubectl wait --for=condition=Established crd objectstores.barmancloud.cnpg.io --timeout=60s
+    - name: Test operator daemon startup
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # Create plugin socket directory structure
+          mkdir -p /plugins/barman-cloud.cloudnative-pg.io
+          chmod -R 777 /plugins
+        start: manager operator --plugin-path /plugins --metrics-bind-address :8080 --metrics-secure=false
+        timeout: 30
+        expected_output: |
+          starting manager
+          Starting EventSource
+          Starting Controller
+          Starting workers
+        post: |
+          set -o pipefail
+          wait-for-it localhost:8081 -t 30
+          curl -fsSL http://127.0.0.1:8081/healthz | grep -F -e "ok"
+
+          wait-for-it localhost:8080 -t 30
+          # Check if metrics endpoint is responding and has expected metrics
+          curl -fsSL http://127.0.0.1:8080/metrics | grep -F -e "controller_runtime_reconcile_total"
+          curl -fsSL http://127.0.0.1:8080/metrics | grep -F -e "go_gc_duration_seconds"
+          curl -fsSL http://127.0.0.1:8080/metrics | grep -F -e "workqueue_retries_total"

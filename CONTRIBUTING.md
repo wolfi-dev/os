@@ -19,7 +19,7 @@ In addition to the above, the Wolfi Maintainers reserve the right to reject othe
 
 ## Setup development environment
 
-To ease the development of Wolfi OS, you can use the [Wolfi `sdk` image](https://github.com/wolfi-dev/tools/pkgs/container/sdk) that already includes both [apko](https://github.com/chainguard-dev/apko) and [melange](https://github.com/chainguard-dev/melange).
+To ease the development of Wolfi OS, you can use the [Wolfi `SDK` image](https://github.com/wolfi-dev/tools/pkgs/container/sdk) that already includes both [apko](https://github.com/chainguard-dev/apko) and [melange](https://github.com/chainguard-dev/melange).
 On Linux and Mac it is also possible to install both the above tools directly into your system.
 
 If you choose not to install the tooling onto your local machine, you can start a container based development environment using

@@ -10,12 +10,6 @@ package:
   dependencies:
     provides:
       - pdns=${{package.full-version}}
-  scriptlets:
-    pre-install: |
-      #!/bin/sh
-      addgroup -S pdns 2>/dev/null
-      adduser -S -D -H -h /var/empty -s /bin/false -G pdns -g pdns pdns 2>/dev/null
-      exit 0
 
 vars:
   py-version: 3.12 # Pinning 3.12 due to imghdr. See: https://peps.python.org/pep-0594/#imghdr
@@ -139,6 +133,12 @@ pipeline:
       - if: ${{build.arch}} == "aarch64"
         runs: PDNS_TEST_NO_IPV6=1 make check # aarch64 has issues with IPv6 tests on the CI, no error logs available
 
+  - name: Create necessary directories
+    runs: |
+      mkdir -p ${{targets.contextdir}}/etc/powerdns/pdns.d
+      mkdir -p ${{targets.contextdir}}/var/run/pdns/
+      mkdir -p ${{targets.contextdir}}/var/lib/powerdns
+
   - uses: strip
 
 subpackages:
@@ -147,12 +147,6 @@ subpackages:
     dependencies:
       provides:
         - pdns-recursor=${{package.full-version}}
-    scriptlets:
-      pre-install: |
-        #!/bin/sh
-        addgroup -S recursor 2>/dev/null
-        adduser -S -D -H -h /var/empty -s /bin/false -G recursor -g recursor recursor 2>/dev/null
-        exit 0
     pipeline:
       - working-directory: ./pdns/recursordist
         pipeline:
@@ -382,6 +376,10 @@ test:
   environment:
     contents:
       packages:
+        - bind-tools
+        - curl
+        - wait-for-it
+        - sqlite
         - ${{package.name}}-backends-all
         - ${{package.name}}-tools-all
   pipeline:
@@ -391,3 +389,23 @@ test:
         pdns_notify --help
         pdns_server --help
         pdnsutil --help
+    - name: "start daemon on localhost"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          curl -fsSL https://raw.githubusercontent.com/PowerDNS/pdns/refs/tags/rec-${{package.version}}/dockerdata/pdns.conf -o /etc/pdns.conf
+          curl -fsSL https://raw.githubusercontent.com/PowerDNS/pdns/refs/tags/rec-${{package.version}}/modules/gsqlite3backend/schema.sqlite3.sql -o /tmp/schema.sqlite3.sql
+          sqlite3 /var/lib/powerdns/pdns.sqlite3 < /tmp/schema.sqlite3.sql
+        start: "pdns_server"
+        timeout: 30
+        expected_output: |
+          Listening on controlsocket
+          UDP server bound
+          TCP server bound
+          Done launching threads
+        post: |
+          wait-for-it -t 5 --strict localhost:53 -- echo ":53 is up"
+          pdnsutil --config-dir=/etc create-zone example.com ns1.example.com
+          pdnsutil --config-dir=/etc add-record example.com ns1 A 127.0.0.1
+          dig @127.0.0.1 -p 53 example.com SOA +norecurse | grep -qi "NO ERROR"
+          sdig 127.0.0.1 53 example.com SOA | grep -qi "No Error"

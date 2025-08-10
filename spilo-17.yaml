@@ -79,7 +79,7 @@ pipeline:
       # The etcd run script contains "dpkg" which needs changing to run on wolfi
       # https://github.com/zalando/spilo/blob/master/postgres-appliance/runit/etcd/run
       sed -i -E \
-        's|\$\([^)]+\) /bin/etcd --data-dir /run/etcd\.data|$(apk --print-arch) /usr/bin/etcd --data-dir /run/etcd.data|' \
+        's|\$\([^)]+\) /bin/etcd --data-dir /run/etcd\.data|${{build.arch}} /usr/bin/etcd --data-dir /run/etcd.data|' \
         postgres-appliance/runit/etcd/run
 
 
@@ -106,6 +106,7 @@ subpackages:
           ln -s /usr/bin/launch.sh ${{targets.contextdir}}/launch.sh
           gcc -s -shared -fPIC -o ${{targets.subpkgdir}}/usr/local/lib/cron_unprivileged.so postgres-appliance/cron_unprivileged.c
           ln -s crond ${{targets.subpkgdir}}/usr/sbin/cron
+          ln -s /etc/pgbouncer/pgbouncer.ini /run/pgbouncer/pgbouncer.ini
     test:
       pipeline:
         - uses: test/tw/ldd-check
@@ -209,79 +210,54 @@ test:
       ETCD_ENABLE_V2_HTTP: true
   pipeline:
     - name: Run and test ${{package.name}}
-      runs: |
-        echo "127.0.0.1 $(hostname)" >> /etc/hosts
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          echo "127.0.0.1 $(hostname)" >> /etc/hosts
 
-        adduser -D -h /home/postgres postgres
-        addgroup crontab
-        mkdir -p "$RW_DIR"/tmp
-        mkdir -p "$RW_DIR"/certs
-        mkdir -p "$RW_DIR"/pgbouncer
-        mkdir -p /var/run/pgbouncer
-        mkdir -p /var/log/pgbouncer
-        mkdir -p "$PGDATA"
-        mkdir -p /pg_wal
-        mkdir -p /var/spool
-        mkdir -p "$RW_DIR"/pgbouncer
-        chown -R postgres:postgres "$PGDATA"
-        chown -R postgres:postgres /pg_wal
-        chown -R postgres:postgres /home/postgres
-        chown -R postgres:postgres /run/*
-
-
-        chown postgres:postgres /var/log/*
-        chown postgres:postgres /var/run/*
+          adduser -D -h /home/postgres postgres
+          addgroup crontab
+          mkdir -p "$RW_DIR"/tmp
+          mkdir -p "$RW_DIR"/certs
+          mkdir -p "$RW_DIR"/pgbouncer
+          mkdir -p /var/run/pgbouncer
+          mkdir -p /var/log/pgbouncer
+          mkdir -p "$PGDATA"
+          mkdir -p /pg_wal
+          mkdir -p /var/spool
+          mkdir -p "$RW_DIR"/pgbouncer
+          chown -R postgres:postgres "$PGDATA"
+          chown -R postgres:postgres /pg_wal
+          chown -R postgres:postgres /home/postgres
+          chown -R postgres:postgres /run/*
 
 
-        # Disable pgbouncer service since no configuration is provided
-        ln -s /etc/pgbouncer/pgbouncer.ini /run/pgbouncer/pgbouncer.ini
-        /launch.sh init &
+          chown postgres:postgres /var/log/*
+          chown postgres:postgres /var/run/*
 
-        # Wait for services to start and Spilo bootstrap to complete
-        sleep 20
 
-        echo "=== Spilo Functional Tests ==="
-
-        # Test 1: Verify Patroni is running and has leadership
-        echo "Testing Patroni status..."
-        curl -s http://localhost:8008/patroni | grep -q "state.*running" || {
-          echo "ERROR: Patroni not responding or not in running state"
-          exit 1
-        }
-
-        # Test 2: Check if PostgreSQL is accepting connections
-        echo "Testing PostgreSQL connectivity..."
-        pg_isready -h localhost -p 5432 -U postgres || {
-          echo "ERROR: PostgreSQL not ready"
-          exit 1
-        }
-
-        # Test 3: Test database operations
-        echo "Testing database operations..."
-        PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d postgres -c "
+          # Disable pgbouncer service since no configuration is provided
+          ln -s /etc/pgbouncer/pgbouncer.ini /run/pgbouncer/pgbouncer.ini
+        start: |
+          /launch.sh init
+        timeout: 60
+        expected_output: |
+          listening on 127.0.0.1:6432
+          setting up initial cluster version using v2 API
+          Selected new etcd server
+          Success. You can now start the database server using
+          database system is ready to accept connections
+          GRANT ROLE
+          You are now connected to database
+        post: |
+          pg_isready -h localhost -p 5432 -U postgres
+          PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h localhost -p 5432 -U postgres -d postgres <<'SQL'
           CREATE TABLE IF NOT EXISTS test_table (id SERIAL PRIMARY KEY, data TEXT);
-          INSERT INTO test_table (data) VALUES ('test_data_' || now());
+          INSERT INTO test_table (data) VALUES (\$\$test_data_\$\$ || now()::text);
           SELECT COUNT(*) FROM test_table;
-        " || {
-          echo "ERROR: Database operations failed"
-          exit 1
-        }
-
-        etcd_v3_data=$(etcdctl --endpoints=http://localhost:2379 get --prefix / 2>/dev/null | head -20)
-
-        # Also check etcd v2 API (which py3-etcd uses)
-        etcd_v2_data=$(curl -s http://localhost:2379/v2/nodes/ 2>/dev/null || echo "v2 API not available")
-
-        if [ -n "$etcd_v3_data" ] || echo "$etcd_v2_data" | grep -q "node"; then
-          echo "SUCCESS: etcd is accessible and contains data"
-          echo "etcd v3 data sample: $(echo "$etcd_v3_data" | head -5)"
-          echo "etcd v2 response: $etcd_v2_data"
-        else
-          echo "WARNING: etcd appears empty, but etcd service is running"
-          # This is not a failure since etcd is working
-        fi
-
-        echo "=== All Spilo tests passed successfully! ==="
+          SQL
+        error_strings: |
+          ERROR:
 
 update:
   enabled: true

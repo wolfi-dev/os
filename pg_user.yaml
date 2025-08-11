@@ -1,0 +1,112 @@
+package:
+  name: pg_user
+  version: "1.1.1"
+  epoch: 1 # CVE-2025-47907
+  description: A CLI application for managing PostgreSQL users
+  copyright:
+    - license: GPL-3.0
+
+vars:
+  pg_version: 17
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/frederikhs/pg_user
+      tag: v${{package.version}}
+      expected-commit: 257869bddb8b1eb735e7e8f1978082f7b0f45782
+
+  - uses: go/build
+    with:
+      packages: .
+      output: pg_user
+      ldflags: -X main.version=${{package.version}}
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: frederikhs/pg_user
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql-${{vars.pg_version}}
+        - postgresql-${{vars.pg_version}}-client
+        - shadow
+        - sudo
+        - glibc-locales
+        - wait-for-it
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATA: /tmp/pgdata
+  pipeline:
+    - name: Test pg_user version
+      runs: |
+        pg_user --version 2>&1 | grep ${{package.version}}
+    - name: Initialize PostgreSQL database
+      runs: |
+        useradd $PGUSER
+        echo -n $PGPASSWORD 2>&1 > /tmp/pwfile
+        chown $PGUSER /tmp/pwfile
+        su - $PGUSER -c "initdb --pwfile=/tmp/pwfile -D $PGDATA --auth=md5" 2>&1
+    - name: Test pg_user with real PostgreSQL database
+      runs: |
+        # Start PostgreSQL server
+        sudo -u $PGUSER pg_ctl start -w -D $PGDATA -o "--unix_socket_directories=/tmp" -l $PGDATA/log 2>&1
+
+        # Wait for PostgreSQL to be ready
+        wait-for-it localhost:5432 -t 10 2>&1
+
+        # # Create .pgpass file for pg_user authentication
+        touch /root/.pgpass
+        echo "localhost:5432:postgres:postgres:postgres" > /root/.pgpass 2>&1
+        chmod 600 /root/.pgpass 2>&1
+
+        # Test pg_user hosts command with real .pgpass file
+        echo "Testing hosts command..."
+        pg_user hosts 2>&1
+
+        # Test user creation
+        echo "Testing user creation..."
+        pg_user add testuser1 --host localhost --no-ssl 2>&1
+
+        # Verify user was created using direct PostgreSQL query
+        echo "Verifying user creation..."
+        psql -h /tmp -d postgres -U postgres -c "SELECT usename FROM pg_user WHERE usename = 'testuser1';" 2>&1 | grep testuser1
+
+
+        # Create a test role first for role-based testing
+        echo "Creating test role..."
+        psql -h /tmp -d postgres -U postgres -c "CREATE ROLE testrole;" 2>&1
+
+        # Test user creation with roles
+        echo "Testing user creation with roles..."
+        pg_user add testuser2 --host localhost --no-ssl --roles=testrole 2>&1
+
+        # Verify user with roles was created
+        echo "Verifying user with roles..."
+        psql -h /tmp -d postgres -U postgres -c "SELECT usename FROM pg_user WHERE usename = 'testuser2';" 2>&1
+
+        # Test user deletion
+        echo "Testing user deletion..."
+        pg_user delete testuser1 --host localhost --no-ssl 2>&1
+
+        # Verify user was deleted
+        echo "Verifying user deletion..."
+        ! psql -h /tmp -d postgres -U postgres -c "SELECT usename FROM pg_user WHERE usename = 'testuser1';" 2>&1 | grep testuser1
+
+        # Test roles listing
+        echo "Testing roles listing..."
+        pg_user roles localhost --no-ssl 2>&1
+
+        # Clean up test users
+        echo "Cleaning up test users..."
+        pg_user delete testuser2 --host localhost --no-ssl 2>&1 || true
+
+        # Stop PostgreSQL
+        sudo -u $PGUSER pg_ctl stop -D $PGDATA 2>&1

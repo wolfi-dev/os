@@ -33,6 +33,12 @@ addressed, and remove any items that are not relevant to this PR.
 - [ ] REQUIRED - The package is available under an OSI-approved or FSF-approved license
 - [ ] REQUIRED - The version of the package is still receiving security updates
 - [ ] This PR links to the upstream project's support policy (e.g. `endoflife.date`)
+- [ ] Functional tests are present.
+- [ ] We cannot write functional tests, but smoke tests are present - explain why in notes below.
+- [ ] Tests fail **and** pass when it's expected.
+
+##### Notes:
+Add notes if required.
 
 #### For new version streams
 <!-- remove if unrelated -->

@@ -44,6 +44,6 @@ Mixing packages with other distributions is not supported and can create securit
 
 ## If Wolfi is missing a package you require
 
-We intend for Wolfi to be the core foundation of Chainguard OS and available as an open source project for use with minimal packages as used in our free Chainguard Containers.
+Wolfi is the core foundation of Chainguard OS and available as an open source project for use with minimal packages as used in our free Chainguard Containers.
 
 Wolfi is not currently intended to be a general purpose operating system, and we are not accepting new package requests at this time. If you're a Chainguard Images customer, please reach out to your account team or submit a support ticket in console so we can prioritize your needs appropriately.

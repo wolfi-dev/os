@@ -46,4 +46,4 @@ Mixing packages with other distributions is not supported and can create securit
 
 Wolfi is the core foundation of Chainguard OS and Chainguard's Starter container images.
 
-Wolfi is not intended to be a general purpose operating system, and we are not accepting new package requests at this time. If you're a Chainguard container images customer, reach out to your account team or submit a support ticket so we can prioritize your needs appropriately.
+Wolfi is not intended to be a general purpose operating system, and we are not accepting new package requests. If you're a Chainguard Containers customer, reach out to your account team or submit a support ticket so we can prioritize your needs appropriately.

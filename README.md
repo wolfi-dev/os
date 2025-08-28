@@ -44,11 +44,13 @@ Mixing packages with other distributions is not supported and can create securit
 
 ## If Wolfi is missing a package you require
 
-Wolfi is not currently intended to be a general purpose desktop operating system. Our priority is to provide packages
+Wolfi is the core foundation of Chainguard OS and the free starter images available from the Chainguard Containers catalog. 
+
+Wolfi is not currently intended to be a general purpose operating system. Our priority is to provide packages
 that enable containerized and embedded system workflows. Please keep this in mind when proposing adding packages to
 Wolfi. Also note that some packages may not be appropriately licensed for inclusion.  FSF or OSI approved [licenses](https://spdx.org/licenses/) are ideal.
 
 Wolfi also aims to keep its package set as up-to-date with security patches as possible. It is a requirement that any 
 package/version contributed to Wolfi has an actively maintained upstream. 
 
-To request inclusion of a package into Wolfi please use our [New Package Request Template](https://wolfi.dev/os/issues/new/choose).
+To request inclusion of a package into Wolfi please use our [New Package Request Template](https://wolfi.dev/os/issues/new/choose). There is no SLA for response to these requests, and inclusion of new packages is not guaranteed. If you're a Chainguard Containers customer, reach out to your account team or submit a support ticket so we can prioritize your needs appropriately.

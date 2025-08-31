@@ -1,0 +1,239 @@
+From cc1d17cf2a4701f3aeaff90a1d37d14445ec10aa Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@surgut.co.uk>
+Date: Sat, 30 Aug 2025 22:39:19 +0100
+Subject: [PATCH] digest-openssl: improve OpenSSL v3 support
+
+From OpenSSL v3 documentation https://docs.openssl.org/3.0/man3/EVP_sha1/#notes:
+
+  Developers should be aware of the negative performance implications
+  of calling this function multiple times and should consider using
+  EVP_MD_fetch(3) with EVP_MD-SHA1(7) instead. See "Performance" in
+  crypto(7) for further information.
+
+https://docs.openssl.org/3.0/man7/crypto/#performance:
+
+  If the prefetched object is not passed to operations, then any
+  implicit fetch will use the internally cached prefetched object, but
+  it will still be slower than passing the prefetched object directly.
+
+Thus update digest-openssl.c digests[] to support above. When
+EVP_MD_fetch() is available, upon first use of digests, prefetch them
+all. And subsequently pass the prefetched EVP_MD implementations.
+
+Also reuse the digest cache in sshkey, which currently has own
+implementation of fetching EVP_sha1 onwards.
+
+Continue to support SSL implementations without EVP_MD_fetch by using
+EVP_<sha>, which are efficient in such implementations.
+
+When fetching MD5 and SHA1 use non-default property query string
+"?fips=yes", this helps interoperability with OpenSSL configured with
+FIPS+default providers on multiple distributions with FIPS support
+(RHEL, ubuntu, SUSE, Chainguard, Keypair, Microsoft, etc). The "?"
+prefix means prefer, but do not require the subsequent property. Thus
+if system is configured with FIPS and non-FIPS algorithms, prefer the
+FIPS ones, if there is any, otherwise fallback to non-FIPS one. This
+has no effect on systems with a single provider, ie. the
+default. Depending on the system configuration they can offer MD5 and
+SHA1 on opt-in basis. Note this can really help in case digest
+calculation is allowed (for example to calculate fingerprints) but
+only when explicitly fetched like that. This is similar to how python,
+dotnet, s2n-tls and many other software already fetch MD5 and
+SHA1. This is crucial to future proof sshd to work with FIPS providers
+without SHA1 in approved mode as in development for 2030 NIST SP
+800-131A Rev3 IPD https://csrc.nist.gov/pubs/sp/800/131/a/r3/ipd, as
+it deprecates SHA1 usage, and yet sshd uses SHA1 for
+non-cryptographically secure purposes, for example
+ssh_connection_hash() but also in other places.
+---
+ configure.ac     |  2 +-
+ digest-openssl.c | 82 ++++++++++++++++++++++++++++++++++++++++++------
+ sshkey.c         | 18 +++++------
+ 3 files changed, 80 insertions(+), 22 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 71766ba10..e4a98803b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3210,7 +3210,7 @@ if test "x$openssl" = "xyes" ; then
+ 	)
+ 
+ 	# Check for various EVP support in OpenSSL
+-	AC_CHECK_FUNCS([EVP_sha256 EVP_sha384 EVP_sha512 EVP_chacha20])
++	AC_CHECK_FUNCS([EVP_sha256 EVP_sha384 EVP_sha512 EVP_chacha20 EVP_MD_fetch])
+ 
+ 	# Check complete ECC support in OpenSSL
+ 	AC_MSG_CHECKING([whether OpenSSL has NID_X9_62_prime256v1])
+diff --git a/digest-openssl.c b/digest-openssl.c
+index e073a807b..df81dbe00 100644
+--- a/digest-openssl.c
++++ b/digest-openssl.c
+@@ -51,27 +51,80 @@ struct ssh_digest {
+ 	int id;
+ 	const char *name;
+ 	size_t digest_len;
+-	const EVP_MD *(*mdfunc)(void);
++#ifdef HAVE_EVP_MD_FETCH
++	EVP_MD *evpmd;
++#else
++	const EVP_MD *evpmd;
++#endif
+ };
+ 
+ /* NB. Indexed directly by algorithm number */
+-const struct ssh_digest digests[] = {
+-	{ SSH_DIGEST_MD5,	"MD5",		16,	EVP_md5 },
+-	{ SSH_DIGEST_SHA1,	"SHA1",		20,	EVP_sha1 },
+-	{ SSH_DIGEST_SHA256,	"SHA256",	32,	EVP_sha256 },
+-	{ SSH_DIGEST_SHA384,	"SHA384",	48,	EVP_sha384 },
+-	{ SSH_DIGEST_SHA512,	"SHA512",	64,	EVP_sha512 },
++struct ssh_digest digests[] = {
++	{ SSH_DIGEST_MD5,	"MD5",		16,	NULL },
++	{ SSH_DIGEST_SHA1,	"SHA1",		20,	NULL },
++	{ SSH_DIGEST_SHA256,	"SHA256",	32,	NULL },
++	{ SSH_DIGEST_SHA384,	"SHA384",	48,	NULL },
++	{ SSH_DIGEST_SHA512,	"SHA512",	64,	NULL },
+ 	{ -1,			NULL,		0,	NULL },
+ };
+ 
++static int ssh_digests_cached = 0;
++
++#ifdef HAVE_EVP_MD_FETCH
++void
++ssh_free_digest_cache(void)
++{
++	int alg;
++	for (alg = 0; digests[alg].id != -1; alg++) {
++		if (digests[alg].evpmd != NULL) {
++			EVP_MD_free(digests[alg].evpmd);
++			digests[alg].evpmd = NULL;
++		}
++	}
++	ssh_digests_cached = 0;
++}
++#endif
++
++void
++ssh_cache_digests(void)
++{
++#ifdef HAVE_EVP_MD_FETCH
++	int alg;
++#endif
++	if (ssh_digests_cached)
++		return;
++#ifdef HAVE_EVP_MD_FETCH
++	for (alg = 0; digests[alg].id != -1; alg++) {
++		switch (alg) {
++		case SSH_DIGEST_MD5:
++		case SSH_DIGEST_SHA1:
++			/* prefer, but do not require fips implementations */
++			digests[alg].evpmd = EVP_MD_fetch(NULL, digests[alg].name, "?fips=yes");
++			break;
++		default:
++			digests[alg].evpmd = EVP_MD_fetch(NULL, digests[alg].name, NULL);
++		}
++	}
++	OPENSSL_atexit(ssh_free_digest_cache);
++#else
++        digests[SSH_DIGEST_MD5].evpmd = EVP_md5();
++        digests[SSH_DIGEST_SHA1].evpmd = EVP_sha1();
++        digests[SSH_DIGEST_SHA256].evpmd = EVP_sha256();
++        digests[SSH_DIGEST_SHA384].evpmd = EVP_sha384();
++        digests[SSH_DIGEST_SHA512].evpmd = EVP_sha512();
++#endif
++	ssh_digests_cached = 1;
++}
++
+ static const struct ssh_digest *
+ ssh_digest_by_alg(int alg)
+ {
++	ssh_cache_digests();
+ 	if (alg < 0 || alg >= SSH_DIGEST_MAX)
+ 		return NULL;
+ 	if (digests[alg].id != alg) /* sanity */
+ 		return NULL;
+-	if (digests[alg].mdfunc == NULL)
++	if (digests[alg].evpmd == NULL)
+ 		return NULL;
+ 	return &(digests[alg]);
+ }
+@@ -81,6 +134,7 @@ ssh_digest_alg_by_name(const char *name)
+ {
+ 	int alg;
+ 
++	ssh_cache_digests();
+ 	for (alg = 0; digests[alg].id != -1; alg++) {
+ 		if (strcasecmp(name, digests[alg].name) == 0)
+ 			return digests[alg].id;
+@@ -88,6 +142,14 @@ ssh_digest_alg_by_name(const char *name)
+ 	return -1;
+ }
+ 
++const EVP_MD *
++ssh_digest_alg_evpmd(int alg)
++{
++	const struct ssh_digest *digest = ssh_digest_by_alg(alg);
++
++	return digest == NULL ? NULL : digest->evpmd;
++}
++
+ const char *
+ ssh_digest_alg_name(int alg)
+ {
+@@ -123,7 +185,7 @@ ssh_digest_start(int alg)
+ 		free(ret);
+ 		return NULL;
+ 	}
+-	if (EVP_DigestInit_ex(ret->mdctx, digest->mdfunc(), NULL) != 1) {
++	if (EVP_DigestInit_ex(ret->mdctx, digest->evpmd, NULL) != 1) {
+ 		ssh_digest_free(ret);
+ 		return NULL;
+ 	}
+@@ -194,7 +256,7 @@ ssh_digest_memory(int alg, const void *m, size_t mlen, u_char *d, size_t dlen)
+ 	if (dlen < digest->digest_len)
+ 		return SSH_ERR_INVALID_ARGUMENT;
+ 	mdlen = dlen;
+-	if (!EVP_Digest(m, mlen, d, &mdlen, digest->mdfunc(), NULL))
++	if (!EVP_Digest(m, mlen, d, &mdlen, digest->evpmd, NULL))
+ 		return SSH_ERR_LIBCRYPTO_ERROR;
+ 	return 0;
+ }
+diff --git a/sshkey.c b/sshkey.c
+index 6b3e24ec4..e85a88640 100644
+--- a/sshkey.c
++++ b/sshkey.c
+@@ -35,6 +35,8 @@
+ #include <openssl/evp.h>
+ #include <openssl/err.h>
+ #include <openssl/pem.h>
++/* Returns the OpenSSL EVP_MD for a digest identifier */
++const EVP_MD *ssh_digest_alg_evpmd(int alg);
+ #endif
+ 
+ #include "crypto_api.h"
+@@ -466,17 +468,11 @@ sshkey_type_certified(int type)
+ static const EVP_MD *
+ ssh_digest_to_md(int hash_alg)
+ {
+-	switch (hash_alg) {
+-	case SSH_DIGEST_SHA1:
+-		return EVP_sha1();
+-	case SSH_DIGEST_SHA256:
+-		return EVP_sha256();
+-	case SSH_DIGEST_SHA384:
+-		return EVP_sha384();
+-	case SSH_DIGEST_SHA512:
+-		return EVP_sha512();
+-	}
+-	return NULL;
++	/* Block MD5 for signatures */
++	if (hash_alg < SSH_DIGEST_SHA1)
++		return NULL;
++
++	return ssh_digest_alg_evpmd(hash_alg);
+ }
+ 
+ int
+-- 
+2.48.1
+

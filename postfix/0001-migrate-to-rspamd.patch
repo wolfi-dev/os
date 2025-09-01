@@ -1,0 +1,246 @@
+From 6ff53faa33a9a6b8a1a9c84729099d39d9baba2c Mon Sep 17 00:00:00 2001
+From: Sanjay Kumar <sanjay.kumar@chainguard.dev>
+Date: Mon, 1 Sep 2025 13:03:26 +0530
+Subject: [PATCH] migrate to rspamd
+
+Signed-off-by: Sanjay Kumar <sanjay.kumar@chainguard.dev>
+---
+ scripts/common-run.sh | 163 ++++++++----------------------------------
+ scripts/run.sh        |   6 +-
+ 2 files changed, 32 insertions(+), 137 deletions(-)
+
+diff --git a/scripts/common-run.sh b/scripts/common-run.sh
+index 4b933d3..1e2cd59 100755
+--- a/scripts/common-run.sh
++++ b/scripts/common-run.sh
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ 
+ announce_startup() (
+-	local postfix_account opendkim_account
++	local postfix_account rspamd_account
+ 
+ 	DISTRO="unknown"
+ 	[ -f /etc/lsb-release ] && . /etc/lsb-release
+@@ -14,9 +14,9 @@ announce_startup() (
+ 	echo -e "${gray}${emphasis}★★★★★ ${reset}${lightblue}POSTFIX STARTING UP${reset} ${gray}(${reset}${emphasis}${DISTRO}${reset}${gray})${emphasis} ★★★★★${reset}"
+ 
+ 	postfix_account="$(cat /etc/passwd | grep -E "^postfix" | cut -f3-4 -d:)"
+-	opendkim_account="$(cat /etc/passwd | grep -E "^opendkim" | cut -f3-4 -d:)"
++	rspamd_account="$(cat /etc/passwd | grep -E "^_rspamd" | cut -f3-4 -d:)"
+ 
+-	notice "System accounts: ${emphasis}postfix${reset}=${orange_emphasis}${postfix_account}${reset}, ${emphasis}opendkim${reset}=${orange_emphasis}${opendkim_account}${reset}. Careful when switching distros."
++	notice "System accounts: ${emphasis}postfix${reset}=${orange_emphasis}${postfix_account}${reset}, ${emphasis}_rspamd${reset}=${orange_emphasis}${rspamd_account}${reset}. Careful when switching distros."
+ )
+ 
+ setup_timezone() {
+@@ -518,21 +518,10 @@ postfix_setup_networks() {
+ 
+ postfix_setup_debugging() {
+ 	if [ ! -z "$INBOUND_DEBUGGING" ]; then
+-		notice "Enabling additional debbuging for: ${emphasis}$POSTFIX_mynetworks${reset}, as INBOUND_DEBUGGING=''${INBOUND_DEBUGGING}''"
++		notice "Enabling additional debugging for: ${emphasis}$POSTFIX_mynetworks${reset}, as INBOUND_DEBUGGING=''${INBOUND_DEBUGGING}''"
+ 		do_postconf -e "debug_peer_list=$POSTFIX_mynetworks"
+-
+-		sed -i -E 's/^[ \t]*#?[ \t]*LogWhy[ \t]*.+$/LogWhy                  yes/' /etc/opendkim/opendkim.conf
+-		if ! egrep -q '^LogWhy' /etc/opendkim/opendkim.conf; then
+-			echo >> /etc/opendkim/opendkim.conf
+-			echo "LogWhy                  yes" >> /etc/opendkim/opendkim.conf
+-		fi
+ 	else
+-		info "Debugging is disabled.${reset}"
+-		sed -i -E 's/^[ \t]*#?[ \t]*LogWhy[ \t]*.+$/LogWhy                  no/' /etc/opendkim/opendkim.conf
+-		if ! egrep -q '^LogWhy' /etc/opendkim/opendkim.conf; then
+-			echo >> /etc/opendkim/opendkim.conf
+-			echo "LogWhy                  no" >> /etc/opendkim/opendkim.conf
+-		fi
++		info "Debugging is disabled."
+ 	fi
+ }
+ 
+@@ -596,137 +585,43 @@ postfix_setup_header_checks() {
+ 	fi
+ }
+ 
+-postfix_setup_dkim() {
+-	local DKIM_ENABLED
+-	local domain_dkim_selector
+-	local private_key
+-	local dkim_socket
+-	local domain
+-	local any_generated
+-	local file
+-
+-	if [[ -n "${DKIM_AUTOGENERATE}" ]]; then
+-		info "${emphasis}DKIM_AUTOGENERATE${reset} set -- will try to auto-generate keys for ${emphasis}${ALLOWED_SENDER_DOMAINS}${reset}."
+-		mkdir -p /etc/opendkim/keys
+-		if [[ -n "${ALLOWED_SENDER_DOMAINS}" ]]; then
+-			for domain in ${ALLOWED_SENDER_DOMAINS}; do
+-				private_key=/etc/opendkim/keys/${domain}.private
+-				if [[ -f "${private_key}" ]]; then
+-					info "Key for domain ${emphasis}${domain}${reset} already exists in ${emphasis}${private_key}${reset}. Will not overwrite."
+-				else
+-					notice "Auto-generating DKIM key for ${emphasis}${domain}${reset} into ${private_key}."
+-					(
+-						cd /tmp
+-						domain_dkim_selector="$(get_dkim_selector "${domain}")"
+-						opendkim-genkey -b 2048 -h rsa-sha256 -r -v --subdomains -s ${domain_dkim_selector} -d $domain
+-						# Fixes https://github.com/linode/docs/pull/620
+-						sed -i 's/h=rsa-sha256/h=sha256/' ${domain_dkim_selector}.txt
+-						mv -v ${domain_dkim_selector}.private /etc/opendkim/keys/${domain}.private
+-						mv -v ${domain_dkim_selector}.txt /etc/opendkim/keys/${domain}.txt
+-
+-						# Fixes #39
+-						chown opendkim:opendkim /etc/opendkim/keys/${domain}.private
+-						chmod 400 /etc/opendkim/keys/${domain}.private
+-
+-						chown opendkim:opendkim /etc/opendkim/keys/${domain}.txt
+-						chmod 644 /etc/opendkim/keys/${domain}.txt
+-
+-					) | sed 's/^/       /'
+-					any_generated=1
+-				fi
+-			done
+-			if [[ -n "${any_generated}" ]]; then
+-				notice "New DKIM keys have been generated! Please make sure to update your DNS records! You need to add the following details:"
+-				for file in /etc/opendkim/keys/*.txt; do
+-					echo "====== $file ======"
+-					cat $file
+-				done
+-				echo
+-			fi
+-		else
+-			warn "DKIM auto-generate requested, but ${emphasis}ALLOWED_SENDER_DOMAINS${reset} not set. Nothing to generate!"
+-		fi
+-	else
+-		debug "${emphasis}DKIM_AUTOGENERATE${reset} not set -- you will need to provide your own keys."
+-	fi
+-
+-	if [ -d /etc/opendkim/keys ] && [ ! -z "$(find /etc/opendkim/keys -type f ! -name .)" ]; then
+-		DKIM_ENABLED=", ${emphasis}opendkim${reset}"
+-		notice "Configuring OpenDKIM."
+-		mkdir -p /var/run/opendkim
+-		chown -R opendkim:opendkim /var/run/opendkim
+-		dkim_socket=$(cat /etc/opendkim/opendkim.conf | egrep ^Socket | awk '{ print $2 }')
+-		if [ $(echo "$dkim_socket" | cut -d: -f1) == "inet" ]; then
+-			dkim_socket=$(echo "$dkim_socket" | cut -d: -f2)
+-			dkim_socket="inet:$(echo "$dkim_socket" | cut -d@ -f2):$(echo "$dkim_socket" | cut -d@ -f1)"
+-		fi
+-		echo -e "        ...using socket $dkim_socket"
++postfix_setup_rspamd() {
++	local RSPAMD_ENABLED
++
++	if [ -d /etc/rspamd/local.d ] && [ ! -z "$(find /etc/rspamd/local.d -type f ! -name .)" ]; then
++		RSPAMD_ENABLED=", ${emphasis}rspamd${reset}"
++		notice "Configuring Rspamd."
++
++		# Fix rspamd permissions and ownership - handle it in package to override base package
++		mkdir -p /var/log/rspamd /var/run/rspamd /var/lib/rspamd/dkim
++		chmod 775 /var/log/rspamd /var/run/rspamd /var/lib/rspamd
++		chmod 700 /var/lib/rspamd/dkim
++		chown -R _rspamd:_rspamd /var/log/rspamd /var/run/rspamd /var/lib/rspamd
+ 
+ 		do_postconf -e "milter_protocol=6"
+ 		do_postconf -e "milter_default_action=accept"
+-		do_postconf -e "smtpd_milters=$dkim_socket"
+-		do_postconf -e "non_smtpd_milters=$dkim_socket"
+-
+-		echo > /etc/opendkim/TrustedHosts
+-		echo > /etc/opendkim/KeyTable
+-		echo > /etc/opendkim/SigningTable
+-
+-		# Since it's an internal service anyways, it's safe
+-		# to assume that *all* hosts are trusted.
+-		echo "0.0.0.0/0" > /etc/opendkim/TrustedHosts
+-
+-		if [ ! -z "$ALLOWED_SENDER_DOMAINS" ]; then
+-			for domain in $ALLOWED_SENDER_DOMAINS; do
+-				private_key=/etc/opendkim/keys/${domain}.private
+-				if [ -f $private_key ]; then
+-					domain_dkim_selector="$(get_dkim_selector "${domain}")"
+-					echo -e "        ...for domain ${emphasis}${domain}${reset} (selector: ${emphasis}${domain_dkim_selector}${reset})"
+-					if ! su opendkim -s /bin/bash -c "cat /etc/opendkim/keys/${domain}.private" > /dev/null 2>&1; then
+-						echo -e "        ...trying to reown ${emphasis}${private_key}${reset} as it's not readable by OpenDKIM..."
+-						# Fixes #39
+-						chown opendkim:opendkim "${private_key}"
+-						chmod u+r "${private_key}"
+-					fi
++		do_postconf -e "smtpd_milters=inet:localhost:11332"
++		do_postconf -e "non_smtpd_milters=inet:localhost:11332"
+ 
+-					echo "${domain_dkim_selector}._domainkey.${domain} ${domain}:${domain_dkim_selector}:${private_key}" >> /etc/opendkim/KeyTable
+-					echo "*@${domain} ${domain_dkim_selector}._domainkey.${domain}" >> /etc/opendkim/SigningTable
+-				else
+-					error "Skipping DKIM for domain ${emphasis}${domain}${reset}. File ${private_key} not found!"
+-				fi
+-			done
+-		fi
+ 	else
+-		info "No DKIM keys found, will not use DKIM."
++		info "No Rspamd configuration found, will not use Rspamd."
+ 		do_postconf -# smtpd_milters
+ 		do_postconf -# non_smtpd_milters
+ 	fi
+ }
+ 
+-opendkim_custom_commands() {
+-	local setting
+-	local key
+-	local padded_key
+-	local value
+-	for setting in ${!OPENDKIM_*}; do
+-		key="${setting:9}"
++rspamd_custom_commands() {
++	local setting key value
++
++	for setting in ${!RSPAMD_*}; do
++		key="${setting:7}"
+ 		value="${!setting}"
++
+ 		if [ -n "${value}" ]; then
+-			if [ "${#key}" -gt 23 ]; then
+-				padded_key="${key} "
+-			else
+-				padded_key="$(printf %-24s "${key}")"
++			info "Applying custom Rspamd setting: ${emphasis}${key}=${value}${reset}"
++			if [[ "$key" == *"dkim"* ]]; then
++				echo "${key} = ${value};" >> /etc/rspamd/local.d/dkim_signing.conf
+ 			fi
+-			if cat /etc/opendkim/opendkim.conf | egrep -q "^[[:space:]]*#?[[:space:]]*${key}"; then
+-				info "Updating custom OpenDKIM setting: ${emphasis}${key}=${value}${reset}"
+-				sed -i -E "s/^[ \t]*#?[ \t]*${key}[ \t]*.+$/${padded_key}${value}/" /etc/opendkim/opendkim.conf
+-			else
+-				info "Adding custom OpenDKIM setting: ${emphasis}${key}=${value}${reset}"
+-				echo "Adding ${padded_key}${value}"
+-				echo "${padded_key}${value}" >> /etc/opendkim/opendkim.conf
+-			fi
+-		else
+-			info "Deleting custom OpenDKIM setting: ${emphasis}${key}${reset}"
+-			sed -i -E "/^[ \t]*#?[ \t]*${key}[ \t]*.+$/d" /etc/opendkim/opendkim.conf
+ 		fi
+ 	done
+ }
+diff --git a/scripts/run.sh b/scripts/run.sh
+index f49647f..daeb51b 100755
+--- a/scripts/run.sh
++++ b/scripts/run.sh
+@@ -34,13 +34,13 @@ postfix_setup_debugging                 # Enable debugging, if defined
+ postfix_setup_sender_domains            # Configure allowed sender domains
+ postfix_setup_masquarading              # Setup masqueraded domains
+ postfix_setup_header_checks             # Enable SMTP header checks, if defined
+-postfix_setup_dkim                      # Configure DKIM, if enabled
++postfix_setup_rspamd                    # Configure DKIM, if enabled
+ postfix_setup_smtpd_sasl_auth           # Enable sender SASL auth, if defined
+ postfix_custom_commands                 # Apply custom postfix settings
+-opendkim_custom_commands                # Apply custom OpenDKIM settings
++rspamd_custom_commands                  # Apply custom OpenDKIM settings
+ postfix_open_submission_port            # Enable the submission port
+ execute_post_init_scripts               # Execute any scripts found in /docker-init.db/
+ unset_sensitive_variables               # Remove environment variables that contains sensitive values (secrets) that are read from conf files
+ 
+-notice "Starting: ${emphasis}rsyslog${reset}, ${emphasis}crond${reset}, ${emphasis}postfix${reset}$DKIM_ENABLED"
++notice "Starting: ${emphasis}rsyslog${reset}, ${emphasis}crond${reset}, ${emphasis}postfix${reset}$RSPAMD_ENABLED"
+ exec supervisord -c /etc/supervisord.conf
+-- 
+2.50.1
+

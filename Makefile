@@ -161,6 +161,16 @@ $(docker_pkg_targets): docker-package/%:
 	@echo "Building using docker runner"
 	MELANGE_RUNNER=docker make package/$*
 
+eco_pkg_targets = $(foreach name,$(pkgs),eco-package/$(name))
+$(eco_pkg_targets): eco-package/%:
+	@echo "Building packages using ecosystems/auth"
+	@mkdir -p $*
+	@gh auth token > $*/.github-token
+	@( \
+		trap 'echo "Cleaning up auth token for $*"; rm -f $*/.github-token' EXIT INT TERM; \
+		make package/$* \
+	)
+
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)

@@ -1,7 +1,7 @@
 package:
   name: liquibase
   version: "4.33.0"
-  epoch: 2
+  epoch: 4
   description: "Liquibase is a database schema change management solution that enables you to revise and release database changes faster and safer from development to production."
   copyright:
     - license: Apache-2.0
@@ -24,6 +24,7 @@ environment:
       - wolfi-base
   environment:
     LANG: en_US.UTF-8
+    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
 
 pipeline:
   - uses: git-checkout
@@ -31,12 +32,6 @@ pipeline:
       repository: https://github.com/liquibase/liquibase
       tag: v${{package.version}}
       expected-commit: 75773ed9b45b0a5adf3c42872d2e5494da669427
-
-  - name: Setup
-    runs: |
-      # Reversion liquibase.build.properties
-      # REF: https://github.com/liquibase/liquibase/blob/master/.github/util/re-version.sh#L87
-      sed -i -e "s/build.version=.*/build.version=${{package.version}}/" liquibase-standard/src/main/resources/liquibase.build.properties
 
   - uses: maven/pombump
     working-directory: liquibase-dist
@@ -47,9 +42,39 @@ pipeline:
     with:
       properties-file: /home/build/pombump-properties-toplevel.yaml
 
+  # This patch fixes an upstream dependency issue where they seem to have forgot to re-add a few dependencies after
+  # removing them in version 4.32.0, in favor of "direct dependency for better dependabot control"
+  - uses: patch
+    with:
+      patches: add-commons-dependencies.patch
+
+  - name: Setup
+    runs: |
+      # Reversion liquibase.build.properties
+      # REF: https://github.com/liquibase/liquibase/blob/master/.github/util/re-version.sh#L87
+      sed -i -e "s/build.version=.*/build.version=${{package.version}}/" liquibase-standard/src/main/resources/liquibase.build.properties
+
+  - name: Add verification markers to ensure build correctness
+    runs: |
+      # These help ensure that we're not accidentally downloading built artifacts from Maven rather than compiling
+      # and using the source code. This can easily happen with one of the targets, `-pl liquibase-dist`, and is not
+      # what we intend.
+
+      # Add a datestamped string to the main targets
+      mkdir -p liquibase-core/src/main/resources/
+      mkdir -p liquibase-standard/src/main/resources/
+      echo "WOLFI_CORE_${{package.version}}_$(date +%s)" > liquibase-core/src/main/resources/WOLFI_MARKER.txt
+      echo "WOLFI_STANDARD_${{package.version}}_$(date +%s)" > liquibase-standard/src/main/resources/WOLFI_STANDARD.txt
+
+      # Modify the internationalization properties file to make sure its not just bundling the above files with Maven assets
+      sed -i 's/Starting Liquibase at/Starting Liquibase (Wolfi Build) at/' liquibase-standard/src/main/resources/liquibase/i18n/liquibase-core.properties
+
   - name: Build
     runs: |
       ./mvnw versions:set -DnewVersion="${{package.version}}"
+
+      # Build with the patched pom
+      echo "==> Building liquibase with fixed dependencies"
       ./mvnw -B clean package -DskipTests=true -P !liquibase-commercial
 
   - name: Install
@@ -59,6 +84,93 @@ pipeline:
       mkdir -p ${{targets.destdir}}/usr/share/java/liquibase
       tar -zxvf liquibase-dist/target/${{package.name}}-${{package.version}}.tar.gz -C ${{targets.destdir}}/usr/share/java/liquibase
       ln -sf /usr/lib/jvm/default-jvm ${{targets.destdir}}/opt/java/openjdk
+
+  - name: Check verification markers
+    runs: |
+      # There was an issue where the following jar wasn't being included. Explicitly ensure that it is included
+      test -f ${{targets.destdir}}/usr/share/java/liquibase/internal/lib/commons-collections4.jar
+
+      # Upstream also has intended files lists, validate using those
+      echo "==> Validating distribution contents against expected files"
+      # List tarball contents, excluding directories (which end with /)
+      tar -tzf liquibase-dist/target/${{package.name}}-${{package.version}}.tar.gz | grep -v '/$' | sort > actual-contents.txt
+
+      # Check against the standard expected contents
+      echo "Comparing with expected-distribution-contents.txt"
+      # Filter out commercial components from expected files since we build with !liquibase-commercial
+      grep -v 'liquibase-commercial.jar' liquibase-dist/expected-distribution-contents.txt | sort > expected-filtered.txt
+
+      if diff -u expected-filtered.txt actual-contents.txt; then
+        echo "✓ Distribution contents match expected"
+      else
+        echo "✗ Distribution contents differ from expected."
+        echo "Missing files:"
+        comm -13 actual-contents.txt expected-filtered.txt
+        echo "Extra files:"
+        comm -23 actual-contents.txt expected-filtered.txt
+        exit 1
+      fi
+
+      # Save the timestamps from when we created the markers
+      EXPECTED_CORE_MARKER=$(cat liquibase-core/src/main/resources/WOLFI_MARKER.txt)
+      EXPECTED_STANDARD_MARKER=$(cat liquibase-standard/src/main/resources/WOLFI_STANDARD.txt)
+
+      # Extract the tar.gz archive to a temp folder
+      mkdir -p /tmp/liquibase-check
+      tar -xzf liquibase-dist/target/liquibase-${{package.version}}.tar.gz -C /tmp/liquibase-check
+      cd /tmp/liquibase-check
+
+      # Check 1 & 2: Verify both WOLFI_MARKER and WOLFI_STANDARD markers in liquibase-core.jar
+      echo "==> Checking liquibase-core.jar for verification markers"
+      jar -xf internal/lib/liquibase-core.jar WOLFI_MARKER.txt WOLFI_STANDARD.txt 2>/dev/null || true
+
+      # Check both markers exist and match exactly
+      for marker_type in CORE STANDARD; do
+        if [ "$marker_type" = "CORE" ]; then
+          marker_file="WOLFI_MARKER.txt"
+          marker_name="WOLFI_MARKER"
+          expected_marker="$EXPECTED_CORE_MARKER"
+          marker_label="core"
+        else
+          marker_file="WOLFI_STANDARD.txt"
+          marker_name="WOLFI_STANDARD"
+          expected_marker="$EXPECTED_STANDARD_MARKER"
+          marker_label="standard"
+        fi
+
+        if [ -f "$marker_file" ]; then
+          actual_marker=$(cat "$marker_file")
+          echo "Expected $marker_label marker: $expected_marker"
+          echo "Actual $marker_label marker:   $actual_marker"
+          if [ "$actual_marker" = "$expected_marker" ]; then
+            echo "✓ $marker_name matches exactly - using our build"
+          else
+            echo "✗ $marker_name doesn't match - not using our build!"
+            exit 1
+          fi
+        else
+          echo "✗✗✗ FAILURE: $marker_file not found in liquibase-core.jar"
+          [ "$marker_type" = "CORE" ] && jar -tf internal/lib/liquibase-core.jar | head -20
+          exit 1
+        fi
+      done
+
+      # Check 3: Modified properties file contains "Wolfi Build" string
+      echo "==> Checking for 'Wolfi Build' string in JAR"
+      # Extract all files and search for our modification
+      mkdir -p /tmp/jar-extract
+      cd /tmp/jar-extract
+      jar -xf /tmp/liquibase-check/internal/lib/liquibase-core.jar
+
+      # Search all files for the "Wolfi Build" string
+      if grep -r "Wolfi Build" . 2>/dev/null; then
+        echo "✓ Found 'Wolfi Build' string in JAR contents"
+      else
+        echo "⚠ 'Wolfi Build' string NOT found in JAR"
+        exit 1
+      fi
+
+      echo "✓✓✓ SUCCESS: All 3 markers match exactly - confirmed we're using locally compiled code!"
 
   - uses: strip
 
@@ -161,6 +273,38 @@ test:
 
         # Rollback to the initial revision.
         liquibase --url="$SQLITE_URL" rollback --tag=firsttag --changelog-file=test/example-changelog.sql
+    - name: Test XML changelog with Parameters
+      runs: |
+        cd $LIQUIBASE_HOME
+
+        cat <<'EOF' >> $LIQUIBASE_HOME/test/example-changelog.xml
+        <databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns:pro="http://www.liquibase.org/xml/ns/pro"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd http://www.liquibase.org/xml/ns/pro http://www.liquibase.org/xml/ns/pro/liquibase-pro-latest.xsd ">
+
+        <property name="table.name" value="personXML" />
+
+        <changeSet id="1" author="your.name" labels="example-label" context="example-context">
+        <comment>example-comment</comment>
+            <createTable tableName="${table.name}">
+            <column name="id" type="int" autoIncrement="true">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+                <column name="name" type="varchar(50)" />
+                <column name="city" type="varchar(30)"/>
+            </createTable>
+        </changeSet>
+        </databaseChangeLog>
+
+        EOF
+
+        liquibase update --url="$SQLITE_URL" -Dtable.name="personXML" --changelog-file=test/example-changelog.xml
+
+        # Verify the table was created
+        sqlite3 /tmp/test.db ".tables" | grep -q "personXML"
+        sqlite3 /tmp/test.db ".schema personXML" | grep -q "city"
     - name: Test LPM CLI basics
       runs: |
         lpm --version

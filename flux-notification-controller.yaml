@@ -1,38 +1,53 @@
 package:
   name: flux-notification-controller
-  version: "1.5.0"
-  epoch: 2
+  version: "1.6.0"
+  epoch: 5 # CVE-2025-47907
   description: The GitOps Toolkit event forwarded and notification dispatcher
   copyright:
     - license: Apache-2.0
 
-environment:
-  contents:
-    packages:
-      - busybox
-      - ca-certificates-bundle
-      - go
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
 
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 85d897c59d451ae0e37ddc9cb8c05d410ff6dca2
+      expected-commit: 3a6de1fcef16947f8abe6fc589bc02977663931e
       repository: https://github.com/fluxcd/notification-controller
       tag: v${{package.version}}
 
-  - uses: go/bump
+  - uses: go/build
     with:
-      deps: |-
-        golang.org/x/oauth2@v0.27.0
-        golang.org/x/crypto@v0.35.0
+      packages: .
+      output: notification-controller
+      ldflags: -X main.Version=${{package.version}}
 
-  - runs: |
-      mkdir -p "${{targets.destdir}}"/usr/bin
-      CGO_ENABLED=0 go build \
-        -ldflags="-X main.Version=${{package.version}}" \
-        -trimpath -a -o "${{targets.destdir}}"/usr/bin/notification-controller .
-
-  - uses: strip
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package for iamguarded"
+    pipeline:
+      - runs: |
+          mkdir -p /opt/iamguarded/fluxcd-notification-controller/bin/
+          ln -sf /usr/bin/notification-controller /opt/iamguarded/fluxcd-notification-controller/bin/notification-controller
+      - uses: iamguarded/build-compat
+        with:
+          package: flux-notification-controller
+          version: ${{vars.major-version}}
+      - uses: iamguarded/finalize-compat
+        with:
+          package: flux-notification-controller
+          version: ${{vars.major-version}}
+    test:
+      pipeline:
+        - runs: |
+            stat /opt/iamguarded/fluxcd-notification-controller/bin/notification-controller
+        - uses: iamguarded/test-compat
+          with:
+            package: flux-notification-controller
+            version: ${{vars.major-version}}
 
 update:
   enabled: true
@@ -41,6 +56,7 @@ update:
     strip-prefix: v
     tag-filter: v
 
+# only passes with docker runner: `MELANGE_EXTRA_OPTS="--runner docker" make test/flux-notification-controller`
 test:
   environment:
     contents:
@@ -48,9 +64,23 @@ test:
         - curl
   pipeline:
     - uses: test/kwok/cluster
-    - name: Verify notification-controller installation
-      runs: |
-        kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
-        kubectl wait --for=condition=Ready nodes --all
-        notification-controller --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1 & \
-        sleep 5; curl -s localhost:8081/metrics  | grep rest_client_requests_total
+    - name: "start ${{package.name}} and test"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl apply -f https://github.com/fluxcd/flux2/releases/latest/download/install.yaml
+          kubectl wait --for=condition=Ready nodes --all
+        start: notification-controller --health-addr :9441 --metrics-addr :8081 > /dev/null 2>&1
+        timeout: 30
+        expected_output: |
+          starting event server
+          starting webhook receiver server
+          starting manager
+          notification.toolkit.fluxcd.io
+          Starting Controller
+          Starting workers
+        post: |
+          #!/bin/sh -e
+          set -o pipefail
+          curl -s localhost:8081/metrics  | grep rest_client_requests_total
+          curl -v localhost:9441/healthz 2>&1 | grep -i "200 OK"

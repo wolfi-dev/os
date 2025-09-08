@@ -1,7 +1,8 @@
 package:
   name: nginx-stable
-  version: "1.26.3"
-  epoch: 0
+  # STABLE VERSIONS MUST USE EVEN MINOR VERSIONS (e.g., 1.26.x, 1.28.x)
+  version: "1.28.0"
+  epoch: 9
   description: HTTP and reverse proxy server (stable version)
   copyright:
     - license: BSD-2-Clause
@@ -11,7 +12,9 @@ package:
     # Let's ensure that we have config. This gets the default, but can also
     # be override by users.
     runtime:
+      - merged-usrsbin
       - nginx-config
+      - wolfi-baselayout
 
 environment:
   contents:
@@ -35,6 +38,12 @@ environment:
       - zeromq-dev
       - zlib-dev
 
+var-transforms:
+  - from: ${{package.version}}
+    match: '^(\d+)\.(\d+)\.(\d+)'
+    replace: '$2'
+    to: minor-version
+
 data:
   - name: modules
     items:
@@ -49,12 +58,25 @@ data:
 # TODO look at adding extra modules like alpine does https://git.alpinelinux.org/aports/tree/main/nginx/APKBUILD#n149
 # Also note the nginx inc config https://hg.nginx.org/pkg-oss/file/tip/alpine
 pipeline:
+  - name: validate-stable-version
+    runs: |
+      # Ensure stable version is even (e.g., 1.26.x, 1.28.x)
+      # ref: https://nginx.org/
+      MINOR=${{vars.minor-version}}
+      if [ $((MINOR % 2)) -ne 0 ]; then
+        echo "ERROR: nginx-stable must use even minor versions (e.g., 1.26.x, 1.28.x)"
+        echo "Current version: ${{package.version}} has odd minor version: $MINOR"
+        exit 1
+      fi
+      echo "Version validation passed: ${{package.version}} is a valid stable version"
+
   - uses: git-checkout
     with:
       repository: https://github.com/nginx/nginx.git
       tag: release-${{package.version}}
-      expected-commit: 1be0fb0c9f9bc3489c7b40576efd6afe6b2eccd5
+      expected-commit: 481d28cb4e04c8096b9b6134856891dc52ecc68f
       destination: nginx-stable
+
   - name: configure
     working-directory: nginx-stable
     runs: |
@@ -63,11 +85,11 @@ pipeline:
 
       ./auto/configure \
           --prefix=/var/lib/nginx \
-          --sbin-path=/usr/sbin/nginx \
+          --sbin-path=/usr/bin/nginx \
           --modules-path=/usr/lib/nginx/modules \
           --conf-path=/etc/nginx/nginx.conf \
-          --pid-path=/run/nginx/nginx.pid \
-          --lock-path=/run/nginx/nginx.lock \
+          --pid-path=/run/nginx.pid \
+          --lock-path=/run/nginx.lock \
           --http-client-body-temp-path=/var/lib/nginx/tmp/client_body \
           --http-proxy-temp-path=/var/lib/nginx/tmp/proxy \
           --http-fastcgi-temp-path=/var/lib/nginx/tmp/fastcgi \
@@ -110,6 +132,7 @@ pipeline:
           --with-stream_realip_module \
           --with-stream_geoip_module=dynamic \
           --with-stream_ssl_preread_module
+
   - working-directory: nginx-stable
     runs: |
       make -j$(nproc)
@@ -122,14 +145,19 @@ pipeline:
       # directory that I could find.
       mkdir pkg-config
       mv ${{targets.destdir}}/etc/nginx pkg-config/
+      # Create parent location for tmp files
+      mkdir -p ${{targets.destdir}}/var/lib/nginx/tmp
+
   - uses: strip
 
 subpackages:
-  - name: nginx-stable-config
+  - name: ${{package.name}}-config
     description: Creates nginx config step that can then be overridden by users
     dependencies:
       runtime:
+        - merged-usrsbin
         - nginx-stable
+        - wolfi-baselayout
       provides:
         - nginx-config=${{package.full-version}}
     pipeline:
@@ -143,12 +171,45 @@ subpackages:
           sed -i 's/#error_log  logs\/error.log;$/error_log  stderr  notice;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
           # and both access logs to stdout
           sed -i 's/#access_log.*;$/access_log  \/dev\/stdout;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: nginx-config
+            real-pkg-name: ${{subpkg.name}}
 
-  - name: nginx-stable-package-config
-    description: Config supplied in packaged nginx.org bundles at https://hg.nginx.org/pkg-oss/
+  - name: ${{package.name}}-syslog-config
+    description: Creates nginx config with syslog logging
     dependencies:
       runtime:
         - nginx-stable
+      provides:
+        - nginx-config=${{package.full-version}}
+    pipeline:
+      - working-directory: nginx-stable
+        runs: |
+          # This was moved into ./pkg-config/etc/nginx so put it into the
+          # subpackage directory here.
+          mkdir -p ${{targets.subpkgdir}}/etc/nginx
+          cp -R ./pkg-config/nginx/* ${{targets.subpkgdir}}/etc/nginx/
+          # default error logs to syslog
+          sed -i 's/#error_log  logs\/error.log;$/error_log  syslog:server=unix:\/dev\/log  notice;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
+          # and both access logs to syslog
+          sed -i 's/#access_log.*;$/access_log  syslog:server=unix:\/dev\/log;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: nginx-config
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: ${{package.name}}-package-config
+    description: Config supplied in packaged nginx.org bundles at https://hg.nginx.org/pkg-oss/
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - nginx-stable
+        - wolfi-baselayout
       provides:
         - nginx-package-config=${{package.full-version}}
     pipeline:
@@ -173,17 +234,22 @@ subpackages:
           mkdir -p ${{targets.contextdir}}/etc/nginx/templates
 
   - range: modules
-    name: nginx-stable-mod-${{range.key}}
+    name: ${{package.name}}-mod-${{range.key}}
     description: Nginx third-party module ${{range.key}}
     dependencies:
       provides:
         - nginx-mod-${{range.key}}=${{package.full-version}}
       runtime:
+        - merged-usrsbin
         - perl-dev
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/lib/nginx/modules
           mkdir -p ${{targets.subpkgdir}}/etc/nginx/modules
+          # --modules-path is only used for installing modules, not loading them
+          mkdir -p ${{targets.subpkgdir}}/var/lib/nginx/
+          ln -sf /usr/lib/nginx/modules ${{targets.subpkgdir}}/var/lib/nginx/modules
 
           mv ${{targets.destdir}}/usr/lib/nginx/modules/ngx_${{range.key}}_module.so ${{targets.subpkgdir}}/usr/lib/nginx/modules/
 
@@ -205,17 +271,17 @@ subpackages:
           esac
     test:
       pipeline:
-        - uses: test/ldd-check
-          with:
-            packages: $(basename ${{targets.contextdir}})
+        - uses: test/tw/ldd-check
 
-  - name: nginx-stable-src
+  - name: ${{package.name}}-src
     description: Nginx source code
     dependencies:
       provides:
         - nginx-src=${{package.full-version}}
       runtime:
+        - merged-usrsbin
         - perl-dev
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/src/nginx
@@ -223,15 +289,15 @@ subpackages:
           ls -latr ${{targets.contextdir}}/usr/src/nginx
     test:
       pipeline:
-        - uses: test/ldd-check
-          with:
-            packages: $(basename ${{targets.contextdir}})
+        - uses: test/tw/ldd-check
 
   - name: ${{package.name}}-config-compat
     description: Nginx config compatibility with upstream image
     dependencies:
       runtime:
+        - merged-usrsbin
         - nginx-stable
+        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/etc/nginx/conf.d
@@ -257,5 +323,6 @@ update:
   github:
     identifier: nginx/nginx
     use-tag: true
-    tag-filter: release-1.26
+    # STABLE VERSIONS MUST USE EVEN MINOR VERSIONS (e.g., 1.26.x, 1.28.x)
+    tag-filter: release-1.28
     strip-prefix: release-

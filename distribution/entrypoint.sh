@@ -1,4 +1,3 @@
-# https://raw.githubusercontent.com/distribution/distribution-library-image/master/entrypoint.sh
 #!/bin/sh
 
 set -e
@@ -9,3 +8,4 @@ case "$1" in
 esac
 
 exec "$@"
+# ref: https://raw.githubusercontent.com/distribution/distribution-library-image/master/entrypoint.sh

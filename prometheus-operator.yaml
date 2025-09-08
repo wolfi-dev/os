@@ -1,7 +1,7 @@
 package:
   name: prometheus-operator
-  version: "0.81.0"
-  epoch: 0
+  version: "0.85.0"
+  epoch: 1 # CVE-2025-47907
   description: Prometheus Operator creates/configures/manages Prometheus clusters atop Kubernetes
   copyright:
     - license: Apache-2.0
@@ -9,6 +9,12 @@ package:
     runtime:
       - merged-bin
       - wolfi-baselayout
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
 
 environment:
   contents:
@@ -26,7 +32,7 @@ pipeline:
     with:
       repository: https://github.com/prometheus-operator/prometheus-operator.git
       tag: v${{package.version}}
-      expected-commit: 240b3031fc5bdcaa3d784bdc776f6114bbc6808d
+      expected-commit: 2ed4172b180213b6082025237bb0c155b74b6080
 
   - uses: autoconf/make
     with:
@@ -58,6 +64,12 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.contextdir}}/usr/bin"
           mv ./prometheus-config-reloader "${{targets.contextdir}}/usr/bin"
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: prometheus-config-reloader-oci-entrypoint-compat
+            real-pkg-name: ${{subpkg.name}}
 
   - name: prometheus-admission-webhook
     description: Prometheus Operator creates/configures/manages Prometheus clusters atop Kubernetes
@@ -81,6 +93,34 @@ subpackages:
             admission-webhook --version
             admission-webhook --help
 
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package for iamguarded"
+    pipeline:
+      - runs: |
+          mkdir -p /opt/iamguarded/prometheus-operator/bin/
+          ln -sf /usr/bin/operator /opt/iamguarded/prometheus-operator/bin/operator
+      - uses: iamguarded/build-compat
+        with:
+          package: prometheus-operator
+          version: ${{vars.major-version}}
+      - uses: iamguarded/finalize-compat
+        with:
+          package: prometheus-operator
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - runs: |
+            stat /opt/iamguarded/prometheus-operator/bin/operator
+            /opt/iamguarded/prometheus-operator/bin/operator --version
+        - uses: iamguarded/test-compat
+          with:
+            package: prometheus-operator
+            version: ${{vars.major-version}}
+
 update:
   enabled: true
   github:
@@ -88,6 +128,11 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
   pipeline:
     - name: "Check operator binary"
       runs: |
@@ -95,19 +140,68 @@ test:
         operator --help
     - name: "Setup mock Kubernetes cluster"
       uses: test/kwok/cluster
-    - name: "Test prometheus-operator with mock API server"
+    - name: "Setup minimal CRDs"
       runs: |
-        output=$(operator --log-level=debug \
-          --apiserver $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}') \
-          -tls-insecure 2>&1 || true)
+        kubectl create namespace prometheus-operator-test
+        kubectl apply -f https://github.com/prometheus-operator/prometheus-operator/releases/download/v${{package.version}}/stripped-down-crds.yaml
+        sleep 5
+    - name: "Test operator deployment"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          operator \
+            --log-level=debug \
+            --apiserver $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}') \
+            --tls-insecure
+        timeout: 30
+        expected_output: |
+          Starting Prometheus Operator
+        error_strings: |
+          ERROR
+          FATAL
+        post: |
+          # Create Prometheus instance
+          cat <<EOF | kubectl apply -f -
+          apiVersion: monitoring.coreos.com/v1
+          kind: Prometheus
+          metadata:
+            name: test-prometheus
+            namespace: prometheus-operator-test
+          spec:
+            replicas: 1
+            serviceAccountName: prometheus-operator
+            serviceMonitorSelector: {}
+            resources:
+              requests:
+                memory: 400Mi
+          EOF
 
-        echo "$output" | grep -q "Starting Prometheus Operator" || {
-          echo "Expected output not found: Starting Prometheus Operator"
-          exit 1
-        }
+          sleep 5
 
-        # The operator will fail because it doesn't expose a simple way to just use our kubeconfig, so just check for the known errors
-        echo "$output" | grep -q "failed to check StorageClass support" || {
-          echo "Expected error not found: failed to check StorageClass support"
-          exit 1
-        }
+          if ! kubectl get prometheus -n prometheus-operator-test test-prometheus; then
+            echo "Prometheus creation failed"
+            exit 1
+          fi
+
+          # Create ServiceMonitor
+          cat <<EOF | kubectl apply -f -
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: test-servicemonitor
+            namespace: prometheus-operator-test
+          spec:
+            selector:
+              matchLabels:
+                app: test-app
+            endpoints:
+            - port: metrics
+          EOF
+
+          if ! kubectl get servicemonitor -n prometheus-operator-test test-servicemonitor; then
+            echo "ServiceMonitor creation failed"
+            exit 1
+          fi
+    - name: "Cleanup test resources"
+      runs: |
+        kubectl delete namespace prometheus-operator-test

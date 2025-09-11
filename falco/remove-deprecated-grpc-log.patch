@@ -1,0 +1,165 @@
+From 390aa7f8bd5bf13c32912fa861382e84b7f6061c Mon Sep 17 00:00:00 2001
+From: Azimjon Ulmasov <azimjon.ulmasov@chainguard.dev>
+Date: Tue, 26 Aug 2025 18:30:02 -0400
+Subject: [PATCH] grpc_server: replace deprecated gpr_* logging with Abseil LogSink (gRPC 1.74 compat)
+
+gRPC 1.74 removed the legacy gpr logging APIs, which caused build errors in Falco. This change migrates our
+gRPC logging integration to Abseil’s logging stack.
+
+What changed
+- Drop the old dispatcher and hooks:
+  - Removed gpr_log_dispatcher_func()
+  - Removed calls to gpr_set_log_verbosity(), gpr_log_verbosity_init(), gpr_set_log_function()
+- Introduce an Abseil LogSink bridge:
+  - Add falcoGrpcLogSink (absl::LogSink) that forwards gRPC’s Abseil logs into Falco’s logger
+  - Preserve message formatting: prefix with "grpc: " and end with '\n'
+  - Map severities: ERROR→ERR, WARNING→WARNING, default→INFO
+- Initialize and register the sink:
+  - Call absl::InitializeLog() during server init
+  - Register the sink via absl::AddLogSink(falcoGrpcLogSink::instance())
+
+---
+ userspace/falco/grpc_server.cpp | 43 +++--------------------
+ userspace/falco/grpc_server.h   | 61 +++++++++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 38 deletions(-)
+
+diff --git a/userspace/falco/grpc_server.cpp b/userspace/falco/grpc_server.cpp
+index d8578e13..5a33fb06 100644
+--- a/userspace/falco/grpc_server.cpp
++++ b/userspace/falco/grpc_server.cpp
+@@ -54,26 +54,6 @@ limitations under the License.
+ 		c.start(this);                                                    \
+ 	}
+ 
+-static void gpr_log_dispatcher_func(gpr_log_func_args* args) {
+-	falco_logger::level priority;
+-	switch(args->severity) {
+-	case GPR_LOG_SEVERITY_ERROR:
+-		priority = falco_logger::level::ERR;
+-		break;
+-	case GPR_LOG_SEVERITY_DEBUG:
+-		priority = falco_logger::level::DEBUG;
+-		break;
+-	default:
+-		priority = falco_logger::level::INFO;
+-		break;
+-	}
+-
+-	std::string copy = "grpc: ";
+-	copy.append(args->message);
+-	copy.push_back('\n');
+-	falco_logger::log(priority, std::move(copy));
+-}
+-
+ void falco::grpc::server::thread_process(int thread_index) {
+ 	void* tag = nullptr;
+ 	bool event_read_success = false;
+@@ -134,24 +114,11 @@ void falco::grpc::server::init(const std::string& server_addr,
+ 	m_cert_chain = cert_chain;
+ 	m_root_certs = root_certs;
+ 
+-	// Set the verbosity level of gpr logger
+-	falco::schema::priority logging_level = falco::schema::INFORMATIONAL;
+-	falco::schema::priority_Parse(log_level, &logging_level);
+-	switch(logging_level) {
+-	case falco::schema::ERROR:
+-		gpr_set_log_verbosity(GPR_LOG_SEVERITY_ERROR);
+-		break;
+-	case falco::schema::DEBUG:
+-		gpr_set_log_verbosity(GPR_LOG_SEVERITY_DEBUG);
+-		break;
+-	case falco::schema::INFORMATIONAL:
+-	default:
+-		// note > info will always enter here since it is != from "informational"
+-		gpr_set_log_verbosity(GPR_LOG_SEVERITY_INFO);
+-		break;
+-	}
+-	gpr_log_verbosity_init();
+-	gpr_set_log_function(gpr_log_dispatcher_func);
++	// Initialize Abseil logging (required for gRPC 1.74+)
++	absl::InitializeLog();
++	
++	// Set up gRPC log forwarding to Falco's logging system
++	absl::AddLogSink(&falcoGrpcLogSink::instance());
+ 
+ 	if(falco::utils::network::is_unix_scheme(m_server_addr)) {
+ 		init_unix_server_builder();
+diff --git a/userspace/falco/grpc_server.h b/userspace/falco/grpc_server.h
+index 5c28206a..ba25f9d6 100644
+--- a/userspace/falco/grpc_server.h
++++ b/userspace/falco/grpc_server.h
+@@ -24,6 +24,13 @@ limitations under the License.
+ #include "outputs.grpc.pb.h"
+ #include "version.grpc.pb.h"
+ #include "grpc_context.h"
++#include "logger.h"
++
++#include "absl/log/globals.h"
++#include "absl/log/initialize.h"
++#include "absl/log/log_sink_registry.h"
++#include "absl/log/log_sink.h" 
++#include "absl/log/log_entry.h"
+ 
+ namespace falco {
+ namespace grpc {
+@@ -75,5 +82,59 @@ private:
+ 	std::atomic<bool> m_stop{false};
+ };
+ 
++/* 		FalcoGrpcLogSink - gRPC 1.74 Compatibility Bridge
++	This singleton class replaces the deprecated gpr_log integration that was removed in recent gRPC.
++	It implements absl::LogSink to capture gRPC's internal Abseil logs and forwards them to Falco's 
++	unified logging system, maintaining the same "grpc: " prefixed format as the original implementation.
++
++	Changes made for gRPC 1.74 compatibility:
++	- Replaced gpr_log_dispatcher_func() with absl::LogSink::Send() override
++	- Removed 
++		gpr_set_log_verbosity(), 
++		gpr_log_verbosity_init(), 
++		gpr_set_log_function() 	calls
++	- Added absl::InitializeLog() and absl::AddLogSink() integration
++	- Preserved original severity mapping: ERROR->ERR, WARNING->WARNING, default->INFO
++	- Maintained identical message formatting with "grpc: " prefix and newline termination
++ */
++class falcoGrpcLogSink : public absl::LogSink {
++public:
++	static falcoGrpcLogSink& instance() {
++		static falcoGrpcLogSink instance_;
++		return instance_;
++	}
++
++	void Send(const absl::LogEntry& entry) override {
++		falco_logger::level m_priority;
++		switch(entry.log_severity()) {
++		case absl::LogSeverity::kError:
++			m_priority = falco_logger::level::ERR;
++			break;
++		case absl::LogSeverity::kWarning:
++			m_priority = falco_logger::level::WARNING;
++			break;
++		default:
++			m_priority = falco_logger::level::INFO;
++			break;
++		}
++
++		std::string msg = "grpc: ";
++		msg.append(entry.text_message());
++		msg.push_back('\n');
++		falco_logger::log(m_priority, std::move(msg));
++	}
++
++private:
++	falcoGrpcLogSink() = default;
++	 
++	~falcoGrpcLogSink() override = default;
++
++	// Non-copyable, non-movable
++	falcoGrpcLogSink(const falcoGrpcLogSink&) = delete;
++	falcoGrpcLogSink& operator=(const falcoGrpcLogSink&) = delete;
++	falcoGrpcLogSink(falcoGrpcLogSink&&) = delete;
++	falcoGrpcLogSink& operator=(falcoGrpcLogSink&&) = delete;
++};
++
+ }  // namespace grpc
+ }  // namespace falco
+

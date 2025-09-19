@@ -1,8 +1,8 @@
 package:
   name: systemd
   # 35712.patch can be dropped when 258 releases
-  version: "257.8"
-  epoch: 1
+  version: "257.9"
+  epoch: 2
   description: The systemd System and Service Manager
   copyright:
     - license: LGPL-2.1-or-later AND GPL-2.0-or-later
@@ -18,10 +18,12 @@ package:
       - merged-usrsbin
       - quota-tools
       - systemd-boot
+      - systemd-systemctl
       - wolfi-baselayout
 
 vars:
   llvm-vers: 19
+  py-version: 3.13
 
 data:
   - name: standalone-binaries
@@ -75,9 +77,10 @@ environment:
       - openssf-compiler-options
       - pcre2-dev
       - posix-libc-utils
-      - py3-jinja2
-      - py3-pyelftools
-      - python3
+      - py${{vars.py-version}}-jinja2
+      - py${{vars.py-version}}-pefile
+      - py${{vars.py-version}}-pyelftools
+      - python-${{vars.py-version}}
       - quota-tools
       - rsync
       - tpm2-tss
@@ -90,7 +93,7 @@ pipeline:
     with:
       repository: https://github.com/systemd/systemd
       tag: v${{package.version}}
-      expected-commit: 5e38d199a623563698ab4a69acbbe3afa9135198
+      expected-commit: 147c30b613960bc24595435bd902a5c4beb5aba9
 
   # systemd-detect is currently broken for aarch64 GCP VM's https://github.com/systemd/systemd/pull/38125
   # https://github.com/chainguard-dev/internal-dev/issues/17776
@@ -109,7 +112,8 @@ pipeline:
         -Dinstall-tests=true \
         -Dstandalone-binaries=true \
         -Dsplit-bin=false \
-        -Ddefault-dnssec=no
+        -Ddefault-dnssec=no \
+        -Dukify=true
 
   - uses: meson/compile
 
@@ -295,13 +299,13 @@ subpackages:
     description: "systemd bootloader (installed for EFI)"
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/
+          mkdir -p ${{targets.subpkgdir}}/boot/EFI/BOOT/
       - if: ${{build.arch}} == 'aarch64'
         runs: |
-          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootaa64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTAA64.EFI
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootaa64.efi ${{targets.subpkgdir}}/boot/EFI/BOOT/BOOTAA64.EFI
       - if: ${{build.arch}} == 'x86_64'
         runs: |
-          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootx64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTX64.EFI
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootx64.efi ${{targets.subpkgdir}}/boot/EFI/BOOT/BOOTX64.EFI
     test:
       environment:
         contents:
@@ -311,10 +315,10 @@ subpackages:
       pipeline:
         - if: ${{build.arch}} == 'aarch64'
           runs: |
-            file /boot/efi/EFI/BOOT/BOOTAA64.EFI | grep "executable for EFI"
+            file /boot/EFI/BOOT/BOOTAA64.EFI | grep "executable for EFI"
         - if: ${{build.arch}} == 'x86_64'
           runs: |
-            file /boot/efi/EFI/BOOT/BOOTX64.EFI | grep "executable for EFI"
+            file /boot/EFI/BOOT/BOOTX64.EFI | grep "executable for EFI"
     dependencies:
       runtime:
         - merged-lib
@@ -355,6 +359,21 @@ subpackages:
             bootctl --help
             kernel-install --version
             kernel-install --help
+
+  - name: "systemd-systemctl"
+    description: "systemd systemctl utility"
+    dependencies:
+      runtime:
+        - libsystemd-shared
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin/
+          mv ${{targets.destdir}}/usr/bin/systemctl ${{targets.subpkgdir}}/usr/bin/
+    test:
+      pipeline:
+        - runs: |
+            systemctl --help
+            systemctl --version
 
   - name: systemd-container
     description: "systemd container tools"
@@ -657,6 +676,36 @@ subpackages:
         - runs: |
             userdbctl --help
 
+  - name: "systemd-ukify"
+    description: "tool for creating unified kernel images"
+    dependencies:
+      runtime:
+        - py${{vars.py-version}}-pefile
+        - py${{vars.py-version}}-cryptography
+        - py${{vars.py-version}}-lz4
+        - systemd-boot
+    pipeline:
+      - runs: |
+          for f in usr/bin/ukify usr/lib/systemd/ukify ; do
+            mkdir -p "${{targets.subpkgdir}}/${f%/*}"
+            mv -v "${{targets.destdir}}/$f" "${{targets.subpkgdir}}/$f"
+          done
+
+          # just replace the first line with '#!/usr/bin/python3.XX'
+          sed -i -e '1s,.*,#!/usr/bin/python${{vars.py-version}},' \
+            "${{targets.subpkgdir}}/usr/bin/ukify"
+    test:
+      pipeline:
+        - runs: |
+            fail() { echo FAIL: "$@"; exit 1; }
+
+            ukify --version | grep -F "${{package.version}}" &&
+               echo "PASS: ukify --version contained ${{package.version}}" ||
+               fail "ukify --version did not contain '${{package.version}}'"
+
+            ukify --help && echo "PASS: ukify --help exited 0" ||
+               fail "ukify --help exited $?"
+
 update:
   enabled: true
   github:
@@ -676,7 +725,6 @@ test:
         skip-files: syslog.socket # intentionally shipped without a corresponding service
     - name: "Check systemctl version"
       runs: |
-        systemctl --version
         busctl --version
         busctl --help
         coredumpctl --version
@@ -697,7 +745,6 @@ test:
         resolvectl --help
         run0 --version
         run0 --help
-        systemctl --help
         systemd-ac-power --version
         systemd-ac-power --help
         systemd-analyze --help

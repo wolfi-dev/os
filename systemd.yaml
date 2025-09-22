@@ -1,8 +1,8 @@
 package:
   name: systemd
   # 35712.patch can be dropped when 258 releases
-  version: "257.6"
-  epoch: 1
+  version: "257.9"
+  epoch: 2
   description: The systemd System and Service Manager
   copyright:
     - license: LGPL-2.1-or-later AND GPL-2.0-or-later
@@ -13,14 +13,17 @@ package:
     runtime:
       - dbus
       - kmod
+      - merged-lib
       - merged-sbin
       - merged-usrsbin
       - quota-tools
       - systemd-boot
+      - systemd-systemctl
       - wolfi-baselayout
 
 vars:
   llvm-vers: 19
+  py-version: 3.13
 
 data:
   - name: standalone-binaries
@@ -74,9 +77,10 @@ environment:
       - openssf-compiler-options
       - pcre2-dev
       - posix-libc-utils
-      - py3-jinja2
-      - py3-pyelftools
-      - python3
+      - py${{vars.py-version}}-jinja2
+      - py${{vars.py-version}}-pefile
+      - py${{vars.py-version}}-pyelftools
+      - python-${{vars.py-version}}
       - quota-tools
       - rsync
       - tpm2-tss
@@ -89,11 +93,16 @@ pipeline:
     with:
       repository: https://github.com/systemd/systemd
       tag: v${{package.version}}
-      expected-commit: 00a12c234e2506f5cab683460199575f13c454db
+      expected-commit: 147c30b613960bc24595435bd902a5c4beb5aba9
 
-  - uses: patch
-    with:
-      patches: 35712.patch
+  # systemd-detect is currently broken for aarch64 GCP VM's https://github.com/systemd/systemd/pull/38125
+  # https://github.com/chainguard-dev/internal-dev/issues/17776
+  - pipeline:
+      - if: ${{build.arch}} == 'aarch64'
+        uses: patch
+        with:
+          patches: |
+            revert-detect-virt.patch
 
   - uses: meson/configure
     with:
@@ -103,15 +112,14 @@ pipeline:
         -Dinstall-tests=true \
         -Dstandalone-binaries=true \
         -Dsplit-bin=false \
-        -Ddefault-dnssec=no
+        -Ddefault-dnssec=no \
+        -Dukify=true
 
   - uses: meson/compile
 
   - uses: meson/install
 
   - runs: |
-      mkdir -p ${{targets.destdir}}/lib
-      mv ${{targets.destdir}}/usr/lib/libsystemd.so* ${{targets.destdir}}/lib/
       # We've never used init we don't intend to
       rm ${{targets.destdir}}/usr/lib/systemd/system/rc-local.service
 
@@ -157,6 +165,9 @@ subpackages:
         - runs: |
             mkdir -p /var/tmp/
             # Skipping tests:
+            # test-execute - won't work in qemu until we have caps, bwrap and docker already skip this
+            # test-namespace - won't work in qemu until we have caps, bwrap and docker already skip this
+            # test-bpf-foreign-programs - won't work in qemu, bwrap and docker already skip this
             # test-sd-device - but got the following error: No such device
             # test-path-util - failed at src/test/test-path-util.c:385, function test_find_executable_full(). Aborting.
             # test-label - Error occurred while opening directory =>: Read-only file system
@@ -181,7 +192,11 @@ subpackages:
             -s test-tpm2 \
             -s test-fd-util \
             -s test-fstab-generator.sh \
-            -s test-rm-rf
+            -s test-rm-rf \
+            -s test-namespace \
+            -s test-mount-util \
+            -s test-bpf-foreign-programs \
+            -s test-execute
 
   - range: standalone-binaries
     name: ${{range.key}}-standalone
@@ -197,6 +212,7 @@ subpackages:
             ${{range.key}} --version
     dependencies:
       runtime:
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -210,6 +226,7 @@ subpackages:
           mv ${{targets.destdir}}/usr/lib/systemd/systemd-shutdown.standalone ${{targets.subpkgdir}}/usr/lib/systemd/systemd-shutdown
     dependencies:
       runtime:
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -219,6 +236,7 @@ subpackages:
     dependencies:
       runtime:
         - libudev
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -233,6 +251,7 @@ subpackages:
     dependencies:
       provider-priority: 10
       runtime:
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -248,13 +267,14 @@ subpackages:
     description: "systemd library"
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/lib
-          mv ${{targets.destdir}}/lib/libsystemd.so.* ${{targets.subpkgdir}}/lib
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/lib/libsystemd.so.* ${{targets.subpkgdir}}/usr/lib
     test:
       pipeline:
         - uses: test/tw/ldd-check
     dependencies:
       runtime:
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -270,6 +290,7 @@ subpackages:
         - uses: test/tw/ldd-check
     dependencies:
       runtime:
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -278,13 +299,13 @@ subpackages:
     description: "systemd bootloader (installed for EFI)"
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/
+          mkdir -p ${{targets.subpkgdir}}/boot/EFI/BOOT/
       - if: ${{build.arch}} == 'aarch64'
         runs: |
-          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootaa64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTAA64.EFI
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootaa64.efi ${{targets.subpkgdir}}/boot/EFI/BOOT/BOOTAA64.EFI
       - if: ${{build.arch}} == 'x86_64'
         runs: |
-          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootx64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTX64.EFI
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootx64.efi ${{targets.subpkgdir}}/boot/EFI/BOOT/BOOTX64.EFI
     test:
       environment:
         contents:
@@ -294,12 +315,13 @@ subpackages:
       pipeline:
         - if: ${{build.arch}} == 'aarch64'
           runs: |
-            file /boot/efi/EFI/BOOT/BOOTAA64.EFI | grep "executable for EFI"
+            file /boot/EFI/BOOT/BOOTAA64.EFI | grep "executable for EFI"
         - if: ${{build.arch}} == 'x86_64'
           runs: |
-            file /boot/efi/EFI/BOOT/BOOTX64.EFI | grep "executable for EFI"
+            file /boot/EFI/BOOT/BOOTX64.EFI | grep "executable for EFI"
     dependencies:
       runtime:
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -309,6 +331,7 @@ subpackages:
     dependencies:
       runtime:
         - libsystemd-shared
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -337,11 +360,27 @@ subpackages:
             kernel-install --version
             kernel-install --help
 
+  - name: "systemd-systemctl"
+    description: "systemd systemctl utility"
+    dependencies:
+      runtime:
+        - libsystemd-shared
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin/
+          mv ${{targets.destdir}}/usr/bin/systemctl ${{targets.subpkgdir}}/usr/bin/
+    test:
+      pipeline:
+        - runs: |
+            systemctl --help
+            systemctl --version
+
   - name: systemd-container
     description: "systemd container tools"
     dependencies:
       runtime:
         - gnutar
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - systemd
@@ -437,6 +476,7 @@ subpackages:
     dependencies:
       runtime:
         - libsystemd-shared
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -479,6 +519,7 @@ subpackages:
         - agetty
         - agetty
         - kbd
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - mount
@@ -487,14 +528,12 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/etc ${{targets.subpkgdir}}/usr/bin
-          ln -s ../lib/systemd/systemd ${{targets.subpkgdir}}/usr/bin/init
           ln -s ../run/systemd/resolve/stub-resolv.conf "${{targets.subpkgdir}}/etc/resolv.conf"
           echo "uninitialized" > "${{targets.subpkgdir}}/etc/machine-id"
     test:
       pipeline:
         - runs: |
             [ -f /usr/bin/init -a -x /usr/bin/init ]
-            # after usrmerge, /sbin/init should exist but before
             grep "uninitialized" /etc/machine-id
 
   - name: "systemd-default-network"
@@ -502,6 +541,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -517,6 +557,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -536,6 +577,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -550,6 +592,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -577,6 +620,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -590,6 +634,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -613,6 +658,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
+        - merged-lib
         - merged-sbin
         - merged-usrsbin
         - wolfi-baselayout
@@ -630,6 +676,36 @@ subpackages:
         - runs: |
             userdbctl --help
 
+  - name: "systemd-ukify"
+    description: "tool for creating unified kernel images"
+    dependencies:
+      runtime:
+        - py${{vars.py-version}}-pefile
+        - py${{vars.py-version}}-cryptography
+        - py${{vars.py-version}}-lz4
+        - systemd-boot
+    pipeline:
+      - runs: |
+          for f in usr/bin/ukify usr/lib/systemd/ukify ; do
+            mkdir -p "${{targets.subpkgdir}}/${f%/*}"
+            mv -v "${{targets.destdir}}/$f" "${{targets.subpkgdir}}/$f"
+          done
+
+          # just replace the first line with '#!/usr/bin/python3.XX'
+          sed -i -e '1s,.*,#!/usr/bin/python${{vars.py-version}},' \
+            "${{targets.subpkgdir}}/usr/bin/ukify"
+    test:
+      pipeline:
+        - runs: |
+            fail() { echo FAIL: "$@"; exit 1; }
+
+            ukify --version | grep -F "${{package.version}}" &&
+               echo "PASS: ukify --version contained ${{package.version}}" ||
+               fail "ukify --version did not contain '${{package.version}}'"
+
+            ukify --help && echo "PASS: ukify --help exited 0" ||
+               fail "ukify --help exited $?"
+
 update:
   enabled: true
   github:
@@ -646,10 +722,9 @@ test:
   pipeline:
     - uses: test/verify-service
       with:
-        skip-files: syslog.socket # intentionally shiped without a corresponding service
+        skip-files: syslog.socket # intentionally shipped without a corresponding service
     - name: "Check systemctl version"
       runs: |
-        systemctl --version
         busctl --version
         busctl --help
         coredumpctl --version
@@ -670,7 +745,6 @@ test:
         resolvectl --help
         run0 --version
         run0 --help
-        systemctl --help
         systemd-ac-power --version
         systemd-ac-power --help
         systemd-analyze --help

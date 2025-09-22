@@ -1,0 +1,96 @@
+name: compiler-hardening-check
+
+needs:
+  packages:
+    - glibc-dev
+    - hardening-check
+    - openssf-compiler-options
+
+inputs:
+  cc:
+    description: |
+      CC compiler to use
+    required: true
+  args:
+    description: |
+      arguments to pass to hardening-check
+    default:
+
+pipeline:
+  - name: compiler hardening check
+    runs: |
+      tmpdir="$(mktemp -t -d hardchk.XXXXXXXXXX)"
+      cd "$tmpdir"
+      cat >hello.c <<"EOF"
+      #include <alloca.h>
+      #include <stdio.h>
+      #include <string.h>
+      int main(int argc, char* argv[]) {
+          printf("hello-c");
+          char buffer[5000];
+          strcpy(buffer, argv[0]);
+          char* dynbuffer = alloca(argc * 1000);
+          strcpy(dynbuffer, argv[0]);
+          return buffer[argc] + dynbuffer[argc];
+      }
+      EOF
+      ${{inputs.cc}} -v -o hello-default hello.c
+      out=$(./hello-default 1 || true)
+      [ "$out" = "hello-c" ]
+
+      case ${{inputs.cc}} in
+          clang*)
+              if [ -d /usr/lib/oldglibc ]; then
+                clangcfgdir="$(mktemp -d clangcfg.XXXXXXXXXX)"
+                clangver="$(${{inputs.cc}} -dumpversion)"
+                ln -s "/etc/clang-${clangver%%.*}/oldglibc.cfg" "$clangcfgdir"
+                disablearg="--config-system-dir=${clangcfgdir} --config=oldglibc.cfg"
+              else
+                disablearg="--config-system-dir=/var/empty"
+              fi
+              nullcc="${{inputs.cc}} $disablearg"
+              softcc="${{inputs.cc}} $disablearg"
+              ;;
+          *)
+              if [ -d /usr/lib/oldglibc ]; then
+                nullspec="/usr/lib/oldglibc/gcc.spec"
+              else
+                nullspec="/dev/null"
+              fi
+              nullcc="env GCC_SPEC_FILE=$nullspec ${{inputs.cc}}"
+              softcc="env GCC_SPEC_FILE=no-hardening.spec ${{inputs.cc}}"
+              ;;
+      esac
+      $nullcc -v -o hello-disabled.null hello.c
+      out=$(./hello-disabled.null 1 || true)
+      [ "$out" = "hello-c" ]
+
+      $softcc -v -o hello-disabled.spec hello.c
+      out=$(./hello-disabled.spec 1 || true)
+      [ "$out" = "hello-c" ]
+
+      # Compile without bind now. Test for -fhardened support (introduced in
+      # gcc 14), and no-op the test if unsupported.
+      $nullcc -fhardened -Wl,-z,lazy -v -o hello-lazy hello.c || cp hello-disabled.spec hello-lazy
+      out=$(./hello-lazy 1 || true)
+      [ "$out" = "hello-c" ]
+
+      arch_skip=
+      # full cfprotection is x86 only for now
+      if [ "${{build.arch}}" = "aarch64" ]; then
+          arch_skip=--nocfprotection
+      fi
+
+      # the branch protection check is ARM only for now
+      [ "${{build.arch}}" = "aarch64" ] || arch_skip=--nobranchprotection
+
+      # Test disabling hardening flags
+      hardening-check --nostackprotector $arch_skip ${{inputs.args}} --color hello-disabled.null && exit 1
+      hardening-check --nostackprotector $arch_skip ${{inputs.args}} --color hello-disabled.spec && exit 1
+
+      # Test disabling bindnow
+      hardening-check --nostackprotector $arch_skip ${{inputs.args}} --color hello-lazy && exit 1
+
+      # Test default build
+      hardening-check --nostackprotector $arch_skip ${{inputs.args}} --color hello-default
+      rm -rf "$tmpdir"

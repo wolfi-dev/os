@@ -1,7 +1,7 @@
 package:
   name: openjdk-8
   version: 8.452.09 # this corresponds to same release as jdk8u452-ga / jdk8u452-b09
-  epoch: 1
+  epoch: 9
   description: "IcedTea distribution of OpenJDK 8"
   copyright:
     - license: GPL-2.0-with-classpath-exception
@@ -55,7 +55,7 @@ environment:
       - libxt-dev
       - libxtst-dev
       - linux-headers
-      - openjdk-7-default-jdk
+      - openjdk-8-default-jdk
       - pango-dev
       - patch
       - pkgconf-dev
@@ -86,6 +86,41 @@ pipeline:
           uri: https://icedtea.classpath.org/download/drops/icedtea8/hotspot.tar.xz
           expected-sha512: 5c8e839d2d74b0308f468d8763a69ab06920f43b92659bbac76f53b48d83ce8d7070a091ca36df99629364fc8d05b8272e7c12d04609b969d5e8db6ace6908df
           extract: false
+      - runs: |
+          # Here be dragons.
+          #
+          # We need to patch the contents of openjdk-git.tar.xz in
+          # order to make it buildable with glibc 2.42.
+          # Unfortunately, we cannot patch it directly because
+          # icedtea's Makefile (correctly) checks if the tarball's
+          # sha256sum is what it expects.  This means that we will
+          # need to do the patching in stages:
+          #
+          # - First, perform the sha256sum verification ourselves.
+          old_sha256sum=$(grep '^OPENJDK_SHA256SUM = ' ../Makefile.am | cut -d ' ' -f3)
+          if [ -z "${old_sha256sum}" ]; then
+            echo "Error: Empty sha256sum for openjdk-git.tar.xz.  Please check the YAML file."
+            exit 1
+          fi
+          if ! echo "${old_sha256sum}  openjdk-git.tar.xz" | sha256sum --check; then
+            echo "Error: sha256sum mismatch for openjdk-git.tar.xz."
+            exit 1
+          fi
+
+          # - Second, unpack, patch the contents and re-tar it.
+          tar xf openjdk-git.tar.xz
+          dir=$(tar tf openjdk-git.tar.xz | head -n1 | cut -d/ -f1)
+          cd "$dir"
+          find . -type f | xargs grep -Fl 'uabs(' | xargs sed -i 's@uabs(@g_uabs(@g'
+          cd ..
+          tar cf openjdk-git.tar.xz "${dir}"
+          rm -rf "${dir}"
+
+          # - Third, calculate the new sha256sum of the tarball.
+          new_sha256sum=$(sha256sum openjdk-git.tar.xz | cut -d' '  -f1)
+
+          # - Fourth, patch icedtea's Makefile to expect the new sha256sum.
+          sed -i "s@^OPENJDK_SHA256SUM = .*@OPENJDK_SHA256SUM = ${new_sha256sum}@" ../Makefile*
 
   - runs: |
       ./autogen.sh
@@ -111,7 +146,7 @@ pipeline:
         --disable-system-sctp \
         --with-openjdk-src-zip=/home/build/icedtea-drops/openjdk-git.tar.xz \
         --with-hotspot-src-zip=/home/build/icedtea-drops/hotspot.tar.xz \
-        --with-jdk-home=/usr/lib/jvm/java-1.7-openjdk \
+        --with-jdk-home=/usr/lib/jvm/default-jvm \
         --with-curves="nist+" \
         --with-pkgversion="Wolfi ${{package.version}}-r${{package.epoch}}"
 
@@ -139,10 +174,14 @@ pipeline:
       *) _jarch="$(uname -m)" ;;
       esac
 
-      # Remove extras not needed for headless installs
-      rm -f "${{targets.destdir}}"/usr/lib/jvm/java-1.8-openjdk/jre/lib/$_jarch/{libjsound,libjsoundalsa,libsplashscreen,libawt*,libfontmanager}.so
+      # Note: Previous to 8.452.09-r4 we had code here to remove additional
+      # things as "not needed for headless installs". That code was broken
+      # and was not actually removing those things. "Fixing" that bug in -r5
+      # broke at least one user of an app that used libawt. So now we're
+      # just removing policytool because it was the one thing actually being
+      # removed before. We should consider if it too should be shipped since
+      # we now know this is being used in head-full environments.
       rm -f "${{targets.destdir}}"/usr/lib/jvm/java-1.8-openjdk/jre/bin/policytool
-      rm -f "${{targets.destdir}}"/usr/lib/jvm/java-1.8-openjdk/bin/{policytool,appletviewer}
 
   - uses: strip
 
@@ -153,6 +192,8 @@ subpackages:
       runtime:
         - java-common
         - java-cacerts
+      provides:
+        - openjdk-8-jre-base=${{package.full-version}}
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib/jvm/java-1.8-openjdk/
@@ -190,6 +231,16 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib/jvm
           ln -sf java-1.8-openjdk "${{targets.subpkgdir}}"/usr/lib/jvm/default-jvm
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: default-jvm
+            real-pkg-name: ${{subpkg.name}}
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: default-jvm-lts
+            real-pkg-name: ${{subpkg.name}}
 
   - name: "openjdk-8-default-jdk"
     description: "Use the openjdk-8 JVM as the default JVM with the JDK installed"
@@ -200,12 +251,25 @@ subpackages:
       provides:
         - default-jdk=1.8
         - default-jdk-lts=1.8
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: default-jdk
+            real-pkg-name: ${{subpkg.name}}
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: default-jdk-lts
+            real-pkg-name: ${{subpkg.name}}
 
 test:
   environment:
     contents:
       packages:
         - openjdk-8-default-jdk
+        - xkbcomp
+        - xkeyboard-config
+        - xvfb-run
     environment:
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk
   pipeline:
@@ -222,6 +286,10 @@ test:
       runs: |
         javac RequestTest.java
         java RequestTest | grep -qi "Successfully connected to example.org"
+    - working-directory: awt-regression
+      runs: |
+        javac SimpleAWTApp.java
+        xvfb-run java SimpleAWTApp
 
 update:
   enabled: true

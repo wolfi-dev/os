@@ -1,0 +1,584 @@
+package:
+  name: postgresql-18
+  version: "REL_18_0"
+  epoch: 0
+  description: A sophisticated object-relational DBMS
+  copyright:
+    - license: BSD-3-Clause
+  dependencies:
+    provides:
+      - postgresql=${{package.full-version}}
+    runtime:
+      - ${{package.name}}-base=${{package.full-version}}
+      - ecpg=${{package.full-version}}
+      - tzdata
+
+data:
+  - name: py-versions
+    items:
+      3.10: "310"
+      3.11: "311"
+      3.12: "312"
+      3.13: "313"
+
+environment:
+  environment:
+    # Used to fetch docker scripts
+    ALPINE_VERSION: "3.21"
+    # Common configure flags for both main package and plpython builds
+    CONFIGURE_FLAGS: >-
+      --bindir=/usr/libexec/${{vars.mangled-package-name}} --datadir=/usr/share/${{vars.mangled-package-name}} --docdir=/usr/share/doc/${{vars.mangled-package-name}} --mandir=/usr/share/${{vars.mangled-package-name}}/man --with-openssl --with-libedit-preferred --with-uuid=e2fs --with-libxml --with-libxslt --with-icu --with-lz4 --with-zstd --with-gssapi --with-ldap --with-llvm --enable-thread-safety
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - bash
+      - bison
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-19
+      - curl
+      - execline-dev
+      - flex
+      - gawk
+      - icu-dev
+      - krb5-dev
+      - libedit-dev
+      - libuuid
+      - libxml2-dev
+      - libxslt-dev
+      - llvm-19-dev
+      - llvm-lld-19-dev
+      - lz4-dev
+      - net-tools
+      - openldap-dev
+      - openssl-dev
+      - py3-supported-build-base-dev
+      - tzdata
+      - util-linux-dev
+      - zlib-dev
+      - zstd-dev
+
+vars:
+  client-tools: clusterdb createdb createuser dropdb dropuser pg_amcheck pg_basebackup pg_dump pg_dumpall pg_isready pg_receivewal pg_recvlogical pg_restore pg_verifybackup psql reindexdb vacuumdb
+  pypi-package: plpython
+
+var-transforms:
+  - from: ${{package.name}}
+    match: "-"
+    replace: ""
+    to: mangled-package-name
+  - from: ${{package.version}}
+    match: '\.'
+    replace: "_"
+    to: mangled-package-version
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 3d6a828938a5fa0444275d3d2f67b64ec3199eb7
+      repository: https://github.com/postgres/postgres
+      tag: REL_${{vars.mangled-package-version}}
+
+  - uses: patch
+    with:
+      patches: |
+        per-version-dirs.patch
+
+  - uses: autoconf/configure
+    with:
+      opts: $CONFIGURE_FLAGS
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - runs: |
+      # Symlink postgres to /usr/bin
+      mkdir -p ${{targets.destdir}}/usr/bin
+      ln -sf /usr/libexec/${{vars.mangled-package-name}}/postgres ${{targets.destdir}}/usr/bin/postgres17
+
+      # the official postgres image listens on all interfaces by default, let's do the same for consistency
+      sed -ri "s!^#?(listen_addresses)\s*=\s*\S+.*!\1 = '*'!" ${{targets.destdir}}/usr/share/${{vars.mangled-package-name}}/postgresql.conf.sample
+      grep -F "listen_addresses = '*'" ${{targets.destdir}}/usr/share/${{vars.mangled-package-name}}/postgresql.conf.sample
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      provides:
+        - postgresql-dev=${{package.full-version}}
+      runtime:
+        - ${{package.name}}
+        - openssl-dev
+        - ${{package.name}}-client
+        - libpq-17
+        - libecpg-17-dev
+    description: postgresql dev
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+          with:
+            packages: postgresql-17-dev
+
+  - name: ${{package.name}}-client-base
+    description: PostgreSQL client base
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}
+          for binary in ${{vars.client-tools}}; do
+            mv ${{targets.destdir}}/usr/libexec/${{vars.mangled-package-name}}/${binary} ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}/${binary}
+          done
+
+  - name: ${{package.name}}-client
+    description: PostgreSQL client
+    dependencies:
+      runtime:
+        - ${{package.name}}-client-base=${{package.full-version}}
+      provides:
+        - postgresql-client=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          for binary in ${{vars.client-tools}}; do
+            ln -sf /usr/libexec/${{vars.mangled-package-name}}/${binary} ${{targets.subpkgdir}}/usr/bin/${binary}
+          done
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: postgresql-client
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: ${{package.name}}-pgadmin-compat
+    description: Provides pg${{vars.major-version}} client utils in pgAdmin's path
+    dependencies:
+      runtime:
+        - ${{package.name}}-client-base
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/pgsql-${{vars.major-version}}
+          for path in ${{targets.outdir}}/${{package.name}}-client-base/usr/libexec/${{vars.mangled-package-name}}/*; do
+            name=${path##*/}
+            ln -s /usr/libexec/${{vars.mangled-package-name}}/$name ${{targets.contextdir}}/usr/local/pgsql-${{vars.major-version}}/$name
+          done
+
+  - name: ${{package.name}}-contrib
+    dependencies:
+      provides:
+        - postgresql-contrib=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}
+          make DESTDIR=${{targets.subpkgdir}} -C contrib install
+    description: Extension modules distributed with PostgreSQL
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: libpq-17
+    description: PostgreSQL libraries
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/lib/libpq.so* ${{targets.subpkgdir}}/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+    dependencies:
+      provider-priority: 17
+      provides:
+        - libpq=${{package.full-version}}
+
+  - name: libecpg-17
+    description: Embedded PostgreSQL libraries
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/lib/libecpg.so* ${{targets.subpkgdir}}/usr/lib/
+          mv ${{targets.destdir}}/usr/lib/libecpg_compat.so* ${{targets.subpkgdir}}/usr/lib/
+          mv ${{targets.destdir}}/usr/lib/libpgtypes.so* ${{targets.subpkgdir}}/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+    dependencies:
+      provider-priority: 17
+      provides:
+        - libecpg=${{package.full-version}}
+
+  - name: libecpg-17-dev
+    description: Embedded PostgreSQL libraries (development files)
+    dependencies:
+      provider-priority: 17
+      runtime:
+        - libecpg-17=${{package.full-version}}
+      provides:
+        - libecpg-dev=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/include/postgresql
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/include/ecpg*.h ${{targets.subpkgdir}}/usr/include/postgresql/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/include/postgresql/informix ${{targets.subpkgdir}}/usr/include/postgresql/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/include/pgtypes*.h ${{targets.subpkgdir}}/usr/include/postgresql/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/include/sql3types.h ${{targets.subpkgdir}}/usr/include/postgresql/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/include/sqlca.h ${{targets.subpkgdir}}/usr/include/postgresql/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/include/sqlda*.h ${{targets.subpkgdir}}/usr/include/postgresql/
+
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/pkgconfig
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/lib/libecpg.* ${{targets.subpkgdir}}/usr/lib/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/lib/libpgtypes.* ${{targets.subpkgdir}}/usr/lib/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/lib/pkgconfig/libecpg.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/lib/pkgconfig/libecpg_compat.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/
+          mv ${{targets.outdir}}/${{package.name}}-dev/usr/lib/pkgconfig/libpgtypes.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/
+    test:
+      environment:
+        contents:
+          packages:
+            - pkgconf
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/pkgconf
+        - runs: |
+            # Test that key header files are present
+            test -f /usr/include/postgresql/ecpg_config.h
+            test -f /usr/include/postgresql/ecpglib.h
+            test -f /usr/include/postgresql/pgtypes.h
+            test -f /usr/include/postgresql/sqlca.h
+
+            # Test that pkgconfig files are present and working
+            pkg-config --exists libecpg
+            pkg-config --exists libecpg_compat
+            pkg-config --exists libpgtypes
+
+            # Test that static libraries are present
+            test -f /usr/lib/libecpg.a
+            test -f /usr/lib/libpgtypes.a
+
+  - name: ecpg-17
+    description: Embedded PostgreSQL SQL preprocessor for C programs
+    dependencies:
+      provider-priority: 17
+      provides:
+        - ecpg=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin/
+          mv ${{targets.destdir}}/usr/libexec/${{vars.mangled-package-name}}/ecpg ${{targets.subpkgdir}}/usr/bin/
+    test:
+      environment:
+        contents:
+          packages:
+            - libecpg-dev=${{package.full-version}}
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: ecpg --help
+        - runs: |
+            cat <<"EOF" >test.pgc
+            /* test.pgc */
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+
+            EXEC SQL INCLUDE sqlca;
+
+            int main() {
+                EXEC SQL BEGIN DECLARE SECTION;
+                const char *db = "testdb";
+                const char *user = "postgres";
+                int id;
+                char name[100];
+                EXEC SQL END DECLARE SECTION;
+
+                EXEC SQL CONNECT TO :db USER :user;
+
+                if (sqlca.sqlcode < 0) {
+                    fprintf(stderr, "Connection failed: %s\n", sqlca.sqlerrm.sqlerrmc);
+                    exit(1);
+                }
+
+                EXEC SQL CREATE TABLE IF NOT EXISTS demo (id INT, name TEXT);
+                EXEC SQL INSERT INTO demo (id, name) VALUES (1, 'chainguard');
+                EXEC SQL COMMIT;
+
+                EXEC SQL DECLARE cur CURSOR FOR SELECT id, name FROM demo;
+                EXEC SQL OPEN cur;
+
+                while (1) {
+                    EXEC SQL FETCH cur INTO :id, :name;
+                    if (sqlca.sqlcode != 0) break;
+                    printf("Row: id = %d, name = %s\n", id, name);
+                }
+
+                EXEC SQL CLOSE cur;
+                EXEC SQL COMMIT;
+                EXEC SQL DISCONNECT;
+
+                return 0;
+            }
+            EOF
+            ecpg -I /usr/include/postgresql test.pgc
+
+  - name: ${{package.name}}-oci-entrypoint-base
+    description: Base for PostgreSQL entrypoint in OCI containers
+    dependencies:
+      runtime:
+        - bash
+        # Needs gosu, added at image level
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}
+          curl https://raw.githubusercontent.com/docker-library/postgres/master/17/alpine"${ALPINE_VERSION}"/docker-entrypoint.sh -o \
+            ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}/docker-entrypoint.sh
+          curl https://raw.githubusercontent.com/docker-library/postgres/master/17/alpine"${ALPINE_VERSION}"/docker-ensure-initdb.sh -o \
+            ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}/docker-ensure-initdb.sh
+          sed -i "s|/docker-entrypoint-initdb.d|/var/lib/postgres/initdb|g" ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}/*.sh
+          sed -i "s|/usr/local|/usr|g" ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}/*.sh
+          chmod +x ${{targets.subpkgdir}}/usr/libexec/${{vars.mangled-package-name}}/*.sh
+
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint for using PostgreSQL in OCI containers
+    dependencies:
+      provides:
+        - postgresql-oci-entrypoint=${{package.full-version}}
+      runtime:
+        - ${{package.name}}-oci-entrypoint-base
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mkdir -p ${{targets.subpkgdir}}/var/lib/postgres/initdb
+          ln -s /usr/libexec/${{vars.mangled-package-name}}/docker-entrypoint.sh ${{targets.subpkgdir}}/usr/bin/docker-entrypoint.sh
+          ln -s /usr/libexec/${{vars.mangled-package-name}}/docker-entrypoint.sh ${{targets.subpkgdir}}/var/lib/postgres/initdb/docker-entrypoint.sh
+          ln -s /usr/libexec/${{vars.mangled-package-name}}/docker-ensure-initdb.sh ${{targets.subpkgdir}}/usr/bin/docker-ensure-initdb.sh
+          ln -s /usr/libexec/${{vars.mangled-package-name}}/docker-ensure-initdb.sh ${{targets.subpkgdir}}/var/lib/postgres/initdb/docker-ensure-initdb.sh
+    test:
+      pipeline:
+        - name: "Verify entrypoint scripts exist and are not empty"
+          runs: |
+            # Define files as a space-separated string
+            FILES="/usr/libexec/${{vars.mangled-package-name}}/docker-entrypoint.sh \
+                  /usr/libexec/${{vars.mangled-package-name}}/docker-ensure-initdb.sh"
+
+            # Iterate over each file
+            for FILE_PATH in $FILES; do
+              # Check if the file exists
+              if [ ! -f "$FILE_PATH" ]; then
+                echo "Error: $FILE_PATH does not exist."
+                exit 1
+              fi
+
+              # Check if the file is not empty
+              if [ ! -s "$FILE_PATH" ]; then
+                echo "Error: $FILE_PATH is empty."
+                exit 1
+              fi
+
+              # Display the first few lines of the file for debugging
+              echo "File $FILE_PATH exists and is not empty. Showing the first few lines:"
+              head -n 10 "$FILE_PATH"
+              echo
+            done
+
+  # This subpackage should always come last to avoid shipping resources included in other subpackages
+  - name: "${{package.name}}-base"
+    description: "Base for PostgreSQL 17"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+
+          # Move contents of main package to base package
+          mv "${{targets.destdir}}"/* "${{targets.subpkgdir}}"
+
+          # Create symlinks to binaries in execdir to bindir in main package
+          export bindir="${{targets.destdir}}/usr/bin"
+          export execdir="/usr/libexec/${{vars.mangled-package-name}}"
+
+          mkdir -p "${bindir}"
+
+          cd "${{targets.subpkgdir}}/${execdir}"
+          for binary in *; do
+            ln -sf "${execdir}/${binary}" "${bindir}/${binary}"
+          done
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  # This subpackage essentially rebuilds postgres with python and should therefore be the very last package built!!!
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+    pipeline:
+      - runs: make distclean
+      - runs: |
+          PYTHON=python${{range.key}}  PYTHON3=python${{range.key}}  ./configure \
+            --host=${{host.triplet.gnu}} \
+            --build=${{host.triplet.gnu}} \
+            --prefix=/usr \
+            $CONFIGURE_FLAGS \
+            --with-python
+      - uses: autoconf/make
+      - uses: autoconf/make-install
+      - runs: |
+          savedir="${{targets.contextdir}}.sav"
+          mkdir -p $savedir/usr/lib/postgresql${{vars.major-version}}
+          mkdir -p $savedir/usr/share/postgresql${{vars.major-version}}/extension
+          mkdir -p $savedir/usr/include/postgresql/${{vars.major-version}}/server
+          mv ${{targets.contextdir}}/usr/share/postgresql${{vars.major-version}}/extension/plpython* $savedir/usr/share/postgresql${{vars.major-version}}/extension/
+          mv ${{targets.contextdir}}/usr/lib/postgresql${{vars.major-version}}/plpython* $savedir/usr/lib/postgresql${{vars.major-version}}/
+          mv ${{targets.contextdir}}/usr/include/postgresql/${{vars.major-version}}/server/plpython* $savedir/usr/include/postgresql/${{vars.major-version}}/server/
+          rm -rf "${{targets.contextdir}}"
+          mv "$savedir" "${{targets.contextdir}}"
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - postgresql-${{vars.major-version}}-client
+            - postgresql-${{vars.major-version}}
+            - shadow
+            - sudo-rs
+            - wait-for-it
+            - python-${{range.key}}
+        environment:
+          PGDATA: /tmp/plpython_test_db
+          PGUSER: testuser
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "Test plpython database functionality"
+          runs: |
+            echo "=== Setting up test database for plpython ==="
+            useradd $PGUSER
+            sudo -u $PGUSER initdb -D $PGDATA 2>&1
+            sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/plpython_logfile start 2>&1
+            wait-for-it localhost:5432 -t 5 2>&1
+            createdb plpython_testdb 2>&1
+
+            psql -d plpython_testdb -c "CREATE EXTENSION plpython3u;"
+            psql -d plpython_testdb -c "
+            CREATE OR REPLACE FUNCTION test_plpython_basic() RETURNS text AS \$\$
+            return 'Hello from plpython3!'
+            \$\$ LANGUAGE plpython3u;" 2>&1
+            PLPYTHON_STATEMENT=$(psql -t -A -d plpython_testdb -c "SELECT test_plpython_basic();")
+            [ "$PLPYTHON_STATEMENT" = "Hello from plpython3!" ]
+
+            # Create a function that returns Python version info
+            psql -d plpython_testdb -c "
+            CREATE OR REPLACE FUNCTION py_version() RETURNS text AS \$\$
+            import sys
+            return f'Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'
+            \$\$ LANGUAGE plpython3u;" 2>&1
+
+            # Get the Python version from plpython
+            PLPYTHON_VERSION=$(psql -t -A -d plpython_testdb -c "SELECT py_version();")
+
+            # Get the system Python version
+            SYSTEM_VERSION=$(python -c "import sys; print(f'Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
+
+            [ "$PLPYTHON_VERSION" = "$SYSTEM_VERSION" ]
+
+            sudo -u $PGUSER pg_ctl -D $PGDATA stop 2>&1
+
+update:
+  version-separator: _
+  enabled: true
+  github:
+    identifier: postgres/postgres
+    strip-prefix: REL_
+    tag-filter: REL_18
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-client
+        - shadow
+        - sudo-rs
+        - glibc-locales
+    environment:
+      PGDATA: /tmp/test_db
+      PGUSER: wolfi
+  pipeline:
+    - name: "Test if PostgreSQL binaries are present and runnable"
+      runs: |
+        command -v initdb
+        command -v pg_ctl
+        command -v psql
+        ecpg --version
+        ecpg --help
+        initdb --version
+        initdb --help
+        pg_archivecleanup --version
+        pg_archivecleanup --help
+        pg_checksums --version
+        pg_checksums --help
+        pg_combinebackup --version
+        pg_combinebackup --help
+        pg_config --version
+        pg_controldata --version
+        pg_controldata --help
+        pg_createsubscriber --version
+        pg_createsubscriber --help
+        pg_ctl --version
+        pg_ctl --help
+        pg_resetwal --version
+        pg_resetwal --help
+        pg_rewind --version
+        pg_rewind --help
+        pg_test_fsync --version
+        pg_test_fsync --help
+        pg_test_timing --version
+        pg_test_timing --help
+        pg_upgrade --version
+        pg_upgrade --help
+        pg_waldump --version
+        pg_waldump --help
+        pg_walsummary --version
+        pg_walsummary --help
+        pgbench --version
+        pgbench --help
+        postgres --version
+        postgres --help
+    - name: "Test database creation"
+      runs: |
+        useradd $PGUSER
+        sudo -u $PGUSER initdb -D /tmp/test_db
+        sudo -u $PGUSER pg_ctl -D /tmp/test_db -l /tmp/logfile start
+        createdb testdb
+        psql -lqt | cut -d \| -f 1 | grep -qw testdb
+    - name: "Test basic read/write operations"
+      runs: |
+        psql -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, test_value VARCHAR(50));"
+        psql -d testdb -c "INSERT INTO test_table (test_value) VALUES ('Hello, PostgreSQL!');"
+        psql -d testdb -t -A -c "SELECT test_value FROM test_table WHERE id=1;"
+    - name: "Test xml support"
+      runs: |
+        psql -d testdb -c "CREATE TABLE test (data xml);"
+        psql -d testdb -c "INSERT INTO test values (XMLPARSE(CONTENT '<foo>bar</foo>'));"
+    - name: "Test server can run and respond to requests"
+      runs: |
+        psql -d testdb -c "\conninfo"
+    - name: "Test XML xpath support"
+      runs: |
+        psql -d testdb -c "SELECT xpath('/book/title', '<book><title>My Title</title></book>');" | grep "<title>My Title</title>"
+    - name: "Test ICU collation presence"
+      runs: |
+        psql -d testdb -c "SELECT collname FROM pg_collation WHERE collprovider = 'i';" | grep -E "unicode|und-x-icu|af-x-icu"
+    - name: "Test krb5 config parameter exists"
+      runs: |
+        psql -d testdb -c "SHOW krb_server_keyfile;" | grep "krb5"
+    - name: "Test JIT is enabled"
+      runs: |
+        psql -t -A -d testdb -c "SHOW jit;" | grep "on"
+    - name: "Test toast compression set to lz4"
+      runs: |
+        psql -t -A -d testdb -c "SET default_toast_compression = 'lz4'; SHOW default_toast_compression;" | grep "^lz4$"

@@ -24,6 +24,11 @@ workflow on GitHub will run to perform the restore.
 
 This will restore the package using the original APK from a GCS bucket.
 
+# Ensure the packages are no longer listed in withdrawn-packages.txt
+
+To ensure that a subsequent withdrawal operation does not withdraw the packages just
+restored remove them from withdrawn-packages.txt.
+
 ## Technical details
 
 The "Restore packages" workflow exists in `.github/workflows/restore-packages.yaml`.

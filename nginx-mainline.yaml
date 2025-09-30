@@ -3,7 +3,7 @@ package:
   # MAINLINE VERSIONS MUST USE ODD MINOR VERSIONS (e.g., 1.27.x, 1.29.x)
   # Must also bump njs at the same time
   version: "1.29.1"
-  epoch: 3
+  epoch: 4
   description: HTTP and reverse proxy server (mainline version)
   copyright:
     - license: BSD-2-Clause
@@ -13,9 +13,7 @@ package:
     # Let's ensure that we have config. This gets the default, but can also
     # be override by users.
     runtime:
-      - merged-usrsbin
       - nginx-config
-      - wolfi-baselayout
 
 environment:
   contents:
@@ -26,16 +24,23 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
+      - cmake
+      - curl-dev
       - gd-dev
       - geoip-dev
+      - git
+      - grpc-dev
       - libmaxminddb-dev
       - libxml2-dev
       - libxslt-dev
       - luajit-dev
       - openssl-dev
-      - pcre2-dev
+      - opentelemetry-cpp-dev
+      - pcre-dev
       - perl-dev
       - pkgconf
+      - protobuf-dev
+      - systemd-dev
       - zeromq-dev
       - zlib-dev
 
@@ -44,6 +49,11 @@ var-transforms:
     match: '^(\d+)\.(\d+)\.(\d+)'
     replace: '$2'
     to: minor-version
+
+vars:
+  # OpenTelemetry commit SHA compatible with nginx mainline
+  # Based on latest nginx tag from opentelemetry-cpp-contrib
+  otel-sha: "5be4b76ebf67fee4d09f897649fd8d9348ba5d73"
 
 data:
   - name: modules
@@ -64,7 +74,7 @@ pipeline:
       # Ensure mainline version is odd (e.g., 1.27.x, 1.29.x)
       MINOR=${{vars.minor-version}}
       if [ $((MINOR % 2)) -eq 0 ]; then
-        echo "ERROR: nginx-mainline must use odd minor versions (e.g., 1.27.x, 1.29.x)"
+        echo "ERROR: ${{package.name}} must use odd minor versions (e.g., 1.27.x, 1.29.x)"
         echo "Current version: ${{package.version}} has even minor version: $MINOR"
         exit 1
       fi
@@ -75,13 +85,24 @@ pipeline:
       repository: https://github.com/nginx/nginx.git
       tag: release-${{package.version}}
       expected-commit: 0024724f2f77ac4fa0d7394e859608d6844a5914
-      destination: nginx-mainline
+      destination: ${{package.name}}
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/open-telemetry/opentelemetry-cpp-contrib.git
+      branch: main
+      tag: ""
+      expected-commit: ${{vars.otel-sha}}
+      destination: opentelemetry-cpp-contrib
 
   - name: configure
-    working-directory: nginx-mainline
+    working-directory: ${{package.name}}
     runs: |
       export LUAJIT_LIB="$(pkgconf --variable=libdir luajit)"
       export LUAJIT_INC="$(pkgconf --variable=includedir luajit)"
+
+      # Set OpenTelemetry paths for nginx otel module
+      export PKG_CONFIG_PATH="/usr/lib/pkgconfig:$PKG_CONFIG_PATH"
 
       ./auto/configure \
           --prefix=/var/lib/nginx \
@@ -131,7 +152,7 @@ pipeline:
           --with-stream_geoip_module=dynamic \
           --with-stream_ssl_preread_module
 
-  - working-directory: nginx-mainline
+  - working-directory: ${{package.name}}
     runs: |
       make -j$(nproc)
       make DESTDIR=${{targets.destdir}} install
@@ -149,17 +170,15 @@ pipeline:
   - uses: strip
 
 subpackages:
-  - name: nginx-mainline-config
+  - name: ${{package.name}}-config
     description: Creates nginx config step that can then be overridden by users
     dependencies:
       runtime:
-        - merged-usrsbin
-        - nginx-mainline
-        - wolfi-baselayout
+        - ${{package.name}}
       provides:
         - nginx-config=${{package.full-version}}
     pipeline:
-      - working-directory: nginx-mainline
+      - working-directory: ${{package.name}}
         runs: |
           # This was moved into ./pkg-config/etc/nginx so put it into the
           # subpackage directory here.
@@ -184,7 +203,7 @@ subpackages:
       provides:
         - nginx-config=${{package.full-version}}
     pipeline:
-      - working-directory: nginx-mainline
+      - working-directory: ${{package.name}}
         runs: |
           # This was moved into ./pkg-config/etc/nginx so put it into the
           # subpackage directory here.
@@ -201,13 +220,11 @@ subpackages:
             virtual-pkg-name: nginx-config
             real-pkg-name: ${{subpkg.name}}
 
-  - name: nginx-mainline-package-config
+  - name: ${{package.name}}-package-config
     description: Config supplied in packaged nginx.org bundles at https://hg.nginx.org/pkg-oss/
     dependencies:
       runtime:
-        - merged-usrsbin
-        - nginx-mainline
-        - wolfi-baselayout
+        - ${{package.name}}
       provides:
         - nginx-package-config=${{package.full-version}}
     pipeline:
@@ -237,27 +254,21 @@ subpackages:
             virtual-pkg-name: nginx-package-config
             real-pkg-name: ${{subpkg.name}}
 
-  - name: nginx-mainline-openrc
-    description: nginx-mainline openrc init
+  - name: ${{package.name}}-openrc
+    description: ${{package.name}} openrc init
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/etc/init.d/
           install -Dm755 nginx.initd "${{targets.subpkgdir}}"/etc/init.d/nginx
-    dependencies:
-      runtime:
-        - merged-usrsbin
-        - wolfi-baselayout
 
   - range: modules
-    name: nginx-mainline-mod-${{range.key}}
+    name: ${{package.name}}-mod-${{range.key}}
     description: Nginx third-party module ${{range.key}}
     dependencies:
       provides:
         - nginx-mod-${{range.key}}=${{package.full-version}}
       runtime:
-        - merged-usrsbin
         - perl-dev
-        - wolfi-baselayout
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/lib/nginx/modules
@@ -288,20 +299,47 @@ subpackages:
       pipeline:
         - uses: test/tw/ldd-check
 
-  - name: nginx-mainline-src
+  - name: ${{package.name}}-mod-otel
+    description: Nginx third-party module otel
+    dependencies:
+      provides:
+        - nginx-mod-otel=${{package.full-version}}
+      runtime:
+        - perl-dev
+    pipeline:
+      - working-directory: opentelemetry-cpp-contrib/instrumentation/nginx
+        runs: |
+          mkdir build
+          cd build
+          cmake -DNGINX_VERSION=${{package.version}} -DCMAKE_POSITION_INDEPENDENT_CODE=ON ..
+          make
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/nginx/modules
+          mkdir -p ${{targets.subpkgdir}}/etc/nginx/modules
+
+          # --modules-path is only used for installing modules, not loading them
+          mkdir -p ${{targets.subpkgdir}}/var/lib/nginx/
+          ln -sf /usr/lib/nginx/modules ${{targets.subpkgdir}}/var/lib/nginx/modules
+
+          mv opentelemetry-cpp-contrib/instrumentation/nginx/build/otel_ngx_module.so ${{targets.subpkgdir}}/usr/lib/nginx/modules/ngx_otel_module.so
+
+          echo "load_module \"modules/ngx_otel_module.so\";" >> ${{targets.subpkgdir}}/etc/nginx/modules/10_otel.conf
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-src
     description: Nginx source code
     dependencies:
       runtime:
-        - merged-usrsbin
-        - nginx-mainline
+        - ${{package.name}}
         - perl-dev
-        - wolfi-baselayout
       provides:
         - nginx-src-main=${{package.full-version}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/src/nginx
-          cp -r ./nginx-mainline/* ${{targets.contextdir}}/usr/src/nginx
+          cp -r ./${{package.name}}/* ${{targets.contextdir}}/usr/src/nginx
           ls -latr ${{targets.contextdir}}/usr/src/nginx
     test:
       pipeline:
@@ -310,10 +348,10 @@ subpackages:
   - name: ${{package.name}}-config-compat
     description: Nginx config compatibility with upstream image
     dependencies:
+      provides:
+        - nginx-config-compat=${{package.full-version}}
       runtime:
-        - merged-usrsbin
-        - nginx-mainline
-        - wolfi-baselayout
+        - ${{package.name}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/etc/nginx/conf.d

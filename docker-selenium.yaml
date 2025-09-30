@@ -4,7 +4,7 @@ package:
   # But the '-' is not a valid character according to APK versioning spec; and resulting
   # 'package format error' when trying to install the package. The workaround is
   # to replace '-' with '.', then mangling the version to replace back.
-  version: "4.35.0.20250808"
+  version: "4.35.0.20250909"
   epoch: 0
   description: Provides a simple way to run Selenium Grid with Chrome, Firefox, and Edge using Docker, making it easier to perform browser automation
   copyright:
@@ -54,7 +54,7 @@ environment:
       - x11vnc
       - yq
   environment:
-    TC: UTC
+    TZ: UTC
     SEL_USER: seluser
     SEL_PASSWD: secret
 
@@ -63,7 +63,7 @@ pipeline:
     with:
       repository: https://github.com/SeleniumHQ/docker-selenium
       tag: ${{vars.mangled-package-version}}
-      expected-commit: 2e8d7ec78113f09eefb74bbb645b43b455a474e0
+      expected-commit: ca1feb491c82273e63bcd610cdde132a1aa5f5d5
 
   - uses: patch
     with:
@@ -76,6 +76,7 @@ subpackages:
         - bash
         - busybox
         - coreutils
+        - gettext
         - selenium-server-compat~${{vars.selenium-version}}
         - sudo-rs
         - supervisor
@@ -84,6 +85,7 @@ subpackages:
         - selenium-server~${{vars.selenium-version}}
         - pulseaudio-utils
         - pulseaudio
+        - ${{package.name}}-compat
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/bin
@@ -91,26 +93,25 @@ subpackages:
           mkdir -p ${{targets.contextdir}}/var/tmp
           mkdir -p ${{targets.contextdir}}/opt/bin
       - runs: |
-          cp ./charts/selenium-grid/configs/node/nodeGridUrl.sh ${{targets.contextdir}}/opt/bin
-          cp ./charts/selenium-grid/configs/node/nodePreStop.sh ${{targets.contextdir}}/opt/bin
+          install -Dm755 ./charts/selenium-grid/configs/node/nodeGridUrl.sh ${{targets.contextdir}}/opt/bin/
+          install -Dm755 ./charts/selenium-grid/configs/node/nodePreStop.sh ${{targets.contextdir}}/opt/bin/
       # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Base/Dockerfile
       - working-directory: Base
         pipeline:
           - runs: |
-              cp check-grid.sh ${{targets.contextdir}}/opt/bin/
-              cp entry_point.sh ${{targets.contextdir}}/opt/bin/
-              cp supervisord.conf ${{targets.contextdir}}/etc
+              install -Dm755 check-grid.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 entry_point.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 handle_heap_dump.sh ${{targets.contextdir}}/opt/bin/
+              install -Dm755 mask ${{targets.contextdir}}/opt/bin/
+              install -Dm644 supervisord.conf ${{targets.contextdir}}/etc/
               mkdir -p ${{targets.contextdir}}/var/run/supervisor
-          - runs: |
-              mkdir -p ${{targets.contextdir}}/opt/selenium
-              echo "${SEL_PASSWD}" > ${{targets.contextdir}}/opt/selenium/initialPasswd
           # TODO: Implement malware scan for jars retrieved by coursier
           - runs: |
               # Retrieve OpenTelemetry/GRPC/Netty Java versions
               # Do not change these. Docker Selenium is sensitive to the versions used
               OPENTELEMETRY_VERSION=$(cat ./Dockerfile | grep "^ARG OPENTELEMETRY_VERSION" | sed "s/.*=//")
               GRPC_VERSION=$(cat ./Dockerfile | grep "^ARG GRPC_VERSION" | sed "s/.*=//")
-              NETTY_VERSION="4.1.118.Final"
+              NETTY_VERSION=$(cat ./Dockerfile | grep "^ARG NETTY_VERSION" | sed "s/.*=//")
 
               mkdir -p ${{targets.contextdir}}/external_jars
               curl -sSLfO https://github.com/coursier/launchers/raw/master/coursier
@@ -118,6 +119,9 @@ subpackages:
               ./coursier fetch --classpath --cache ${{targets.contextdir}}/external_jars \
                 io.opentelemetry:opentelemetry-exporter-otlp:${OPENTELEMETRY_VERSION} \
                 io.netty:netty-handler:${NETTY_VERSION} \
+                io.netty:netty-codec:${NETTY_VERSION} \
+                io.netty:netty-codec-http:${NETTY_VERSION} \
+                io.netty:netty-codec-http2:${NETTY_VERSION} \
                 io.grpc:grpc-netty:${GRPC_VERSION} > ${{targets.contextdir}}/external_jars/.classpath.txt
               chmod 665 ${{targets.contextdir}}/external_jars/.classpath.txt
               sed -i 's|${{targets.contextdir}}||g' ${{targets.contextdir}}/external_jars/.classpath.txt
@@ -134,16 +138,22 @@ subpackages:
         - name: "Check selenium base status"
           uses: test/daemon-check-output
           with:
-            start: "/opt/bin/entry_point.sh"
+            setup: |
+              adduser -D -H seluser
+              chown seluser:seluser /tmp /var/tmp
+              mkdir -p /var/run/supervisor
+              chown seluser:seluser /var/run/supervisor
+            start: |
+              su seluser -c /opt/bin/entry_point.sh
             timeout: 60
             expected_output: |
               supervisord started
 
-  - name: ${{package.name}}-config
+  - name: ${{package.name}}-compat
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/opt/selenium/
-          install -m644 "./example-config.toml" ${{targets.contextdir}}/opt/selenium/config.toml
+          install -m775 "./example-config.toml" ${{targets.contextdir}}/opt/selenium/config.toml
 
   - name: ${{package.name}}-supervisor-config
     description: Docker Selenium supervisor configuration
@@ -156,20 +166,20 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.contextdir}}/etc
           cd ./Base
-          install supervisord.conf ${{targets.contextdir}}/etc
-          mv ${{targets.contextdir}}/etc/supervisord.conf ${{targets.contextdir}}/etc
-
-          # Unset setuid bit
-          # jason@ copied this directly from https://serverfault.com/a/238964
-          # The extra 0 is to unset the setuid bit apparently.
-          chmod 0775 ${{targets.contextdir}}/etc/supervisord.conf
+          install -m644 supervisord.conf ${{targets.contextdir}}/etc
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: supervisor-config
+            real-pkg-name: ${{subpkg.name}}
 
   - name: ${{package.name}}-standalone
     dependencies:
       runtime:
         - selenium-server-standalone~${{vars.selenium-version}}
         - ${{package.name}}-base
-        - ${{package.name}}-config
+        - ${{package.name}}-compat
     pipeline:
       - working-directory: Standalone
         pipeline:
@@ -177,8 +187,7 @@ subpackages:
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
               mkdir -p ${{targets.contextdir}}/opt/bin
               install -Dm755 start-selenium-standalone.sh ${{targets.contextdir}}/opt/bin/
-              install -Dm755 selenium.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
-              install -Dm755 generate_config ${{targets.contextdir}}/opt/bin/
+              install -Dm644 selenium.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
     test:
       environment:
         contents:
@@ -219,18 +228,16 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}-base
-        - ${{package.name}}-config
         - selenium-server~${{vars.selenium-version}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/opt/bin
-          mkdir -p ${{targets.contextdir}}/opt/selenium
       # https://github.com/SeleniumHQ/docker-selenium/blob/trunk/Hub/Dockerfile
       - working-directory: Hub
         pipeline:
           - runs: |
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
-              install -Dm755 selenium-grid-hub.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm644 selenium-grid-hub.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-selenium-grid-hub.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
@@ -285,7 +292,6 @@ subpackages:
         - xmessage
         - xvfb-run
         - ${{package.name}}-base
-        - ${{package.name}}-config
         - selenium-server~${{vars.selenium-version}}
     pipeline:
       - working-directory: NodeBase
@@ -298,17 +304,16 @@ subpackages:
               mkdir -p ${{targets.contextdir}}/home/$SEL_USER/.fluxbox
               mkdir -p ${{targets.contextdir}}/tmp/.X11-unix
               mkdir -p ${{targets.contextdir}}/home/$SEL_USER/.vnc
-              mkdir -p ${{targets.contextdir}}/opt/selenium
           - runs: |
               install -Dm755 start-selenium-node.sh ${{targets.contextdir}}/opt/bin/
               install -Dm755 start-xvfb.sh ${{targets.contextdir}}/opt/bin/
-              install -Dm755 selenium.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm644 selenium.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-vnc.sh ${{targets.contextdir}}/opt/bin/
               install -Dm755 start-novnc.sh ${{targets.contextdir}}/opt/bin/
-              install -Dm755 selenium_grid_logo.png ${{targets.contextdir}}/usr/share/images/fluxbox/ubuntu-light.png
+              install -Dm644 selenium_grid_logo.png ${{targets.contextdir}}/usr/share/images/fluxbox/ubuntu-light.png
               install -Dm755 generate_config ${{targets.contextdir}}/opt/bin/
-              install -Dm755 json_merge.py ${{targets.contextdir}}/opt/bin/
               install -Dm755 generate_relay_config ${{targets.contextdir}}/opt/bin/
+              install -Dm755 json_merge.py ${{targets.contextdir}}/opt/bin/
               echo "${SEL_PASSWD}" | x11vnc -storepasswd - ${{targets.contextdir}}/home/$SEL_USER/.vnc/passwd
     test:
       environment:
@@ -343,11 +348,10 @@ subpackages:
         pipeline:
           - runs: |
               mkdir -p ${{targets.contextdir}}/opt/bin/
-              mkdir -p ${{targets.contextdir}}/opt/selenium/
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 wrap_chromium_binary ${{targets.contextdir}}/opt/bin/
               install -Dm755 chrome-cleanup.sh ${{targets.contextdir}}/opt/bin/
-              install -Dm755 chrome-cleanup.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm644 chrome-cleanup.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
     test:
       environment:
         environment:
@@ -360,6 +364,8 @@ subpackages:
         - name: "Check selenium node-chromium status"
           uses: test/daemon-check-output
           with:
+            setup: |
+              touch /opt/selenium/config.toml
             start: "/opt/bin/start-selenium-node.sh"
             timeout: 60
             expected_output: |
@@ -372,20 +378,25 @@ subpackages:
         - ${{package.name}}-node-base
         - geckodriver
         - firefox
+        - ${{package.name}}-compat
     pipeline:
       - working-directory: NodeFirefox
         pipeline:
           - runs: |
               mkdir -p ${{targets.contextdir}}/opt/bin
               mkdir -p ${{targets.contextdir}}/opt/selenium/
+              chmod 775 ${{targets.contextdir}}/opt/selenium/
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 firefox-cleanup.sh ${{targets.contextdir}}/opt/bin/firefox-cleanup.sh
-              install -Dm755 firefox-cleanup.conf ${{targets.contextdir}}/etc/supervisor/conf.d/firefox-cleanup.conf
+              install -Dm644 firefox-cleanup.conf ${{targets.contextdir}}/etc/supervisor/conf.d/firefox-cleanup.conf
               echo "firefox" > ${{targets.contextdir}}/opt/selenium/browser_name
               firefox --version | awk '{print $3}' > ${{targets.contextdir}}/opt/selenium/browser_version
               echo "\"moz:firefoxOptions\": {\"binary\": \"/usr/bin/firefox\"}" > ${{targets.contextdir}}/opt/selenium/browser_binary_location
     test:
       environment:
+        contents:
+          packages:
+            - ${{package.name}}-compat
         environment:
           SE_EVENT_BUS_PUBLISH_PORT: 4442
           SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
@@ -410,8 +421,12 @@ subpackages:
       runtime:
         - ${{package.name}}-node-chromium
         - ${{package.name}}-standalone
+        - ${{package.name}}-compat
     test:
       environment:
+        contents:
+          packages:
+            - ${{package.name}}-compat
         environment:
           SE_EVENT_BUS_PUBLISH_PORT: 4442
           SE_EVENT_BUS_SUBSCRIBE_PORT: 4443
@@ -438,7 +453,7 @@ subpackages:
           - runs: |
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
               mkdir -p ${{targets.contextdir}}/opt/bin
-              install -Dm755 selenium-grid-eventbus.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm644 selenium-grid-eventbus.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-selenium-grid-eventbus.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
@@ -466,7 +481,7 @@ subpackages:
           - runs: |
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
               mkdir -p ${{targets.contextdir}}/opt/bin
-              install -Dm755 selenium-grid-distributor.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm644 selenium-grid-distributor.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-selenium-grid-distributor.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
@@ -498,7 +513,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}-base
-        - ${{package.name}}-config
+        - ${{package.name}}-compat
         - socat
     pipeline:
       - working-directory: NodeDocker
@@ -506,11 +521,16 @@ subpackages:
           - runs: |
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
               mkdir -p ${{targets.contextdir}}/opt/bin
-              install -Dm755 selenium-grid-docker.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              mkdir -p ${{targets.contextdir}}/opt/selenium
+              install -Dm644 config.toml ${{targets.contextdir}}/opt/selenium/docker.toml
+              install -Dm644 selenium-grid-docker.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-selenium-grid-docker.sh ${{targets.contextdir}}/opt/bin/
               install -Dm755 start-socat.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
+        contents:
+          packages:
+            - ${{package.name}}-compat
         environment:
           SE_DISTRIBUTOR_PORT: 5553
           SE_BIND_HOST: false
@@ -539,7 +559,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}-base
-        - ${{package.name}}-config
+        - ${{package.name}}-compat
         - selenium-server~${{vars.selenium-version}}
     pipeline:
       - working-directory: Router
@@ -547,7 +567,7 @@ subpackages:
           - runs: |
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
               mkdir -p ${{targets.contextdir}}/opt/bin
-              install -Dm755 selenium-grid-router.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm644 selenium-grid-router.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-selenium-grid-router.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
@@ -587,7 +607,7 @@ subpackages:
           - runs: |
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
               mkdir -p ${{targets.contextdir}}/opt/bin
-              install -Dm755 selenium-grid-session-queue.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm644 selenium-grid-session-queue.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-selenium-grid-session-queue.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
@@ -610,8 +630,8 @@ subpackages:
     description: Docker Selenium Sessions
     dependencies:
       runtime:
+        - ${{package.name}}-compat
         - ${{package.name}}-base
-        - ${{package.name}}-config
         - selenium-server~${{vars.selenium-version}}
     pipeline:
       - working-directory: Sessions
@@ -619,7 +639,8 @@ subpackages:
           - runs: |
               mkdir -p ${{targets.contextdir}}/etc/supervisor/conf.d
               mkdir -p ${{targets.contextdir}}/opt/bin
-              install -Dm755 selenium-grid-sessions.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
+              install -Dm755 generate_config ${{targets.contextdir}}/opt/bin/
+              install -Dm644 selenium-grid-sessions.conf ${{targets.contextdir}}/etc/supervisor/conf.d/
               install -Dm755 start-selenium-grid-sessions.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
@@ -645,7 +666,7 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}-node-docker
-        - ${{package.name}}-config
+        - ${{package.name}}-compat
     pipeline:
       - working-directory: StandaloneDocker
         pipeline:
@@ -654,9 +675,6 @@ subpackages:
               install -Dm755 start-selenium-grid-docker.sh ${{targets.contextdir}}/opt/bin/
     test:
       environment:
-        contents:
-          packages:
-            - ${{package.name}}-config
         environment:
           SE_BIND_HOST: true
           SE_SESSION_REQUEST_TIMEOUT: 300
@@ -664,7 +682,7 @@ subpackages:
           SE_RELAX_CHECKS: true
           CONFIG_FILE: /opt/selenium/config.toml
       pipeline:
-        - name: "Check selenium sessions status"
+        - name: "Check selenium standalone docker status"
           uses: test/daemon-check-output
           with:
             start: "/opt/bin/start-selenium-grid-docker.sh"
@@ -693,9 +711,9 @@ subpackages:
           DRAIN_AFTER_SESSION_COUNT: 10
           SE_DRAIN_AFTER_SESSION_COUNT: 4
           SE_NODE_MAX_SESSIONS: 10
-          SE_NODE_BROWSER_NAME: chrome
+          SE_NODE_BROWSER_NAME: firefox
           SE_NODE_BROWSER_VERSION: test
-          SE_BROWSER_BINARY_LOCATION: '"binary": "/usr/bin/chromium-browser"'
+          SE_BROWSER_BINARY_LOCATION: '"binary": "/usr/bin/firefox"'
           SE_BIND_HOST: false
           CONFIG_FILE: /opt/selenium/config.toml
       pipeline:

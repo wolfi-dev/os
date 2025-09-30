@@ -11,8 +11,7 @@ on:
 # Don't withdraw during builds, to prevent out of sync signatures.
 concurrency: build
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   withdraw:
@@ -37,7 +36,7 @@ jobs:
       - uses: google-github-actions/auth@b7593ed2efd1c1617e1b0254da33b86225adb2a5 # v2.1.12
         id: auth
         with:
-          workload_identity_provider: "projects/12758742386/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          workload_identity_provider: "projects/12758742386/locations/global/workloadIdentityPools/gh-pool-wolfi/providers/github-provider"
           service_account: "wolfi-dev@chainguard-github-secrets.iam.gserviceaccount.com"
       - uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
         with:
@@ -64,7 +63,7 @@ jobs:
           set -euo pipefail
           for arch in x86_64 aarch64; do
             mkdir -p $arch
-            curl -v https://packages.wolfi.dev/os/$arch/APKINDEX.tar.gz 2>verbose | wolfictl withdraw $(grep -v '\#' withdrawn-packages.txt) --signing-key="${{ github.workspace }}/wolfi-signing.rsa" > $arch/APKINDEX.tar.gz
+            curl -v https://packages.wolfi.dev/os/$arch/APKINDEX.tar.gz 2>verbose | wolfictl withdraw --packages-file=withdrawn-packages.txt --signing-key="${{ github.workspace }}/wolfi-signing.rsa" > $arch/APKINDEX.tar.gz
 
             # Parse the object generation from the -v output.
             GEN=$(grep "x-goog-generation" verbose | cut -d' ' -f3)
@@ -75,15 +74,6 @@ jobs:
             # This is a bit of a hack until we drop this APKINDEX entirely.
             gcloud storage cp --if-generation-match="${GEN}" --cache-control="no-store" $arch/APKINDEX.tar.gz gs://wolfi-production-registry-destination/os/$arch/APKINDEX.tar.gz
           done
-      - name: Delete withdrawn packages
-        run: |
-          set -euo pipefail
-          for arch in x86_64 aarch64; do
-            for pkg in $(grep -v '\#' withdrawn-packages.txt); do
-              echo "=> $pkg"
-              gsutil -m rm -f gs://wolfi-production-registry-destination/os/$arch/$pkg || true
-            done
-          done
       - name: Upload full withdrawn packages list
         run: |
           set -euxo pipefail
@@ -91,15 +81,6 @@ jobs:
           gsutil cp \
             all-withdrawn-packages.txt \
             gs://wolfi-production-registry-destination/os/withdrawn-packages.txt
-      - name: Delete sbom packages from the lifecycle automation
-        run: |
-          set -euo pipefail
-          for arch in x86_64 aarch64; do
-            for pkg in $(grep -v '\#' withdrawn-packages.txt); do
-              echo "=> $pkg"
-              gsutil -m rm -f gs://insights-apk-sbom-prod/wolfi-production-registry-destination/os/$arch/$pkg.sbom.json || true
-            done
-          done
       # use public chainguard provider.
       - uses: chainguard-dev/setup-chainctl@f4ed65b781b048c44d4f033ae854c025c5531c19 # v0.3.2
         with:
@@ -109,13 +90,39 @@ jobs:
       - name: 'Withdraw packages from apk.cgr.dev'
         run: |
           set -e
+          # Transform text file into JSON for bulk withdrawal, ignoring empty lines and comments and trimming whitespace
+          jq -R -n '{apks: [inputs | select(length > 0 and startswith("#") | not) | gsub("^\\s+|\\s+$"; "") | select(length > 0)]}' withdrawn-packages.txt > withdrawn-packages.json
           for arch in "aarch64" "x86_64"; do
-            while IFS= read -r pkg; do
-              curl -X DELETE \
-                  --user "user:$(chainctl auth token --audience apk.cgr.dev)" \
-                  "https://apk.cgr.dev/chainguard/${arch}/${pkg}" || true
-            done < <(grep -v -e '^$' -v '\#' withdrawn-packages.txt | cut -d':' -f2) # Ignore empty lines and comments
+            curl -X POST -H "Content-Type: application/json" \
+                --user "user:$(chainctl auth token --audience apk.cgr.dev)" \
+                --data @withdrawn-packages.json \
+                "https://apk.cgr.dev/chainguard/${arch}/withdraw" || true
           done
+      - name: Batch delete SBOM files
+        run: |
+          set -euo pipefail
+
+          # Create file lists for batch deletion from withdrawn packages
+          mkdir -p deletion-lists
+
+          # Clean withdrawn packages list (remove comments and empty lines)
+          grep -v '^#' withdrawn-packages.txt | grep -v '^$' > clean-withdrawn-packages.txt
+
+          for arch in x86_64 aarch64; do
+            echo "Processing $arch architecture for batch deletion..."
+
+            # Create SBOM URLs for deletion (convert .apk to .spdx.json)
+            sed "s|\.apk$|.spdx.json|; s|^|gs://insights-apk-sbom-prod/wolfi-production-registry-destination/os/$arch/|" clean-withdrawn-packages.txt > "deletion-lists/sbom-urls-to-delete-$arch.txt"
+
+            PACKAGE_COUNT=$(wc -l < clean-withdrawn-packages.txt)
+            echo "  Attempting to delete $PACKAGE_COUNT SBOM files for $arch"
+
+            # Batch delete SBOM files
+            echo "  Batch deleting SBOM files..."
+            gsutil -m rm -I < "deletion-lists/sbom-urls-to-delete-$arch.txt" || echo "  Some SBOM files may not exist or already deleted"
+          done
+
+          echo "Batch deletion process completed"
       - uses: rtCamp/action-slack-notify@e31e87e03dd19038e411e38ae27cbad084a90661 # v2.2.1
         if: failure()
         env:

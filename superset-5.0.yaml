@@ -1,7 +1,7 @@
 package:
   name: superset-5.0
   version: "5.0.0"
-  epoch: 4
+  epoch: 6
   description: Data Visualization and Data Exploration Platform
   copyright:
     - license: Apache-2.0
@@ -38,10 +38,11 @@ environment:
       - ca-certificates-bundle
       - mariadb-connector-c-dev
       - mariadb-dev
-      - nodejs-20 # Fixes an unsopperted engine error
-      - npm<11.0.0 # Fixes an unsopperted engine error
+      - nodejs-20 # Fixes an unsupported engine error
+      - npm<11.0.0 # Fixes an unsupported engine error
       - nvm
       - openldap-dev
+      - patch
       - py${{vars.python-version}}-pip
       - py${{vars.python-version}}-sqlparse
       - python-${{vars.python-version}}-dev
@@ -84,7 +85,7 @@ pipeline:
       pip install pillow pyarrow
 
       # For running translations
-      pip install flask flask-appbuilder==4.6.2
+      pip install flask flask-appbuilder==4.8.1
 
       sed -i 's/"cryptography>=42.0.4.*"/"cryptography>=44.0.1"/' pyproject.toml
 
@@ -173,6 +174,45 @@ subpackages:
           # copy config file
           mkdir -p ${{targets.contextdir}}/app/superset
           install -m755 /opt/iamguarded/scripts/superset/files/superset_config.py ${{targets.contextdir}}/app/superset/
+
+          # Fix user config - we need this to allow superset to be run
+          # as root inside bubblewrap, otherwise we can't test on aarch64
+          sed -i 's~export SUPERSET_DAEMON_USER="superset"~export SUPERSET_DAEMON_USER=${SUPERSET_DAEMON_USER:-"superset"}~g' /opt/iamguarded/scripts/superset-env.sh
+          sed -i 's~export SUPERSET_DAEMON_GROUP="superset"~export SUPERSET_DAEMON_GROUP=${SUPERSET_DAEMON_GROUP:-"superset"}~g' /opt/iamguarded/scripts/superset-env.sh
+
+          cat << EOF > run.patch
+          --- /opt/iamguarded/scripts/superset/run.sh
+          +++ run.sh
+          @@ -22,6 +22,17 @@
+           . /opt/iamguarded/scripts/libos.sh
+           . /opt/iamguarded/scripts/libsuperset.sh
+
+          +should_i_switch_user(){
+          +  if am_i_root; then
+          +    if [[ "\$SUPERSET_DAEMON_USER" != "root" ]]; then
+          +       # Switch User
+          +       return 0
+          +    fi
+          +  fi
+          +  # Return false
+          +  return 1
+          +}
+          +
+           if [[ "\$SUPERSET_ROLE" = "webserver" ]]; then
+               command="gunicorn"
+               args=(
+          @@ -55,7 +66,7 @@
+           fi
+
+           info "** Starting Superset \${SUPERSET_ROLE} **"
+          -if am_i_root; then
+          +if should_i_switch_user; then
+               exec_as_user "\$SUPERSET_DAEMON_USER" "\${command}" "\${args[@]}"
+           else
+               exec "\${command}" "\${args[@]}"
+          EOF
+
+          patch /opt/iamguarded/scripts/superset/run.sh  < run.patch
       - uses: iamguarded/finalize-compat
         with:
           package: superset
@@ -186,7 +226,6 @@ subpackages:
             - coreutils
             - posix-libc-utils
             - cmd:useradd
-            - cmd:sudo
       pipeline:
         - uses: iamguarded/test-compat
           with:
@@ -200,21 +239,20 @@ subpackages:
               mkdir -p /opt/iamguarded/superset/tmp ; chmod 0777 /opt/iamguarded/superset/tmp
               mkdir -p /opt/iamguarded/superset/logs ; chmod 0777 /opt/iamguarded/superset/logs
               mkdir -p /opt/iamguarded/superset/superset_home ; chmod 0777 /opt/iamguarded/superset/superset_home
-              # TODO(wojciechka): remove once cleared.
-              chmod go+u /home/build
-              chown superset:superset /home/build
             start: |
-              sudo -usuperset env \
-                SUPERSET_DATABASE_HOST=localhost \
-                SUPERSET_HOME=/app/superset_home \
-                PATH=/usr/share/superset/venv/bin:$PATH \
-                SUPERSET_SECRET_KEY=1234 \
-                SUPERSET_ROLE=webserver \
-                FLASK_APP='superset.app:create_app()' \
-                PYTHONPATH=/app/pythonpath \
-                bash \
-                  /opt/iamguarded/scripts/superset/entrypoint.sh \
-                  /opt/iamguarded/scripts/superset/run.sh
+              env \
+              SUPERSET_DAEMON_USER=root \
+              SUPERSET_DAEMON_GROUP=root \
+              SUPERSET_DATABASE_HOST=localhost \
+              SUPERSET_HOME=/app/superset_home \
+              PATH=/usr/share/superset/venv/bin:$PATH \
+              SUPERSET_SECRET_KEY=1234 \
+              SUPERSET_ROLE=webserver \
+              FLASK_APP='superset.app:create_app()' \
+              PYTHONPATH=/app/pythonpath \
+              bash \
+                /opt/iamguarded/scripts/superset/entrypoint.sh \
+                /opt/iamguarded/scripts/superset/run.sh
             timeout: 60
             expected_output: |
               Welcome to the Iamguarded image for Superset
@@ -226,6 +264,13 @@ subpackages:
               Listening at: http://0.0.0.0:8080
               Using worker: gthread
               Booting worker with pid
+            # We expect the worker to ERROR as there isn't a database available
+            error_strings: |
+              FAIL
+              FATAL
+              Traceback.*most.recent.call
+              Exception in thread
+              command not found
 
 update:
   enabled: true

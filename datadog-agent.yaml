@@ -2,8 +2,8 @@ package:
   name: datadog-agent
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: "7.69.3"
-  epoch: 0 # GHSA-2464-8j7c-4cjm
+  version: "7.70.2"
+  epoch: 2 # GHSA-jc7w-c686-c4v9
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -25,7 +25,7 @@ capabilities:
     - CAP_SYS_ADMIN # This is needed to run unshare(1).
 
 vars:
-  py-version: "3.12"
+  python-version: "3.12"
   destd: /opt/datadog-agent
 
 var-transforms:
@@ -78,8 +78,8 @@ environment:
       - ninja
       - openssf-compiler-options
       - procps-dev
-      - py${{vars.py-version}}-build-base-dev
-      - py${{vars.py-version}}-semver
+      - py${{vars.python-version}}-build-base-dev
+      - py${{vars.python-version}}-semver
       - systemd-dev
       - util-linux-misc # unshare
       - wget # Required for downloading clang-12 and kernel headers from debian
@@ -104,24 +104,16 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: bec7e177929c0f232be31adb5fddd97febcfcda1
-
-  - uses: go/bump
-    with:
-      deps: |-
-        github.com/go-viper/mapstructure/v2@v2.4.0
-      modroot: internal/tools
+      expected-commit: 83bbd725677c102445fdf7963b631a919004af43
 
   - runs: |
       sed -i'' 's/v1\.3\.7/v1.6.1/g' go.mod
 
-  # Recent commit to the init.go code changed some of the logic of Python path resolving
-  # for the embedded Python, causing issues. Let's revert the commit to return to the previous
-  # behavior. This change was introduced for MacOS use-cases, so not relevant to Linux.
+  # Apply build fixes for system-probe compilation
   # https://github.com/DataDog/datadog-agent/pull/31426
   - uses: patch
     with:
-      patches: dont-import-python-relatively.patch fix-7.66.0-ftbfs.patch
+      patches: fix-7.66.0-ftbfs.patch
 
   # Ensure that we don't run into nvidia GPU issues at runtime.
   - runs: |
@@ -132,15 +124,18 @@ pipeline:
   # these won't leak into the package.
   - runs: |
       # install `invoke` and its dependencies
-      python${{vars.py-version}} -m pip install invoke requests toml pyyaml packaging codeowners
+      python${{vars.python-version}} -m pip install invoke requests toml pyyaml packaging codeowners
 
       # install `gitlab`
-      python${{vars.py-version}} -m pip install python-gitlab
+      python${{vars.python-version}} -m pip install python-gitlab
 
   - uses: go/bump
     with:
+      go-version: "1.24.7" # package built w/ go-1.24 - keeps tidy at 1.24.7, otherwise go mod tidy fails
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
+      deps: |-
+        github.com/ulikunitz/xz@v0.5.14
 
   - if: ${{build.arch}} == 'aarch64'
     name: Install clang-12
@@ -227,13 +222,44 @@ pipeline:
   - name: Build the RtLoader wrapper
     runs: |
       invoke -e rtloader.make \
-        --install-prefix="${{targets.destdir}}/usr" \
+        --install-prefix="${{targets.contextdir}}${{vars.destd}}/embedded" \
         --cmake-options="\
-          -DCMAKE_INSTALL_BINDIR=/usr/bin \
+          -DCMAKE_INSTALL_BINDIR=bin \
           -DCMAKE_INSTALL_LIBDIR=lib \
           -DCMAKE_CXX_FLAGS=-Os \
           -DCMAKE_C_FLAGS=-Os"
       invoke -e rtloader.install
+
+  - name: Setup Python libraries and symlinks
+    runs: |
+      # Create embedded directory structure
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/bin
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/lib
+
+      # Create Python 3.12 directory structure to match what the subpackage will create
+      # subpackage expects this directory structure to exist when it runs
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/lib/python3.12
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/lib/python3.12/site-packages
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/lib/python3.12/lib-dynload
+
+      # Copy Python 3.12 standard library from system
+      if [ -d /usr/lib/python3.12 ]; then
+        cp -r /usr/lib/python3.12/* ${{targets.contextdir}}${{vars.destd}}/embedded/lib/python3.12/
+      fi
+
+      # Create Python binary symlinks
+      cd ${{targets.contextdir}}${{vars.destd}}/embedded/bin
+      ln -sf python3.12 python3
+      ln -sf python3 python
+
+      # Symlink Python libraries needed by rtloader
+      ln -sf /usr/lib/libpython3.12.so.1.0 ${{targets.contextdir}}${{vars.destd}}/embedded/lib/libpython3.12.so.1.0
+      ln -sf /usr/lib/libpython3.12.so.1.0 ${{targets.contextdir}}${{vars.destd}}/embedded/lib/libpython3.12.so
+      ln -sf /usr/lib/libpython3.12.so.1.0 ${{targets.contextdir}}${{vars.destd}}/embedded/lib/libpython3.so
+
+      # Create ld.so.conf.d entry
+      mkdir -p ${{targets.contextdir}}/etc/ld.so.conf.d
+      echo "${{vars.destd}}/embedded/lib" > ${{targets.contextdir}}/etc/ld.so.conf.d/datadog-agent-embedded.conf
 
   - name: Build the agent
     runs: |
@@ -244,8 +270,8 @@ pipeline:
         --bundle trace-agent \
         --bundle system-probe \
         --bundle security-agent \
-        --exclude-rtloader \
         --no-development \
+        --python-home-3=/opt/datadog-agent/embedded \
         --embedded-path /usr/lib
         #--bundle-ebpf \ # Same as above for the system-probe.build Invoke task.
 
@@ -349,7 +375,7 @@ subpackages:
         - busybox
         - coreutils
         - findutils
-        - python-${{vars.py-version}}-base
+        - python-${{vars.python-version}}-base
     pipeline:
       - working-directory: /home/integrations
         pipeline:
@@ -366,22 +392,22 @@ subpackages:
               SOURCE_DATE_EPOCH=315532800
 
               # Create virtual environment
-              python${{vars.py-version}} -m venv .venv
+              python${{vars.python-version}} -m venv .venv
 
               # Install locked dependencies
-              .venv/bin/pip${{vars.py-version}} install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.py-version}}.txt
+              .venv/bin/pip${{vars.python-version}} install --require-hashes --only-binary=:all: --no-deps -r .deps/resolved/linux-${{build.arch}}_${{vars.python-version}}.txt
 
               excludes="datadog_checks_base datadog_checks_dev datadog_checks_tests_helper docker_daemon esxi teleport"
               checks=$(invoke -r /home/build agent.collect-integrations /home/integrations/ 3 linux --excluded "$excludes")
 
               # Install core, downloader, and dependencies
-              .venv/bin/pip${{vars.py-version}} install \
+              .venv/bin/pip${{vars.python-version}} install \
                 "./datadog_checks_base[deps, http]" \
                 "./datadog_checks_downloader" \
                 $(echo ${checks} | xargs -n1 echo | sed 's|^|./|')
 
               # Remediate GHSA-5rjg-fvgr-3xxf
-              .venv/bin/pip${{vars.py-version}} install --upgrade setuptools==78.1.1 protobuf==5.29.5
+              .venv/bin/pip${{vars.python-version}} install --upgrade setuptools==78.1.1 protobuf==5.29.5
 
               find .venv -name "*.pyc" -delete
               find .venv -name "__pycache__" -exec rm -rf {} +
@@ -389,7 +415,7 @@ subpackages:
               find .venv -name "pymqe.cpython*.so" -delete
 
               mkdir -p ${{targets.contextdir}}${{vars.destd}}
-              .venv/bin/pip${{vars.py-version}} freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
+              .venv/bin/pip${{vars.python-version}} freeze > ${{targets.contextdir}}${{vars.destd}}/final_constraints-py3.txt
 
               # Include the agent's requirements for the core integrations.
               cp requirements-agent-release.txt ${{targets.contextdir}}${{vars.destd}}/
@@ -682,12 +708,12 @@ test:
     - name: Ensure checks can be loaded (base)
       uses: python/import
       with:
-        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
+        python: ${{vars.destd}}/embedded/bin/python${{vars.python-version}}
         import: datadog_checks.base
     - name: Ensure checks can be loaded (downloader)
       uses: python/import
       with:
-        python: ${{vars.destd}}/embedded/bin/python${{vars.py-version}}
+        python: ${{vars.destd}}/embedded/bin/python${{vars.python-version}}
         import: datadog_checks.downloader
     - name: Execute bins
       runs: |

@@ -1,7 +1,7 @@
 package:
   name: trino
-  version: "476"
-  epoch: 9 # GHSA-2hmj-97jw-28jh
+  version: "477"
+  epoch: 0 # GHSA-mmxm-8w33-wc4h, GHSA-3p8m-j85q-pgmj
   description: The distributed SQL query engine for big data, formerly known as PrestoSQL
   copyright:
     - license: Apache-2.0
@@ -10,7 +10,7 @@ package:
     memory: 64Gi
   dependencies:
     runtime:
-      - openjdk-24-default-jvm
+      - openjdk-25-default-jvm
       - trino-config
 
 environment:
@@ -25,7 +25,9 @@ environment:
       - go
       - jvmkill
       - maven
-      - openjdk-24-default-jdk
+      - nodejs
+      - npm
+      - openjdk-25-default-jdk
       - upx
       - wolfi-base
 
@@ -34,7 +36,7 @@ pipeline:
     with:
       repository: https://github.com/trinodb/trino.git
       tag: ${{package.version}}
-      expected-commit: 7f3746a7fa0b27ace2470340e848feaf3ee73f48
+      expected-commit: aec2d2a4f0f57a0a0c9d4aee3a1dd59fcb513438
 
   - uses: git-checkout
     working-directory: ./airlift/launcher
@@ -45,17 +47,26 @@ pipeline:
 
   - working-directory: ./airlift/launcher
     runs: |
-      export JAVA_HOME=/usr/lib/jvm/java-24-openjdk
+      export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
       ./mvnw package
 
   - uses: maven/pombump
 
+  - name: "remove upstream artificial requirement for Oracle or Temurin JDKs"
+    runs: |
+      sed -i '/<requireJavaVendor>/,/<\/requireJavaVendor>/d' pom.xml
+      # Re-sort the pom.xml
+      ./mvnw sortpom:sort -q
+
   - runs: |
       set -x
 
-      export JAVA_HOME=/usr/lib/jvm/java-24-openjdk
+      export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
+      export NPM_CONFIG_CACHE=/home/build/.node
+      export NPM_CONFIG_PREFIX=/home/build/.node
 
-      ./mvnw package -q -DskipTests -Dmaven.source.skip=true -Dair.check.skip-all -T 8  -pl '!:trino-docs,!:trino-tests,!:trino-product-tests,!:trino-product-tests-launcher,!:trino-web-ui' -am
+      ./mvnw package -q -DskipTests -Dair.check.skip-all -Dmaven.enforcer.skip=true -Dmaven.test.failure.ignore=true \
+        -pl '!:trino-docs'
 
       mkdir -p ${{targets.destdir}}/usr/lib/trino
       cp ./core/trino-server/target/trino-server-${{package.version}}/NOTICE ${{targets.destdir}}/usr/lib/trino/
@@ -75,34 +86,39 @@ pipeline:
 data:
   - name: plugins
     items:
+      ai-functions: ai-functions
       bigquery: bigquery
       blackhole: blackhole
       cassandra: cassandra
       clickhouse: clickhouse
       delta-lake: delta-lake
       druid: druid
+      duckdb: duckdb
       elasticsearch: elasticsearch
       exasol: exasol
       exchange-filesystem: exchange-filesystem
       exchange-hdfs: exchange-hdfs
       faker: faker
+      functions-python: functions-python
       geospatial: geospatial
       google-sheets: google-sheets
       hive: hive
       http-event-listener: http-event-listener
-      http-server-event-listener: http-server-event-listener
       hudi: hudi
       iceberg: iceberg
       ignite: ignite
       jmx: jmx
-      kafka: kafka
       kafka-event-listener: kafka-event-listener
+      kafka: kafka
+      lakehouse: lakehouse
+      ldap-group-provider: ldap-group-provider
+      loki: loki
       mariadb: mariadb
       memory: memory
       ml: ml
       mongodb: mongodb
-      mysql: mysql
       mysql-event-listener: mysql-event-listener
+      mysql: mysql
       opa: opa
       openlineage: openlineage
       opensearch: opensearch
@@ -111,12 +127,14 @@ data:
       pinot: pinot
       postgresql: postgresql
       prometheus: prometheus
+      ranger: ranger
       redis: redis
       redshift: redshift
       resource-group-managers: resource-group-managers
       session-property-managers: session-property-managers
       singlestore: singlestore
       snowflake: snowflake
+      spooling-filesystem: spooling-filesystem
       sqlserver: sqlserver
       teradata-functions: teradata-functions
       thrift: thrift
@@ -134,6 +152,15 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/etc
           cp -r core/docker/default/etc ${{targets.subpkgdir}}/etc/trino
+    test:
+      pipeline:
+        - name: "verify the package has at least one file in the directory tree"
+          runs: |
+            dir="/etc/trino"
+            if ! find "$dir" -type f -print -quit | grep -q . ; then
+              echo "FAIL: No files found in [$dir] directory." >&2
+              exit 1
+            fi
 
   - name: ${{package.name}}-oci-entrypoint
     dependencies:
@@ -160,6 +187,13 @@ subpackages:
     test:
       pipeline:
         - uses: test/tw/ldd-check
+        - name: "verify main binary link is present and correctly configured"
+          runs: |
+            link="/usr/bin/run-trino"
+            if [ "$(readlink $link)" != "/usr/lib/trino/bin/run-trino" ] ; then
+              echo "FAIL: main binary link [$link] not correctly configured." >&2
+              exit 1
+            fi
 
   - range: plugins
     name: trino-plugin-${{range.key}}
@@ -177,6 +211,24 @@ subpackages:
             filename=$(basename $path)
             ln -s "../../lib/${filename}" "${{targets.subpkgdir}}/usr/lib/trino/plugin/${{range.value}}/${filename}"
           done
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "verify plugin JARs are correctly configured"
+          runs: |
+            dir="/usr/lib/trino/plugin/${{range.key}}/"
+            if ! find "$dir" -name "*.jar" -print -quit | grep -q . ; then
+              echo "FAIL: No .jar files found in [$dir] directory." >&2
+              exit 1
+            fi
+
+            find "$dir" -type l -name "*.jar" | while read -r link; do
+              target=$(readlink -f "$link")
+              if [ ! -e "$target" ]; then
+                echo "FAIL: Broken symlink [$link -> $target]." >&2
+                exit 1
+              fi
+            done
 
 update:
   enabled: true

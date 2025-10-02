@@ -1,0 +1,141 @@
+From 70c87b79f7cf5852896af70aa5ac181145db6e14 Mon Sep 17 00:00:00 2001
+From: Uti Edun <uti.edun@chainguard.dev>
+Date: Mon, 29 Sep 2025 12:41:20 +0000
+Subject: [PATCH] Fix deprecated werkzeug.__version__ usage with backward
+ compatibility
+
+Replace deprecated werkzeug.__version__ with modern importlib.metadata.version()
+approach while maintaining backward compatibility:
+
+- Try importlib.metadata.version() first (Python 3.8+ standard)
+- Fallback to importlib_metadata.version() (backport for older Python)
+- Final fallback to werkzeug.__version__ (deprecated but compatible)
+
+Also adds comprehensive tests for all version detection scenarios.
+
+Fixes deprecation warning: The __version__ attribute is deprecated.
+Use feature detection, or importlib.metadata.version('werkzeug'), instead.
+---
+ .../auth_manager/security_manager/override.py | 16 +++-
+ .../security_manager/test_override.py         | 74 ++++++++++++++++++-
+ 2 files changed, 88 insertions(+), 2 deletions(-)
+
+diff --git a/providers/fab/src/airflow/providers/fab/auth_manager/security_manager/override.py b/providers/fab/src/airflow/providers/fab/auth_manager/security_manager/override.py
+index 5f1653db99..790a844e54 100644
+--- a/providers/fab/src/airflow/providers/fab/auth_manager/security_manager/override.py
++++ b/providers/fab/src/airflow/providers/fab/auth_manager/security_manager/override.py
+@@ -765,7 +765,21 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
+         app.config.setdefault("AUTH_API_LOGIN_ALLOW_MULTIPLE_PROVIDERS", False)
+ 
+         from packaging.version import Version
+-        from werkzeug import __version__ as werkzeug_version
++
++        try:
++            # For werkzeug >= 3.0, use importlib.metadata.version
++            from importlib.metadata import version
++
++            werkzeug_version = version("werkzeug")
++        except ImportError:
++            # Fallback for older Python versions (< 3.8)
++            try:
++                from importlib_metadata import version
++
++                werkzeug_version = version("werkzeug")
++            except ImportError:
++                # Final fallback to deprecated __version__ for werkzeug < 3.0
++                from werkzeug import __version__ as werkzeug_version
+ 
+         parsed_werkzeug_version = Version(werkzeug_version)
+         if parsed_werkzeug_version < Version("3.0.0"):
+diff --git a/providers/fab/tests/unit/fab/auth_manager/security_manager/test_override.py b/providers/fab/tests/unit/fab/auth_manager/security_manager/test_override.py
+index 0a41328517..61f2f0bda5 100644
+--- a/providers/fab/tests/unit/fab/auth_manager/security_manager/test_override.py
++++ b/providers/fab/tests/unit/fab/auth_manager/security_manager/test_override.py
+@@ -17,7 +17,7 @@
+ from __future__ import annotations
+ 
+ from unittest import mock
+-from unittest.mock import Mock
++from unittest.mock import Mock, patch
+ 
+ from tests_common.test_utils.compat import ignore_provider_compatibility_error
+ 
+@@ -75,3 +75,75 @@ class TestFabAirflowSecurityManagerOverride:
+         sm.find_user = Mock(return_value=mock_user)
+         check_password.return_value = False
+         assert not sm.check_password("test_user", "test_password")
++
++    @patch("importlib.metadata.version")
++    def test_werkzeug_version_detection_modern(self, mock_version):
++        """Test werkzeug version detection using importlib.metadata (modern approach)."""
++        mock_version.return_value = "3.0.1"
++
++        sm = EmptySecurityManager()
++
++        # Test the version detection logic by directly calling the method that contains it
++        # We'll mock the app.config.setdefault to verify the right branch is taken
++        mock_app = Mock()
++        mock_app.config = {}
++
++        sm.init_config(mock_app)
++
++        # Verify that importlib.metadata.version was called
++        mock_version.assert_called_once_with("werkzeug")
++
++    @patch("importlib.metadata.version", side_effect=ImportError)
++    @patch("importlib_metadata.version")
++    def test_werkzeug_version_detection_backport(
++        self, mock_importlib_metadata_version, mock_importlib_version
++    ):
++        """Test werkzeug version detection using importlib_metadata (backport for older Python)."""
++        mock_importlib_metadata_version.return_value = "2.3.7"
++
++        sm = EmptySecurityManager()
++        mock_app = Mock()
++        mock_app.config = {}
++
++        sm.init_config(mock_app)
++
++        # Verify that importlib_metadata.version was called as fallback
++        mock_importlib_metadata_version.assert_called_once_with("werkzeug")
++
++    @patch("importlib.metadata.version", side_effect=ImportError)
++    @patch("importlib_metadata.version", side_effect=ImportError)
++    @patch("werkzeug.__version__", "2.0.3", create=True)
++    def test_werkzeug_version_detection_fallback(self, mock_importlib_metadata, mock_importlib):
++        """Test werkzeug version detection fallback to deprecated __version__."""
++        sm = EmptySecurityManager()
++        mock_app = Mock()
++        mock_app.config = {}
++        mock_app.config.setdefault = Mock()
++
++        sm.init_config(mock_app)
++
++        # Verify the config was set for older werkzeug version (pbkdf2 hash)
++        expected_hash = (
++            "pbkdf2:sha256:150000$Z3t6fmj2$22da622d94a1f8118c0976a03d2f18f680bfff877c9a965db9eedc51bc0be87c"
++        )
++        mock_app.config.setdefault.assert_any_call("AUTH_DB_FAKE_PASSWORD_HASH_CHECK", expected_hash)
++
++    @patch("importlib.metadata.version")
++    def test_werkzeug_version_detection_new_version_config(self, mock_version):
++        """Test config setting for werkzeug >= 3.0.0."""
++        mock_version.return_value = "3.0.0"
++
++        sm = EmptySecurityManager()
++        mock_app = Mock()
++        mock_app.config = {}
++        mock_app.config.setdefault = Mock()
++
++        sm.init_config(mock_app)
++
++        # Verify the config was set for newer werkzeug version (scrypt hash)
++        expected_hash = (
++            "scrypt:32768:8:1$wiDa0ruWlIPhp9LM$6e409d093e62ad54df2af895d0e125b05ff6cf6414"
++            "8350189ffc4bcc71286edf1b8ad94a442c00f890224bf2b32153d0750c89ee9"
++            "401e62f9dcee5399065e4e5"
++        )
++        mock_app.config.setdefault.assert_any_call("AUTH_DB_FAKE_PASSWORD_HASH_CHECK", expected_hash)
+-- 
+2.51.0
+

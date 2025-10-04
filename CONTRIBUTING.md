@@ -85,3 +85,10 @@ Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CV
 - When you're ready to submit a PR for a new package or to update a package, make sure your YAML file(s) are **formatted correctly**, so that they'll pass CI. We use [yam](https://github.com/chainguard-dev/yam) for YAML formatting. You should be able to run the `yam` command from the root of this repo to get all files formatted correctly.
 
 - When running a lot of melange builds using `docker` as a runner (default on Mac) you may want to increase the Docker VM CPU, Memory and especially storage resources, else Docker can easily run out of disk space.
+
+- To check whether a package is part of wolfi or not you just need to do an apk update. Fetch APKINDEX from https://apk.cgr.dev/chainguard/some-architecture/APKINDEX.tar.gz and do an apk search <package>. For example getconf is not present as separate package in this repo but it is a part of subpackage called posix-libc-utils which is part of wolfi
+
+
+
+
+

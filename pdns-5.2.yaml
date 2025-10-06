@@ -1,7 +1,7 @@
 package:
   name: pdns-5.2
   version: "5.2.5"
-  epoch: 1
+  epoch: 2
   description: PowerDNS Authoritative Server
   copyright:
     - license: GPL-2.0-or-later
@@ -144,6 +144,144 @@ pipeline:
   - uses: strip
 
 subpackages:
+  - name: ${{package.name}}-nosodium
+    description: PowerDNS Authoritative Server without libsodium
+    dependencies:
+      provides:
+        - pdns-nosodium=${{package.full-version}}
+    pipeline:
+      - uses: autoconf/configure
+        with:
+          opts: |
+            --sbindir=/usr/bin \
+            --with-modules="" \
+            --with-dynmodules="bind geoip ldap lmdb lua2 gmysql godbc pipe gpgsql remote gsqlite3" \
+            --enable-tools \
+            --enable-unit-tests \
+            --enable-systemd \
+            --disable-static \
+            --enable-remotebackend-zeromq=no \
+            --with-libcrypto=/usr \
+            --enable-ixfrdist \
+            --enable-reproducible \
+            --with-libsodium=no \
+            --with-gnutls=no
+      - uses: autoconf/make
+      - uses: autoconf/make-install
+      - assertions:
+          required-steps: 1
+        pipeline:
+          - if: ${{build.arch}} == "x86_64"
+            runs: make check
+          - if: ${{build.arch}} == "aarch64"
+            runs: PDNS_TEST_NO_IPV6=1 make check # aarch64 has issues with IPv6 tests on the CI, no error logs available
+      - name: Create necessary directories
+        runs: |
+          mkdir -p ${{targets.contextdir}}/etc/powerdns/pdns.d
+          mkdir -p ${{targets.contextdir}}/var/run/pdns/
+          mkdir -p ${{targets.contextdir}}/var/lib/powerdns
+      - uses: strip
+    test:
+      pipeline:
+        - runs: |
+            # this is dumb, but libmariadb.so.3 is not available here in tests  - apko solves for it at the image level
+            mkdir -p ${{targets.contextdir}}/usr/lib/
+            ln -sf /usr/lib/pdns/libgsqlite3backend.so /usr/lib/libmariadb.so.3
+        - uses: test/tw/ldd-check
+        - runs: |
+            set -euo pipefail
+            pdns_server --help
+            pdnsutil --help
+        - name: "Verify libsodium and gnutls are not loaded"
+          runs: |
+            set -euo pipefail
+            # Check that pdns_server binary does not link to libsodium or gnutls
+            if ldd /usr/bin/pdns_server | grep -E "(libsodium|libgnutls)"; then
+              echo "ERROR: pdns-nosodium should not link to libsodium or gnutls libraries"
+              exit 1
+            fi
+
+  - name: ${{package.name}}-recursor-nosodium
+    description: PowerDNS Recursive Server without libsodium
+    dependencies:
+      provides:
+        - pdns-recursor=${{package.full-version}}
+    pipeline:
+      - runs: BUILDER_VERSION=${{package.version}} BUILDER_MODULES=recursor autoreconf -vfi
+      - working-directory: ./pdns/recursordist
+        pipeline:
+          - uses: autoconf/configure
+            with:
+              opts: |
+                --sysconfdir=/etc/powerdns \
+                --sbindir=/usr/bin \
+                --enable-dns-over-tls \
+                --enable-unit-tests \
+                --enable-snmp \
+                --enable-dnstap \
+                --enable-nod \
+                --with-lua=lua${{vars.lua-version}} \
+                --with-libcrypto=/usr \
+                --with-libcap \
+                --with-libsodium=no \
+                --with-gnutls=no
+          - uses: autoconf/make
+          - uses: autoconf/make-install
+          - assertions:
+              required-steps: 1
+            pipeline:
+              - if: ${{build.arch}} == "x86_64"
+                runs: make check
+              - if: ${{build.arch}} == "aarch64"
+                runs: PDNS_TEST_NO_IPV6=1 make check # aarch64 has issues with IPv6 tests on the CI, no error logs available
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - pdns-recursor-compat
+            - wait-for-it
+        accounts:
+          groups:
+            - groupname: pdns
+              gid: 953
+          users:
+            - username: pdns
+              gid: 953
+              uid: 953
+          run-as: 0 # To bind :53 on the CI
+        environment:
+          TINI_SUBREAPER: 1
+          DEBUG_CONFIG: yes
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: |
+            pdns_recursor --help
+            rec_control --help
+        - name: "Verify libsodium and gnutls are not loaded"
+          runs: |
+            set -euo pipefail
+            # Check that pdns_recursor binary does not link to libsodium or gnutls
+            if ldd /usr/bin/pdns_recursor | grep -E "(libsodium|libgnutls)"; then
+              echo "ERROR: pdns-nosodium should not link to libsodium or gnutls libraries"
+              exit 1
+            fi
+        - name: "start daemon on localhost"
+          uses: test/daemon-check-output
+          with:
+            start: "/usr/bin/tini -- /usr/local/sbin/pdns_recursor-startup"
+            timeout: 30
+            expected_output: |
+              YAML config found and processed
+              Enabled TCP data-ready
+              Listening for queries
+              Launching worker threads
+              Launching tcpworker threads
+              Enabled multiplexer
+            post: |
+              wait-for-it -t 5 --strict localhost:8082
+              wait-for-it -t 5 --strict localhost:53
+
   - name: ${{package.name}}-recursor
     description: PowerDNS Recursive Server
     dependencies:

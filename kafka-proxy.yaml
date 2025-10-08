@@ -1,10 +1,18 @@
 package:
   name: kafka-proxy
   version: "0.4.3"
-  epoch: 3 # CVE-2025-47907
+  epoch: 4 # CVE-2025-47907
   description: Allows a service to connect to Kafka brokers without having to deal with SASL/PLAIN authentication and SSL certificates
   copyright:
     - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - libcap-utils
+  accounts:
+    # Need to run with privilege to be able to do setcap
+    run-as: root
 
 pipeline:
   - uses: git-checkout
@@ -22,8 +30,29 @@ pipeline:
     with:
       packages: .
       output: kafka-proxy
+      ldflags: -X github.com/grepplabs/kafka-proxy/config.Version=${{package.version}}
 
-  - uses: strip
+  - runs: |
+      setcap cap_net_bind_service=+ep "${{targets.contextdir}}/usr/bin/kafka-proxy"
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/opt/kafka-proxy/bin
+          ln -sf /usr/bin/kafka-proxy "${{targets.contextdir}}"/opt/kafka-proxy/bin/kafka-proxy
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+        - uses: test/tw/ver-check
+          with:
+            bins: /opt/kafka-proxy/bin/kafka-proxy
 
 update:
   enabled: true
@@ -32,7 +61,42 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    environment:
+      KAFKA_ADDRESS: "localhost:9092"
+      KAFKA_PROXY_ADDRESS: "localhost:32399"
+    contents:
+      packages:
+        - kafka
+        - uuidgen
+        - libcap-utils
   pipeline:
-    - runs: |
-        kafka-proxy --help
-        kafka-proxy version
+    - uses: test/tw/ver-check
+      with:
+        bins: kafka-proxy
+    - name: Test file capabilities
+      runs: |
+        getcap /usr/bin/kafka-proxy | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=ep$'
+    - name: "Test kafka-proxy startup"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          export PATH="/usr/lib/kafka/bin:$PATH"
+          CLUSTER_ID="$(kafka-storage.sh random-uuid)"
+          echo "Using cluster ID: $CLUSTER_ID"
+          kafka-storage.sh format -t "$CLUSTER_ID" -c /usr/lib/kafka/config/server.properties.original --standalone
+          kafka-server-start.sh /usr/lib/kafka/config/server.properties.original > /dev/null 2>&1 &
+        start: kafka-proxy server --bootstrap-server-mapping "${KAFKA_ADDRESS},${KAFKA_PROXY_ADDRESS}"
+        expected_output: |
+          Ready for new connections
+          Starting kafka-proxy
+        timeout: 30
+        post: |
+          export PATH="/usr/lib/kafka/bin:$PATH"
+          TOPIC_NAME="test-topic-$(uuidgen)"
+          PARTITIONS=1
+          REPLICATION_FACTOR=1
+
+          # Create and verify test topic
+          kafka-topics.sh --create --topic "${TOPIC_NAME}" --partitions "${PARTITIONS}" --replication-factor "${REPLICATION_FACTOR}" --if-not-exists --bootstrap-server ${KAFKA_PROXY_ADDRESS}
+          kafka-topics.sh --describe --topic "${TOPIC_NAME}" --bootstrap-server ${KAFKA_PROXY_ADDRESS} | grep "${TOPIC_NAME}"

@@ -1,0 +1,145 @@
+package:
+  name: coredns-1.13
+  version: "1.13.1"
+  epoch: 0
+  description: CoreDNS is a DNS server that chains plugins
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - coredns=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - libcap-utils
+      - make
+  accounts:
+    # Need to run with privilege to be able to do setcap
+    run-as: root
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 1db4568df6aaacda6ebbce87717156bd855f8103
+      repository: https://github.com/coredns/coredns
+      tag: v${{package.version}}
+
+  - runs: |
+      # Generate code and fetch plugins
+      GOLANG_VERSION=$(go version | awk '{print $3}' | sed 's/^go//') make gen
+
+  - uses: go/build
+    with:
+      ldflags: -X github.com/coredns/coredns/coremain.GitCommit=v${{package.version}}
+      output: coredns
+      packages: .
+
+  - runs: setcap cap_net_bind_service=+ep "${{targets.contextdir}}/usr/bin/coredns"
+
+subpackages:
+  - name: ${{package.name}}-compat
+    dependencies:
+      provides:
+        - coredns-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+          ln -s /usr/bin/coredns ${{targets.subpkgdir}}/coredns
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - runs: |
+            set -o pipefail
+            readlink -f /coredns | grep /usr/bin/coredns
+            /coredns --version
+            /coredns --help
+
+  - name: kuma-coredns-1.13
+    description: CoreDNS with plugins used by Kuma
+    dependencies:
+      provides:
+        - kuma-coredns=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # We need to explicitly set the GOLANG_VERSION since it's used by
+          # the make file below and if there are mismatches, things go bad.
+          # For more details: https://github.com/wolfi-dev/os/pull/36612#issuecomment-2547453359
+          export GOLANG_VERSION=`go version | sed -n 's/.*go\([0-9.]*\).*/\1/p'`
+
+          # Build with plugins used by Kuma
+          # Plugin list: https://github.com/kumahq/coredns-builds/blob/main/plugin.cfg
+          mv kuma-plugin.cfg plugin.cfg
+          # Generate code and fetch plugins
+          make gen
+      - uses: go/build
+        with:
+          ldflags: -X github.com/coredns/coredns/coremain.GitCommit=v${{package.version}}
+          output: coredns
+          packages: .
+    test:
+      environment:
+        contents:
+          packages:
+            - libcap-utils
+      pipeline:
+        - runs: |
+            coredns -version
+            coredns -plugins
+
+update:
+  enabled: true
+  github:
+    identifier: coredns/coredns
+    strip-prefix: v
+    tag-filter: v1.13.
+    use-tag: true
+
+# only passes with docker runner: `MELANGE_EXTRA_OPTS="--runner docker"
+test:
+  environment:
+    contents:
+      packages:
+        - bind-tools
+        - libcap-utils
+  pipeline:
+    - runs: |
+        coredns -version
+        coredns -plugins
+        coredns --version
+        coredns --help
+    - runs: |
+        cat > Corefile <<EOF
+        .:1053 {
+            file /home/build/db.wolfi.dev
+            log
+            errors
+            cache
+        }
+        EOF
+
+        cat > /home/build/db.wolfi.dev <<'EOF'
+        $TTL 3600
+        @    IN SOA ns1.wolfi.dev. admin.wolfi.dev. (
+                  20240101   ; Serial
+                  7200       ; Refresh
+                  3600       ; Retry
+                  1209600    ; Expire
+                  3600 )     ; Negative Cache TTL
+        ;
+        @    IN NS  ns1.wolfi.dev.
+        ;
+        foo.wolfi.dev  IN TXT "hi"
+        EOF
+
+        coredns > /dev/null 2>&1 &
+        sleep 2
+
+        # validates intree plugins can be successfully loaded
+        dig @localhost -p 1053 foo.wolfi.dev TXT +short | grep -q '"hi"'
+    - name: Test file capabilities
+      runs: |
+        getcap /usr/bin/coredns | cut -d ' ' -f2 | grep -q -E '^cap_net_bind_service=ep$'

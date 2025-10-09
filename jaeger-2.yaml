@@ -1,0 +1,159 @@
+package:
+  name: jaeger-2
+  version: "2.11.0"
+  epoch: 0
+  description: Jaeger, a Distributed Tracing Platform
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - jaeger=${{package.full-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/jaegertracing/jaeger
+      tag: v${{package.version}}
+      expected-commit: c17f97d4add9f96e52852f8f238689568e8a48d9
+      recurse-submodules: true
+
+  - working-directory: jaeger-ui
+    runs: |
+      npm pkg set resolutions.react-icons=5.0.1
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - nodejs-20
+      - npm
+
+data:
+  - name: jaeger-components
+    items:
+      all-in-one: "."
+      anonymizer: "."
+      collector: "."
+      es-index-cleaner: "."
+      es-rollover: "."
+      esmapping-generator: "."
+      ingester: "."
+      query: "."
+      remote-storage: "."
+      tracegen: "."
+
+subpackages:
+  - range: jaeger-components
+    name: "${{package.name}}-${{range.key}}"
+    dependencies:
+      provides:
+        - jaeger-${{range.key}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          ## Only run this step if building for all-in-one package
+          ## This builds the ui component of jaeger with npm
+          if [[ "${{range.key}}" = "all-in-one" ]]; then
+            mkdir -p jaeger-ui/packages/jaeger-ui/build
+            rm -rf cmd/query/app/ui/actual/*
+            npm install --prefix jaeger-ui/
+            cd jaeger-ui/packages/jaeger-ui/build
+            npm install
+            npm run build
+          fi
+      - runs: |
+          ## Only run this step if building for all-in-one package
+          ## This copies the build artifact into a go package
+          COMPONENT="${{range.key}}"
+          if [[ "$COMPONENT" = "all-in-one" ]]; then
+            cp -r jaeger-ui/packages/jaeger-ui/build/* cmd/query/app/ui/actual
+            find cmd/query/app/ui/actual -type f | grep -v .gitignore | xargs gzip --no-name
+            touch -t "$(date -r jaeger-ui/packages/jaeger-ui/build/index.html '+%Y%m%d%H%M.%S')" cmd/query/app/ui/actual/index.html.gz
+          fi
+      - runs: |
+          COMPONENT="${{range.key}}"
+          if [[ "$COMPONENT" = "all-in-one" ]]; then
+            mkdir -p "${{targets.contextdir}}/etc/jaeger"
+            install -m644 "./sampling_strategies.json" "${{targets.contextdir}}"/etc/jaeger/sampling_strategies.json
+          fi
+      - uses: go/build
+        with:
+          packages: ./cmd/${{range.key}}
+          ldflags: -X github.com/jaegertracing/jaeger/internal/version.latestVersion=v${{package.version}} -X github.com/jaegertracing/jaeger/internal/version.commitSHA=$(git rev-parse HEAD) -X github.com/jaegertracing/jaeger/internal/version.date=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+          output: ${{range.key}}
+    test:
+      pipeline:
+        - runs: |
+            apk add ${{package.name}}-${{range.key}}
+            ${{range.key}} --help
+        - name: version check
+          runs: |
+            COMPONENT="${{range.key}}"
+            if [[ "$COMPONENT" != "es-index-cleaner" && "$COMPONENT" != "es-rollover" ]]; then
+              echo "Checking version of ${{range.key}}"
+              ${{range.key}} version 2>&1| grep ${{package.version}}
+            fi
+
+  - range: jaeger-components
+    name: "${{package.name}}-${{range.key}}-compat"
+    dependencies:
+      provides:
+        - jaeger-${{range.key}}-compat=${{package.full-version}}
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts for all Jaeger components"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/go/bin"
+          ln -sf /usr/bin/${{range.key}} ${{targets.contextdir}}/go/bin/${{range.key}}-linux
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-all-in-one
+        - ${{package.name}}-anonymizer
+        - ${{package.name}}-collector
+        - ${{package.name}}-es-index-cleaner
+        - ${{package.name}}-es-rollover
+        - ${{package.name}}-esmapping-generator
+        - ${{package.name}}-ingester
+        - ${{package.name}}-query
+        - ${{package.name}}-remote-storage
+        - ${{package.name}}-tracegen
+        - jq
+  pipeline:
+    - name: "Check all in one status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/all-in-one"
+        timeout: 60
+        expected_output: |
+          Starting HTTP server
+    - name: "Check connector status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/collector"
+        timeout: 60
+        expected_output: |
+          Admin server started
+    - name: "Check query status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/query"
+        timeout: 60
+        expected_output: |
+          Admin server started
+    - name: "Check ingester status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/query"
+        timeout: 60
+        expected_output: |
+          Admin server started
+
+update:
+  enabled: true
+  github:
+    use-tag: true
+    identifier: jaegertracing/jaeger
+    strip-prefix: v
+    tag-filter-prefix: v2

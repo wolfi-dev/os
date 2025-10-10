@@ -10,34 +10,99 @@ inputs:
     description: |
       "Indirect dependencies to bundle. Provide a line or space separated list of Python packages with constraints."
     default: ""
+  dev-group:
+    description: "Toggle the dev dependency group."
+    default: "false"
+  extra-groups:
+    description: "Extra groups to include in requirements."
+    default: ""
   package:
     description: "Name of main package to install."
-    required: true
+    default: ""
+  pyproject:
+    description: "Path to pyproject"
+    default: "pyproject.toml"
   python:
     description: "Path to Python executable."
     default: "/usr/bin/python3"
+  # This is only ever required if requires-python is higher than the version
+  # constraint for dependencies. This is a non-issue for anything that has a
+  # uv lockfile already, but for projects that don't, we may need to do this
+  #
+  # Example input:
+  # "== '3.13'" or ">= '${{vars.python-version}}'"
+  #
+  # The single quotes around the version are required
+  python-version-constraint:
+    description: "Constraint for the version(s) of Python supported by requirements."
+    default: ""
 
 pipeline:
   - runs: |
       # Set Python path
       export "UV_PYTHON=${{inputs.python}}"
 
-      # Initialize dummy project
-      project_dir=$(mktemp -d); cd $project_dir
-      uv init
+      if [ -f "${{inputs.pyproject}}" ] && [ -z "${{inputs.package}}" ]; then
+        echo "Project found. Locking..."
+        project_dir="$(dirname ${{inputs.pyproject}})"; cd $project_dir
+
+        # Set Python version constraint, if provided
+        if ! grep -q "^\[tool\.uv\]" "${{inputs.pyproject}}"; then
+          if [ -n "${{inputs.python-version-constraints}}" ]; then
+            {
+              echo "[tool.uv]"
+              echo "environments = [\"python_version ${{inputs.python-version-constraints}} \"]"
+            } >> "${{inputs.pyproject}}"
+          fi
+        else
+          echo "tool.uv already defined in ${{inputs.pyproject}}!"
+          echo "Failed to set Python version constraint."
+          exit 1
+        fi
+
+        # Now, lock the project
+        uv lock
+      elif [ -n "${{inputs.package}}" ]; then
+        echo "Initializing project..."
+        project_dir="$(mktemp -d)"; cd $project_dir
+
+        # Initialize dummy project
+        uv init
+
+        # Add version-constrained main package
+        # The package version must align with the version of our main package
+        uv add "${{inputs.package}}==${{package.version}}"
+      else
+        echo "Failed to parse main package!"
+        echo "When a project is not present, a package must be defined."
+        exit 1
+      fi
 
       # Add any indirect dependencies
-      for pkg in "${{inputs.dependencies}}"; do
-        uv add $pkg
-      done
+      if [ -n "${{inputs.dependencies}}" ]; then
+        for pkg in "${{inputs.dependencies}}"; do
+          uv add $pkg
+        done
+      fi
 
-      # Add version-constrained main package
-      # The package version must align with the version of our main package
-      uv add ${{inputs.package}}==${{package.version}}
+      # Disable inclusion of dev group by default
+      export_options="--no-dev"
+
+      # Reset export options, if dev group included
+      if [ "${{inputs.dev-group}}" = "true" ]; then
+        export_options=""
+      fi
+
+      # Append any extra groups, if provided
+      if [ -n "${{inputs.extra-groups}}" ]; then
+        for group in "${{inputs.extra-groups}}"; do
+          extra_options="$extra_options --extra $group"
+        done
+      fi
 
       # Export locked requirements
       echo "Copy the following into ${{package.name}}/requirements.locked:"
-      uv export
+      uv export "$export_options"
 
       # Exit so that output can be easily copied      
       exit 1

@@ -10,6 +10,7 @@ else
 endif
 TARGETDIR = packages/${ARCH}
 
+DOCKER ?= $(shell which docker)
 MELANGE ?= $(shell which melange)
 WOLFICTL ?= $(shell which wolfictl)
 KEY ?= local-melange.rsa
@@ -194,7 +195,7 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 
 .PHONY: dev-container
 dev-container:
-	docker run --pull=always --privileged --rm -it \
+	$(DOCKER) run --pull=always --privileged --rm -it \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
@@ -213,7 +214,7 @@ local-wolfi: $(KEY)
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --pull=always --rm -it \
+	$(DOCKER) run --pull=always --rm -it \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
@@ -263,7 +264,7 @@ dev-container-wolfi: $(KEY)
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --pull=always --rm -it \
+	$(DOCKER) run --pull=always --rm -it \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \

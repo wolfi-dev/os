@@ -198,6 +198,7 @@ dev-container:
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
+	    -e HTTP_AUTH \
 	    ghcr.io/wolfi-dev/sdk:latest
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages

@@ -1,7 +1,7 @@
 package:
   name: airflow-3
   version: "3.1.0"
-  epoch: 0
+  epoch: 1
   description: Platform to programmatically author, schedule, and monitor workflows
   options:
     #  There is a dependency on libarrow.so although it
@@ -29,6 +29,9 @@ package:
     - license: Apache-2.0
 
 vars:
+  airflow-home: '/opt/airflow'
+  # This should be /home/airflow/.local in the future
+  venv-home: '/opt/airflow'
   # As of now (2025/04/28), airflow is primarily available for python 3.12 and will break for python 3.13
   # For ref: https://airflow.apache.org/blog/airflow-2.9.0
   python-version: 3.12
@@ -94,7 +97,7 @@ pipeline:
       yarn run build
       rm -rf node_modules
 
-  - name: "Build and install the main package"
+  - name: "Build and install"
     runs: |
       # requires EPOCH to be later that 1980
       export SOURCE_DATE_EPOCH=315532800
@@ -102,27 +105,30 @@ pipeline:
       # To install mysqlclient wheel
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
 
+      # Create virtual environment
+      uv venv ${{vars.venv-home}} --system-site-packages
+      source ${{vars.venv-home}}/bin/activate
+
       python${{vars.python-version}} -m build --wheel
       # We need to use uv to avoid `resolution to deep` errors`
-      uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
+      uv pip install --verbose --upgrade --resolution highest dist/*.whl
 
       # We need to add this additionally  because graphviz is an optional dependency https://github.com/apache/airflow/blob/d2c9563605ca6d3dc40ec0fc2fe6853c86641441/airflow-core/pyproject.toml#L157
-      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow graphviz
+      uv pip install --verbose --upgrade graphviz
 
       # CVE-2025-50181 CVE-2025-50182
-      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow urllib3==2.5.0
+      uv pip install --verbose --upgrade urllib3==2.5.0
 
       # GHSA-9548-qrrj-x5pj
-      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow aiohttp==3.12.14
+      uv pip install --verbose --upgrade aiohttp==3.12.14
 
       # GHSA-2c2j-9gv5-cj73
-      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow starlette==0.47.2
+      uv pip install --verbose --upgrade starlette==0.47.2
 
       # GHSA-847f-9342-265h
-      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow h2==4.3.0
+      uv pip install --verbose --upgrade h2==4.3.0
 
-  - name: "Build and install the additional provider packages"
-    runs: |
+      # Build and install the additional provider packages
       # By default, the airflow celery provider is not built, but running the upstream helm chart requires it
       # There are a few others we want to include by default as well
 
@@ -130,10 +136,9 @@ pipeline:
       for pkg in ${{vars.providers}}; do
         cd "$pkg"
 
-        # Python will sometimes pull a 2.x airflow version, we do not want this.
-        if [[ "$pkg" == "celery" ]]; then
-            sed -i 's/"apache-airflow>=2.9.0"/"apache-airflow==${{package.version}}"/' pyproject.toml
-        fi
+        # Providers may have an rdep on airflow.
+        # Do not reinstall airflow.
+        sed -i '/apache-airflow.*=.*/d' pyproject.toml
 
         # apache-airflow-providers-mysql links against libcrypto.so.1.1 on arm64, and does not provide the
         # necessary source files to rebuild the package for arm against libcrypto3 (like the x86 version is),
@@ -147,53 +152,46 @@ pipeline:
 
         # Build and install the wheel
         python${{vars.python-version}} -m build --wheel
-        uv pip install --verbose --upgrade --resolution highest --prefix=${{targets.contextdir}}/opt/airflow dist/*.whl
+        uv pip install --verbose --upgrade --resolution highest dist/*.whl
         cd -
       done
+      cd ${{package.srcdir}}
 
-  - name: "bump snowflake provider to remediate CVE-2025-50213"
-    runs: |
-      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow apache-airflow-providers-snowflake>=6.4.0
+      # bump snowflake provider to remediate CVE-2025-50213
+      uv pip install --verbose --upgrade apache-airflow-providers-snowflake>=6.4.0
 
-  # Flask >2.2.5 is not supported. Using Flask > 2.2.5 causes the same issue
-  # as the one documented here:
-  # - https://github.com/spec-first/connexion/issues/1699#issuecomment-1524042812
-  # Upstream is working on supporting Flask 2.2.5+, as documented in the issue
-  # and PR below:
-  # - https://github.com/apache/airflow/issues/52509
-  # - https://github.com/apache/airflow/pull/50960
-  - name: "Downgrade Flask 2.2.5"
-    runs: |
-      uv pip install --verbose --upgrade --prefix=${{targets.contextdir}}/opt/airflow Flask==2.2.5
+      # Flask >2.2.5 is not supported. Using Flask > 2.2.5 causes the same issue
+      # as the one documented here:
+      # - https://github.com/spec-first/connexion/issues/1699#issuecomment-1524042812
+      # Upstream is working on supporting Flask 2.2.5+, as documented in the issue
+      # and PR below:
+      # - https://github.com/apache/airflow/issues/52509
+      # - https://github.com/apache/airflow/pull/50960
+      uv pip install --verbose --upgrade Flask==2.2.5
 
-  - runs: find . -name '__pycache__' -exec rm -rf {} +
+      # Remove litellm log file that generates secret alerts from trivy
+      find ${{vars.venv-home}}/lib/python${{vars.python-version}} -name 'litellm.log' -exec rm -f {} +
 
-  - name: "Remove litellm log file that generates secret alerts from trivy"
-    runs: |
-      find ${{targets.contextdir}}/opt/airflow/lib/python${{vars.python-version}} -name 'litellm.log' -exec rm -f {} +
+      # Replace hooks.slack.com with something obviously not hooks.slack.com to avoid secret alert from trivy
+      find ${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages/litellm -name _types.py -exec sed -i "s/hooks.slack.com/nothooks.slack.com/g" {} +
 
-  - name: "Replace hooks.slack.com with something obviously not hooks.slack.com to avoid secret alert from trivy"
-    runs: |
-      find ${{targets.contextdir}}/opt/airflow/lib/python${{vars.python-version}}/site-packages/litellm -name _types.py -exec sed -i "s/hooks.slack.com/nothooks.slack.com/g" {} +
-
-  - name: "Remove any patch related files from the install tree"
-    runs: |
-      find ${{targets.contextdir}}/opt/airflow/lib/python${{vars.python-version}} -name "*.orig" -print -exec rm -f {} +
-
-  - runs: |
-      chmod 0644 ${{targets.contextdir}}/opt/airflow/.lock
-
-      mkdir -p ${{targets.destdir}}/opt/airflow/dags
-      mkdir -p ${{targets.destdir}}/opt/airflow/logs
-      mkdir -p ${{targets.destdir}}/scripts/docker
+      # Remove any patch related files from the install tree
+      find ${{vars.venv-home}}/lib/python${{vars.python-version}} -name "*.orig" -print -exec rm -f {} +
 
       # The first time you run Airflow, it will create a file called `airflow.cfg` in
       # `$AIRFLOW_HOME` directory
       # However, for production case it is advised to generate the configuration
-      export PYTHONPATH=${{targets.contextdir}}/opt/airflow:${{targets.contextdir}}/opt/airflow/lib/python${{vars.python-version}}/site-packages
-      export PATH=${{targets.contextdir}}/opt/airflow/bin:$PATH
+      airflow config list --defaults > ${{targets.destdir}}/"airflow.cfg"
 
-      ${{targets.destdir}}/opt/airflow/bin/airflow config list --defaults > ${{targets.destdir}}/"airflow.cfg"
+      # Install
+      mkdir -p ${{targets.contextdir}}/opt
+      mv ${{vars.venv-home}} ${{targets.contextdir}}/opt/
+
+      chmod 0644 ${{targets.contextdir}}/${{vars.venv-home}}/.lock
+
+      mkdir -p ${{targets.destdir}}/${{vars.airflow-home}}/dags
+      mkdir -p ${{targets.destdir}}/${{vars.airflow-home}}/logs
+      mkdir -p ${{targets.destdir}}/scripts/docker
 
       cp airflow-core/src/airflow/config_templates/default_webserver_config.py ${{targets.contextdir}}/
 
@@ -204,6 +202,8 @@ pipeline:
 
 subpackages:
   - name: ${{package.name}}-compat
+    options:
+      no-depends: true
     dependencies:
       runtime:
         - ${{package.name}}
@@ -214,8 +214,8 @@ subpackages:
     pipeline:
       - runs: |
           # Symlink libstdc++ from usr/lib to /usr/lib/$(uname -m)-linux-gnu/
-          mkdir -p ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu
-          ln -sf /usr/lib/libstdc++.so.6 ${{targets.subpkgdir}}/usr/lib/$(uname -m)-linux-gnu/
+          mkdir -p ${{targets.contextdir}}/usr/lib/$(uname -m)-linux-gnu
+          ln -s /usr/lib/libstdc++.so.6 ${{targets.contextdir}}/usr/lib/$(uname -m)-linux-gnu/
     test:
       pipeline:
         - uses: test/virtualpackage
@@ -226,7 +226,7 @@ subpackages:
   - name: ${{package.name}}-iamguarded-compat
     dependencies:
       runtime:
-        - ${{package.name}}
+        - ${{package.name}}=${{package.full-version}}
         - bash
         - busybox
         - coreutils
@@ -243,10 +243,10 @@ subpackages:
           version: ${{vars.major-version}}
       - runs: |
           mkdir -p /opt/iamguarded
-          ln -sf /opt/airflow /opt/iamguarded
-          mkdir -p ${{targets.contextdir}}/opt/airflow/venv
+          ln -s ${{vars.venv-home}} /opt/iamguarded
+          mkdir -p ${{targets.contextdir}}/${{vars.airflow-home}}/venv
           chmod g+rwX /opt/iamguarded
-          ln -sf /opt/airflow/lib /opt/airflow/bin ${{targets.contextdir}}/opt/airflow/venv
+          ln -s ${{vars.venv-home}} ${{targets.contextdir}}/${{vars.airflow-home}}/venv
           mkdir -p ${{targets.contextdir}}/opt/airflow/bin
           touch ${{targets.contextdir}}/opt/airflow/bin/activate
           chmod 0755 ${{targets.contextdir}}/opt/airflow/bin/activate
@@ -316,32 +316,41 @@ test:
     contents:
       packages:
         - py${{vars.python-version}}-pip
+    accounts:
+      groups:
+        - groupname: airflow
+          gid: 1001
+      users:
+        - username: airflow
+          gid: 1001
+          uid: 1001
+      run-as: 0
+    environment:
+      HOME: /home/airflow
   pipeline:
     - name: "Ensure no airflow 2.x components are pulled in by mistake"
       runs: |
-        pip list --path=/opt/airflow/lib/python${{vars.python-version}}/site-packages/ | grep airflow
-        ls -lah /opt/airflow/lib/python${{vars.python-version}}/site-packages/
+        pip list --path=${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages/ | grep airflow
+        ls -lah ${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages/
 
         # A known bad file example: apache_airflow-2.10.5.dist-info
-        if ls -1 /opt/airflow/lib/python${{vars.python-version}}/site-packages | grep -q "apache_airflow-2.*.dist-info"; then
+        if ls -1 ${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages | grep -q "apache_airflow-2.*.dist-info"; then
             echo "Error: apache_airflow-2.* file(s) found! Please diagnose"
             exit 1
         fi
     - name: "Test Python package import and version"
       runs: |
-        export PATH=/opt/airflow/bin:$PATH
-        export PYTHONPATH=/opt/airflow/lib/python${{vars.python-version}}/site-packages
-        HOME=/home/build airflow version | grep ${{package.version}}
+        source ${{vars.venv-home}}/bin/activate
+        airflow version | grep ${{package.version}}
         python${{vars.python-version}} -c "import airflow"
     - name: "Test Flask is at the supported version"
       runs: |
         set -e
-        export PYTHONPATH=/opt/airflow/lib/python${{vars.python-version}}/site-packages
+        source ${{vars.venv-home}}/bin/activate
         python -c "from flask.json import JSONEncoder"
     - name: "List providers"
       runs: |
-        export PATH=/opt/airflow/bin:$PATH
-        export PYTHONPATH=/opt/airflow/lib/python${{vars.python-version}}/site-packages
+        source ${{vars.venv-home}}/bin/activate
 
         PROVIDERS_LIST=$(airflow providers list)
         echo $PROVIDERS_LIST
@@ -352,9 +361,9 @@ test:
         done
     - name: "Load and test a DAG"
       runs: |
+        source ${{vars.venv-home}}/bin/activate
+
         # Set environment variables
-        export PATH=/opt/airflow/bin:$PATH
-        export PYTHONUSERBASE=/opt/airflow
         export AIRFLOW_HOME=/opt/airflow
 
         # Prevents warnings about example dags not being in the right place under /opt/airflow

@@ -1,0 +1,242 @@
+From 18c86161449040fa1c1c45117308f5b30cec8410 Mon Sep 17 00:00:00 2001
+From: Scott Moser <smoser@brickies.net>
+Date: Thu, 16 Oct 2025 17:11:41 -0400
+Subject: [PATCH] Replace use of ssh-keygen with python code to do the same.
+
+Along the way, add pytest entry for tox.ini, and bump
+the versions of pylint and pycodestyle.
+
+pylint at the older version won't allow the use of fstrings.
+fstrings are supported in anything greater than 3.5.  python 3.5
+went EOL in 2020, so I think its safe to use fstrings now.
+
+Upstream PR: https://code.launchpad.net/~smoser/ssh-import-id/+git/ssh-import-id/+merge/494576
+---
+ .pylintrc                             |   7 ++
+ ssh_import_id/__init__.py             | 100 +++++++++++++++++++-------
+ ssh_import_id/test_key_fingerprint.py |  29 ++++++++
+ tox.ini                               |  16 +++--
+ 4 files changed, 121 insertions(+), 31 deletions(-)
+ create mode 100644 ssh_import_id/test_key_fingerprint.py
+
+diff --git a/.pylintrc b/.pylintrc
+index 5d1ab14..b876281 100644
+--- a/.pylintrc
++++ b/.pylintrc
+@@ -3,6 +3,13 @@ disable=
+   inconsistent-return-statements,
+   invalid-name,
+   missing-docstring,
++  broad-exception-raised,
++  consider-using-f-string,
++  consider-using-with,
++  possibly-used-before-assignment,
++  raise-missing-from,
++  unspecified-encoding,
++  line-too-long,
+ 
+ [REPORTS]
+ output-format=parseable
+diff --git a/ssh_import_id/__init__.py b/ssh_import_id/__init__.py
+index 034adda..b483457 100644
+--- a/ssh_import_id/__init__.py
++++ b/ssh_import_id/__init__.py
+@@ -18,7 +18,10 @@
+ # along with ssh-import-id.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ import argparse
++import binascii
++import base64
+ import getpass
++import hashlib
+ import json
+ try:
+     from json.decoder import JSONDecodeError
+@@ -26,9 +29,8 @@ except ImportError:
+     JSONDecodeError = ValueError
+ import logging
+ import os
+-import subprocess
++import struct
+ import sys
+-import tempfile
+ import urllib.error
+ from urllib.parse import quote_plus
+ from urllib.request import Request, urlopen
+@@ -81,36 +83,80 @@ def die(msg):
+     sys.exit(1)
+ 
+ 
++def read_string(buf, off):
++    if off + 4 > len(buf):
++        raise SystemExit("truncated:%s" % buf)
++    slen = struct.unpack(">I", buf[off:off + 4])[0]
++    off += 4
++    return buf[off:off + slen], off + slen
++
++
++def rsa_keylen(buf):
++    alg, off = read_string(buf, 0)
++    if alg != b'ssh-rsa':
++        raise ValueError(f"key is type {alg} not ssh-rsa: {buf}")
++    _, off = read_string(buf, off)  # exponent
++    klenbuf, off = read_string(buf, off)
++    return int.from_bytes(klenbuf, 'big').bit_length()
++
++
++def dsa_keylen(buf):
++    alg, off = read_string(buf, 0)
++    if alg != b'ssh-dss':
++        raise ValueError(f"key is type {alg} not ssh-dss: {buf}")
++    mpint, off = read_string(buf, off)
++    return int.from_bytes(mpint, 'big').bit_length()
++
++
+ def key_fingerprint(fields):
+     """
+-    Get the fingerprint for an SSH public key
+-    Returns None if not valid key material
++    Compute the SSH public key fingerprint as would be output with
++    ssh-keygen -l -f <file>
++    Example:
++      key_fingerprint(['ssh-ed25519',
++        'AAAAC3NzaC1lZDI1NTE5AAAAIMkGoTfVoNpsJrNxzq9WpRhlCp0qsPwsOHopWxNbIM8Z',
++        'smoser@frink'])
++      -> ['256', 'SHA256:XCEFfvF2V6u0ESVb/GLp/HAHVCZMoi36uskzHxTBUk0',
++          'smoser@frink', '(ED25519)']
+     """
+-    if not fields:
+-        return None
+-    if len(fields) < 3:
++    if not fields or len(fields) < 2:
+         return None
+-    tempfd, tempname = tempfile.mkstemp(
+-        prefix='ssh-auth-key-check', suffix='.pub')
+-    TEMPFILES.append(tempname)
+-    with os.fdopen(tempfd, "w") as tempf:
+-        tempf.write(" ".join(fields))
+-        tempf.write("\n")
+-    keygen_proc = subprocess.Popen(
+-        ['ssh-keygen', '-l', '-f', tempname], stdout=subprocess.PIPE)
+-    keygen_out, _ = keygen_proc.communicate(None)
+-    if keygen_proc.returncode:
+-        # Non-zero RC: probably not a public key
+-        return None
+-    os.unlink(tempname)
+-    keygen_fields = keygen_out.split()
+-    if not keygen_fields or len(keygen_fields) < 2:
+-        # Empty output?
++
++    key_type = fields[0]
++    key_b64 = fields[1]
++    comment = ' '.join(fields[2:]) if len(fields) > 2 else "no comment"
++
++    try:
++        key_ascii = key_b64.encode("ascii")
++        key_bytes = base64.b64decode(key_ascii)
++    except (UnicodeDecodeError, binascii.Error):
+         return None
+-    out = []
+-    for k in keygen_out.split():
+-        out.append(str(k.decode('utf-8').strip()))
+-    return out
++
++    # Compute SHA256 fingerprint (same as ssh-keygen -l -E sha256)
++    digest = hashlib.sha256(key_bytes).digest()
++    fp_b64 = base64.b64encode(digest).decode("ascii").rstrip("=")
++    fingerprint = f"SHA256:{fp_b64}"
++
++    # Map key type to bit length and printable type name
++    key_map = {
++        "ssh-ed25519": ("256", "ED25519"),
++        "ssh-dss": ("1024", "DSA"),
++        "ecdsa-sha2-nistp256": ("256", "ECDSA"),
++        "ecdsa-sha2-nistp384": ("384", "ECDSA"),
++        "ecdsa-sha2-nistp521": ("521", "ECDSA"),
++        "sk-ecdsa-sha2-nistp256@openssh.com": ("256", "ECDSA-SK"),
++        "sk-ssh-ed25519@openssh.com": ("256", "ED25519-SK"),
++    }
++
++    # rsa and dsa have variable length keys
++    if key_type == "ssh-rsa":
++        bits, ptype = (str(rsa_keylen(key_bytes)), "RSA")
++    elif key_type == "ssh-dss":
++        bits, ptype = (str(dsa_keylen(key_bytes)), "DSA")
++    else:
++        bits, ptype = key_map.get(key_type, ("?", f"{key_type}"))
++
++    return [bits, fingerprint, comment, f"({ptype})"]
+ 
+ 
+ def open_output(name, mode='a+'):
+diff --git a/ssh_import_id/test_key_fingerprint.py b/ssh_import_id/test_key_fingerprint.py
+new file mode 100644
+index 0000000..4e0bd49
+--- /dev/null
++++ b/ssh_import_id/test_key_fingerprint.py
+@@ -0,0 +1,29 @@
++# flake8: noqa
++import pytest
++import ssh_import_id
++
++
++@pytest.mark.parametrize("keyline, expected", [
++    ('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkGoTfVoNpsJrNxzq9WpRhlCp0qsPwsOHopWxNbIM8Z smoser@frink',
++     '256 SHA256:XCEFfvF2V6u0ESVb/GLp/HAHVCZMoi36uskzHxTBUk0 smoser@frink (ED25519)'),
++    ('ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDg6lO2L8jcnFlpASMsAD7nc3B7QO/c4IzJBOzaEh1GU0+50hT+tdk0+bdCTWxZteycs6rojJtizjhiHOluvKoSTg9ld9fFVSaJ76zyEHj9yBA0UgiDJqgeUadEguv8L7HpjKD6wabFbo5rx65a0wotXpyNv/YzmhthiSrhqOYUwTJ0lNZt3wYJxsx4GQ+8eGymXYsSBNWhAfeQT1AN/gnVza6oP3QEjyM8q1xTCl9WgKXnkz1N+TxTxvPlt0f7y1YAUg02sIL9AAtyPhY/tVEJfZFGuH7obcDJwpwTsGC341+X5q7YD9EJx9x9V5WjIKiWj40xTLQGH4pc2a6liXn4sT4V7pqKAH7cxGnASk7ZzhGP3B+g2GAMtQC0WfrDeJNUryhG3g6x41nyqtUsZeDUvRS7rGryTUNNvUScI3zhV36YC9OvS+h/EcQ4vLyanTcNSi1uvfiOa7A69Qyd76rh584k9xdf0YfV+6mswKPrTery5TSkcaw8BsN4BqeTiM2wpgAmK+OmgdFZ7xiQmJXLfCFND8ApW+WTWU5FOZpeFFTIWp9hBnJLA8U9bBoV+krRmZj7QlZetFP78C9E8ywgoDRpjORR39jt9vRXhHpWPk5Ox5/UNGsN9Bx8oEZz9kqfrc2Ja8nqp5bB+9LiBqn3+AIQK7qp/1hjnOS+/syIOQ== coredev@1234',
++     '4096 SHA256:Zopg0vu2nLCbM4cPb20OeI2VcSC3lc0ddLIILb5UFsg coredev@1234 (RSA)'),
++    ('ssh-dss AAAAB3NzaC1kc3MAAAEBAJL94TuurlB6dgU3rbWIcjvVldjfhOAu+tszkoGMeISxY7AFQcBbWM6iB0qHRIu622lR05LB/0tMS3i2VPw8DmhNYr68CbvcvNXVoHyam6JtwIDbTltMpv2L/oyQUdezZXM9XafK1+8JeRoNUYZgEr5KBTem7i8vqXtb77u54n3jkQJhi+TlI8ryMUB5dwUagPUlZ8fxZ3R6U2mZlBSbdVEF3AqZK1YfNXYUBR8OJCX4Fn9dCzMtNzjeexFvsMev15qRmZON/V/7nOfcOQqx/mPV4KPO1SQG4PgC1gPdrZm4054cxu+niB+jPRThyZd6Zg89yLitlFIwqPjImIongpUAAAAVANWt851JbYdUDSrCPVxN5HMtqYO5AAABAQCOcawGLkeKwrcWQuTxwfiTMGd+j/KfjopD4xqQf4m8Gu8bAffRkNnYB4UB52Lt9qFrxOngJp88E8syMWf7HCvYsoyRJHiRopv+tgN67ZHB7i/v6pzT9cBOfTfwou7BhNR/crEFxv7fTjxkx1l2KuQcUpaNPl5KqTEIqjjHUneLCmuKKCzvUmHdQTMFPsnib7k4MKr8lOJh2qrmWshfG6NSyX54vlCmM2IdriPlh3A1kBHOf+7JuemhlbToLWWcT5lNONLTuP7YRuIjNnnkLNwDiRNLCHGsj93ecQcidWDqA9pNd6W45Jd1onRtyDh/r1FnEJrNxbkNP2AcEUEe5SzZAAABACRWszpm1qqO7zMO8O+lrdfBRhQwNBUvtL3kWgWUJrJ6A4k08bne+6KqINw08jdPKETm+WbJc96s13D4XdvCZBzW5+n8FYO0rkcYyR2fh+GXvskptwWjl8nCSZ28H48gqDupr50wXbm7OjIQ1W2aMlYtp66/1CzZXByWex2Q7JlOYd41dBWqkRxvnM7h9w97PygkbRz0bxQit2hFLTYS1VXAf0xkA8NJ5AWvDk0dWOSxsNFnC0NM7K2nE+FRDKitmqydrSpxakgN95mx2a+mWBdJCLXLAK6ujQusdJKh8GkzyRuWQ/nq0ccysrUxjFFUt7o/EngXsIqhEOupDUskdsQ= coredev@hostname',
++     '2048 SHA256:Z9rHxUuI39Ze/C9iZ1ODdNr+lSIjgrdhssYN3YzirYk coredev@hostname (DSA)'),
++    ('sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBNub7yaBe9xSCCAtYG0N1VXtKnYCRCkpFUlCldjLIyYv1Xz0oJQBIJHO/HLJ2H/ZlP/ObKplN+l0mHnW9ACxlOMAAAAEc3NoOg==',
++     '256 SHA256:FAD8F89UgyBHO7araYQSCe5QtLthlx6fTO7DBktf0E8 no comment (ECDSA-SK)'),
++    ('sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIDUoNG0ZFnEUpkmTfkUOrXqidO1bi6PJAmHw9qnul9NuAAAABHNzaDo=',
++     '256 SHA256:ODe/XhzkNdD94qkx0Dvjv4BGwQ066GU9o6Qs8olG7Tw no comment (ED25519-SK)'),
++    ('ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBACID0zdlqmLKz+mHp+8g9mfz10krSfYpo5+km0F4Gzj9zhTvCcTGoWFC6lpNr9byd7YRvB8HBvvoXfG6TmV61wVYgHw8cv2BBISqj09wRn4NNNF3+CITgzlBOgBbEeEweYC08OU+Gjs1Gahb2FR7INc1wDlHKvn/JkKHxM5IvRikeoIeA== coredev@ubuntu',
++     '521 SHA256:eyOvhtnzTxYEWSP+9Lb2Yon4MqZ5EXFSnLBVS2Qok4M coredev@ubuntu (ECDSA)'),
++    ('ssh-dss AAAAB3NzaC1kc3MAAACBAJ5uAFY6oaHLjlcuo5yf1x9gN5mcuDu5v7JmZKyvtPMJg/R5jljit5S3EGaFBNZ9DxcMf7yWsYmcRJxLZvYmCiSNIybJzBebAjeFjQr84XkC4X2XmTwLY7jkfu4hLh8zX5eUlsb2hmpZP9vN88rlU8KztQOyO3IuZ19rK0dhEbkxAAAAFQCVHwkTihnzBk9uwa4OvVjqgNax3QAAAIBWon7jwX+N4BN/jOTeZdJ3TM/uY4ZrUZHiPzBxqRVLkUerDgSZcjOHe7Lb7fEB6mAJdspjDjbnaSzgQEAFb//c05nIeq41g5MmPnxmvydBcfAACknQKpm52TwDMU2AC5q5Qx7ITGIsmQYFxpLfEixg20QIJQcqB+X6yg86zA74QwAAAIEAjtyS8EzSIhSLcRsjxb1wYoA03B+fWOkYFZxi1F4QQKf8UnDPUuXGye8cQKpuQikCcy1guYAdpM/wWgZZkdihPbDNeXzl03ReRXXNjhHl+46HF4kmXGwoTHH6HsOPkt77EaEiCep3Z1mcuAcZDBONsNcyM7ccTd1A6yYtsZ3kBvw= user@localhost',
++     '1024 SHA256:RPKJJLRrJwL+QYMb8mIQOYV70k66ra1tBa7DrES2Vhc user@localhost (DSA)'),
++    ('ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBIuWFtqIoZ7OzXwFcNS3ARY8qlE+QCC37MuzWLn7S7QNCsjeSFQj0fGtnfwwHXc+jOEzNPu49HCWZZ8XWUMrXGY= user@localhost',
++     '256 SHA256:dPhT6je9SI3Ix6ouENaT5KC65AR7JrayViEz4sKqE1Q user@localhost (ECDSA)'),
++    ('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBZD0BJ4cbO7gdR0ncScv++/uuVhNyVZIchrfaM4qcVs user@localhost',
++     '256 SHA256:KNENJxaBWf6prhHPSPcMharb4yJpo2MDW6zqiOt9xW4 user@localhost (ED25519)'),
++    ('ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDvFnRBKVATKQwUNjiLAXfl7Gl0gmB/PCgIIoaBZOKnK9ZciwYuYGD0Zs0lTs7AvmRQRZXQdwVNq1gdogQU9ZOYmKYYMxjbpLSNQzgM0CtUgKskKvt5d+7sz6iUDhGDVRKFKRdrQSPHTFJQMJYsC4t6gsdxtREd2yk9T6oPpYs+QgWl2Diyxgs3XLOcpeW3CkhzQ9z/OOeKGsOF1XOcz+CQHSLbcQcDbSRSxRG1qinIFgDc1V0tQoclW6R9JSH9He71+cqQxjlPR8djXGhPpFq/46wMqwcjr7A3x3syGhRHKKexEMzwyDrurcjozwvqdqN7FVDboskGgB2e+8SePU2V3FW2dfyZlRdZAyr+QSFqZAiWIOCInQi+IApZfYlMh9tnSitITtZWATgqDRPS/EUocO3Qk3047CMYbbfCCqOCxkboSwNG2AUh/z2UkeBQZXzm6cpguDiEwi8NSM0RebBcIfyGWZ4pC7AF7K/AkzK6wqjnyup84lYf3/0N/lSeLuc= user@localhost',
++     '3072 SHA256:hC+atMjUVo0u0hhK5BHuoLPDA9+6diUy1wUL9/iq72U user@localhost (RSA)'),
++])
++def test_key_fingerprint(keyline, expected):
++    assert ' '.join(ssh_import_id.key_fingerprint(keyline.split())) == expected
+diff --git a/tox.ini b/tox.ini
+index 86413bb..d255fb4 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,16 +1,24 @@
+ [tox]
+-envlist = pycodestyle, pylint
++envlist = pycodestyle, pylint, pytest
+ recreate = True
+ 
+ [testenv:pycodestyle]
+ basepython = python3
+ deps =
+-    pycodestyle==2.5.0
+-commands = {envpython} -m pycodestyle {posargs:ssh_import_id/}
++    pycodestyle==2.14.0
++commands = {envpython} -m pycodestyle --ignore=E501 {posargs:ssh_import_id/}
+ 
+ [testenv:pylint]
+ basepython = python3
+ deps =
+-    pylint==2.4.4
++    pylint==4.0.1
++    pytest
+ commands = {envpython} -m pylint --output-format=parseable \
+    {posargs:ssh_import_id/}
++
++[testenv:pytest]
++basepython = python3
++deps =
++    pytest
++commands = {envpython} -m pytest \
++   {posargs:ssh_import_id/}
+-- 
+2.43.0
+

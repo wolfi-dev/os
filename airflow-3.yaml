@@ -1,7 +1,7 @@
 package:
   name: airflow-3
   version: "3.1.0"
-  epoch: 1
+  epoch: 2
   description: Platform to programmatically author, schedule, and monitor workflows
   options:
     #  There is a dependency on libarrow.so although it
@@ -15,14 +15,11 @@ package:
       - keyutils # mysql provider requires libkeyutils.so.1
       - libudev # for libudev.so.1
       - mariadb-connector-c # for libmariadb.so.3
-      - merged-usrsbin
       - netcat-openbsd # nc is required
       - posix-libc-utils # genconf is required
-      - py${{vars.python-version}}-packaging # Airflow uses this at runtime for config loading
       - python-${{vars.python-version}}
       - tzdata
       - unixodbc
-      - wolfi-baselayout
     provides:
       - airflow=${{package.full-version}}
   copyright:
@@ -34,17 +31,13 @@ vars:
   venv-home: '/opt/airflow'
   # As of now (2025/04/28), airflow is primarily available for python 3.12 and will break for python 3.13
   # For ref: https://airflow.apache.org/blog/airflow-2.9.0
-  python-version: 3.12
+  python-version: '3.12'
   # This list is based on providers that were part of the 2.x version of this package, as well as manually added dependencies
-  # to ensure we're building dependent providers too (not pulling from PyPi). This is an ordered list.
-  # Use / as a separator
-  providers: "standard amazon sqlite imap smtp ftp fab http celery cncf/kubernetes docker elasticsearch google grpc hashicorp microsoft/azure mysql odbc openlineage postgres redis sendgrid sftp slack snowflake ssh"
+  # to ensure we're building dependent providers too. This is an ordered list.
+  # Use , as a separator
+  providers: 'standard,amazon,sqlite,imap,smtp,ftp,fab,http,celery,cncf-kubernetes,docker,elasticsearch,google,grpc,hashicorp,microsoft-azure,mysql,odbc,openlineage,postgres,redis,sendgrid,sftp,slack,snowflake,ssh'
 
 var-transforms:
-  - from: ${{vars.providers}}
-    match: "/"
-    replace: "-"
-    to: providers-with-dash
   - from: ${{package.version}}
     match: ^(\d+)\.\d+\.\d+$
     replace: "$1"
@@ -54,32 +47,15 @@ environment:
   contents:
     packages:
       - build-base
-      - cargo-auditable
-      - findutils
-      - gcc
-      - glibc-dev
+      - busybox
+      - curl
       - glibc-locales
-      - graphviz
       - localedef
       - mariadb-connector-c-dev
       - mariadb-dev
-      - nodejs
-      - npm
-      - pkgconf-dev
-      - pnpm
-      - postgresql-dev
-      - py${{vars.python-version}}-build-bin
-      - py${{vars.python-version}}-pip
-      - py${{vars.python-version}}-xmlsec
-      - python-${{vars.python-version}}
+      - pkgconf
       - python-${{vars.python-version}}-dev
-      - rust
       - uv
-      - wget
-      - wolfi-base
-      - xmlsec-dev
-      - xmlsec-openssl
-      - yarn
 
 pipeline:
   - uses: git-checkout
@@ -88,100 +64,54 @@ pipeline:
       tag: ${{package.version}}
       expected-commit: 54bd5d8cd9f6f477cc83445737614dec81c4323c
 
-  - working-directory: ./airflow-core/src/airflow/ui
-    runs: |
-      # front-end build
-      yarn install --frozen-lockfile
-      # Update BrowsersList regularly: https://github.com/browserslist/update-db#readme
-      npx update-browserslist-db@latest
-      yarn run build
-      rm -rf node_modules
+  - runs: |
+      curl -f https://raw.githubusercontent.com/apache/airflow/constraints-${{package.version}}/constraints-${{vars.python-version}}.txt \
+           -o constraints-${{vars.python-version}}.txt
 
-  - name: "Build and install"
-    runs: |
-      # requires EPOCH to be later that 1980
+  - uses: py/tw/bump-constraints
+    with:
+      constraints-file: constraints-${{vars.python-version}}.txt
+      packages: |
+        cryptography==44.0.1 # GHSA-79v4-65xg-pq4g, GHSA-h4gh-qq45-vh27
+
+  - runs: |
+      # ZIP doesn't handle the SDE we set correctly, so set it to 1980-01-01
       export SOURCE_DATE_EPOCH=315532800
 
-      # To install mysqlclient wheel
+      # Dynamically set cflags for mysqlclient
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
 
-      # Create virtual environment
+      # Create and source virtual environment
       uv venv ${{vars.venv-home}} --system-site-packages
       source ${{vars.venv-home}}/bin/activate
 
-      python${{vars.python-version}} -m build --wheel
-      # We need to use uv to avoid `resolution to deep` errors`
-      uv pip install --verbose --upgrade --resolution highest dist/*.whl
+      # Use constraint file to respect upstream dependency versions
+      uv pip install --constraint constraints-${{vars.python-version}}.txt apache-airflow[${{vars.providers}}]==${{package.version}}
 
-      # We need to add this additionally  because graphviz is an optional dependency https://github.com/apache/airflow/blob/d2c9563605ca6d3dc40ec0fc2fe6853c86641441/airflow-core/pyproject.toml#L157
-      uv pip install --verbose --upgrade graphviz
+      # Graphviz is used by Airflow's DAG viewer
+      uv pip install --constraint constraints-${{vars.python-version}}.txt graphviz
 
-      # CVE-2025-50181 CVE-2025-50182
-      uv pip install --verbose --upgrade urllib3==2.5.0
-
-      # GHSA-9548-qrrj-x5pj
-      uv pip install --verbose --upgrade aiohttp==3.12.14
-
-      # GHSA-2c2j-9gv5-cj73
-      uv pip install --verbose --upgrade starlette==0.47.2
-
-      # GHSA-847f-9342-265h
-      uv pip install --verbose --upgrade h2==4.3.0
-
-      # Build and install the additional provider packages
-      # By default, the airflow celery provider is not built, but running the upstream helm chart requires it
-      # There are a few others we want to include by default as well
-
-      cd providers
-      for pkg in ${{vars.providers}}; do
-        cd "$pkg"
-
-        # Providers may have an rdep on airflow.
-        # Do not reinstall airflow.
-        sed -i '/apache-airflow.*=.*/d' pyproject.toml
-
-        # apache-airflow-providers-mysql links against libcrypto.so.1.1 on arm64, and does not provide the
-        # necessary source files to rebuild the package for arm against libcrypto3 (like the x86 version is),
-        # so instead we'll just make sure the provider dependency that does this (mysqlclient) is removed,
-        # and we only use mysql-connector-python instead.
-        if [[ "$pkg" == "mysql" ]]; then
-          if [[ "${{build.arch}}" == "aarch64" ]]; then
-            sed -i '/mysql-connector-python>=/d' pyproject.toml
-          fi
-        fi
-
-        # Build and install the wheel
-        python${{vars.python-version}} -m build --wheel
-        uv pip install --verbose --upgrade --resolution highest dist/*.whl
-        cd -
-      done
-      cd ${{package.srcdir}}
-
-      # bump snowflake provider to remediate CVE-2025-50213
-      uv pip install --verbose --upgrade apache-airflow-providers-snowflake>=6.4.0
-
-      # Flask >2.2.5 is not supported. Using Flask > 2.2.5 causes the same issue
-      # as the one documented here:
-      # - https://github.com/spec-first/connexion/issues/1699#issuecomment-1524042812
-      # Upstream is working on supporting Flask 2.2.5+, as documented in the issue
-      # and PR below:
-      # - https://github.com/apache/airflow/issues/52509
-      # - https://github.com/apache/airflow/pull/50960
-      uv pip install --verbose --upgrade Flask==2.2.5
+      # Uninstall pip and virtualenv from virtual environment
+      #
+      # pip doesn't need to be present in the virtual environment,
+      # the venv can be managed via a system installed package manager
+      #
+      # virtualenv vendors an outdated and unused pip wheel
+      uv pip uninstall pip virtualenv
 
       # Remove litellm log file that generates secret alerts from trivy
-      find ${{vars.venv-home}}/lib/python${{vars.python-version}} -name 'litellm.log' -exec rm -f {} +
+      find ${{vars.venv-home}}/lib/python${{vars.python-version}} -name 'litellm.log' -exec rm {} +
 
       # Replace hooks.slack.com with something obviously not hooks.slack.com to avoid secret alert from trivy
       find ${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages/litellm -name _types.py -exec sed -i "s/hooks.slack.com/nothooks.slack.com/g" {} +
 
       # Remove any patch related files from the install tree
-      find ${{vars.venv-home}}/lib/python${{vars.python-version}} -name "*.orig" -print -exec rm -f {} +
+      find ${{vars.venv-home}}/lib/python${{vars.python-version}} -name "*.orig" -print -exec rm {} +
 
       # The first time you run Airflow, it will create a file called `airflow.cfg` in
       # `$AIRFLOW_HOME` directory
       # However, for production case it is advised to generate the configuration
-      airflow config list --defaults > ${{targets.destdir}}/"airflow.cfg"
+      airflow config list --defaults > ${{targets.destdir}}/airflow.cfg
 
       # Install
       mkdir -p ${{targets.contextdir}}/opt
@@ -207,8 +137,6 @@ subpackages:
     dependencies:
       runtime:
         - ${{package.name}}
-        - merged-usrsbin
-        - wolfi-baselayout
       provides:
         - airflow-compat=${{package.full-version}}
     pipeline:
@@ -232,7 +160,6 @@ subpackages:
         - coreutils
         - ini-file
         - wait-for-port
-        - wolfi-baselayout
       provides:
         - airflow-iamguarded-compat=${{package.full-version}}
     description: "Iamguarded compat for Airflow"
@@ -312,32 +239,7 @@ update:
     tag-filter-prefix: 3.
 
 test:
-  environment:
-    contents:
-      packages:
-        - py${{vars.python-version}}-pip
-    accounts:
-      groups:
-        - groupname: airflow
-          gid: 1001
-      users:
-        - username: airflow
-          gid: 1001
-          uid: 1001
-      run-as: 0
-    environment:
-      HOME: /home/airflow
   pipeline:
-    - name: "Ensure no airflow 2.x components are pulled in by mistake"
-      runs: |
-        pip list --path=${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages/ | grep airflow
-        ls -lah ${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages/
-
-        # A known bad file example: apache_airflow-2.10.5.dist-info
-        if ls -1 ${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages | grep -q "apache_airflow-2.*.dist-info"; then
-            echo "Error: apache_airflow-2.* file(s) found! Please diagnose"
-            exit 1
-        fi
     - name: "Test Python package import and version"
       runs: |
         source ${{vars.venv-home}}/bin/activate
@@ -352,12 +254,11 @@ test:
       runs: |
         source ${{vars.venv-home}}/bin/activate
 
-        PROVIDERS_LIST=$(airflow providers list)
-        echo $PROVIDERS_LIST
+        PROVIDERS_LIST="$(airflow providers list)"
 
-        # Use - as a separator
-        for pkg in ${{vars.providers-with-dash}}; do
-          echo $PROVIDERS_LIST | grep "apache-airflow-providers-$pkg"
+        PROVIDERS="$(echo ${{vars.providers}} | sed 's/,/ /g')"
+        for provider in $PROVIDERS; do
+          echo "$PROVIDERS_LIST" | grep -F "apache-airflow-providers-$provider"
         done
     - name: "Load and test a DAG"
       runs: |

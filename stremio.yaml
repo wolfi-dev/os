@@ -8,12 +8,11 @@ package:
   dependencies:
     runtime:
       - libdrm
-      - librsvg
-      - libnss
       - libnspr
+      - libnss
+      - librsvg
       - mesa
       - mesa-gbm
-      - mpv-dev
       - nodejs
       - qt5-qtbase
       - qt5-qtdeclarative
@@ -29,12 +28,12 @@ environment:
       - busybox
       - ca-certificates-bundle
       - cmake
+      - libnspr-dev
+      - libnss-dev
       - librsvg
       - mpv-dev
       - nodejs
       - npm
-      - libnss-dev
-      - libnspr-dev
       - openssl-dev
       - pkgconf
       - qt5-qtbase-dev
@@ -53,106 +52,6 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: 0589927cb53bc68e09776ec94ce3860b64ca10a4
 
-  - name: Add CompatibleSingleApp implementation
-    runs: |
-      # Embed CompatibleSingleApp source (custom Qt single-instance implementation)
-      cat > compatible_singleapp.h << 'EOF'
-      #ifndef COMPATIBLESINGLEAPP_H
-      #define COMPATIBLESINGLEAPP_H
-
-      #include <QApplication>
-      #include <QLocalServer>
-      #include <QLocalSocket>
-
-      class CompatibleSingleApp : public QApplication {
-          Q_OBJECT
-      public:
-          CompatibleSingleApp(int &argc, char **argv, bool allowSecondary = false);
-          bool isPrimary() const { return m_isPrimary; }
-          bool isSecondary() const { return !m_isPrimary; }
-          bool sendMessage(const QByteArray &message, int timeout = 100);
-
-      signals:
-          void receivedMessage(quint32 instanceId, QByteArray message);
-
-      private slots:
-          void receiveConnection();
-          void readMessage();
-
-      private:
-          bool m_isPrimary;
-          QLocalServer *m_server;
-          QString m_serverName;
-      };
-      #endif
-      EOF
-
-      cat > compatible_singleapp.cpp << 'EOF'
-      #include "compatible_singleapp.h"
-      #include <QDataStream>
-      #include <QCryptographicHash>
-
-      CompatibleSingleApp::CompatibleSingleApp(int &argc, char **argv, bool allowSecondary)
-          : QApplication(argc, argv), m_isPrimary(true), m_server(nullptr) {
-
-          m_serverName = QCryptographicHash::hash(
-              QCoreApplication::applicationFilePath().toUtf8(),
-              QCryptographicHash::Sha256
-          ).toHex();
-
-          QLocalSocket socket;
-          socket.connectToServer(m_serverName);
-          if (socket.waitForConnected(500)) {
-              m_isPrimary = false;
-              return;
-          }
-
-          if (!allowSecondary) {
-              m_server = new QLocalServer(this);
-              QLocalServer::removeServer(m_serverName);
-
-              if (m_server->listen(m_serverName)) {
-                  connect(m_server, &QLocalServer::newConnection,
-                          this, &CompatibleSingleApp::receiveConnection);
-              }
-          }
-      }
-
-      bool CompatibleSingleApp::sendMessage(const QByteArray &message, int timeout) {
-          QLocalSocket socket;
-          socket.connectToServer(m_serverName);
-
-          if (!socket.waitForConnected(timeout))
-              return false;
-
-          QByteArray block;
-          QDataStream out(&block, QIODevice::WriteOnly);
-          out << message;
-
-          socket.write(block);
-          socket.flush();
-          socket.waitForBytesWritten(timeout);
-
-          return true;
-      }
-
-      void CompatibleSingleApp::receiveConnection() {
-          QLocalSocket *socket = m_server->nextPendingConnection();
-          connect(socket, &QLocalSocket::readyRead,
-                  this, &CompatibleSingleApp::readMessage);
-      }
-
-      void CompatibleSingleApp::readMessage() {
-          QLocalSocket *socket = qobject_cast<QLocalSocket*>(sender());
-          if (!socket) return;
-
-          QByteArray message = socket->readAll();
-          emit receivedMessage(0, message);
-
-          socket->disconnectFromServer();
-      }
-      EOF
-
   - uses: patch
     with:
       patches: stremio/001-release-makefile-fhs.patch
@@ -167,6 +66,10 @@ pipeline:
 
   - uses: patch
     with:
+      patches: stremio/004-fhs-server-paths.patch
+
+  - uses: patch
+    with:
       patches: stremio/005-process-environment-fix.patch
 
   - uses: patch
@@ -176,6 +79,14 @@ pipeline:
   - uses: patch
     with:
       patches: stremio/007-remove-qthelper-deprecated.patch
+
+  - uses: patch
+    with:
+      patches: stremio/008-optional-system-tray.patch
+
+  - uses: patch
+    with:
+      patches: stremio/009-add-compatiblesingleapp.patch
 
   - name: Generate icons
     runs: |
@@ -215,18 +126,12 @@ pipeline:
 
       # Detect container environment
       if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || grep -q '/docker/\|/lxc/' /proc/1/cgroup 2>/dev/null; then
-          # Container: check for GPU passthrough
-          if [ -e /dev/dri/card0 ]; then
-              # GPU available: attempt hardware acceleration
-              export LIBGL_DRIVERS_PATH=/usr/lib/xorg/modules/dri
-              export QT_XCB_GL_INTEGRATION=xcb_glx
-          else
-              # No GPU: software rendering
-              export QT_XCB_GL_INTEGRATION=none
-              export QT_QUICK_BACKEND=software
-          fi
+          # Container: ALWAYS use software rendering
+          # GLX rarely works in containers even with GPU passthrough
+          export QT_XCB_GL_INTEGRATION=none
+          export QT_QUICK_BACKEND=software
       else
-          # Bare metal: prefer hardware acceleration
+          # Bare metal: try hardware acceleration first
           if [ -e /dev/dri/card0 ]; then
               export LIBGL_DRIVERS_PATH=/usr/lib/xorg/modules/dri
               export QT_XCB_GL_INTEGRATION=xcb_glx
@@ -239,6 +144,9 @@ pipeline:
       # Common settings
       export QT_AUTO_SCREEN_SCALE_FACTOR="${QT_AUTO_SCREEN_SCALE_FACTOR:-1}"
       export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+
+      # Disable QtWebEngine sandbox (required for container compatibility)
+      export QTWEBENGINE_DISABLE_SANDBOX=1
 
       exec /usr/libexec/stremio/stremio "$@"
       WRAPPER
@@ -265,14 +173,14 @@ pipeline:
 subpackages:
   - name: stremio-doc
     description: Stremio documentation
-    pipeline:
+    pipeline
+    # test:
+    #   pipeline:
+    #     # - uses: test/no-docs:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/share/doc/stremio
           install -Dm644 README.md "${{targets.subpkgdir}}"/usr/share/doc/stremio/
           install -Dm644 LICENSE.md "${{targets.subpkgdir}}"/usr/share/doc/stremio/
-    # test:
-    #   pipeline:
-    #     # - uses: test/no-docs
 
 update:
   enabled: true
@@ -291,7 +199,8 @@ test:
         - qt5-qtquickcontrols
         - qt5-qtquickcontrols2
         - qt5-qtwebengine
-  pipeline:
+  pipeline
+  # - uses: test/no-docs:
     - name: Test binary exists and is executable
       runs: |
         test -f /usr/bin/stremio
@@ -317,4 +226,3 @@ test:
       runs: |
         # Verify stack protector and FORTIFY_SOURCE were applied
         readelf -p .comment /usr/libexec/stremio/stremio | grep -q GCC || true
-    # - uses: test/no-docs

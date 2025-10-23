@@ -55,12 +55,18 @@ Use this when a package provides multiple distinct libraries that may be used in
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/lib
           mv ${{targets.destdir}}/usr/lib/libprotoc*.so.* ${{targets.subpkgdir}}/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 
   - name: libprotobuf${{vars.soversion}}
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/lib
           mv ${{targets.destdir}}/usr/lib/libprotobuf.so.* ${{targets.subpkgdir}}/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 ```
 
 **Approach B: Single library subpackage (all libraries together)**
@@ -73,6 +79,9 @@ Use this when a package provides one primary library or multiple libraries that 
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/lib
           mv ${{targets.destdir}}/usr/lib/*.so.* ${{targets.subpkgdir}}/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 ```
 
 **Choosing the right approach:**
@@ -120,8 +129,17 @@ var-transforms:
 
 subpackages:
   - name: libprotoc${{vars.soversion}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
   - name: libprotobuf${{vars.soversion}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
   - name: libprotobuf-lite${{vars.soversion}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 ```
 
 ### Example 2: fmt (X.Y.Z version format, major only)
@@ -139,6 +157,9 @@ var-transforms:
 
 subpackages:
   - name: lib${{package.name}}${{vars.soversion}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 ```
 
 ### Example 3: jemalloc (soversion doesn't match package version)
@@ -153,6 +174,9 @@ vars:
 
 subpackages:
   - name: libjemalloc${{vars.soversion}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 ```
 
 In this case, the package provides `so:libjemalloc.so.2=2` but the version is `5.3.0`, so we use a direct `vars` declaration.

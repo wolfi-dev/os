@@ -352,10 +352,9 @@ mv "$(2).tmp" "$(2)"
 endef
 
 define repo_token_if_needed
-$(eval yamlfile := $1.yaml)
 $(eval pkgname := $1)
 
-@if grep -qE 'uses:.*(auth/guarded-repo|iamguarded/)' $(yamlfile); then \
+@if [ -n "$$($(MAKE) -s compile/$(pkgname) | jq -r '.. | .uses? | strings | select(test("auth/guarded-repo"))')" ]; then \
 	echo "Creating guarded repo token for $(pkgname)…"; \
 	$(MAKE) repo-token/$(pkgname); \
 else \
@@ -364,13 +363,9 @@ fi
 endef
 
 define libraries_token_if_needed
-$(eval yamlfile := $1.yaml)
 $(eval pkgname := $1)
 
-$(eval num_auth_pipelines := $(shell grep -cE 'uses:.*auth/' $(yamlfile)))
-$(eval num_ignored_auth_pipelines := $(shell grep -cE 'uses:.*(auth/guarded-repo|iamguarded/)' $(yamlfile)))
-
-@if [ $(num_auth_pipelines) -gt $(num_ignored_auth_pipelines) ]; then \
+@if [ -n "$$($(MAKE) -s compile/$(pkgname) | jq -r '.. | .uses? | strings | select(test("auth/(?!guarded-repo)"))')" ]; then \
 	echo "Creating guarded libraries token for $(pkgname)…"; \
 	$(MAKE) lib-token/$(pkgname); \
 else \

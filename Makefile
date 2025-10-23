@@ -124,27 +124,11 @@ $(repo_token_targets): repo-token/%: %/.guarded-repo.token
 libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
 $(libraries_token_targets): lib-token/%: %/.libraries.token
 
-.PHONY: is-google-service-account
-is-google-service-account:
-	@if ! curl -f -H "Metadata-Flavor: Google" \
-			  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=issuer.enforce.dev \
-			  -o /dev/null; then \
-		echo "Google SA token not found."; \
-		exit 1; \
-	fi
-	@echo "Google SA token found."
-
-.PHONY: _tokens-if-needed
-_tokens-if-needed:
-	$(call repo_token_if_needed,$(PKGNAME))
-	$(call libraries_token_if_needed,$(PKGNAME))
-
 .PHONY: tokens-if-needed/%
 tokens-if-needed/%:
 	$(eval pkgname := $*)
-	@if ! $(MAKE) is-google-service-account 2>/dev/null; then \
-		$(MAKE) _tokens-if-needed PKGNAME=$(pkgname); \
-	fi
+	$(call repo_token_if_needed,$(pkgname))
+	$(call libraries_token_if_needed,$(pkgname))
 
 .PHONY: clean-tokens/%
 clean-tokens/%:

@@ -1,0 +1,330 @@
+Subject: Add CompatibleSingleApp implementation for threading compatibility
+Upstream: No (Wolfi-specific)
+Author: Juan Manuel Méndez Rey <vejeta@gmail.com>
+This patch adds a custom SingleApplication implementation that's compatible
+with QQmlApplicationEngine. The system libsingleapplication-dev has threading
+incompatibilities with Qt5's QML engine that cause runtime crashes.
+The CompatibleSingleApp provides identical functionality using QLocalSocket/QLocalServer
+for inter-process communication without threading conflicts. MainApp class definition
+is handled in mainapplication.h to avoid Qt MOC compilation conflicts.
+---
+--- /dev/null
++++ b/compatible_singleapp.h
+@@ -0,0 +1,57 @@
++// Based on SingleApplication v3.3.4 by Itay Grudev
++// Copyright (C) 2015-2020 Itay Grudev
++// Copyright (C) 2025 Juan Manuel Méndez Rey <vejeta@gmail.com>
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#ifndef COMPATIBLE_SINGLEAPP_H
++#define COMPATIBLE_SINGLEAPP_H
++
++#include <QApplication>
++#include <QLocalServer>
++#include <QLocalSocket>
++#include <QStandardPaths>
++#include <QCryptographicHash>
++
++// Drop-in replacement for SingleApplication that's compatible with QQmlApplicationEngine
++class CompatibleSingleApp : public QApplication
++{
++    Q_OBJECT
++
++public:
++    enum Mode {
++        User = 0x1,
++        System = 0x2
++    };
++
++    explicit CompatibleSingleApp(int &argc, char *argv[], bool allowSecondary = false,
++                                Mode mode = User, int timeout = 1000, const QString &userData = QString());
++    ~CompatibleSingleApp();
++
++    bool isPrimary() const { return m_isPrimary; }
++    bool isSecondary() const { return !m_isPrimary; }
++    bool sendMessage(const QByteArray &message, int timeout = 5000);
++
++signals:
++    void receivedMessage(quint32 instanceId, QByteArray message);
++    void receivedMessage(QVariant instanceId, QVariant message);
++
++public slots:
++    void processMessage(quint32 instanceId, QByteArray message) {
++        emit receivedMessage(QVariant(instanceId), QVariant(QString::fromUtf8(message)));
++    }
++
++private slots:
++    void handleNewConnection();
++    void readMessage();
++
++private:
++    void initializeServer();
++    QString generateServerName();
++
++    QLocalServer *m_server;
++    bool m_isPrimary;
++    QString m_serverName;
++    int m_timeout;
++};
++
++#endif // COMPATIBLE_SINGLEAPP_H
+--- /dev/null
++++ b/compatible_singleapp.cpp
+@@ -0,0 +1,129 @@
++// Based on SingleApplication v3.3.4 by Itay Grudev
++// Copyright (C) 2015-2020 Itay Grudev
++// Copyright (C) 2025 Juan Manuel Méndez Rey <vejeta@gmail.com>
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "compatible_singleapp.h"
++#include <QDir>
++#include <QDataStream>
++#include <QTimer>
++#include <QDebug>
++
++CompatibleSingleApp::CompatibleSingleApp(int &argc, char *argv[], bool allowSecondary,
++                                        Mode mode, int timeout, const QString &userData)
++    : QApplication(argc, argv)
++    , m_server(nullptr)
++    , m_isPrimary(false)
++    , m_timeout(timeout)
++{
++    Q_UNUSED(allowSecondary)
++    Q_UNUSED(mode)
++    Q_UNUSED(userData)
++
++    m_serverName = generateServerName();
++
++    // Try to connect to existing instance
++    QLocalSocket socket;
++    socket.connectToServer(m_serverName);
++
++    if (socket.waitForConnected(m_timeout)) {
++        // Another instance is running, we are secondary
++        m_isPrimary = false;
++        socket.disconnectFromServer();
++        qDebug() << "Secondary instance detected, server name:" << m_serverName;
++    } else {
++        // No other instance, we are primary
++        m_isPrimary = true;
++        initializeServer();
++        qDebug() << "Primary instance, initialized server:" << m_serverName;
++    }
++}
++
++CompatibleSingleApp::~CompatibleSingleApp()
++{
++    if (m_server) {
++        m_server->close();
++        delete m_server;
++    }
++}
++
++void CompatibleSingleApp::initializeServer()
++{
++    if (m_server) return;
++
++    m_server = new QLocalServer(this);
++
++    // Remove any existing server socket
++    QLocalServer::removeServer(m_serverName);
++
++    if (!m_server->listen(m_serverName)) {
++        qWarning() << "Failed to create local server:" << m_server->errorString();
++        m_isPrimary = false;
++        return;
++    }
++
++    connect(m_server, &QLocalServer::newConnection, this, &CompatibleSingleApp::handleNewConnection);
++    qDebug() << "Local server initialized successfully:" << m_serverName;
++}
++
++QString CompatibleSingleApp::generateServerName()
++{
++    QString appPath = QApplication::applicationFilePath();
++    QCryptographicHash hash(QCryptographicHash::Sha256);
++    hash.addData(appPath.toUtf8());
++    QString serverName = QStringLiteral("CompatibleSingleApp-") +
++                        QString::fromLatin1(hash.result().toHex().left(8));
++
++    return serverName;
++}
++
++bool CompatibleSingleApp::sendMessage(const QByteArray &message, int timeout)
++{
++    if (m_isPrimary) {
++        qWarning() << "Primary instance cannot send messages to itself";
++        return false;
++    }
++
++    QLocalSocket socket;
++    socket.connectToServer(m_serverName);
++
++    if (!socket.waitForConnected(timeout)) {
++        qWarning() << "Failed to connect to primary instance:" << socket.errorString();
++        return false;
++    }
++
++    QDataStream stream(&socket);
++    stream << message;
++
++    bool success = socket.waitForBytesWritten(timeout);
++    socket.disconnectFromServer();
++
++    return success;
++}
++
++void CompatibleSingleApp::handleNewConnection()
++{
++    if (!m_server) return;
++
++    QLocalSocket *socket = m_server->nextPendingConnection();
++    if (!socket) return;
++
++    connect(socket, &QLocalSocket::readyRead, this, &CompatibleSingleApp::readMessage);
++    connect(socket, &QLocalSocket::disconnected, socket, &QLocalSocket::deleteLater);
++}
++
++void CompatibleSingleApp::readMessage()
++{
++    QLocalSocket *socket = qobject_cast<QLocalSocket*>(sender());
++    if (!socket) return;
++
++    QDataStream stream(socket);
++    QByteArray message;
++    stream >> message;
++
++    if (!message.isEmpty()) {
++        quint32 instanceId = static_cast<quint32>(qHash(socket));
++        emit receivedMessage(instanceId, message);
++        qDebug() << "Message received from instance" << instanceId << ":" << message;
++    }
++}
+
+index d571c4e..03cea9a 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -1,5 +1,5 @@
+-#include <QQmlApplicationEngine>
+ #include <QtWebEngine>
++#include <QQmlApplicationEngine>
+ #include <QSysInfo>
+ 
+ #include <clocale>
+@@ -31,14 +31,17 @@ typedef QApplication Application;
+ 
+ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
+     QQmlContext *ctx = engine->rootContext();
+-    SystemTray * systemTray = new SystemTray();
+ 
+     ctx->setContextProperty("applicationDirPath", QGuiApplication::applicationDirPath());
+     ctx->setContextProperty("appTitle", QString(APP_TITLE));
++#ifndef DISABLE_AUTOUPDATER
+     ctx->setContextProperty("autoUpdater", app.autoupdater);
++#else
++    ctx->setContextProperty("autoUpdater", QVariant());
++#endif
+ 
+-    // Set access to an object of class properties in QML context
+-    ctx->setContextProperty("systemTray", systemTray);
++    // SystemTray creation delayed - will be created after QML engine is ready
++    ctx->setContextProperty("systemTray", QVariant());
+ 
+     #ifdef QT_DEBUG
+         ctx->setContextProperty("debug", true);
+@@ -49,7 +52,22 @@ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
+ 
+ int main(int argc, char **argv)
+ {
+-    qputenv("QTWEBENGINE_CHROMIUM_FLAGS", "--autoplay-policy=no-user-gesture-required");
++    // CRITICAL: Qt attributes must be set BEFORE QtWebEngine::initialize()
++    // Without Qt::AA_ShareOpenGLContexts, QtWebEngine corrupts Qt's plugin loader
++    // causing SIGTRAP crashes during accessibility plugin loading
++    QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
++    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
++
++    // CRITICAL: Environment variables must be set BEFORE QtWebEngine::initialize()
++    // Chromium reads QTWEBENGINE_CHROMIUM_FLAGS during initialization
++    // Sandbox disable flags required for container compatibility
++    qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
++            "--autoplay-policy=no-user-gesture-required "
++            "--no-sandbox "
++            "--disable-seccomp-filter-sandbox "
++            "--disable-setuid-sandbox "
++            "--disable-namespace-sandbox");
++
+     #ifdef _WIN32
+     // Default to ANGLE (DirectX), because that seems to eliminate so many issues on Windows
+     // Also, according to the docs here: https://wiki.qt.io/Qt_5_on_Windows_ANGLE_and_OpenGL, ANGLE is also preferrable
+@@ -65,16 +83,14 @@ int main(int argc, char **argv)
+     }
+     #endif
+ 
+-    // This is really broken on Linux
+-    #ifndef Q_OS_LINUX
+-    Application::setAttribute(Qt::AA_EnableHighDpiScaling);
+-    #endif
+-
+     Application::setApplicationName("Stremio");
+     Application::setApplicationVersion(STREMIO_SHELL_VERSION);
+     Application::setOrganizationName("Smart Code ltd");
+     Application::setOrganizationDomain("stremio.com");
+ 
++    // QtWebEngine::initialize() must be called BEFORE QApplication constructor (prevents QML crashes)
++    QtWebEngine::initialize();
++
+     MainApp app(argc, argv, true);
+     #ifndef Q_OS_MACOS
+     if( app.isSecondary() ) {
+@@ -106,8 +122,18 @@ int main(int argc, char **argv)
+ 
+     engine->load(QUrl(QStringLiteral("qrc:/main.qml")));
+ 
++    // Create SystemTray after QML engine is loaded and ready
++    SystemTray * systemTray = new SystemTray();
++    engine->rootContext()->setContextProperty("systemTray", systemTray);
++
+     #ifndef Q_OS_MACOS
+-    QObject::connect( &app, &SingleApplication::receivedMessage, &app, &MainApp::processMessage );
++    // Connect CompatibleSingleApp IPC signals
++    // Note: Using QOverload to select correct signal overload (quint32, QByteArray)
++    // CompatibleSingleApp emits two versions of receivedMessage for compatibility
++    QObject::connect( &app,
++                      QOverload<quint32, QByteArray>::of(&CompatibleSingleApp::receivedMessage),
++                      &app,
++                      &MainApp::processMessage );
+     #endif
+     QObject::connect( &app, SIGNAL(receivedMessage(QVariant, QVariant)), engine->rootObjects().value(0),
+                       SLOT(onAppMessageReceived(QVariant, QVariant)) );
+diff --git a/mainapplication.h b/mainapplication.h
+index 1f502d6..b4997d3 100644
+--- a/mainapplication.h
++++ b/mainapplication.h
+@@ -1,20 +1,23 @@
+ #include <QEvent>
+ #include <QFileOpenEvent>
+-#include "singleapplication.h"
++#include "compatible_singleapp.h"
+ #include "autoupdater.h"
+ 
+ #ifdef Q_OS_MACOS
+ #define APP_TYPE QApplication
+ #else
+-#define APP_TYPE SingleApplication
++#define APP_TYPE CompatibleSingleApp
+ #endif
+ 
+ class MainApp : public APP_TYPE
+ {
+     Q_OBJECT
+ 
+-  public: 
+-    MainApp(int &argc, char **argv, bool unique) : APP_TYPE(argc, argv, unique) {
++  public:
++    // Note: CompatibleSingleApp constructor parameter is inverted
++    // unique=true means we want single instance (allowSecondary=false)
++    // unique=false means we allow multiple instances (allowSecondary=true)
++    MainApp(int &argc, char **argv, bool unique) : APP_TYPE(argc, argv, !unique) {
+       autoupdater = new AutoUpdater();
+       autoupdater->moveToThread(&autoupdaterThread);
+       autoupdaterThread.start();

@@ -1,0 +1,358 @@
+diff --git a/compatible_singleapp.cpp b/compatible_singleapp.cpp
+new file mode 100644
+index 0000000..90706e1
+--- /dev/null
++++ b/compatible_singleapp.cpp
+@@ -0,0 +1,178 @@
++// Based on SingleApplication v3.3.4 by Itay Grudev
++// Copyright (C) 2015-2020 Itay Grudev
++// Copyright (C) 2025 Juan Manuel Méndez Rey <vejeta@gmail.com>
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "compatible_singleapp.h"
++#include <QDataStream>
++#include <QDir>
++#include <QStandardPaths>
++#include <QDebug>
++
++CompatibleSingleApp::CompatibleSingleApp(int &argc, char *argv[], bool allowSecondary,
++                                       Mode mode, int timeout, const QString &userData)
++    : QApplication(argc, argv)
++    , m_isPrimary(false)
++    , m_allowSecondary(allowSecondary)
++    , m_mode(mode)
++    , m_timeout(timeout)
++    , m_userData(userData)
++    , m_localServer(nullptr)
++    , m_localSocket(nullptr)
++    , m_instanceId(0)
++{
++    m_appName = QApplication::applicationName();
++    if (m_appName.isEmpty()) {
++        m_appName = QApplication::applicationFilePath();
++        m_appName = m_appName.split("/").last();
++    }
++
++    generateHash();
++
++    if (m_mode == System) {
++        m_socketName = QString("%1.%2").arg(m_appName, m_socketName);
++    } else {
++        m_socketName = QString("%1.%2.%3").arg(m_appName, m_userData, m_socketName);
++    }
++
++    if (m_allowSecondary) {
++        if (connectToExisting(m_timeout)) {
++            m_isPrimary = false;
++            return;
++        }
++    }
++
++    if (startPrimary()) {
++        m_isPrimary = true;
++    } else {
++        m_isPrimary = false;
++    }
++}
++
++CompatibleSingleApp::~CompatibleSingleApp()
++{
++    cleanUp();
++}
++
++void CompatibleSingleApp::generateHash()
++{
++    QCryptographicHash hash(QCryptographicHash::Sha256);
++    hash.addData(QApplication::applicationFilePath().toUtf8());
++    m_socketName = hash.result().toHex();
++}
++
++void CompatibleSingleApp::cleanUp()
++{
++    if (m_localServer) {
++        m_localServer->close();
++        delete m_localServer;
++        m_localServer = nullptr;
++    }
++
++    if (m_localSocket) {
++        m_localSocket->close();
++        delete m_localSocket;
++        m_localSocket = nullptr;
++    }
++}
++
++bool CompatibleSingleApp::startPrimary()
++{
++    m_localServer = new QLocalServer(this);
++    m_localServer->setSocketOptions(QLocalServer::UserAccessOption);
++
++    if (!m_localServer->listen(m_socketName)) {
++        return false;
++    }
++
++    connect(m_localServer, &QLocalServer::newConnection, this, &CompatibleSingleApp::slotConnectionEstablished);
++    return true;
++}
++
++bool CompatibleSingleApp::connectToExisting(int timeout)
++{
++    m_localSocket = new QLocalSocket(this);
++    m_localSocket->connectToServer(m_socketName);
++
++    if (!m_localSocket->waitForConnected(timeout)) {
++        return false;
++    }
++
++    connect(m_localSocket, &QLocalSocket::readyRead, this, [this]() {
++        slotDataAvailable(m_localSocket, 0);
++    });
++
++    connect(m_localSocket, &QLocalSocket::disconnected, this, [this]() {
++        slotClientDisconnected(m_localSocket);
++    });
++
++    return true;
++}
++
++bool CompatibleSingleApp::sendMessage(const QByteArray &message, int timeout)
++{
++    if (m_isPrimary) {
++        return false;
++    }
++
++    if (!m_localSocket || m_localSocket->state() != QLocalSocket::ConnectedState) {
++        return false;
++    }
++
++    QByteArray block;
++    QDataStream out(&block, QIODevice::WriteOnly);
++    out.setVersion(QDataStream::Qt_5_0);
++    out << quint32(0);
++    out << message;
++    out.device()->seek(0);
++    out << quint32(block.size() - sizeof(quint32));
++
++    m_localSocket->write(block);
++    return m_localSocket->waitForBytesWritten(timeout);
++}
++
++void CompatibleSingleApp::slotConnectionEstablished()
++{
++    QLocalSocket *socket = m_localServer->nextPendingConnection();
++    if (!socket) {
++        return;
++    }
++
++    connect(socket, &QLocalSocket::readyRead, this, [this, socket]() {
++        slotDataAvailable(socket, 0);
++    });
++
++    connect(socket, &QLocalSocket::disconnected, this, [this, socket]() {
++        slotClientDisconnected(socket);
++    });
++}
++
++void CompatibleSingleApp::slotDataAvailable(QLocalSocket *socket, quint32 instanceId)
++{
++    QDataStream in(socket);
++    in.setVersion(QDataStream::Qt_5_0);
++
++    while (socket->bytesAvailable() > 0) {
++        quint32 blockSize;
++        in >> blockSize;
++
++        if (socket->bytesAvailable() < blockSize) {
++            break;
++        }
++
++        QByteArray message;
++        in >> message;
++
++        emit receivedMessage(instanceId, message);
++        emit receivedMessage(QVariant(instanceId), QVariant(message));
++    }
++}
++
++void CompatibleSingleApp::slotClientDisconnected(QLocalSocket *socket)
++{
++    socket->deleteLater();
++}
++
++#include "compatible_singleapp.moc"
++
++// vim: set ts=4 sw=4 et:
+\ No newline at end of file
+diff --git a/compatible_singleapp.h b/compatible_singleapp.h
+new file mode 100644
+index 0000000..5be7645
+--- /dev/null
++++ b/compatible_singleapp.h
+@@ -0,0 +1,63 @@
++// Based on SingleApplication v3.3.4 by Itay Grudev
++// Copyright (C) 2015-2020 Itay Grudev
++// Copyright (C) 2025 Juan Manuel Méndez Rey <vejeta@gmail.com>
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#ifndef COMPATIBLE_SINGLEAPP_H
++#define COMPATIBLE_SINGLEAPP_H
++
++#include <QApplication>
++#include <QLocalServer>
++#include <QLocalSocket>
++#include <QStandardPaths>
++#include <QCryptographicHash>
++
++// Drop-in replacement for SingleApplication that's compatible with QQmlApplicationEngine
++class CompatibleSingleApp : public QApplication
++{
++    Q_OBJECT
++
++public:
++    enum Mode {
++        User = 0x1,
++        System = 0x2
++    };
++
++    explicit CompatibleSingleApp(int &argc, char *argv[], bool allowSecondary = false,
++                                Mode mode = User, int timeout = 1000, const QString &userData = QString());
++    ~CompatibleSingleApp();
++
++    bool isPrimary() const { return m_isPrimary; }
++    bool isSecondary() const { return !m_isPrimary; }
++    bool sendMessage(const QByteArray &message, int timeout = 5000);
++
++signals:
++    void receivedMessage(quint32 instanceId, QByteArray message);
++    void receivedMessage(QVariant instanceId, QVariant message);
++
++private slots:
++    void slotConnectionEstablished();
++    void slotDataAvailable(QLocalSocket *socket, quint32 instanceId);
++    void slotClientDisconnected(QLocalSocket *socket);
++
++private:
++    void generateHash();
++    void cleanUp();
++    bool startPrimary();
++    bool connectToExisting(int timeout);
++
++    bool m_isPrimary;
++    bool m_allowSecondary;
++    Mode m_mode;
++    int m_timeout;
++    QString m_userData;
++    QString m_appName;
++    QString m_socketName;
++    QLocalServer *m_localServer;
++    QLocalSocket *m_localSocket;
++    quint32 m_instanceId;
++};
++
++#endif // COMPATIBLE_SINGLEAPP_H
++
++// vim: set ts=4 sw=4 et:
+\ No newline at end of file
+diff --git a/main.cpp b/main.cpp
+index d571c4e..924f49a 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -31,14 +31,13 @@ typedef QApplication Application;
+ 
+ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
+     QQmlContext *ctx = engine->rootContext();
+-    SystemTray * systemTray = new SystemTray();
+ 
+     ctx->setContextProperty("applicationDirPath", QGuiApplication::applicationDirPath());
+     ctx->setContextProperty("appTitle", QString(APP_TITLE));
+     ctx->setContextProperty("autoUpdater", app.autoupdater);
+ 
+-    // Set access to an object of class properties in QML context
+-    ctx->setContextProperty("systemTray", systemTray);
++    // SystemTray creation delayed - will be created after QML engine is ready
++    ctx->setContextProperty("systemTray", QVariant());
+ 
+     #ifdef QT_DEBUG
+         ctx->setContextProperty("debug", true);
+@@ -49,7 +48,17 @@ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
+ 
+ int main(int argc, char **argv)
+ {
+-    qputenv("QTWEBENGINE_CHROMIUM_FLAGS", "--autoplay-policy=no-user-gesture-required");
++    // CRITICAL: Qt attributes must be set BEFORE QtWebEngine::initialize()
++    QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
++    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
++
++    // CRITICAL: Environment variables must be set BEFORE QtWebEngine::initialize()
++    qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
++            "--autoplay-policy=no-user-gesture-required "
++            "--no-sandbox "
++            "--disable-seccomp-filter-sandbox "
++            "--disable-setuid-sandbox "
++            "--disable-namespace-sandbox");
+     #ifdef _WIN32
+     // Default to ANGLE (DirectX), because that seems to eliminate so many issues on Windows
+     // Also, according to the docs here: https://wiki.qt.io/Qt_5_on_Windows_ANGLE_and_OpenGL, ANGLE is also preferrable
+@@ -65,16 +74,14 @@ int main(int argc, char **argv)
+     }
+     #endif
+ 
+-    // This is really broken on Linux
+-    #ifndef Q_OS_LINUX
+-    Application::setAttribute(Qt::AA_EnableHighDpiScaling);
+-    #endif
+-
+     Application::setApplicationName("Stremio");
+     Application::setApplicationVersion(STREMIO_SHELL_VERSION);
+     Application::setOrganizationName("Smart Code ltd");
+     Application::setOrganizationDomain("stremio.com");
+ 
++    // QtWebEngine::initialize() must be called BEFORE QApplication constructor
++    QtWebEngine::initialize();
++
+     MainApp app(argc, argv, true);
+     #ifndef Q_OS_MACOS
+     if( app.isSecondary() ) {
+@@ -106,8 +113,13 @@ int main(int argc, char **argv)
+ 
+     engine->load(QUrl(QStringLiteral("qrc:/main.qml")));
+ 
++    // Create SystemTray after QML engine is loaded and ready
++    SystemTray * systemTray = new SystemTray();
++    engine->rootContext()->setContextProperty("systemTray", systemTray);
++
+     #ifndef Q_OS_MACOS
+-    QObject::connect( &app, &SingleApplication::receivedMessage, &app, &MainApp::processMessage );
++    QObject::connect( &app, QOverload<quint32, QByteArray>::of(&CompatibleSingleApp::receivedMessage),
++                      &app, &MainApp::processMessage );
+     #endif
+     QObject::connect( &app, SIGNAL(receivedMessage(QVariant, QVariant)), engine->rootObjects().value(0),
+                       SLOT(onAppMessageReceived(QVariant, QVariant)) );
+diff --git a/mainapplication.h b/mainapplication.h
+index 1f502d6..2fdb618 100644
+--- a/mainapplication.h
++++ b/mainapplication.h
+@@ -1,12 +1,12 @@
+ #include <QEvent>
+ #include <QFileOpenEvent>
+-#include "singleapplication.h"
++#include "compatible_singleapp.h"
+ #include "autoupdater.h"
+ 
+ #ifdef Q_OS_MACOS
+ #define APP_TYPE QApplication
+ #else
+-#define APP_TYPE SingleApplication
++#define APP_TYPE CompatibleSingleApp
+ #endif
+ 
+ class MainApp : public APP_TYPE
+@@ -14,7 +14,7 @@ class MainApp : public APP_TYPE
+     Q_OBJECT
+ 
+   public: 
+-    MainApp(int &argc, char **argv, bool unique) : APP_TYPE(argc, argv, unique) {
++    MainApp(int &argc, char **argv, bool unique) : APP_TYPE(argc, argv, !unique) {
+       autoupdater = new AutoUpdater();
+       autoupdater->moveToThread(&autoupdaterThread);
+       autoupdaterThread.start();

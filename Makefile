@@ -127,6 +127,7 @@ $(libraries_token_targets): lib-token/%: %/.libraries.token
 .PHONY: tokens-if-needed/%
 tokens-if-needed/%:
 	$(eval pkgname := $*)
+	$(MAKE) compile/$(pkgname)
 	$(call repo_token_if_needed,$(pkgname))
 	$(call libraries_token_if_needed,$(pkgname))
 
@@ -227,14 +228,14 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/"
 	$(MAKE) clean-tokens/$(pkgname)
 
-# Please do not print any additional content via this target
-# so that we can parse output directly with jq
 compile_targets = $(foreach name,$(pkgs),compile/$(name))
 $(compile_targets): compile/%:
-	@$(MAKE) $(KEY) >/dev/null 2>&1
-	@mkdir -p ./$(*)/
+	mkdir -p ./compiled ./$(*)/
+	$(eval jsonfile := compiled/$*.json)
 	$(eval yamlfile := $*.yaml)
-	@$(MELANGE) compile $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(*)/
+	$(eval pkgname := $*)
+	$(MELANGE) compile $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(*)/ > $(jsonfile)
+	@printf "Compiled manifest for $(pkgname) written to $(jsonfile)"
 
 .PHONY: dev-container
 dev-container:
@@ -336,9 +337,10 @@ mv "$(2).tmp" "$(2)"
 endef
 
 define repo_token_if_needed
+$(eval jsonfile := compiled/$1.json)
 $(eval pkgname := $1)
 
-@if [ -n "$$($(MAKE) -s compile/$(pkgname) | jq -r '.. | .uses? | strings | select(test("auth/guarded-repo"))')" ]; then \
+@if jq -er '.. | .uses? | strings | select(test("auth/guarded-repo"))' $(jsonfile); then \
 	echo "Creating guarded repo token for $(pkgname)…"; \
 	$(MAKE) repo-token/$(pkgname); \
 else \
@@ -347,9 +349,10 @@ fi
 endef
 
 define libraries_token_if_needed
+$(eval jsonfile := compiled/$1.json)
 $(eval pkgname := $1)
 
-@if [ -n "$$($(MAKE) -s compile/$(pkgname) | jq -r '.. | .uses? | strings | select(test("auth/(?!guarded-repo)"))')" ]; then \
+@if jq -er '.. | .uses? | strings | select(test("auth/(?!guarded-repo)"))' $(jsonfile); then \
 	echo "Creating guarded libraries token for $(pkgname)…"; \
 	$(MAKE) lib-token/$(pkgname); \
 else \

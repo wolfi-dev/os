@@ -1,0 +1,365 @@
+package:
+  name: boost-1.88
+  version: "1.88.0"
+  epoch: 0
+  description: "Free peer-reviewed portable C++ source libraries"
+  copyright:
+    - license: "BSL-1.0"
+  dependencies:
+    provides:
+      - boost=${{package.full-version}}
+  resources:
+    cpu: 32
+    memory: 16Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - bzip2-dev
+      - ca-certificates-bundle
+      - patch
+      - py3-supported-build-base-dev
+      - wolfi-base
+      - xz-dev
+      - zlib-dev
+      - zstd-dev
+
+vars:
+  b2: './tools/build/src/engine/b2'
+  build-opts: 'release toolset=gcc debug-symbols=off threading=single,multi runtime-link=shared link=shared,static cflags=-fno-strict-aliasing --layout=tagged -q'
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+  - name: libs
+    items:
+      atomic: atomic
+      charconv: charconv
+      chrono: chrono
+      container: container
+      context: context
+      contract: contract
+      coroutine: coroutine
+      date_time: date_time
+      fiber: fiber
+      filesystem: filesystem
+      graph: graph
+      iostreams: iostreams
+      json: json
+      locale: locale
+      log: log
+      math: math
+      nowide: nowide
+      prg_exec_monitor: prg_exec_monitor
+      process: process
+      program_options: program_options
+      random: random
+      regex: regex
+      serialization: serialization
+      stacktrace: stacktrace
+      system: system
+      thread: thread
+      timer: timer
+      type_erasure: type_erasure
+      unit_test_framework: unit_test_framework
+      url: url
+      wave: wave
+      wserialization: wserialization
+
+# transform melange version, i.e. 1.81.0 => 1_81_0
+var-transforms:
+  - from: ${{package.version}}
+    match: \.
+    replace: _
+    to: mangled-package-version
+  - from: ${{package.version}}
+    to: soversion
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://archives.boost.io/release/${{package.version}}/source/boost_${{vars.mangled-package-version}}.tar.gz
+      expected-sha256: 3621533e820dcab1e8012afd583c0c73cf0f77694952b81352bf38c1488f9cb4
+
+  # Build the Boost build tool
+  - working-directory: tools/build/src/engine
+    runs: ./build.sh cc gcc
+
+  # Build the Boost BCP tool
+  - working-directory: tools/bcp
+    runs: ../build/src/engine/b2 -j$(nproc)
+
+  - runs: |
+      # Build Boost, excluding Boost.Python
+      # Boost.Python is built below for each Python version
+      ${{vars.b2}} ${{vars.build-opts}} \
+        --prefix="${{targets.contextdir}}/usr" \
+        -j$(nproc) \
+        --without-python
+
+      # Install Boost
+      ${{vars.b2}} \
+        --includedir="${{targets.contextdir}}"/usr/include \
+        --libdir="${{targets.contextdir}}"/usr/lib \
+        install \
+        --without-python
+
+      # Install Boost tools and license
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      install -Dm755 tools/build/src/engine/b2 "${{targets.contextdir}}"/usr/bin/b2
+      install -Dm755 dist/bin/bcp "${{targets.contextdir}}"/usr/bin/bcp
+      install -Dm644 LICENSE_1_0.txt \
+        "${{targets.contextdir}}"/usr/share/licenses/${{package.name}}/LICENSE_1_0.txt
+
+  - uses: strip
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-lib${{package.name}}
+    description: "Boost library for Python ${{range.key}}"
+    dependencies:
+      provides:
+        - py${{range.key}}-libboost=${{package.full-version}}
+    pipeline:
+      - runs: |
+          abiflags="$(python${{range.key}}-config --abiflags)"
+
+          # Create user config that includes Python version and abiflags
+          PY3_VERSION=$(python${{range.key}} -c 'import sys; print("%i.%i" % (sys.version_info.major, sys.version_info.minor))')
+          cat > user-config.jam <<-__EOF__
+          using python : ${PY3_VERSION:+$PY3_VERSION }: /usr/bin/python${{range.key}} : ${PY3_VERSION:+/usr/include/python${PY3_VERSION}${abiflags} }: : : : ${abiflags:+$abiflags };
+          __EOF__
+
+          # Build Boost.Python
+          ${{vars.b2}} ${{vars.build-opts}} \
+            --prefix="${{targets.destdir}}/usr" \
+            --build-dir=build-py${{range.key}} \
+            --stagedir=stage-py${{range.key}} \
+            -j$(nproc) \
+            --with-python
+
+          # Install Boost.Python in the main package
+          # This is intentional as we want to ship bindings in boost-dev
+          # and this makes splitting those away easier
+          ${{vars.b2}} \
+            --user-config=user-config.jam \
+            --includedir="${{targets.destdir}}"/usr/include \
+            --libdir="${{targets.destdir}}"/usr/lib \
+            --build-dir=build-py${{range.key}} \
+            --stagedir=stage-py${{range.key}} \
+            install \
+            --with-python
+
+          # Install Boost Python library
+          mkdir -p "${{targets.contextdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libboost_python${{range.value}}*.so.* "${{targets.contextdir}}"/usr/lib/
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-dev
+            - gcc
+            - python-${{range.key}}-dev
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "Test Python ${{range.key}} bindings"
+          runs: |
+            cat > py_test.cpp << 'EOF'
+            #include <boost/python.hpp>
+            #include <iostream>
+
+            char const* hello() { return "Hello, there!"; }
+
+            BOOST_PYTHON_MODULE(hello_there)
+            {
+                boost::python::def("hello", hello);
+            }
+            EOF
+
+            g++ -fPIC -shared -o hello_there.so py_test.cpp -lboost_python${{range.value}} $(python${{range.key}}-config --includes) $(python${{range.key}}-config --ldflags)
+
+            cat > test_libboost_python.py << 'EOF'
+            import hello_there
+            print(hello_there.hello())
+            EOF
+
+            python${{range.key}} test_libboost_python.py
+
+  - name: py3-supported-lib${{package.name}}
+    description: "Meta-package for Boost Python libraries"
+    dependencies:
+      provides:
+        - py3-supported-libboost=${{package.full-version}}
+      runtime:
+        - py3.10-lib${{package.name}}
+        - py3.11-lib${{package.name}}
+        - py3.12-lib${{package.name}}
+        - py3.13-lib${{package.name}}
+    test:
+      pipeline:
+        - uses: test/metapackage
+
+  - range: libs
+    name: libboost-${{range.key}}${{vars.soversion}}
+    description: "Boost ${{range.key}} library"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libboost_${{range.key}}*.so.* "${{targets.contextdir}}"/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-docs
+    description: "Boost documentation"
+    dependencies:
+      provides:
+        - boost-docs=${{package.full-version}}
+    pipeline:
+      - uses: split/manpages
+      - runs: |
+          # NOTE: ship license in -docs package so we can keep the main boost package empty
+          mkdir -p "${{targets.contextdir}}"/usr/share/licenses/${{package.name}}
+          mv "${{targets.destdir}}"/usr/share/licenses/${{package.name}}/LICENSE_1_0.txt "${{targets.contextdir}}"/usr/share/licenses/${{package.name}}
+
+  - name: ${{package.name}}-static
+    description: "Boost static libraries"
+    dependencies:
+      provides:
+        - boost-static=${{package.full-version}}
+    pipeline:
+      - uses: split/static
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-dev
+    description: "Development files for Boost"
+    dependencies:
+      provides:
+        - boost-dev=${{package.full-version}}
+      runtime:
+        - ${{package.name}}-tools
+        - ${{package.name}}-static
+    pipeline:
+      - uses: split/dev
+
+  - name: ${{package.name}}-tools
+    description: "Boost development tools"
+    dependencies:
+      provides:
+        - boost-tools=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/* "${{targets.contextdir}}"/usr/bin
+    # test added by a robot (binary)
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/bin/b2
+            stat /usr/bin/bcp
+
+update:
+  enabled: true
+  github:
+    identifier: boostorg/boost
+    strip-prefix: boost-
+    use-tag: true
+    tag-filter: boost-1.88.
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-dev
+        - gcc
+  pipeline:
+    # NOTE: boost main package should always be empty otherwise we break upgrades due to new libraries appearing.
+    - uses: test/emptypackage
+    - name: "Verify core tools installation"
+      runs: |
+        b2 -v
+        bcp --version
+    - uses: test/tw/ldd-check
+    - name: "Test basic header compilation"
+      runs: |
+        cat > test.cpp << 'EOF'
+        #include <boost/version.hpp>
+        #include <iostream>
+        int main() {
+            std::cout << BOOST_VERSION << std::endl;
+            return 0;
+        }
+        EOF
+        g++ test.cpp -o version_test
+        ./version_test
+    - name: "Test filesystem library"
+      runs: |
+        cat > fs_test.cpp << 'EOF'
+        #include <boost/filesystem.hpp>
+        #include <iostream>
+        int main() {
+            boost::filesystem::path p("/tmp");
+            return !boost::filesystem::exists(p);
+        }
+        EOF
+        g++ fs_test.cpp -o fs_test -lboost_filesystem
+        ./fs_test
+    - name: "Test thread library"
+      runs: |
+        cat > thread_test.cpp << 'EOF'
+        #include <boost/thread.hpp>
+        #include <iostream>
+
+        void thread_func() {
+            std::cout << "Thread executed" << std::endl;
+        }
+
+        int main() {
+            boost::thread t(thread_func);
+            t.join();
+            return 0;
+        }
+        EOF
+        g++ thread_test.cpp -o thread_test -lboost_thread -pthread
+        ./thread_test
+    - name: "Test program options library"
+      runs: |
+        cat > options_test.cpp << 'EOF'
+        #include <boost/program_options.hpp>
+        namespace po = boost::program_options;
+        int main() {
+            po::options_description desc("Test options");
+            desc.add_options()
+                ("help", "produce help message");
+            po::variables_map vm;
+            return 0;
+        }
+        EOF
+        g++ options_test.cpp -o options_test -lboost_program_options
+        ./options_test
+    - name: "Test serialization library"
+      runs: |
+        cat > serial_test.cpp << 'EOF'
+        #include <boost/archive/text_oarchive.hpp>
+        #include <boost/archive/text_iarchive.hpp>
+        #include <sstream>
+        int main() {
+            std::stringstream ss;
+            boost::archive::text_oarchive oa(ss);
+            int x = 42;
+            oa << x;
+            return 0;
+        }
+        EOF
+        g++ serial_test.cpp -o serial_test -lboost_serialization
+        ./serial_test
+    - uses: test/no-docs

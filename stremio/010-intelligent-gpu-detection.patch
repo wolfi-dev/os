@@ -1,0 +1,235 @@
+Subject: Force software rendering and disable OpenGL for QtWebEngine in containers
+Upstream: No (Container-specific workaround)
+Author: Juan Manuel Méndez Rey <vejeta@gmail.com>
+
+QtWebEngine tries to initialize hardware OpenGL (GLX) even when
+Qt::AA_UseSoftwareOpenGL is set, causing fatal abort() in containers
+without GPU access.
+
+This patch uses multiple Qt attributes to completely disable hardware
+OpenGL and force software rendering:
+- Qt::AA_UseSoftwareOpenGL: Force software OpenGL
+- QT_XCB_GL_INTEGRATION=none: Disable GLX completely
+- QT_QUICK_BACKEND=software: Force software backend
+- LIBGL_ALWAYS_SOFTWARE=1: Force Mesa software rendering
+
+This patch is generated based on the state AFTER applying patches 001-009,
+following the sequential patch methodology documented in MELANGE_PATCHING_SOLUTION.md
+
+---
+diff --git a/main.cpp b/main.cpp
+index a333361..a7e63a9 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -1,23 +1,21 @@
++#include <QApplication>
+ #include <QQmlApplicationEngine>
+-#include <QtWebEngine>
+-#include <QSysInfo>
+-
+-#include <clocale>
+-
+-#define APP_TITLE "Stremio - Freedom to Stream"
+-
+-#define DESKTOP true
+-
+-#ifdef DESKTOP
+-#include <QtWidgets/QApplication>
+-typedef QApplication Application;
+-
+-#include <QQmlEngine>
++#include <QQmlContext>
++#include <QFile>
++#include <QDir>
++#include <QIcon>
++#include <QtWebEngine/qtwebengineglobal.h>
++#ifdef Q_OS_MACOS
++#include <QOperatingSystemVersion>
++#endif
+ 
++#include <QSysInfo>
+ #include <QStandardPaths>
+ 
++#ifdef DESKTOP
+ #include <QSystemTrayIcon>
+ #include "systemtray.h"
++#endif
+ 
+ #include "mainapplication.h"
+ #include "stremioprocess.h"
+@@ -25,15 +23,77 @@ typedef QApplication Application;
+ #include "screensaver.h"
+ #include "qclipboardproxy.h"
+ 
+-#else
+-#include <QGuiApplication>
++#ifdef Q_OS_LINUX
++#include <signal.h>
++#include <execinfo.h>
++#endif
++
++#define STREMIO_ORG_NAME "Smart Code ltd"
++#define STREMIO_ORG_DOMAIN "stremio.com"
++
++#ifdef Q_OS_LINUX
++void handleCrashDumps() {
++    // Crash dump handler implementation
++}
+ #endif
+ 
++// Comprehensive container detection
++bool isRunningInContainer() {
++    if (QFile::exists("/.dockerenv") ||
++        QFile::exists("/run/.containerenv") ||
++        QFile::exists("/etc/apk/world")) {
++        return true;
++    }
++
++    QFile cgroupFile("/proc/1/cgroup");
++    if (cgroupFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
++        QString content = QString::fromUtf8(cgroupFile.readAll());
++        cgroupFile.close();
++        if (content.contains("/docker/") || content.contains("/lxc/") ||
++            content.contains("/kubepods/") || content.contains("/containerd/") ||
++            content.contains("/podman/")) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++// Check GPU device accessibility
++bool hasGPUAccess() {
++    QDir driDir("/dev/dri");
++    if (!driDir.exists()) {
++        return false;
++    }
++
++    QStringList renderNodes = driDir.entryList(QStringList() << "renderD*", QDir::System);
++    if (!renderNodes.isEmpty()) {
++        for (const QString &node : renderNodes) {
++            QFile nodeFile("/dev/dri/" + node);
++            if (nodeFile.exists() && nodeFile.open(QIODevice::ReadOnly)) {
++                nodeFile.close();
++                return true;
++            }
++        }
++    }
++
++    QStringList cards = driDir.entryList(QStringList() << "card*", QDir::System);
++    for (const QString &card : cards) {
++        QFile cardFile("/dev/dri/" + card);
++        if (cardFile.exists() && cardFile.open(QIODevice::ReadOnly)) {
++            cardFile.close();
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
+     QQmlContext *ctx = engine->rootContext();
+ 
+     ctx->setContextProperty("applicationDirPath", QGuiApplication::applicationDirPath());
+-    ctx->setContextProperty("appTitle", QString(APP_TITLE));
++    ctx->setContextProperty("appTitle", QString("Stremio - Freedom to Stream"));
+     ctx->setContextProperty("autoUpdater", app.autoupdater);
+ 
+     // SystemTray creation delayed - will be created after QML engine is ready
+@@ -48,38 +108,38 @@ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
+ 
+ int main(int argc, char **argv)
+ {
+-    // CRITICAL: Qt attributes must be set BEFORE QtWebEngine::initialize()
+-    QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
+-    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+-
+-    // CRITICAL: Environment variables must be set BEFORE QtWebEngine::initialize()
+-    qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
+-            "--autoplay-policy=no-user-gesture-required "
+-            "--no-sandbox "
+-            "--disable-seccomp-filter-sandbox "
+-            "--disable-setuid-sandbox "
+-            "--disable-namespace-sandbox");
+-    #ifdef _WIN32
+-    // Default to ANGLE (DirectX), because that seems to eliminate so many issues on Windows
+-    // Also, according to the docs here: https://wiki.qt.io/Qt_5_on_Windows_ANGLE_and_OpenGL, ANGLE is also preferrable
+-    // We do not need advanced OpenGL features but we need more universal support
+-
+-    Application::setAttribute(Qt::AA_UseOpenGLES);
+-    auto winVer = QSysInfo::windowsVersion();
+-    if(winVer <= QSysInfo::WV_WINDOWS8 && winVer != QSysInfo::WV_None) {
+-        qputenv("NODE_SKIP_PLATFORM_CHECK", "1");
++    // CRITICAL: Must be FIRST before any Qt initialization
++    bool inContainer = isRunningInContainer();
++    bool hasGPU = hasGPUAccess();
++
++    if (inContainer && !hasGPU) {
++        // Multiple approaches to disable hardware OpenGL
++        QCoreApplication::setAttribute(Qt::AA_UseSoftwareOpenGL);
++
++        // Set environment variables BEFORE Qt initializes
++        qputenv("QT_XCB_GL_INTEGRATION", "none");
++        qputenv("QT_QUICK_BACKEND", "software");
++        qputenv("LIBGL_ALWAYS_SOFTWARE", "1");
+     }
+-    if(winVer <= QSysInfo::WV_WINDOWS7 && winVer != QSysInfo::WV_None) {
+-        qputenv("QT_ANGLE_PLATFORM", "d3d9");
++
++    QCoreApplication::setOrganizationName(STREMIO_ORG_NAME);
++    QCoreApplication::setOrganizationDomain(STREMIO_ORG_DOMAIN);
++    QCoreApplication::setApplicationName("Stremio");
++    QCoreApplication::setApplicationVersion(STREMIO_SHELL_VERSION);
++
++    // Log rendering method
++    if (inContainer && !hasGPU) {
++        qDebug() << "Stremio: Container without GPU - software rendering forced";
++    } else if (inContainer && hasGPU) {
++        qDebug() << "Stremio: Container with GPU passthrough detected";
++    } else {
++        qDebug() << "Stremio: Bare metal - hardware acceleration";
+     }
+-    #endif
+ 
+-    Application::setApplicationName("Stremio");
+-    Application::setApplicationVersion(STREMIO_SHELL_VERSION);
+-    Application::setOrganizationName("Smart Code ltd");
+-    Application::setOrganizationDomain("stremio.com");
++    #ifdef Q_OS_MACOS
++    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling, true);
++    #endif
+ 
+-    // QtWebEngine::initialize() must be called BEFORE QApplication constructor
+     QtWebEngine::initialize();
+ 
+     MainApp app(argc, argv, true);
+@@ -89,18 +149,15 @@ int main(int argc, char **argv)
+             app.sendMessage( app.arguments().at(1).toUtf8() );
+         else
+             app.sendMessage( "SHOW" );
+-        //app.sendMessage( app.arguments().join(' ').toUtf8() );
+         return 0;
+     }
+     #endif
+ 
+     app.setWindowIcon(QIcon(":/images/stremio_window.png"));
+ 
+-
+     // Qt sets the locale in the QGuiApplication constructor, but libmpv
+     // requires the LC_NUMERIC category to be set to "C", so change it back.
+     std::setlocale(LC_NUMERIC, "C");
+-    
+ 
+     static QQmlApplicationEngine* engine = new QQmlApplicationEngine();
+ 
+@@ -109,7 +166,7 @@ int main(int argc, char **argv)
+     qmlRegisterType<MpvObject>("com.stremio.libmpv", 1, 0, "MpvObject");
+     qmlRegisterType<ClipboardProxy>("com.stremio.clipboard", 1, 0, "Clipboard");
+ 
+-    InitializeParameters(engine, app); 
++    InitializeParameters(engine, app);
+ 
+     engine->load(QUrl(QStringLiteral("qrc:/main.qml")));
+ 

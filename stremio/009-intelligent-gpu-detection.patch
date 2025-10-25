@@ -14,12 +14,28 @@ This patch implements comprehensive detection for:
 CRITICAL: setAttribute(Qt::AA_UseSoftwareOpenGL) must be called BEFORE
 any Qt initialization (even setApplicationName) to prevent GLX initialization.
 
+Uses QFileInfo::isReadable() instead of QFile::open() to avoid blocking
+on /dev/dri/* devices in containerized environments.
+
+Global variables g_hasGPUAccess and g_inContainer are exported (non-static)
+for use by mpv.cpp (patch 010) to configure video output accordingly.
+
 ---
+From 7460b234c00aded3fd6d6b2d0ddff93a9dff0da9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Juan=20Manuel=20M=C3=A9ndez=20Rey?= <vejeta@gmail.com>
+Date: Sat, 25 Oct 2025 12:05:12 +0200
+Subject: [PATCH] After patch 009 - Intelligent GPU detection for container
+ environments
+
+---
+ main.cpp | 162 ++++++++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 113 insertions(+), 49 deletions(-)
+
 diff --git a/main.cpp b/main.cpp
-index a333361..a7e63a9 100644
+index a333361..62b5b40 100644
 --- a/main.cpp
 +++ b/main.cpp
-@@ -1,23 +1,21 @@
+@@ -1,23 +1,22 @@
 +#include <QApplication>
  #include <QQmlApplicationEngine>
 -#include <QtWebEngine>
@@ -39,6 +55,7 @@ index a333361..a7e63a9 100644
 +#include <QQmlContext>
 +#include <QFile>
 +#include <QDir>
++#include <QFileInfo>
 +#include <QIcon>
 +#include <QtWebEngine/qtwebengineglobal.h>
 +#ifdef Q_OS_MACOS
@@ -55,7 +72,7 @@ index a333361..a7e63a9 100644
  
  #include "mainapplication.h"
  #include "stremioprocess.h"
-@@ -25,15 +23,77 @@ typedef QApplication Application;
+@@ -25,15 +24,83 @@ typedef QApplication Application;
  #include "screensaver.h"
  #include "qclipboardproxy.h"
  
@@ -75,6 +92,10 @@ index a333361..a7e63a9 100644
 +}
  #endif
  
++// Global GPU detection state - accessible from mpv.cpp via extern
++bool g_hasGPUAccess = false;
++bool g_inContainer = false;
++
 +// Comprehensive container detection
 +bool isRunningInContainer() {
 +    if (QFile::exists("/.dockerenv") ||
@@ -97,29 +118,31 @@ index a333361..a7e63a9 100644
 +    return false;
 +}
 +
-+// Check GPU device accessibility
++// Check GPU device accessibility using QFileInfo (non-blocking)
 +bool hasGPUAccess() {
 +    QDir driDir("/dev/dri");
 +    if (!driDir.exists()) {
 +        return false;
 +    }
 +
++    // Check render nodes first (preferred for containers)
 +    QStringList renderNodes = driDir.entryList(QStringList() << "renderD*", QDir::System);
 +    if (!renderNodes.isEmpty()) {
 +        for (const QString &node : renderNodes) {
-+            QFile nodeFile("/dev/dri/" + node);
-+            if (nodeFile.exists() && nodeFile.open(QIODevice::ReadOnly)) {
-+                nodeFile.close();
++            QString nodePath = "/dev/dri/" + node;
++            QFileInfo nodeInfo(nodePath);
++            if (nodeInfo.exists() && nodeInfo.isReadable()) {
 +                return true;
 +            }
 +        }
 +    }
 +
++    // Fallback to card devices
 +    QStringList cards = driDir.entryList(QStringList() << "card*", QDir::System);
 +    for (const QString &card : cards) {
-+        QFile cardFile("/dev/dri/" + card);
-+        if (cardFile.exists() && cardFile.open(QIODevice::ReadOnly)) {
-+            cardFile.close();
++        QString cardPath = "/dev/dri/" + card;
++        QFileInfo cardInfo(cardPath);
++        if (cardInfo.exists() && cardInfo.isReadable()) {
 +            return true;
 +        }
 +    }
@@ -136,7 +159,7 @@ index a333361..a7e63a9 100644
      ctx->setContextProperty("autoUpdater", app.autoupdater);
  
      // SystemTray creation delayed - will be created after QML engine is ready
-@@ -48,38 +108,38 @@ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
+@@ -48,38 +115,38 @@ void InitializeParameters(QQmlApplicationEngine *engine, MainApp& app) {
  
  int main(int argc, char **argv)
  {
@@ -161,10 +184,10 @@ index a333361..a7e63a9 100644
 -    if(winVer <= QSysInfo::WV_WINDOWS8 && winVer != QSysInfo::WV_None) {
 -        qputenv("NODE_SKIP_PLATFORM_CHECK", "1");
 +    // CRITICAL: Must be FIRST before any Qt initialization
-+    bool inContainer = isRunningInContainer();
-+    bool hasGPU = hasGPUAccess();
++    g_inContainer = isRunningInContainer();
++    g_hasGPUAccess = hasGPUAccess();
 +
-+    if (inContainer && !hasGPU) {
++    if (g_inContainer && !g_hasGPUAccess) {
 +        // Multiple approaches to disable hardware OpenGL
 +        QCoreApplication::setAttribute(Qt::AA_UseSoftwareOpenGL);
 +
@@ -182,9 +205,9 @@ index a333361..a7e63a9 100644
 +    QCoreApplication::setApplicationVersion(STREMIO_SHELL_VERSION);
 +
 +    // Log rendering method
-+    if (inContainer && !hasGPU) {
++    if (g_inContainer && !g_hasGPUAccess) {
 +        qDebug() << "Stremio: Container without GPU - software rendering forced";
-+    } else if (inContainer && hasGPU) {
++    } else if (g_inContainer && g_hasGPUAccess) {
 +        qDebug() << "Stremio: Container with GPU passthrough detected";
 +    } else {
 +        qDebug() << "Stremio: Bare metal - hardware acceleration";
@@ -203,7 +226,7 @@ index a333361..a7e63a9 100644
      QtWebEngine::initialize();
  
      MainApp app(argc, argv, true);
-@@ -89,18 +149,15 @@ int main(int argc, char **argv)
+@@ -89,18 +156,15 @@ int main(int argc, char **argv)
              app.sendMessage( app.arguments().at(1).toUtf8() );
          else
              app.sendMessage( "SHOW" );
@@ -222,7 +245,7 @@ index a333361..a7e63a9 100644
  
      static QQmlApplicationEngine* engine = new QQmlApplicationEngine();
  
-@@ -109,7 +166,7 @@ int main(int argc, char **argv)
+@@ -109,7 +173,7 @@ int main(int argc, char **argv)
      qmlRegisterType<MpvObject>("com.stremio.libmpv", 1, 0, "MpvObject");
      qmlRegisterType<ClipboardProxy>("com.stremio.clipboard", 1, 0, "Clipboard");
  
@@ -231,3 +254,6 @@ index a333361..a7e63a9 100644
  
      engine->load(QUrl(QStringLiteral("qrc:/main.qml")));
  
+-- 
+2.51.0
+

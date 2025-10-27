@@ -1,0 +1,123 @@
+package:
+  name: set_user-17
+  version: "4.2.0"
+  epoch: 0
+  description: PostgreSQL extension for controlled privilege escalation with enhanced logging
+  copyright:
+    - license: PostgreSQL
+
+var-transforms:
+  - from: ${{package.version}}
+    match: \.
+    replace: _
+    to: mangled-package-version
+  - from: ${{package.name}}
+    match: '^set_user-(\d+)$'
+    replace: $1
+    to: pg-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - clang-19
+      - llvm-19
+      - postgresql-${{vars.pg-version}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/pgaudit/set_user
+      expected-commit: db4e871528c4b62bba672abaf9044f4cc618ae8c
+      tag: REL${{vars.mangled-package-version}}
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - uses: strip
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql-${{vars.pg-version}}
+        - postgresql-${{vars.pg-version}}-client
+        - shadow
+        - sudo-rs
+        - glibc-locales
+        - wait-for-it
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+  pipeline:
+    - name: Initialize PostgreSQL database
+      runs: |
+        useradd $PGUSER
+        echo -n $PGPASSWORD 2>&1 > /tmp/pwfile
+        sudo -u $PGUSER initdb --pwfile=/tmp/pwfile -D /tmp/pgdata --auth=md5 2>&1
+    - name: Test set_user extension
+      runs: |
+        sudo -u $PGUSER pg_ctl start -w -D /tmp/pgdata -o "--shared_preload_libraries=set_user --unix_socket_directories=/tmp" -l /tmp/pgdata/log 2>&1
+
+        # Wait for PostgreSQL to be ready
+        wait-for-it localhost:5432 -t 4
+
+        # Test extension creation and basic functionality
+        psql -h /tmp -d postgres -U postgres << 'EOF'
+        -- Create the set_user extension
+        CREATE EXTENSION set_user;
+
+        -- Verify extension is installed
+        SELECT * FROM pg_extension WHERE extname = 'set_user';
+
+        -- Create a test role
+        CREATE ROLE test_role;
+
+        -- Test basic set_user functionality
+        SELECT set_user('test_role');
+
+        -- Verify current user changed
+        SELECT current_user;
+
+        -- Test reset_user functionality
+        SELECT reset_user();
+
+        -- Verify user was reset
+        SELECT current_user;
+
+        -- Test set_user_u (superuser) functionality
+        SELECT set_user_u('postgres');
+
+        -- Verify current user
+        SELECT current_user;
+
+        -- Reset back
+        SELECT reset_user();
+
+        -- Clean up test role
+        DROP ROLE test_role;
+        EOF
+
+        # Check for any errors in PostgreSQL logs
+        if grep -E '(ERROR|FATAL)' /tmp/pgdata/log/postgresql.log 2>/dev/null | grep -Ev '(no COPY in progress|could not connect to|could not send|the database system is not yet accepting connections|database system is shutting|error reading result of streaming command|database system is starting up)'; then
+          echo "PostgreSQL errors found in logs"
+          exit 1
+        fi
+
+        # Cleanup: Stop PostgreSQL and kill any remaining processes
+        pg_ctl stop -D /tmp/pgdata -m fast 2>/dev/null || true
+    - uses: test/tw/ldd-check
+
+update:
+  version-transform:
+    - match: \_
+      replace: .
+  enabled: true
+  github:
+    identifier: pgaudit/set_user
+    tag-filter-contains: _
+    strip-prefix: REL
+    use-tag: true
+    tag-filter: REL

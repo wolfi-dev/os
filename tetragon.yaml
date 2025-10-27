@@ -1,0 +1,230 @@
+package:
+  name: tetragon
+  version: "1.6.0"
+  epoch: 0
+  description: "eBPF-based Security Observability and Runtime Enforcement"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bpftool
+      - ca-certificates-bundle
+      - gops
+      - iproute2
+
+environment:
+  environment:
+    LOCAL_CLANG: "1"
+  contents:
+    packages:
+      - bash-completion
+      - clang-17
+      - elfutils-dev
+      - libbpf-dev
+      - linux-headers
+      - llvm-17
+      - make
+      - pkgconf
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/cilium/tetragon
+      tag: v${{package.version}}
+      expected-commit: 87ce9b713a40c3d227960023ac2c6559bc901349
+
+  - name: (Cross-)Compile bpf programs
+    runs: |
+      make -C bpf clean
+      make -C bpf -j$(nproc)
+
+  - uses: go/build
+    with:
+      packages: ./cmd/tetragon
+      output: tetragon
+      ldflags: |
+        -X github.com/cilium/tetragon/pkg/version.Version=${{package.version}}
+
+  - name: Install BPF objects
+    runs: |
+      mkdir -p "${{targets.destdir}}/var/lib/tetragon/"
+      # Tetragon loads these at runtime from --bpf-lib (defaults under /var/lib/tetragon)
+      install -m 0644 bpf/objs/* "${{targets.destdir}}/var/lib/tetragon/"
+
+  - name: Install default config
+    runs: |
+      install -d "${{targets.destdir}}/etc/tetragon"
+      # Provide a sensible default; users can override via flags/env
+      if [ -f examples/configuration/tetragon.yaml ]; then
+        install -m 0644 examples/configuration/tetragon.yaml "${{targets.destdir}}/etc/tetragon/tetragon.yaml"
+      fi
+
+subpackages:
+  - name: ${{package.name}}-bash-completion
+    description: "Bash completion compatibility package for tetragon image"
+    dependencies:
+      runtime:
+        - bash
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/tetragon/tetragon.conf.d"
+          mkdir -p "${{targets.subpkgdir}}/etc/tetragon/tetragon.tp.d"
+          mkdir -p "${{targets.subpkgdir}}/etc/bash"
+          mkdir -p "${{targets.subpkgdir}}/etc/bash_completion.d"
+          mkdir -p "${{targets.subpkgdir}}/usr/share/bash-completion"
+          # Copy helper script that sets up the Bash completion environment and compatibility layer for older Bash completion functions
+          # We're not keeping bash-completion package in image to reduce since only the below scripts are bundled in the image
+          cp -r /etc/profile.d/bash_completion.sh "${{targets.subpkgdir}}/etc/bash/bash_completion.sh"
+          cp -r /etc/bash_completion.d/000_bash_completion_compat.bash "${{targets.subpkgdir}}/etc/bash_completion.d/000_bash_completion_compat.bash"
+          cp -r /usr/share/bash-completion/bash_completion "${{targets.subpkgdir}}/usr/share/bash-completion/bash_completion"
+    test:
+      pipeline:
+        - name: "Check for scripts"
+          runs: |
+            test -s /etc/bash/bash_completion.sh
+            test -s /etc/bash_completion.d/000_bash_completion_compat.bash
+            test -s /usr/share/bash-completion/bash_completion
+
+  - name: tetra
+    description: "Tetra CLI for Tetragon"
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/tetra
+          output: tetra
+          ldflags: |
+            -X github.com/cilium/tetragon/pkg/version.Version=${{package.version}}
+      - name: "Add tetragon bash completion scripts as per upstream"
+        runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/bash_completion.d"
+          ${{targets.subpkgdir}}/usr/bin/tetra completion bash > "${{targets.subpkgdir}}/etc/bash_completion.d/tetra"
+          chmod a+r "${{targets.subpkgdir}}/etc/bash_completion.d/tetra"
+    test:
+      pipeline:
+        - name: "Basic Version Test"
+          runs: |
+            tetra version 2>&1 | grep -q "${{package.version}}"
+        - name: "Completion Script test"
+          runs: |
+            # Functional tests are covered in tetragon tests
+            tetra completion bash 2>&1 | grep -q "bash completion V2 for tetra"
+
+  - name: tetragon-operator
+    description: "Tetragon operator for Kubernetes"
+    dependencies:
+      runtime:
+        - ca-certificates-bundle
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./operator
+          output: tetragon-operator
+          ldflags: |
+            -X github.com/cilium/tetragon/pkg/version.Version=${{package.version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+        environment:
+          KUBERNETES_SERVICE_HOST: "127.0.0.1"
+          KUBERNETES_SERVICE_PORT: "32764"
+          OPERATOR_HEALTH_PORT: "8081"
+      pipeline:
+        - uses: test/kwok/cluster
+          with:
+            serviceaccount: true
+        - name: "Completion Script test" # Version flag or command doesn't exist for operator
+          runs: |
+            tetragon-operator completion bash | grep -q "bash completion V2 for tetragon-operator"
+        - name: "Set up configuration for operator"
+          runs: |
+            # Grant cluster-admin to operator's service account
+            kubectl create clusterrolebinding tetragon-op-admin --clusterrole=cluster-admin --serviceaccount=default:default
+            kubectl auth can-i get crd --as=system:serviceaccount:default:default
+        - name: "Test Tetragon Operator"
+          uses: test/daemon-check-output
+          with:
+            start: tetragon-operator serve --metrics-bind-address :2113 --health-probe-bind-address :"${OPERATOR_HEALTH_PORT}"
+            timeout: 20
+            expected_output: |
+              Starting Tetragon Operator
+              Initialization complete
+              Starting EventSource
+              Starting Controller
+              starting manager
+              Starting workers
+            post: |
+              # Health checks
+              curl -sf "http://127.0.0.1:${OPERATOR_HEALTH_PORT}/healthz" | grep -q "ok"
+              curl -sf "http://127.0.0.1:${OPERATOR_HEALTH_PORT}/readyz"  | grep -q 'ok'
+              # Verify CRDs created by tetragon-operator
+              kubectl wait --for=condition=Established --timeout=45s crd/tracingpolicies.cilium.io
+              kubectl wait --for=condition=Established --timeout=45s crd/tracingpoliciesnamespaced.cilium.io
+              kubectl wait --for=condition=Established --timeout=45s crd/podinfo.cilium.io
+              kubectl get crd tracingpolicies.cilium.io -o name
+              kubectl get crd tracingpoliciesnamespaced.cilium.io -o name
+              kubectl get crd podinfo.cilium.io -o name
+
+update:
+  enabled: true
+  github:
+    identifier: cilium/tetragon
+    strip-prefix: v
+    use-tag: true
+    tag-filter: v
+  ignore-regex-patterns:
+    - -pre
+    - -rc
+    - ^api
+    - ^rthooks
+
+capabilities:
+  add:
+    - CAP_NET_ADMIN
+    - CAP_SYS_ADMIN
+    - CAP_BPF
+
+test:
+  environment:
+    environment:
+      SERVER_PORT: "54321"
+      METRICS_PORT: "2112"
+    contents:
+      packages:
+        - curl
+        - tetra=${{package.full-version}}
+  pipeline:
+    - name: Basic Version Test
+      runs: |
+        tetragon version 2>&1 | grep -q "${{package.version}}"
+    - name: "Test Tetragon Daemon"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp
+        start: tetragon --server-address "127.0.0.1:${SERVER_PORT}" --metrics-server ":${METRICS_PORT}" --export-filename "/tmp/tetragon.json" --log-format json >/tmp/tetragon.out
+        timeout: 20
+        expected_output: |
+          Loaded sensor successfully
+          Listening for events
+          Starting gRPC server
+        post: |
+          # Check Metrics
+          curl -sf http://127.0.0.1:${METRICS_PORT}/metrics > metrics.txt
+          grep -q "tetragon_flags_total" metrics.txt
+          grep -q "tetragon_events_exported_total" metrics.txt
+          grep -q "tetragon_observer_ringbuf_queue_events_received_total" metrics.txt
+          grep -q "tetragon_policyfilter_operations_total" metrics.txt
+          grep -q "tetragon_watcher_events_total" metrics.txt
+          # Tetra CLI Tests
+          # Status
+          tetra --server-address "127.0.0.1:${SERVER_PORT}" status 2>&1 | grep "Status: running"
+          # tetra bugtool: Produce a tar archive with debug information
+          tetra bugtool 2>&1 | grep -q "executed command"
+          test -s tetragon-bugtool.tar.gz
+          # Detect eBPF system features
+          tetra --server-address "127.0.0.1:${SERVER_PORT}" probe 2>&1 | grep -q "signal: true"
+          # Loglevel
+          tetra loglevel get 2>&1 | grep -q "Current log level: LOG_LEVEL_INFO"

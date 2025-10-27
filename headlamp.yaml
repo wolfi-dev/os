@@ -1,0 +1,97 @@
+package:
+  name: headlamp
+  version: "0.36.0"
+  epoch: 0 # CVE-2025-47910
+  description: A Kubernetes web UI that is fully-featured, user-friendly and extensible.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - busybox
+      - gnutar
+      - nodejs-${{vars.node-version}}
+
+vars:
+  node-version: 18 # Headlamp requires Node.js 18 for frontend builds as of v0.34.0
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - curl
+      - gnutar
+      - jq
+      - nodejs-${{vars.node-version}}
+      - npm
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 4a499b0aede871b0ad6abaffbe6867d257465de7
+      repository: https://github.com/kubernetes-sigs/headlamp
+      tag: v${{package.version}}
+
+  - working-directory: backend
+    uses: go/build
+    with:
+      packages: ./cmd
+      tidy: true
+      output: headlamp-server
+
+  - working-directory: frontend
+    runs: |
+      npm ci --only=prod
+      npm run build
+      mkdir -p "${{targets.destdir}}/headlamp/frontend"
+      cp -r build/* "${{targets.destdir}}/headlamp/frontend/"
+
+  - runs: |
+      mkdir -p "${{targets.destdir}}/headlamp/plugins"
+      mkdir -p "${{targets.destdir}}/headlamp/static-plugins"
+      mkdir -p "${{targets.destdir}}/tools"
+      install -m 0644 container/build-manifest.json "${{targets.destdir}}/tools/"
+      install -m 0755 container/fetch-plugins.sh "${{targets.destdir}}/tools/"
+      cd "${{targets.destdir}}/tools"
+      ./fetch-plugins.sh "${{targets.destdir}}/headlamp/static-plugins"
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/headlamp"
+          ln -sf /usr/bin/headlamp-server "${{targets.contextdir}}/headlamp/headlamp-server"
+    test:
+      pipeline:
+        - runs: test "$(readlink /headlamp/headlamp-server)" = "/usr/bin/headlamp-server"
+
+update:
+  enabled: true
+  github:
+    identifier: kubernetes-sigs/headlamp
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+        - ${{package.name}}-compat
+  pipeline:
+    - uses: test/kwok/cluster
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+        start: |
+          /headlamp/headlamp-server -html-static-dir=/headlamp/frontend -plugins-dir=/headlamp/plugins -listen-addr=127.0.0.1 -port=4466 -kubeconfig /tmp/kubeconfig.yaml -metrics-enabled
+        timeout: 30
+        expected_output: |
+          Creating Headlamp handler
+          Listen address: 127.0.0.1:4466
+          Plugins dir: /headlamp/plugins
+        post: |
+          wait-for-it 127.0.0.1:4466 -t 30 -- echo "Port 4466 is ready"
+          curl -sSf http://127.0.0.1:4466/ | grep -q "<title>Headlamp</title>"
+          curl -sSf http://127.0.0.1:4466/metrics | grep -q '^go_goroutines'

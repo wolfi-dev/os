@@ -1,0 +1,119 @@
+package:
+  name: quiche
+  version: "0.24.6"
+  epoch: 0
+  description: An implementation of the QUIC transport protocol and HTTP/2 as specified by the IETF
+  copyright:
+    - license: BSD-2-Clause
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - clang
+      - cmake
+      - rustup
+  environment:
+    RUSTUP_TOOLCHAIN: stable
+    CARGO_TARGET_DIR: target
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/cloudflare/quiche
+      tag: ${{package.version}}
+      expected-commit: 020a43a0a5eed76f57dd3ce5012149aa576c594d
+
+  - name: Prepare
+    runs: |
+      cargo update
+      cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+
+  - uses: cargo/build
+    with:
+      output: quiche-server
+      rustflags: "-C link-args=-Wl,-z,shstk"
+      opts: |
+        --release \
+        --frozen \
+        --no-default-features \
+        --features ffi,pkg-config-meta,qlog,boringssl-boring-crate
+
+  - name: Install files
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/lib
+      mkdir -p ${{targets.destdir}}/usr/lib/pkgconfig
+      install -Dm755 ./target/release/quiche-client ${{targets.destdir}}/usr/bin/quiche-client
+      install -Dm755 ./target/release/libquiche.so ${{targets.destdir}}/usr/lib/libquiche.so
+      install -Dm755 ./target/release/quiche.pc ${{targets.destdir}}/usr/lib/pkgconfig/quiche.pc
+      install -Dm644 quiche/include/quiche.h ${{targets.destdir}}/usr/include/quiche.h
+      install -Dm644 COPYING ${{targets.destdir}}/usr/share/licenses/${{package.name}}/COPYING
+
+  - uses: strip
+
+subpackages:
+  - name: libquiche
+    description: "Development headers, .pc files, and static libs for quiche"
+    pipeline:
+      - uses: split/dev
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/lib/libquiche.so* ${{targets.subpkgdir}}/usr/lib/
+      - name: Versioned SONAME
+        runs: |
+          # Create a versioned symlink for the library, as most binaries linked against versioned libraries.
+          # For example, /usr/local/bin/dnsdist needs libquiche.so.<VERSION>.
+          ln -sf /usr/lib/libquiche.so ${{targets.subpkgdir}}/usr/lib/libquiche.so.${{vars.major-version}}
+    test:
+      pipeline:
+        - uses: test/pkgconf
+        - uses: test/tw/ldd-check
+        - runs: stat /usr/lib/libquiche.so.${{vars.major-version}}
+
+update:
+  enabled: true
+  github:
+    identifier: cloudflare/quiche
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - wait-for-it
+        - openssl
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: |
+        quiche-client --help
+        quiche-server --help
+    - name: Basic connection test
+      runs: |
+        response=$(quiche-client https://cloudflare-quic.com/ --no-verify)
+        if echo "$response" | grep -i "HTTP/3 using NGINX and quiche"; then
+          echo "Connection successful"
+        elif echo "$response" | grep -i "challenge-error-text"; then
+          echo "Connection successful, but received a challenge response on the CI"
+          echo "This is expected if the server has identified the client as a bot or crawler."
+        else
+          echo "Connection failed: $response"
+          exit 1
+        fi
+    - name: "Spin up local server and client round-trip"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir www
+          echo "hello from quiche" > www/index.html
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout cert.key -out cert.crt -subj "/CN=localhost" -days 1
+        start: quiche-server --listen 127.0.0.1:4433 --root ./www --cert cert.crt --key cert.key
+        timeout: 15
+        expected_output: " " # Server doesn't output anything on start
+        post: |
+          wait-for-it -t 5 --strict localhost:4433 -- echo ":4433 is up"
+          quiche-client https://127.0.0.1:4433/ --no-verify | grep "hello from quiche"

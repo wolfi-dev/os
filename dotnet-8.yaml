@@ -1,45 +1,46 @@
 package:
   name: dotnet-8
-  version: "8.0.17"
+  version: "8.0.121"
   epoch: 0
-  description: ".NET SDK"
+  description: ".NET ${{vars.major-version}} host"
   copyright:
     - license: MIT
   resources:
-    cpu: 2
-    memory: 32Gi
+    cpu: 32
+    memory: 64Gi
   dependencies:
     runtime:
       - icu
     provides:
-      - dotnet=${{package.version}}
+      - dotnet=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
 
 environment:
+  environment:
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
   contents:
     packages:
       - bash
-      - build-base
+      - brotli-dev
       - busybox
-      - ca-certificates-bundle
-      - clang-15
-      - clang-15-default
+      - clang-20
       - cmake
       - curl
-      - dotnet-bootstrap-8=${{package.version}}
+      - dotnet-bootstrap-${{vars.major-version}}
       - glibc-locale-en
       - icu-dev
       - krb5-dev
       - libunwind-dev
-      - llvm15
-      - llvm15-cmake-default
-      - llvm15-dev
-      - llvm15-tools
       - lttng-ust-dev
-      - ncurses-dev
+      - make
       - openssl-dev
       - python3
-      - samurai
-      - wolfi-base
+      - rapidjson-dev
       - zlib-dev
 
 pipeline:
@@ -47,147 +48,155 @@ pipeline:
     with:
       repository: https://github.com/dotnet/dotnet
       tag: v${{package.version}}
-      expected-commit: 30c331373e55effdf3c799bdec8751e6ee5367f6
-      destination: /home/build/src
+      expected-commit: eed318ae2d2a3b35d344b9ec73c361265a938310
 
-  - working-directory: /home/build/src
-    pipeline:
-      - runs: |
-          sed -i -E 's|( /p:BuildDebPackage=false)|\1 /p:EnablePackageValidation=false|' src/runtime/eng/SourceBuild.props
-          sed -i -E 's|( /p:BuildDebPackage=false)|\1 --cmakeargs -DCLR_CMAKE_USE_SYSTEM_LIBUNWIND=TRUE|' src/runtime/eng/SourceBuild.props
-          ln -sf /usr/share/dotnet-bootstrap-8/dotnet .dotnet
-          mkdir -p prereqs/packages/archive/
-          ln -sf /usr/share/dotnet-bootstrap-8/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz prereqs/packages/archive/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz
-          mkdir -p prereqs/packages/previously-source-built
-          tar -xzvf prereqs/packages/archive/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz -C prereqs/packages/previously-source-built/
-      - runs: |
-          ./build.sh --clean-while-building \
-            -- \
-            /v:n \
-            /p:ContinueOnPrebuiltBaselineError=true \
-            /p:MinimalConsoleLogOutput=false \
-            /p:SkipPortableRuntimeBuild=true \
-            /p:BuildWithOnlineSources=false \
-            /p:CustomPrebuiltSourceBuiltPackagesPath=$(realpath prereqs/packages/previously-source-built)
-      - runs: |
-          mkdir -p "${{targets.destdir}}"/usr/share/dotnet
-          mkdir -p "${{targets.destdir}}"/usr/bin
-      - assertions:
-          required-steps: 1
-        pipeline:
-          - if: ${{build.arch}} == 'aarch64'
-            runs: |
-              tar zxf artifacts/arm64/Release/dotnet-sdk-*.tar.gz -C "${{targets.destdir}}"/usr/share/dotnet
-          - if: ${{build.arch}} == 'x86_64'
-            runs: |
-              tar zxf artifacts/x64/Release/dotnet-sdk-*.tar.gz -C "${{targets.destdir}}"/usr/share/dotnet
-      - runs: |
-          ln -s /usr/share/dotnet/dotnet "${{targets.destdir}}"/usr/bin/dotnet
+  - runs: |
+      sed -i -E 's|( /p:BuildDebPackage=false)|\1 /p:EnablePackageValidation=false|' src/runtime/eng/SourceBuild.props
+      sed -i -E 's|( /p:BuildDebPackage=false)|\1 --cmakeargs -DCLR_CMAKE_USE_SYSTEM_LIBUNWIND=TRUE|' src/runtime/eng/SourceBuild.props
+
+      if [ ${{build.arch}} = "aarch64" ]; then
+        # Dotnet does not have support for PAC/BTI which Axion uses
+        # See: https://github.com/dotnet/runtime/pull/110472
+        # EXTRA_${FLAG} is supposed to work, but it doesn't
+        # so directly override the values which is supposedly a no-no
+        # See also: https://github.com/dotnet/runtime/issues/61859
+        export CFLAGS="-mbranch-protection=none"
+        export CXXFLAGS="-mbranch-protection=none"
+      fi
+
+      # Setup bootstrap .NET SDK
+      mkdir -p prereqs/packages/archive
+      ln -sf /usr/share/dotnet-bootstrap/dotnet .dotnet
+      ln -sf /usr/share/dotnet-bootstrap/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz \
+        prereqs/packages/archive/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz
+
+      # Extract .NET bootstrap archive
+      mkdir -p prereqs/packages/previously-source-built
+      tar -xzvf prereqs/packages/archive/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz \
+        -C prereqs/packages/previously-source-built/
+
+      # Build .NET SDK
+      ./build.sh --clean-while-building -- \
+        /v:n \
+        /p:ContinueOnPrebuiltBaselineError=true \
+        /p:MinimalConsoleLogOutput=false \
+        /p:SkipPortableRuntimeBuild=true \
+        /p:BuildWithOnlineSources=false \
+        /p:CustomPrebuiltSourceBuiltPackagesPath=$(realpath prereqs/packages/previously-source-built)
+
+      # Install .NET
+      mkdir -p ${{targets.contextdir}}/usr/share/dotnet
+      tar zxf artifacts/*/Release/dotnet-sdk-*.tar.gz -C ${{targets.contextdir}}/usr/share/dotnet
+
+      # Symlink .NET host to path
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      ln -s /usr/share/dotnet/dotnet ${{targets.contextdir}}/usr/bin/dotnet
 
   - uses: strip
 
 subpackages:
-  - name: dotnet-8-runtime
-    description: "The .NET Core Runtime, version 8"
-    pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/share/dotnet/shared
-          mv "${{targets.destdir}}"/usr/share/dotnet/shared/Microsoft.NETCore.App "${{targets.subpkgdir}}"/usr/share/dotnet/shared/
+  - name: dotnet-${{vars.major-version}}-sdk
+    description: ".NET ${{vars.major-version}} SDK"
     dependencies:
       runtime:
-        - dotnet-8
+        - aspnet-${{vars.major-version}}-runtime=${{package.full-version}}
+        - aspnet-${{vars.major-version}}-targeting-pack=${{package.full-version}}
+        - dotnet-${{vars.major-version}}-runtime=${{package.full-version}}
+        - dotnet-${{vars.major-version}}-targeting-pack=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet
+          for i in sdk sdk-manifests templates; do
+            mv ${{targets.destdir}}/usr/share/dotnet/$i \
+               ${{targets.contextdir}}/usr/share/dotnet/
+          done
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: dotnet tool install -g Microsoft.Web.LibraryManager.Cli
+
+  - name: dotnet-${{vars.major-version}}-runtime
+    description: "The .NET ${{vars.major-version}} Core Runtime"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/shared
+          mv ${{targets.destdir}}/usr/share/dotnet/shared/Microsoft.NETCore.App ${{targets.contextdir}}/usr/share/dotnet/shared/
+    dependencies:
+      provides:
+        - dotnet-runtime=${{package.full-version}}
+      runtime:
+        - dotnet-${{vars.major-version}}=${{package.full-version}}
     test:
       pipeline:
         - uses: test/tw/ldd-check
 
-  - name: dotnet-8-runtime-default
-    dependencies:
-      runtime:
-        - dotnet-8-runtime
-      provides:
-        - dotnet-runtime=8
-
-  - name: aspnet-8-runtime
-    description: "The ASP.NET Core Runtime, version 8"
+  - name: aspnet-${{vars.major-version}}-runtime
+    description: "The ASP.NET ${{vars.major-version}} Core Runtime"
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/share/dotnet/shared
-          mv "${{targets.destdir}}"/usr/share/dotnet/shared/Microsoft.AspNetCore.App "${{targets.subpkgdir}}"/usr/share/dotnet/shared/
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/shared
+          mv ${{targets.destdir}}/usr/share/dotnet/shared/Microsoft.AspNetCore.App ${{targets.contextdir}}/usr/share/dotnet/shared/
     dependencies:
+      provides:
+        - aspnet-runtime=${{package.full-version}}
       runtime:
-        - dotnet-8-runtime
+        - dotnet-${{vars.major-version}}-runtime=${{package.full-version}}
         - libexpat1
         - libbrotlidec1
-
-  - name: aspnet-8-runtime-default
-    dependencies:
-      runtime:
-        - aspnet-8-runtime
-      provides:
-        - aspnet-runtime=8
-
-  - name: dotnet-8-targeting-pack
-    description: "The .NET Core targeting pack, version 8"
-    dependencies:
-      runtime:
-        - libstdc++-dev
-    pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/share/dotnet/packs
-          mv "${{targets.destdir}}"/usr/share/dotnet/packs/NETStandard.Library.* "${{targets.subpkgdir}}"/usr/share/dotnet/packs/
-          mv "${{targets.destdir}}"/usr/share/dotnet/packs/Microsoft.NETCore.App.* "${{targets.subpkgdir}}"/usr/share/dotnet/packs/
     test:
       pipeline:
-        - uses: test/tw/ldd-check
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: aspnet-runtime
+            real-pkg-name: ${{subpkg.name}}
 
-  - name: aspnet-8-targeting-pack
-    description: "The ASP.NET targeting pack, version 8"
+  - name: dotnet-${{vars.major-version}}-targeting-pack
+    description: "The .NET ${{vars.major-version}} Core targeting pack"
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/share/dotnet/packs
-          mv "${{targets.destdir}}"/usr/share/dotnet/packs/Microsoft.AspNetCore.App.* "${{targets.subpkgdir}}"/usr/share/dotnet/packs/
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/packs
+          mv ${{targets.destdir}}/usr/share/dotnet/packs/NETStandard.Library.* ${{targets.contextdir}}/usr/share/dotnet/packs/
+          mv ${{targets.destdir}}/usr/share/dotnet/packs/Microsoft.NETCore.App.* ${{targets.contextdir}}/usr/share/dotnet/packs/
     dependencies:
-      runtime:
-        - dotnet-8-targeting-pack
-
-  - name: dotnet-8-sdk
-    description: "The .NET Core SDK, version 8"
-    pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/share/dotnet
-
-          for i in sdk sdk-manifests templates; do
-            mv "${{targets.destdir}}"/usr/share/dotnet/$i "${{targets.subpkgdir}}"/usr/share/dotnet/
-          done
-    dependencies:
-      runtime:
-        - dotnet-8-runtime
-        - aspnet-8-runtime
-        - dotnet-8-targeting-pack
-        - aspnet-8-targeting-pack
-
-  - name: dotnet-8-sdk-default
-    dependencies:
-      runtime:
-        - dotnet-8-sdk
-        - dotnet-8-runtime-default
-        - aspnet-8-runtime-default
       provides:
-        - dotnet-sdk=8
+        - dotnet-targeting-pack=${{package.full-version}}
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: dotnet-targeting-pack
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: aspnet-${{vars.major-version}}-targeting-pack
+    description: "The ASP.NET ${{vars.major-version}} targeting pack"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/packs
+          mv ${{targets.destdir}}/usr/share/dotnet/packs/Microsoft.AspNetCore.App.* ${{targets.contextdir}}/usr/share/dotnet/packs/
+    dependencies:
+      provides:
+        - aspnet-targeting-pack=${{package.full-version}}
+      runtime:
+        - dotnet-${{vars.major-version}}-targeting-pack=${{package.full-version}}
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: aspnet-targeting-pack
+            real-pkg-name: ${{subpkg.name}}
 
 update:
   enabled: true
   github:
     identifier: dotnet/dotnet
     strip-prefix: v
-    use-tag: true
     tag-filter: "v8"
 
 test:
   environment:
     contents:
       packages:
-        - dotnet-8-sdk
+        - dotnet-${{vars.major-version}}-sdk=${{package.full-version}}
   pipeline:
     - name: Basic .NET command test
       runs: |

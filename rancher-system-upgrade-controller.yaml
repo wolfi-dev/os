@@ -1,0 +1,114 @@
+package:
+  name: rancher-system-upgrade-controller
+  version: "0.17.0"
+  epoch: 0 # CVE-2025-47910
+  description: A Kubernetes controller that safely automates node upgrades in your cluster, coordinating OS and Kubernetes version updates with minimal disruption.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - tzdata
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rancher/system-upgrade-controller
+      tag: v${{package.version}}
+      expected-commit: f2c9e60b1078fd6fd9555da7cfe49fc30d0efa90
+
+  - uses: go/build
+    with:
+      packages: .
+      output: system-upgrade-controller
+      ldflags: |
+        -X github.com/rancher/system-upgrade-controller/pkg/version.Version=${{package.version}}
+        -X github.com/rancher/system-upgrade-controller/pkg/version.Revision=$(git rev-parse HEAD)
+        -X github.com/rancher/system-upgrade-controller/pkg/version.Branch=HEAD
+        -X github.com/rancher/system-upgrade-controller/pkg/version.BuildUser=reproducible@reproducible
+        -X github.com/rancher/system-upgrade-controller/pkg/version.BuildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d-%H:%M)
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - -rc
+  github:
+    identifier: rancher/system-upgrade-controller
+    strip-prefix: v
+
+test:
+  pipeline:
+    - name: "Basic binary verification"
+      runs: |
+        system-upgrade-controller --version | grep -q "${{package.version}}"
+        system-upgrade-controller --help | grep -q "in ur system controllin ur upgradez"
+    - uses: test/kwok/cluster
+    - name: "Test controller daemon startup"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl create namespace system-upgrade
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: system-upgrade
+            namespace: system-upgrade
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: system-upgrade
+          rules:
+          - apiGroups: ["", "apps", "batch", "upgrade.cattle.io"]
+            resources: ["*"]
+            verbs: ["*"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: system-upgrade
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system-upgrade
+          subjects:
+          - kind: ServiceAccount
+            name: system-upgrade
+            namespace: system-upgrade
+          EOF
+          kubectl apply -f https://raw.githubusercontent.com/rancher/system-upgrade-controller/v${{package.version}}/pkg/crds/yaml/generated/upgrade.cattle.io_plans.yaml
+          kubectl wait --for=condition=Established crd plans.upgrade.cattle.io --timeout=60s
+        start: |
+          system-upgrade-controller \
+            --kubeconfig ~/.kube/config \
+            --namespace system-upgrade \
+            --name system-upgrade-controller \
+            --debug
+        timeout: 30
+        expected_output: |
+          Starting /v1, Kind=Node controller
+          Starting upgrade.cattle.io/v1, Kind=Plan controller
+        post: |
+          kubectl apply -f - <<EOF
+          apiVersion: upgrade.cattle.io/v1
+          kind: Plan
+          metadata:
+            name: test-plan
+            namespace: system-upgrade
+          spec:
+            nodeSelector:
+              matchLabels:
+                node-role.kubernetes.io/agent: ""
+            serviceAccountName: system-upgrade
+            concurrency: 1
+            version: "test-version"
+            upgrade:
+              image: cgr.dev/chainguard/wolfi-base:latest
+              command: ["sh", "-c"]
+              args: ["echo test"]
+          EOF
+          kubectl get plan test-plan -n system-upgrade -o jsonpath='{.metadata.name}'
+
+          # Wait for the plan to be processed and check node labels to verify if it ran successfully
+          sleep 5
+          kubectl get nodes -l plan.upgrade.cattle.io/test-plan

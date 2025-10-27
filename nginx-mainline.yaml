@@ -1,8 +1,9 @@
 package:
   name: nginx-mainline
+  # MAINLINE VERSIONS MUST USE ODD MINOR VERSIONS (e.g., 1.27.x, 1.29.x)
   # Must also bump njs at the same time
-  version: "1.28.0"
-  epoch: 0
+  version: "1.29.2"
+  epoch: 1
   description: HTTP and reverse proxy server (mainline version)
   copyright:
     - license: BSD-2-Clause
@@ -25,7 +26,6 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
-      - gcc-14-default
       - gd-dev
       - geoip-dev
       - libmaxminddb-dev
@@ -33,11 +33,17 @@ environment:
       - libxslt-dev
       - luajit-dev
       - openssl-dev
-      - pcre-dev
+      - pcre2-dev
       - perl-dev
       - pkgconf
       - zeromq-dev
       - zlib-dev
+
+var-transforms:
+  - from: ${{package.version}}
+    match: '^(\d+)\.(\d+)\.(\d+)'
+    replace: '$2'
+    to: minor-version
 
 data:
   - name: modules
@@ -53,12 +59,24 @@ data:
 # TODO look at adding extra modules like alpine does https://git.alpinelinux.org/aports/tree/main/nginx/APKBUILD#n149
 # Also note the nginx inc config https://hg.nginx.org/pkg-oss/file/tip/alpine
 pipeline:
+  - name: validate-mainline-version
+    runs: |
+      # Ensure mainline version is odd (e.g., 1.27.x, 1.29.x)
+      MINOR=${{vars.minor-version}}
+      if [ $((MINOR % 2)) -eq 0 ]; then
+        echo "ERROR: nginx-mainline must use odd minor versions (e.g., 1.27.x, 1.29.x)"
+        echo "Current version: ${{package.version}} has even minor version: $MINOR"
+        exit 1
+      fi
+      echo "Version validation passed: ${{package.version}} is a valid mainline version"
+
   - uses: git-checkout
     with:
       repository: https://github.com/nginx/nginx.git
       tag: release-${{package.version}}
-      expected-commit: 481d28cb4e04c8096b9b6134856891dc52ecc68f
+      expected-commit: 7f71abdd14769d633457f1e7e182de3dc98c1fb8
       destination: nginx-mainline
+
   - name: configure
     working-directory: nginx-mainline
     runs: |
@@ -70,8 +88,8 @@ pipeline:
           --sbin-path=/usr/bin/nginx \
           --modules-path=/usr/lib/nginx/modules \
           --conf-path=/etc/nginx/nginx.conf \
-          --pid-path=/run/nginx/nginx.pid \
-          --lock-path=/run/nginx/nginx.lock \
+          --pid-path=/run/nginx.pid \
+          --lock-path=/run/nginx.lock \
           --http-client-body-temp-path=/var/lib/nginx/tmp/client_body \
           --http-proxy-temp-path=/var/lib/nginx/tmp/proxy \
           --http-fastcgi-temp-path=/var/lib/nginx/tmp/fastcgi \
@@ -83,8 +101,6 @@ pipeline:
           --group=nginx \
           --with-threads \
           --with-file-aio \
-          \
-          --without-pcre2 \
           \
           --with-compat \
           \
@@ -114,6 +130,7 @@ pipeline:
           --with-stream_realip_module \
           --with-stream_geoip_module=dynamic \
           --with-stream_ssl_preread_module
+
   - working-directory: nginx-mainline
     runs: |
       make -j$(nproc)
@@ -126,6 +143,9 @@ pipeline:
       # directory that I could find.
       mkdir pkg-config
       mv ${{targets.destdir}}/etc/nginx pkg-config/
+      # Create parent location for tmp files
+      mkdir -p ${{targets.destdir}}/var/lib/nginx/tmp
+
   - uses: strip
 
 subpackages:
@@ -149,6 +169,37 @@ subpackages:
           sed -i 's/#error_log  logs\/error.log;$/error_log  stderr  notice;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
           # and both access logs to stdout
           sed -i 's/#access_log.*;$/access_log  \/dev\/stdout;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: nginx-config
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: ${{package.name}}-syslog-config
+    description: Creates nginx config with syslog logging
+    dependencies:
+      runtime:
+        - ${{package.name}}
+      provides:
+        - nginx-config=${{package.full-version}}
+    pipeline:
+      - working-directory: nginx-mainline
+        runs: |
+          # This was moved into ./pkg-config/etc/nginx so put it into the
+          # subpackage directory here.
+          mkdir -p ${{targets.subpkgdir}}/etc/nginx
+          cp -R ./pkg-config/nginx/* ${{targets.subpkgdir}}/etc/nginx/
+          # default error logs to syslog
+          sed -i 's/#error_log  logs\/error.log;$/error_log  syslog:server=unix:\/dev\/log  notice;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
+          # and both access logs to syslog
+          sed -i 's/#access_log.*;$/access_log  syslog:server=unix:\/dev\/log;/' ${{targets.subpkgdir}}/etc/nginx/nginx.conf
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: nginx-config
+            real-pkg-name: ${{subpkg.name}}
 
   - name: nginx-mainline-package-config
     description: Config supplied in packaged nginx.org bundles at https://hg.nginx.org/pkg-oss/
@@ -179,6 +230,12 @@ subpackages:
       - name: "Create templates directory"
         runs: |
           mkdir -p ${{targets.contextdir}}/etc/nginx/templates
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: nginx-package-config
+            real-pkg-name: ${{subpkg.name}}
 
   - name: nginx-mainline-openrc
     description: nginx-mainline openrc init
@@ -262,6 +319,11 @@ subpackages:
           mkdir -p ${{targets.subpkgdir}}/etc/nginx/conf.d
           install -m644 -D nginx.default.conf ${{targets.subpkgdir}}/etc/nginx/conf.d/
           ln -s /etc/nginx/conf.d/nginx.default.conf ${{targets.subpkgdir}}/etc/nginx/conf.d/default.conf
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /etc/nginx/conf.d/default.conf
 
 test:
   environment:
@@ -279,10 +341,6 @@ test:
         - ${{package.name}}-mod-stream
         - curl
   pipeline:
-    - name: Create Nginx user and directories
-      runs: |
-        # Create necessary directories
-        mkdir -p /var/lib/nginx/tmp/client_body /var/lib/nginx/tmp/proxy /var/lib/nginx/tmp/fastcgi /var/lib/nginx/tmp/uwsgi /var/lib/nginx/tmp/scgi /run/nginx
     - name: Verify Nginx Version
       runs: |
         # Ensure Nginx is installed and shows the correct version
@@ -306,10 +364,14 @@ test:
     - name: Start Nginx and Check Status
       runs: |
         # Start Nginx and check if it is running
-        nginx || exit 1
+        nginx
         nginx -t  # Verify the configuration is valid
         sleep 5  # Give some time for Nginx to start
-        curl -I http://localhost || exit 1  # Check if Nginx is serving a basic request
+        curl -I http://localhost  # Check if Nginx is serving a basic request
+
+        if [ -f /run/nginx.pid ]; then
+          kill $(cat /run/nginx.pid)
+        fi
     - name: Check modules are installed/loadable
       runs: |
         sed -i '1i include /etc/nginx/modules/*.conf;' /etc/nginx/nginx.conf
@@ -320,5 +382,6 @@ update:
   github:
     identifier: nginx/nginx
     use-tag: true
-    tag-filter: release-1.28
+    # MAINLINE VERSIONS MUST USE ODD MINOR VERSIONS (e.g., 1.27.x, 1.29.x)
+    tag-filter: release-1.29
     strip-prefix: release-

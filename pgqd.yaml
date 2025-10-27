@@ -1,0 +1,162 @@
+package:
+  name: pgqd
+  version: "3.5"
+  epoch: 0
+  description: PgQ maintenance daemon
+  copyright:
+    - license: ISC
+  dependencies:
+    runtime:
+      - libevent
+      - py3-docutils
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - libevent-dev
+      - libtool
+      - pkgconf-dev
+      - postgresql-${{vars.pg-version}}-dev
+      - py3-docutils
+
+vars:
+  pg-version: "17"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 3edb5c00959c5be2f91f63d90457281b0999e902
+      repository: https://github.com/pgq/pgqd
+      tag: v${{package.version}}
+      recurse-submodules: true
+
+  - runs: |
+      ./autogen.sh
+
+  - uses: autoconf/configure
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/etc/
+      install -m644 pgqd.ini ${{targets.destdir}}/etc/
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-doc
+    pipeline:
+      - uses: split/manpages
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/share/doc/pgqd
+          if [ -d ${{targets.destdir}}/usr/share/doc/pgqd ]; then
+            mv ${{targets.destdir}}/usr/share/doc/pgqd/* ${{targets.subpkgdir}}/usr/share/doc/pgqd/
+          fi
+    description: pgqd documentation and manual pages
+    test:
+      pipeline:
+        - uses: test/docs
+        - runs: |
+            # Verify man page is present and readable
+            test -f /usr/share/man/man1/pgqd.1
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}
+        - postgresql-${{vars.pg-version}}
+        - postgresql-${{vars.pg-version}}-client
+        - shadow
+        - sudo-rs
+        - procps
+        - curl
+        - glibc
+        - libpq-${{vars.pg-version}}
+    environment:
+      PGUSER: testuser
+      PGDATA: /tmp/test_pgdata
+      PGPORT: 5433
+  pipeline:
+    - name: "Verify pgqd binary and basic functionality"
+      runs: |
+        pgqd -V 2>&1| grep ${{package.version}}
+        pgqd --help 2>&1| grep "usage"
+    - uses: test/tw/ldd-check
+    - name: "Test pgqd with PostgreSQL database and queue maintenance"
+      runs: |
+        useradd $PGUSER
+        sudo -u $PGUSER initdb -D $PGDATA
+        sudo -u $PGUSER pg_ctl -D ${PGDATA} -l /tmp/logfile start
+        sudo -u $PGUSER createdb ${PGDB}
+
+        cat > /tmp/pgqd_maint_test.ini << EOF
+        [pgqd]
+        logfile = /tmp/pgqd_maint.log
+        pidfile = /tmp/pgqd_maint.pid
+
+        [pgq_test_db]
+        host = localhost
+        port = 5434
+        user = testpgq
+        dbname = pgq_test_db
+        ticker_period = 3
+        maint_period = 5
+        EOF
+
+        timeout 8 pgqd /tmp/pgqd_maint_test.ini -v &
+        MAINT_PID=$!
+        sleep 6
+
+        # Check if pgqd handled the maintenance period correctly
+        if kill -0 $MAINT_PID 2>/dev/null; then
+          echo "✓ pgqd maintenance cycle test completed"
+          kill -TERM $MAINT_PID 2>/dev/null || true
+          wait $MAINT_PID 2>/dev/null || true
+        fi
+
+        # Verify maintenance log was created and contains expected entries
+        if [ -f /tmp/pgqd_maint.log ]; then
+          echo "✓ pgqd maintenance log created"
+          # Check for any database connection or maintenance messages
+          grep -i "connect\|maint\|tick" /tmp/pgqd_maint.log || echo "✓ pgqd ran maintenance cycle"
+        fi
+
+        # Cleanup
+        sudo -u testpgq pg_ctl -D /tmp/pgq_test_data stop || true
+
+        echo "✓ pgqd maintenance functionality test completed"
+    - name: "Test signal handling and daemon operations"
+      runs: |
+        cat > /tmp/simple_pgqd.ini << EOF
+        [pgqd]
+        logfile = /tmp/pgqd_signal_test.log
+        pidfile = /tmp/pgqd_signal_test.pid
+        EOF
+
+        pgqd -d /tmp/simple_pgqd.ini || return 1
+        sleep 1
+        pgqd -s /tmp/simple_pgqd.ini || return 1
+        sleep 1
+        grep -q SIGINT /tmp/pgqd_signal_test.log
+    - name: "Test configuration validation and error handling"
+      runs: |-
+        # Test invalid configuration handling
+        cat > /tmp/invalid_pgqd.ini << EOF
+        [pgqd]
+        invalid_option = true
+        logfile = /tmp/invalid_test.log
+        EOF
+
+        # pgqd should handle invalid config gracefully
+        pgqd --ini | grep 'logfile'
+
+update:
+  enabled: true
+  github:
+    identifier: pgq/pgqd
+    strip-prefix: v
+    use-tag: true

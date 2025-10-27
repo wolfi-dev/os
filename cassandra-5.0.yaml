@@ -1,7 +1,7 @@
 package:
   name: cassandra-5.0
-  version: "5.0.4"
-  epoch: 0
+  version: "5.0.5"
+  epoch: 6 # GHSA-3p8m-j85q-pgmj
   description: Open Source NoSQL Database
   copyright:
     - license: Apache-2.0
@@ -9,7 +9,7 @@ package:
     runtime:
       - curl
       - jemalloc
-      - python-${{vars.py-version}} # needed for cqlsh
+      - python-${{vars.python-version}} # needed for cqlsh
     provides:
       - cassandra=${{package.full-version}}
 
@@ -20,7 +20,7 @@ var-transforms:
     to: major-minor-version
 
 vars:
-  py-version: 3.11
+  python-version: 3.11
   java-version: 17
 
 environment:
@@ -31,13 +31,14 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
+      - curl # for entrypoint verification
       - go # for documentation generation
       - openjdk-${{vars.java-version}}-default-jdk
-      - py${{vars.py-version}}-build
-      - py${{vars.py-version}}-cython-bin
-      - py${{vars.py-version}}-pip
-      - py${{vars.py-version}}-setuptools
-      - python-${{vars.py-version}}-dev
+      - py${{vars.python-version}}-build
+      - py${{vars.python-version}}-cython-bin
+      - py${{vars.python-version}}-pip
+      - py${{vars.python-version}}-setuptools
+      - python-${{vars.python-version}}-dev
   environment:
     JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
 
@@ -45,12 +46,8 @@ pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/apache/cassandra
-      expected-commit: b81163b04b1d99036730ff233595d7bfb88611d1
+      expected-commit: c8abc9f3e1bb46bc4d699c3a167e43df62b9bec8
       tag: cassandra-${{package.version}}
-
-  - uses: patch
-    with:
-      patches: fix-doc-build.patch
 
   - uses: maven/pombump
     with:
@@ -78,6 +75,16 @@ pipeline:
       ln -sT /var/lib/cassandra/ "${{targets.destdir}}"/usr/share/java/cassandra/data
       ln -sT /var/log/cassandra/ "${{targets.destdir}}"/usr/share/java/cassandra/logs
 
+      # The build process downloads `.so` files from an old commit in
+      # Cassandra's GitHub repo: remove all but the amd64 `.so` (there isn't
+      # one for ARM) to avoid generating impossible to satisfy `so:`
+      # dependencies
+      for so in ${{targets.destdir}}/usr/share/java/cassandra/lib/sigar-bin/*; do
+        if ! [[ $so = "*-amd64-linux.so" ]]; then
+          rm $so
+        fi
+      done
+
 subpackages:
   - name: ${{package.name}}-compat
     dependencies:
@@ -89,12 +96,62 @@ subpackages:
           ln -sf /opt/cassandra/conf ${{targets.subpkgdir}}/etc/cassandra
           mkdir -p ${{targets.subpkgdir}}/opt
           ln -sf /usr/share/java/cassandra ${{targets.subpkgdir}}/opt/cassandra
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: cassandra-compat
+            real-pkg-name: ${{subpkg.name}}
+
+  # This subpackage provides compatibility with upstream docker-library/cassandra entrypoint behavior.
+  # It fetches the official entrypoint script from GitHub and verifies its integrity using SHA256.
+  # The entrypoint script processes environment variables (CASSANDRA_SEEDS, CASSANDRA_CLUSTER_NAME,
+  # CASSANDRA_DC, CASSANDRA_RACK, etc.) and writes them to configuration files.
+  #
+  # This is necessary for sustaining because upstream may update the entrypoint script independently
+  # of Cassandra releases. By tracking the SHA256 hash, we can detect when the script changes and
+  # decide whether to update our vendored copy or investigate breaking changes.
+  #
+  # If the hash verification fails, the pipeline will exit 1 to alert that the upstream
+  # entrypoint has changed and requires review before accepting the update.
+  - name: ${{package.name}}-entrypoint-compat
+    description: Entrypoint script for Cassandra environment variable configuration
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+        - findutils
+        - gawk
+        - gosu
+        - iproute2
+        - sed
+      provides:
+        - cassandra-entrypoint-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          ENTRYPOINT_URL="https://raw.githubusercontent.com/docker-library/cassandra/master/5.0/docker-entrypoint.sh"
+          curl -o /tmp/docker-entrypoint.sh "$ENTRYPOINT_URL"
+
+          EXPECTED_SHA256="9a5b895a511bd19512eb19e001196bc458d80201b98e3acca85e8792e99f4aed"
+          ACTUAL_SHA256=$(sha256sum /tmp/docker-entrypoint.sh | cut -d' ' -f1)
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            exit 1
+          fi
+
+          mkdir -p ${{targets.contextdir}}/usr/local/bin/
+          cp docker-entrypoint.sh ${{targets.contextdir}}/usr/local/bin/
+          chmod +x ${{targets.contextdir}}/usr/local/bin/docker-entrypoint.sh
+    test:
+      pipeline:
+        - runs: |
+            # Verify the entrypoint script is executable
+            test -x /usr/local/bin/docker-entrypoint.sh
 
   - name: cqlsh-${{vars.major-minor-version}}
     dependencies:
       runtime:
-        - py${{vars.py-version}}-cassandra-driver
-        - py${{vars.py-version}}-wcwidth
+        - py${{vars.python-version}}-cassandra-driver
+        - py${{vars.python-version}}-wcwidth
       provides:
         - cqlsh=${{package.full-version}}
     pipeline:
@@ -102,12 +159,12 @@ subpackages:
         working-directory: pylib
         uses: py/pip-build-install
         with:
-          python: python${{vars.py-version}}
+          python: python${{vars.python-version}}
       - name: "Install cqlsh executable"
         runs: |
           mkdir -p ${{targets.contextdir}}/usr/bin
           cp ./bin/cqlsh.py ${{targets.contextdir}}/usr/bin/cqlsh
-          python=python${{vars.py-version}}
+          python=python${{vars.python-version}}
           sed -i "1s,.*,#!/usr/bin/$python,g" ${{targets.contextdir}}/usr/bin/cqlsh
           head -n 1 ${{targets.contextdir}}/usr/bin/cqlsh
     test:

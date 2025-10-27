@@ -3,99 +3,77 @@ name: Withdraw packages
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - "withdrawn-packages.txt"
 
 # Don't withdraw during builds, to prevent out of sync signatures.
 concurrency: build
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   withdraw:
     if: github.repository == 'wolfi-dev/os'
     name: Withdraw packages
     runs-on: ubuntu-latest
-
     permissions:
       id-token: write
       contents: read
-
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@0080882f6c36860b6ba35c610c98ce87d4e2f26f # v2.10.2
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: audit
-
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0 # We want the full history for uploading withdrawn-packages.txt to GCS. If this takes too long, we look at merging both files.
-
       # this need to point to main to always get the latest action
       - name: "Install wolfictl onto PATH"
         uses: wolfi-dev/actions/install-wolfictl@main # main
-
       # This is managed here: https://github.com/chainguard-dev/secrets/blob/main/wolfi-dev.tf
-      - uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f # v2.1.7
+      - uses: google-github-actions/auth@b7593ed2efd1c1617e1b0254da33b86225adb2a5 # v2.1.12
         id: auth
         with:
-          workload_identity_provider: "projects/12758742386/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          workload_identity_provider: "projects/12758742386/locations/global/workloadIdentityPools/gh-pool-wolfi/providers/github-provider"
           service_account: "wolfi-dev@chainguard-github-secrets.iam.gserviceaccount.com"
-
-      - uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a # v2.1.2
+      - uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
         with:
           project_id: "chainguard-github-secrets"
-
-      - uses: 'google-github-actions/get-secretmanager-secrets@e5bb06c2ca53b244f978d33348d18317a7f263ce' # v2.2.2
+      - uses: 'google-github-actions/get-secretmanager-secrets@50ec04d56ddf2740b0bde82926cc742f90e06d2b' # v2.2.4
         id: secrets
         with:
           secrets: |-
             token:chainguard-github-secrets/wolfi-dev-signing-key
-
       - run: echo "${{ steps.secrets.outputs.token }}" > ./wolfi-signing.rsa
       - run: |
           sudo mkdir -p /etc/apk/keys
           sudo cp ./wolfi-signing.rsa.pub /etc/apk/keys/wolfi-signing.rsa.pub
-
       # We use a different GSA for our interaction with GCS.
-      - uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f # v2.1.7
+      - uses: google-github-actions/auth@b7593ed2efd1c1617e1b0254da33b86225adb2a5 # v2.1.12
         with:
           workload_identity_provider: "projects/618116202522/locations/global/workloadIdentityPools/prod-shared-e350/providers/prod-shared-gha"
           service_account: "prod-images-ci@prod-images-c6e5.iam.gserviceaccount.com"
-
-      - uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a # v2.1.2
+      - uses: google-github-actions/setup-gcloud@6a7c903a70c8625ed6700fa299f5ddb4ca6022e9 # v2.1.5
         with:
           project_id: "prod-images-c6e5"
-
       - name: Withdraw from index
         run: |
           set -euo pipefail
           for arch in x86_64 aarch64; do
             mkdir -p $arch
-            curl -v https://packages.wolfi.dev/os/$arch/APKINDEX.tar.gz 2>verbose | wolfictl withdraw $(grep -v '\#' withdrawn-packages.txt) --signing-key="${{ github.workspace }}/wolfi-signing.rsa" > $arch/APKINDEX.tar.gz
+            curl -v https://packages.wolfi.dev/os/$arch/APKINDEX.tar.gz 2>verbose | wolfictl withdraw --packages-file=withdrawn-packages.txt --signing-key="${{ github.workspace }}/wolfi-signing.rsa" > $arch/APKINDEX.tar.gz
 
             # Parse the object generation from the -v output.
             GEN=$(grep "x-goog-generation" verbose | cut -d' ' -f3)
             echo "APKINDEX.tar.gz object generation for ${arch} was ${GEN}"
 
             # This will fail if the APKINDEX is modified between when we download it and when we upload the modified version.
-            # That's totally fine, just re-run the withdrawl workflow.
+            # That's totally fine, just re-run the withdrawal workflow.
             # This is a bit of a hack until we drop this APKINDEX entirely.
             gcloud storage cp --if-generation-match="${GEN}" --cache-control="no-store" $arch/APKINDEX.tar.gz gs://wolfi-production-registry-destination/os/$arch/APKINDEX.tar.gz
           done
-
-      - name: Delete withdrawn packages
-        run: |
-          set -euo pipefail
-          for arch in x86_64 aarch64; do
-            for pkg in $(grep -v '\#' withdrawn-packages.txt); do
-              echo "=> $pkg"
-              gsutil -m rm -f gs://wolfi-production-registry-destination/os/$arch/$pkg || true
-            done
-          done
-
       - name: Upload full withdrawn packages list
         run: |
           set -euxo pipefail
@@ -103,36 +81,49 @@ jobs:
           gsutil cp \
             all-withdrawn-packages.txt \
             gs://wolfi-production-registry-destination/os/withdrawn-packages.txt
-
-      - name: Delete sbom packages from the lifecycle automation
-        run: |
-          set -euo pipefail
-          for arch in x86_64 aarch64; do
-            for pkg in $(grep -v '\#' withdrawn-packages.txt); do
-              echo "=> $pkg"
-              gsutil -m rm -f gs://insights-apk-sbom-prod/wolfi-production-registry-destination/os/$arch/$pkg.sbom.json || true
-            done
-          done
-
       # use public chainguard provider.
-      - uses: chainguard-dev/setup-chainctl@272698817627c158bbd813cb783b62a4b9bbbc67 # v0.3.1
+      - uses: chainguard-dev/setup-chainctl@f4ed65b781b048c44d4f033ae854c025c5531c19 # v0.3.2
         with:
           # Managed here:
           # https://github.com/chainguard-dev/mono/blob/main/env/chainguard-images/iac/wolfi-os-pusher.tf
           identity: "720909c9f5279097d847ad02a2f24ba8f59de36a/6a26f2970f880c31"
-
       - name: 'Withdraw packages from apk.cgr.dev'
         run: |
           set -e
+          # Transform text file into JSON for bulk withdrawal, ignoring empty lines and comments and trimming whitespace
+          jq -R -n '{apks: [inputs | select(length > 0 and startswith("#") | not) | gsub("^\\s+|\\s+$"; "") | select(length > 0)]}' withdrawn-packages.txt > withdrawn-packages.json
           for arch in "aarch64" "x86_64"; do
-            while IFS= read -r pkg; do
-              curl -X DELETE \
-                  --user "user:$(chainctl auth token --audience apk.cgr.dev)" \
-                  "https://apk.cgr.dev/chainguard/${arch}/${pkg}" || true
-            done < <(grep -v -e '^$' -v '\#' withdrawn-packages.txt | cut -d':' -f2) # Ignore empty lines and comments
+            curl -X POST -H "Content-Type: application/json" \
+                --user "user:$(chainctl auth token --audience apk.cgr.dev)" \
+                --data @withdrawn-packages.json \
+                "https://apk.cgr.dev/chainguard/${arch}/withdraw" || true
+          done
+      - name: Batch delete SBOM files
+        run: |
+          set -euo pipefail
+
+          # Create file lists for batch deletion from withdrawn packages
+          mkdir -p deletion-lists
+
+          # Clean withdrawn packages list (remove comments and empty lines)
+          grep -v '^#' withdrawn-packages.txt | grep -v '^$' > clean-withdrawn-packages.txt
+
+          for arch in x86_64 aarch64; do
+            echo "Processing $arch architecture for batch deletion..."
+
+            # Create SBOM URLs for deletion (convert .apk to .spdx.json)
+            sed "s|\.apk$|.spdx.json|; s|^|gs://insights-apk-sbom-prod/wolfi-production-registry-destination/os/$arch/|" clean-withdrawn-packages.txt > "deletion-lists/sbom-urls-to-delete-$arch.txt"
+
+            PACKAGE_COUNT=$(wc -l < clean-withdrawn-packages.txt)
+            echo "  Attempting to delete $PACKAGE_COUNT SBOM files for $arch"
+
+            # Batch delete SBOM files
+            echo "  Batch deleting SBOM files..."
+            gsutil -m rm -I < "deletion-lists/sbom-urls-to-delete-$arch.txt" || echo "  Some SBOM files may not exist or already deleted"
           done
 
-      - uses: rtCamp/action-slack-notify@c33737706dea87cd7784c687dadc9adf1be59990 # v2.2.1
+          echo "Batch deletion process completed"
+      - uses: rtCamp/action-slack-notify@e31e87e03dd19038e411e38ae27cbad084a90661 # v2.2.1
         if: failure()
         env:
           SLACK_ICON: http://github.com/chainguard-dev.png?size=48

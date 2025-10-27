@@ -1,0 +1,83 @@
+package:
+  name: nova
+  version: "3.11.8"
+  epoch: 2 # CVE-2025-47910
+  description: Find outdated or deprecated Helm charts running in your cluster.
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: a15d321dd2102c93b46e8b2c227f4c5b152b02dc
+      repository: https://github.com/FairwindsOps/nova
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        helm.sh/helm/v3@v3.18.5
+        github.com/go-viper/mapstructure/v2@v2.4.0
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X main.version=${{package.version}}
+        -X main.commit=$(git rev-parse HEAD)
+      output: nova
+      packages: .
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf /usr/bin/nova ${{targets.contextdir}}/nova
+    test:
+      pipeline:
+        - name: "Verify the symlink"
+          runs: |
+            test "$(readlink /nova)" = "/usr/bin/nova"
+
+update:
+  enabled: true
+  github:
+    identifier: FairwindsOps/nova
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - helm
+        - kubectl
+        - jq
+  pipeline:
+    - uses: test/kwok/cluster
+    # let's deploy something old on top of the cluster
+    - runs: |
+        kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+        # the latest version of components was 0.8.0 at the time of writing this, but we want to test against an older version
+        kubectl apply --kubeconfig /tmp/kubeconfig.yaml -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+        kubectl wait --kubeconfig /tmp/kubeconfig.yaml --for=condition=Available --timeout=60s deployment/metrics-server -n kube-system
+    - runs: |
+        export KUBECONFIG=/tmp/kubeconfig.yaml
+        OUTPUT=$(nova find --containers)
+
+        # the output would be something like:
+        # {"container_images":[{"name":"registry.k8s.io/metrics-server/metrics-server","current_version":"v0.7.2","latest_version":"v0.8.0","latest_minor_version":"v0.7.2","latest_patch_version":"v0.7.2","outdated":true,"affectedWorkloads":[{"name":"metrics-server","namespace":"kube-system","kind":"Deployment","container":"metrics-server"}]}],"err_images":null,"include_all":false,"latest_string_found":false}
+        # so use jq to find the latest version and compare it with the current version
+        CURRENT_VERSION=$(echo "$OUTPUT" | jq -r '.container_images[0].current_version')
+        LATEST_VERSION=$(echo "$OUTPUT" | jq -r '.container_images[0].latest_version')
+
+        # they both should be different for a successful test
+        # but the value would be like v0.7.2 and v0.8.0, so we need to strip the v prefix
+        CURRENT_VERSION=${CURRENT_VERSION#v}
+        LATEST_VERSION=${LATEST_VERSION#v}
+        if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
+          echo "Current version ($CURRENT_VERSION) is the same as latest version ($LATEST_VERSION), test failed"
+          exit 1
+        else
+          echo "Current version ($CURRENT_VERSION) is different from latest version ($LATEST_VERSION), test passed"
+        fi

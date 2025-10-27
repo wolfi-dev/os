@@ -1,0 +1,100 @@
+package:
+  name: helm-mapkubeapis
+  version: 0.6.1
+  epoch: 3 # GHSA-f9f8-9pmf-xv68
+  description: Helm plugin to map and update deprecated Kubernetes APIs in Helm release manifests
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/helm/helm-mapkubeapis
+      tag: v${{package.version}}
+      expected-commit: afa30453b58395ad8215cfe2c1a1edff50428baa
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/oauth2@v0.27.0
+        helm.sh/helm/v3@v3.18.5
+
+  # Dropping helm plugins in /usr/libexec since they are binaries and
+  # configuration intended to be run by the helm command.
+  # See https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch04s07.html
+  # Installers of this package will have to set this environment var
+  # HELM_PLUGINS=/usr/libexec/helm-plugins
+  - uses: go/build
+    with:
+      packages: ./cmd/mapkubeapis
+      output: mapkubeapis
+      ldflags: -X main.version=v${{package.version}}
+
+  - runs: |
+      INSTALL_DIR="${{targets.destdir}}/usr/libexec/helm-plugins/${{package.name}}"
+      mkdir -p "${INSTALL_DIR}"
+      mkdir -p "${INSTALL_DIR}/bin"
+      mkdir -p "${INSTALL_DIR}/config"
+      ln -sf /usr/bin/mapkubeapis "${INSTALL_DIR}/bin/mapkubeapis"
+      install -Dm644 plugin.yaml "${{targets.destdir}}/usr/libexec/helm-plugins/helm-mapkubeapis/plugin.yaml"
+      install -Dm644 config/Map.yaml "${{targets.destdir}}/usr/libexec/helm-plugins/helm-mapkubeapis/config/Map.yaml"
+
+update:
+  enabled: true
+  github:
+    identifier: helm/helm-mapkubeapis
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - helm
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
+      HELM_PLUGINS: "/usr/libexec/helm-plugins"
+  pipeline:
+    - runs: |
+        helm env
+        helm plugin list 2>&1 | grep -i 'mapkubeapis'
+    - uses: test/kwok/cluster
+    - name: "Tests for helm-mapkubeapis plugin"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/deprecated-chart/templates
+          export KUBECONFIG=$HOME/.kwok/clusters/kwok/kubeconfig.yaml
+          cat > /tmp/deprecated-chart/Chart.yaml <<EOF
+          apiVersion: v2
+          name: deprecated-chart
+          version: 0.1.0
+          EOF
+
+          cat > /tmp/deprecated-chart/templates/deploy.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: deprecated-deploy
+          spec:
+            selector:
+              matchLabels:
+                app: test
+            replicas: 1
+            template:
+              metadata:
+                labels:
+                  app: test
+              spec:
+                containers:
+                - name: nginx
+                  image: nginx:latest
+          EOF
+            helm install deprecated-release /tmp/deprecated-chart --namespace test-ns --create-namespace --debug --kubeconfig $HOME/.kwok/clusters/kwok/kubeconfig.yaml
+        start: helm mapkubeapis deprecated-release --namespace test-ns 2>&1
+        timeout: 60
+        expected_output: |
+          Finished checking release
+          deprecated or removed APIs to supported versions, completed successfully
+        post: |
+          echo "Successfully test passed"

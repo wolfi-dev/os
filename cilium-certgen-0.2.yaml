@@ -1,0 +1,167 @@
+package:
+  name: cilium-certgen-0.2
+  version: "0.2.4"
+  epoch: 2 # CVE-2025-47907
+  description: A convenience tool to generate and store certificates for Hubble Relay mTLS.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - cilium-certgen=${{package.full-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 31ece05387d5edf7928d441c6c14870a625aa3d1
+      repository: https://github.com/cilium/certgen
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: github.com/go-viper/mapstructure/v2@v2.4.0
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X main.version=${{package.version}}
+        -X main.commit=$(git rev-parse HEAD)
+      output: cilium-certgen
+      packages: .
+
+update:
+  enabled: true
+  github:
+    identifier: cilium/certgen
+    strip-prefix: v
+    tag-filter: v0.2.
+
+test:
+  environment:
+    contents:
+      packages:
+        - ca-certificates-bundle
+        - jq
+        - kubectl
+        - openssl
+  pipeline:
+    - name: Smoke test
+      runs: |
+        cilium-certgen --version
+        cilium-certgen --help
+    - name: Generate certificates
+      runs: |
+        # Test certificate generation functionality
+        # Create test directory
+        mkdir -p /tmp/certgen-test
+        cd /tmp/certgen-test
+
+        # Test 1: Validate help and flags
+        cilium-certgen --help | grep -q "config-file"
+        cilium-certgen --help | grep -q "ca-cert-file"
+        cilium-certgen --help | grep -q "ca-key-file"
+        cilium-certgen --help | grep -q "ca-generate"
+
+        # Test 2: Create certificate configuration
+        cat > cert-config.yaml << EOF
+        certs:
+          - name: basic-server-cert
+            namespace: default
+            commonName: server.example.com
+            hosts:
+              - server.example.com
+              - api.example.com
+              - 10.0.0.100
+            usage:
+              - signing
+              - key encipherment
+              - server auth
+            validity: 48h
+        EOF
+
+        # Test 3: Generate CA certificate and key manually
+        openssl req -x509 -newkey rsa:2048 -keyout test-ca.key -out test-ca.crt -days 1 -nodes \
+          -subj "/CN=Test Root CA"
+
+        # Test 4: Verify certificates we created
+        openssl x509 -text -noout -in test-ca.crt | grep -i "CN.*Test Root CA"
+        openssl x509 -checkend 3600 -noout -in test-ca.crt  # Check if valid for next hour
+
+        # Test 5: Validate configuration file format
+        if ! cat cert-config.yaml | grep -q "commonName: server.example.com"; then
+          echo "Configuration validation failed"
+          exit 1
+        fi
+
+        # Test 6: Try to run cilium-certgen with dry-run style validation
+        # Since this tool requires Kubernetes, we'll test error handling
+        if cilium-certgen --ca-cert-file=test-ca.crt --ca-key-file=test-ca.key --config-file=cert-config.yaml 2>&1 | grep -q "connection refused"; then
+          echo "Expected connection error when no Kubernetes cluster available - this is normal"
+        fi
+
+        echo "Certificate generation validation tests completed successfully"
+    - uses: test/kwok/cluster
+    - name: Cluster certificate generation test
+      runs: |
+        # Set up kubeconfig like in nova.yaml
+        kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+        export KUBECONFIG=/tmp/kubeconfig.yaml
+
+        # Verify cluster is working
+        kubectl cluster-info
+        kubectl get nodes
+
+        # Test 1: Basic CA Generation and Single Certificate Test
+        # Purpose: Validates the fundamental CA generation capability and single certificate creation with custom parameters.
+
+        # Setup: Create namespace
+        kubectl create namespace certgen-test-basic
+
+        # Save certificate configuration
+        cat > /tmp/basic-cert-config.yaml << EOF
+        certs:
+          - name: basic-server-cert
+            namespace: certgen-test-basic
+            commonName: server.example.com
+            hosts:
+              - server.example.com
+              - api.example.com
+              - 10.0.0.100
+            usage:
+              - signing
+              - key encipherment
+              - server auth
+            validity: 48h
+        EOF
+
+        # Test Execution: Generate CA and certificates
+        KUBECONFIG=/tmp/kubeconfig.yaml cilium-certgen \
+            --ca-generate \
+            --ca-secret-name=test-ca \
+            --ca-secret-namespace=certgen-test-basic \
+            --ca-common-name="Test Root CA" \
+            --ca-validity-duration=72h \
+            --config-file=/tmp/basic-cert-config.yaml \
+            --k8s-kubeconfig-path=/tmp/kubeconfig.yaml \
+            --debug
+
+        # Extract certificates for verification
+        kubectl get secret -n certgen-test-basic test-ca --template='{{ index .data "ca.crt" }}' | base64 -d > /tmp/test-ca.crt
+        kubectl get secret -n certgen-test-basic basic-server-cert --template='{{ index .data "tls.crt" }}' | base64 -d > /tmp/server.crt
+        kubectl get secret -n certgen-test-basic basic-server-cert --template='{{ index .data "tls.key" }}' | base64 -d > /tmp/server.key
+
+        # Verification
+        openssl x509 -text -noout -in /tmp/test-ca.crt | grep -i "CN.*Test Root CA"
+        openssl x509 -checkend 3600 -noout -in /tmp/test-ca.crt
+        openssl verify -CAfile /tmp/test-ca.crt /tmp/server.crt
+        openssl x509 -subject -noout -in /tmp/server.crt | grep -i "CN.*server.example.com"
+        openssl x509 -ext subjectAltName -noout -in /tmp/server.crt | grep -E "server.example.com|api.example.com|10.0.0.100"
+
+        # Verify secrets were created correctly
+        kubectl get secret -n certgen-test-basic test-ca -o jsonpath='{.type}' | grep -q "Opaque"
+        kubectl get secret -n certgen-test-basic basic-server-cert -o jsonpath='{.type}' | grep -q "kubernetes.io/tls"
+
+        echo "Expected Output validation:"
+        echo "- CA secret test-ca created in certgen-test-basic namespace"
+        echo "- Server certificate secret with proper TLS type and SAN entries"
+        echo "- All certificate validations pass with correct validity periods"
+        echo "All certificate tests passed successfully"

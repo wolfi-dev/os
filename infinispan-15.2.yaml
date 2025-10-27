@@ -1,0 +1,207 @@
+package:
+  name: infinispan-15.2
+  version: "15.2.6"
+  epoch: 1 # GHSA-fghv-69vj-qj49
+  description: Infinispan is an open source data grid platform and highly scalable NoSQL cloud data store.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - infinispan=${{package.full-version}}
+    runtime:
+      - openjdk-${{vars.java-version}}-default-jdk
+
+vars:
+  java-version: "21" # https://github.com/infinispan/infinispan/blob/main/documentation/src/main/asciidoc/topics/contributing/basics.adoc#pre-requisites
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - maven
+      - openjdk-${{vars.java-version}}-default-jdk
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/infinispan/infinispan
+      tag: ${{package.version}}.Final
+      expected-commit: c5dd3a4c57c605eb0667b7225732fef39aac0f03
+
+  - uses: maven/pombump
+
+  - name: Create dirs
+    runs: |
+      mkdir -p ${{targets.contextdir}}/usr/share/java/infinispan
+      mkdir -p ${{targets.contextdir}}/usr/share/java/gossiprouter
+      mkdir -p ${{targets.contextdir}}/deployments/data
+      mkdir -p ${{targets.contextdir}}/home/default
+
+  - name: Build
+    runs: |
+      mvn clean install -B -T$(nproc)C \
+        -am \
+        -Pdistribution \
+        -DskipTests \
+        --no-transfer-progress \
+        --fail-fast
+
+  - name: Install
+    runs: |
+      dest="${{targets.contextdir}}/usr/share/java/infinispan"
+      mkdir -p "$dest"
+
+      tmpdir=$(mktemp -d)
+      unzip -q ./distribution/target/distribution/infinispan-server-${{package.version}}.Final.zip -d "$tmpdir"
+      mv "$tmpdir"/infinispan-server-${{package.version}}.Final/* "$dest"
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility package for the ${{package.name}}
+    dependencies:
+      provides:
+        - infinispan-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt
+          ln -sf /usr/share/java/infinispan ${{targets.contextdir}}/opt/infinispan
+          ln -sf /usr/share/java/gossiprouter ${{targets.contextdir}}/opt/gossiprouter
+    test:
+      pipeline:
+        - runs: |
+            test "$(readlink /opt/infinispan)" = "/usr/share/java/infinispan"
+            test "$(readlink /opt/gossiprouter)" = "/usr/share/java/gossiprouter"
+
+  - name: ${{package.name}}-images
+    description: Contains various artifacts to create Infinispan server and CLI images
+    dependencies:
+      runtime:
+        - bash-binsh
+        - busybox # Needed for "dirname, basename, uname, sleep, grep, tr" commands in cli.sh
+      provides:
+        - infinispan-images=${{package.full-version}}
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/infinispan/infinispan-images
+          expected-commit: 305f828fe586e82a2cba7383604010a9eab71231
+          branch: ${{vars.major-minor-version}}.x # No tags matching to the package version, so use branch
+      # https://github.com/infinispan/infinispan-images/tree/main/modules/org/infinispan
+      - name: Create dirs
+        runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/java/infinispan/bin
+          mkdir -p ${{targets.contextdir}}/usr/share/java/gossiprouter/bin
+      - name: Copy runtime files
+        working-directory: modules/org/infinispan/runtime
+        runs: |
+          cp -ar ./added/bin/* ${{targets.contextdir}}/usr/share/java/infinispan/bin/
+          cp -ar ./added/gossiprouter/bin/* ${{targets.contextdir}}/usr/share/java/gossiprouter/bin/
+      - name: Copy distribution files
+        working-directory: modules/org/infinispan/distribution/jvm
+        runs: |
+          cp -ar ./added/bin/* ${{targets.contextdir}}/usr/share/java/infinispan/bin/
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/share/java/infinispan/bin/launch.sh
+            stat /usr/share/java/infinispan/bin/java-opts.sh
+            stat /usr/share/java/infinispan/bin/server.conf
+            stat /usr/share/java/gossiprouter/bin/launch.sh
+
+update:
+  enabled: true
+  github:
+    identifier: infinispan/infinispan
+    use-tag: true
+    tag-filter: 15.2.
+    strip-prefix: v
+    strip-suffix: .Final
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-${{vars.java-version}}-default-jdk
+        - ${{package.name}}-images
+        - ${{package.name}}-compat
+        - wait-for-it
+        - curl
+    accounts:
+      groups:
+        - groupname: infinispan
+          gid: 185
+      users:
+        - username: infinispan
+          gid: 185
+          uid: 185
+      run-as: 0 # Need to be run as root to fix an issue: "./bin/launch.sh: line 65: /opt/infinispan/server/conf/generated-identities.batch: Permission denied"
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+      JAVA_OPTS: "-Dio.netty.transport.noNative=true" # To create io_uring, it need to be run as root, run-as: 0 doesn't work in this case.
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      container: oci
+      GECOS: Default user
+      HOME: /home/default
+      UID: 185
+      USER: default
+      JAVA_VENDOR: openjdk
+      JAVA_VERSION: ${{vars.java-version}}
+      JAVA_DATA_DIR: /deployments/data
+      LANG: C.utf8
+      ISPN_HOME: /opt/infinispan
+      JAVA_GC_MAX_METASPACE_SIZE: 96m
+      JAVA_GC_METASPACE_SIZE: 32m
+      JAVA_MAX_MEM_RATIO: 5
+      PASS: password
+      IDENTITIES_BATCH: /tmp/identities.batch
+  pipeline:
+    - name: "start daemon on localhost"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          cat > /tmp/identities.batch <<EOF
+          user create default -p password -g admin
+          EOF
+        start: sh -c 'cd /opt/infinispan && bash ./bin/launch.sh'
+        timeout: 30
+        # Omit 'java.lang.RuntimeException' from error strings since we're running at root and the following
+        # error log is expected:
+        # "Native IOUring transport not available, using NIO instead: java.lang.RuntimeException: failed to create io_uring ring fd: Operation not permitted"
+        error_strings: |
+          ERROR
+          FAIL
+          FATAL
+          Traceback.*most.recent.call
+          Exception in thread
+          java.lang.NullPointerException
+          Gem::MissingSpecError
+          command not found
+        expected_output: |
+          server listening on
+          Infinispan Server ${{package.version}}.Final started
+        post: |
+          wait-for-it -t 3 --strict localhost:57800 -- echo ":57800 is up"
+          wait-for-it -t 3 --strict localhost:11222 -- echo ":11222 is up"
+          curl -sfL --retry 3 http://localhost:11222/rest/v2/health/status
+          curl --digest -u default:password \
+            -X POST \
+            "http://localhost:11222/rest/v2/caches/testcache?template=org.infinispan.DIST_SYNC"
+          curl --digest -u default:password \
+              -X POST "http://localhost:11222/rest/v2/caches/testcache/hello" \
+              -d 'world'
+          curl --digest -u default:password \
+              "http://localhost:11222/rest/v2/caches/testcache/hello"

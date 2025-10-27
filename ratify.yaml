@@ -1,0 +1,174 @@
+package:
+  name: ratify
+  version: "1.4.0"
+  epoch: 5 # CVE-2025-47910
+  description: Artifact Ratification Framework (CNCF Sandbox)
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: f3f6229dee1051e4beb580ec17ad68b7a45f23af
+      repository: https://github.com/notaryproject/ratify
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.35.0
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/net@v0.38.0
+        github.com/go-jose/go-jose/v3@v3.0.4
+        github.com/go-jose/go-jose/v4@v4.0.5
+        github.com/golang-jwt/jwt/v4@v4.5.2
+        github.com/golang-jwt/jwt/v5@v5.2.2
+        github.com/cloudflare/circl@v1.6.1
+        github.com/open-policy-agent/opa@v1.4.0
+        github.com/go-viper/mapstructure/v2@v2.4.0
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X github.com/ratify-project/ratify/internal/version.GitCommitHash=$(git rev-parse HEAD)
+        -X github.com/ratify-project/ratify/internal/version.GitTag=${{package.version}}
+      output: ratify
+      packages: ./cmd/ratify
+
+  - runs: |
+      mkdir -p ${{targets.contextdir}}/opt/ratify
+      install -Dpm644 -t "${{targets.contextdir}}/opt/ratify/" config/config.json
+
+data:
+  - name: plugins
+    items:
+      sbom:
+      licensechecker:
+      schemavalidator:
+      vulnerabilityreport:
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility package for the ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/app
+          ln -sf /usr/bin/ratify ${{targets.contextdir}}/app/ratify
+    test:
+      pipeline:
+        - runs: test "$(readlink /app/ratify)" = "/usr/bin/ratify"
+
+  - name: ${{package.name}}-crds
+    description: Ratify CRDs CLI
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/crds
+          cp -ar ./charts/ratify/crds/* ${{targets.contextdir}}/crds
+    dependencies:
+      runtime:
+        - kubectl
+    test:
+      pipeline:
+        - runs: |
+            # check if the CRDs are present and test crds folder is not empty
+            if [ ! -d "/crds" ] || [ ! "$(ls -A /crds)" ]; then
+              echo "CRDs directory is empty or does not exist"
+              exit 1
+            fi
+
+  - range: plugins
+    name: ${{package.name}}-${{range.key}}
+    description: Ratify ${{range.key}} plugin
+    pipeline:
+      - uses: go/build
+        with:
+          output: ${{range.key}}
+          packages: ./plugins/verifier/${{range.key}}
+
+  - range: plugins
+    name: ${{package.name}}-${{range.key}}-compat
+    description: Ratify ${{range.key}} compatibility package
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/ratify/plugins
+          ln -sf /usr/bin/${{range.key}} ${{targets.contextdir}}/opt/ratify/plugins/${{range.key}}
+    test:
+      pipeline:
+        - runs: test "$(readlink /opt/ratify/plugins/${{range.key}})" = "/usr/bin/${{range.key}}"
+
+update:
+  enabled: true
+  github:
+    identifier: notaryproject/ratify
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+  pipeline:
+    - runs: |
+        # Inspired by the tests on the official documentation: https://ratify.dev/docs/next/quickstarts/ratify-cli
+        curl -sSLO https://raw.githubusercontent.com/notaryproject/ratify/dev/test/testdata/notation.crt
+        cat > config.json <<EOF
+        {
+            "executor": {},
+            "store": {
+                "version": "1.0.0",
+                "plugins": [
+                    {
+                        "name": "oras",
+                        "cosignEnabled": true
+                    }
+                ]
+            },
+            "policy": {
+                "version": "1.0.0",
+                "plugin": {
+                    "name": "regoPolicy",
+                    "policyPath": "",
+                    "policy": "package ratify.policy\ndefault valid := false\nvalid {\n not failed_verify(input)\n}\nfailed_verify(reports) {\n  [path, value] := walk(reports)\n  value == false\n  path[count(path) - 1] == \"isSuccess\"\n}"
+                }
+            },
+            "verifier": {
+                "version": "1.0.0",
+                "plugins": [
+                    {
+                        "name": "notation",
+                        "artifactTypes": "application/vnd.cncf.notary.signature",
+                        "verificationCerts": [
+                            "./notation.crt"
+                        ],
+                        "trustPolicyDoc": {
+                            "version": "1.0",
+                            "trustPolicies": [
+                                {
+                                    "name": "default",
+                                    "registryScopes": [
+                                        "*"
+                                    ],
+                                    "signatureVerification": {
+                                        "level": "strict"
+                                    },
+                                    "trustStores": [
+                                        "ca:ca-certs"
+                                    ],
+                                    "trustedIdentities": [
+                                        "*"
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+        EOF
+
+        if ! ratify verify -c config.json -s ghcr.io/deislabs/ratify/notary-image:signed | grep -F -e '"isSuccess": true'; then
+          echo "Verification failed"
+          exit 1
+        fi
+
+        echo "Verification succeeded"

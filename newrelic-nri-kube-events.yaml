@@ -36,6 +36,11 @@ update:
 
 test:
   environment:
+    contents:
+      packages:
+        - kubectl
+        - wait-for-it
+        - curl
     environment:
       KUBERNETES_SERVICE_HOST: "127.0.0.1"
       KUBERNETES_SERVICE_PORT: "32764"
@@ -44,46 +49,23 @@ test:
       with:
         bins: nri-kube-events
     - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
     - name: Basic Functional test
       uses: test/daemon-check-output
       with:
         setup: |
-          # In-cluster SA materials expected by client-go
-          mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
-          # Copy cluster CA used by kwok into the SA path
-          CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
-          cp "$CA" /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          # Ensure the service account exists and mint a token file for client-go
-          kubectl create serviceaccount default --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create token default > /var/run/secrets/kubernetes.io/serviceaccount/token
-          # client-go reads the namespace from this file
-          echo -n "default" > /var/run/secrets/kubernetes.io/serviceaccount/namespace
-
           # RBAC so the SA can list/watch core/v1 events cluster-wide
-          cat <<'EOF' | kubectl apply -f -
-          apiVersion: rbac.authorization.k8s.io/v1
-          kind: ClusterRole
-          metadata:
-            name: nri-kube-events-read-events
-          rules:
-          - apiGroups: [""]
-            resources: ["events"]
-            verbs: ["get","list","watch"]
-          ---
-          apiVersion: rbac.authorization.k8s.io/v1
-          kind: ClusterRoleBinding
-          metadata:
-            name: nri-kube-events-read-events
-          subjects:
-          - kind: ServiceAccount
-            name: default
-            namespace: default
-          roleRef:
-            apiGroup: rbac.authorization.k8s.io
-            kind: ClusterRole
-            name: nri-kube-events-read-events
-          EOF
-          # Minimal config: stdout sink
+          kubectl create clusterrole nri-kube-events-reader \
+            --verb=get,list,watch \
+            --resource=events,services,pods,nodes,namespaces,persistentvolumes,persistentvolumeclaims \
+            --resource=deployments,daemonsets.apps \
+            --resource=jobs,cronjobs.batch \
+            --resource=events.events.k8s.io
+          kubectl create clusterrolebinding nri-kube-events-reader \
+            --clusterrole=nri-kube-events-reader \
+            --serviceaccount=default:default
+          # Minimal config for nri-kube-events : stdout sink
           cat > /tmp/test-config.yaml <<'YAML'
           log:
             level: info
@@ -91,10 +73,19 @@ test:
             - name: stdout
               kind: stdout
           YAML
-        start: nri-kube-events --config /tmp/test-config.yaml -promaddr 127.0.0.1:0
+        start: nri-kube-events --config /tmp/test-config.yaml -promaddr 127.0.0.1:80
         timeout: 10
         expected_output: |
           New Relic Kube Events integration
           ${{package.version}}
           Router started
           Serving Prometheus metrics
+          ADDED
+          Active
+        post: |
+          # Validate Metrics
+          wait-for-it 127.0.0.1:80
+          curl -fsSL 127.0.0.1:80 > metrics.txt
+          grep -q "nr_k8s_descriptions_workqueue_length" metrics.txt
+          grep -q "nr_kube_events_sink_request_duration_seconds_bucket" metrics.txt
+          grep -q "nr_kube_events_workqueue_length" metrics.txt

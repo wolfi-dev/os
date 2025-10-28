@@ -1,7 +1,7 @@
 package:
   name: qemu
   version: "10.1.2"
-  epoch: 0
+  epoch: 1
   description: "fast processor emulator"
   copyright:
     - license: GPL-2.0
@@ -12,6 +12,9 @@ package:
       - ${{package.name}}-system-x86_64
       - ${{package.name}}-utils
       - glib
+
+vars:
+  python-version: "3.13"
 
 environment:
   contents:
@@ -25,16 +28,14 @@ environment:
       - glib-dev
       - glib-static
       - libaio-dev
+      - libjpeg-turbo-dev
       - liburing-dev
       - ncurses
       - ncurses-dev
       - ninja-build
       - perl
       - pixman-dev
-      - py3-packaging
-      - py3-pip
-      - py3-sphinx
-      - python3
+      - python3-as-${{vars.python-version}}
       - samurai
       - wolfi-base
       - zlib-dev
@@ -48,13 +49,24 @@ pipeline:
       expected-commit: ccaea6b2656ec6eab966585f7b16438208f98de7
       tag: v${{package.version}}
 
-  - runs: |
-      mkdir build
-      cd build
-      # until this is initialized value don't remove the CFLAGS changes below https://github.com/qemu/qemu/blob/v10.1.0/target/i386/kvm/tdx.c#L827
-      CFLAGS="$CFLAGS -Wno-maybe-uninitialized"  ../configure --enable-system --enable-slirp --enable-vnc --target-list=x86_64-softmmu,aarch64-softmmu --prefix=${{targets.destdir}}/usr
+  - name: "qemu-system"
+    runs: |
+      mkdir -p build/qemu
+      cd build/qemu
+      # until this is initialized value don't remove the CFLAGS changes below
+      # https://github.com/qemu/qemu/blob/v10.1.0/target/i386/kvm/tdx.c#L827
+      CFLAGS="$CFLAGS -Wno-maybe-uninitialized" \
+          ../../configure \
+              --enable-system \
+              --enable-slirp \
+              --enable-vnc \
+              --target-list=x86_64-softmmu,aarch64-softmmu \
+              --prefix=/usr
       make -j$(nproc)
-      make install
+      make install DESTDIR=${{targets.destdir}}
+
+  - name: "strip"
+    runs: |
       # Remove this firmware file, which we don't need, but requires so:dld.sl, which we don't have
       rm -f ${{targets.destdir}}/usr/share/qemu/hppa-firmware64.img
       # Can't use strip pipeline; there are some binaries that melange can't strip,
@@ -208,6 +220,66 @@ subpackages:
 
           # arm vars are same as format as aarch64, but this is easier for consumer.
           cp "${{targets.destdir}}"/usr/share/qemu/edk2-arm-vars.fd "${{targets.subpkgdir}}"/usr/share/qemu/edk2-aarch64-vars.fd
+
+  - name: ${{package.name}}-user
+    description: "QEMU user binaries"
+    pipeline:
+      - runs: |
+          mkdir -p build/user
+          cd build/user
+          # until this is initialized value don't remove the CFLAGS changes below
+          # https://github.com/qemu/qemu/blob/v10.1.0/target/i386/kvm/tdx.c#L827
+          CFLAGS="$CFLAGS -Wno-maybe-uninitialized" \
+              ../../configure \
+                  --static --disable-plugins \
+                  --target-list=aarch64-linux-user,i386-linux-user,x86_64-linux-user \
+                  --prefix=/usr
+          make -j$(nproc)
+          make install DESTDIR=${{targets.contextdir}}
+          rm -rf ${{targets.contextdir}}/usr/share/qemu
+          cd ../..
+
+          chmod ugo+x binfmt-install
+          ./binfmt-install ${{targets.contextdir}} ${{build.arch}} aarch64 i386 x86_64
+          # keep /usr/share/qemu/binfmt.d which are just inert files
+          rm -Rf ${{targets.contextdir}}/usr/lib/binfmt.d/
+    test:
+      pipeline:
+        - uses: test/tw/ver-check
+          with:
+            bins: qemu-aarch64 qemu-i386 qemu-x86_64
+            version-flag: "-version"
+        - uses: test/tw/help-check
+          with:
+            bins: qemu-aarch64 qemu-i386 qemu-x86_64
+            help-flag: -h
+
+  - name: ${{package.name}}-user-binfmt
+    description: "binfmt files for qemu-user"
+    dependencies:
+      runtime:
+        - ${{package.name}}-user
+    pipeline:
+      - runs: |
+          # package the symlinks to qemu-user that systemd-binfmt.service(8) will see
+          # but remove the targets of those symlinks whic are provided by qemu-user
+          chmod ugo+x binfmt-install
+          ./binfmt-install ${{targets.contextdir}} ${{build.arch}} aarch64 i386 x86_64
+          rm -Rf ${{targets.contextdir}}/usr/share/qemu/binfmt.d/
+    test:
+      pipeline:
+        - runs: |
+            set +x
+            dir=/usr/lib/binfmt.d
+            found=""
+            for f in $dir/*.conf ; do
+               [ -e "$f" ] || { echo "$f - did not exist"; continue; }
+               [ -f "$f" ] || { echo "$f - unexpected non-file"; continue; }
+               found="${found} ${f##*/}"
+            done
+            found=${found# }
+            [ -n "$found" ] || { echo "FATAL: did not find files in $dir"; exit 1; }
+            echo "PASS: found conf files in $dir: $found"
 
 test:
   pipeline:

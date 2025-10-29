@@ -1,25 +1,24 @@
 package:
   name: nri-kubernetes
-  version: "3.47.0"
-  epoch: 0 # GHSA-2464-8j7c-4cjm
+  version: "3.48.0"
+  epoch: 1 # GHSA-2464-8j7c-4cjm
   description: New Relic integration for Kubernetes
   copyright:
     - license: Apache-2.0
-
-environment:
-  contents:
-    packages:
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go
+  dependencies:
+    runtime:
+      # Dependencies from upstream Dockerfile: https://github.com/newrelic/nri-kubernetes/blob/main/Dockerfile#L6
+      - bind-tools # DNS tools for service discovery and cluster connectivity
+      - curl # Used by nri-flex integration for Pixie Cloud Connector health checks (charts/newrelic-infrastructure/templates/kubelet/integrations-configmap.yaml:64)
+      - dash-binsh
+      - tini # Init process manager used in container ENTRYPOINT (Dockerfile:10)
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/newrelic/nri-kubernetes
       tag: v${{package.version}}
-      expected-commit: f853380ee51b032935f78b2bbabaa83b1f282fda
+      expected-commit: e14683be30cdf03d6d9bc718d38a8b00200df355
 
   - uses: go/build
     with:
@@ -36,42 +35,51 @@ test:
       packages:
         - curl
         - python3
+        - wait-for-it
+    environment:
+      AGENT_PORT: "8001"
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
   pipeline:
-    - name: "Set up mock metrics endpoint with request logging"
-      runs: |
-        mkdir -p /tmp/test-configs
-        # Start the metrics server in background
-        nohup python3 test_metrics_server.py > /tmp/metrics.log 2>&1 &
-        sleep 5
-    - name: "Create nri-kubernetes configuration"
-      runs: |
-        mkdir -p /etc/newrelic-infra/integrations.d
-        cp test-configs/nri-kubernetes.yml /etc/newrelic-infra/integrations.d/
-        cp test-configs/nri-kubernetes-config.yml /etc/newrelic-infra/
-    - name: "Test metrics endpoint and validate interaction"
-      runs: |
-        if curl -s http://localhost:8080/metrics | grep -q "test_metric"; then
-          echo "Mock metrics endpoint is accessible"
-        else
-          echo "Failed to access mock metrics endpoint"
-          cat /tmp/metrics.log
-          exit 1
-        fi
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          set -eo pipefail
 
-        # Run nri-kubernetes
-        timeout 10 /usr/bin/nri-kubernetes --verbose > /dev/null 2>&1 &
-        NRIPID=$!
-        sleep 5
+          # Start mock agent to mimic newrelic-infra agent
+          # nri-kubernetes sends metrics to agent (not directly to cloud)
+          python3 test_metrics_server.py > /tmp/agent.log 2>&1 &
+          AGENT_PID=$!
+          echo "${AGENT_PID}" > /tmp/agent.pid
 
-        # Check if we received any requests
-        if [ -f /tmp/request.log ] && grep -q "/metrics" /tmp/request.log; then
-          echo "Verified: nri-kubernetes accessed the metrics endpoint"
-          echo "Request details:"
-          cat /tmp/request.log
-        else
-          echo "Error: No requests received from nri-kubernetes"
-          exit 1
-        fi
+          # Wait for mock agent to be ready
+          wait-for-it "localhost:${AGENT_PORT}" -t 30
+
+          curl -sf "http://localhost:${AGENT_PORT}/" | grep -F "ready"
+
+          mkdir -p /etc/newrelic-infra
+          cp test-configs/nri-kubernetes-config.yml /etc/newrelic-infra/nri-kubernetes.yml
+        start: nri-kubernetes
+        timeout: 30
+        expected_output: |
+          Waiting for agent container to be ready...
+          New Relic Kubernetes integration Version
+        post: |
+          set -eo pipefail
+
+          # Kill the mock agent
+          kill -9 "$(cat /tmp/agent.pid)" 2>/dev/null || true
+
+          # Verify nri-kubernetes sent data to mock agent
+          # becuase nri-kubernetes sends data to the New Relic agent
+          # the log should contain POST requests with kubernetes metrics
+
+          test -f /tmp/agent_received.log
+          grep -F "Received POST to /v1/data" /tmp/agent_received.log
+          grep -F "com.newrelic.kubernetes" /tmp/agent_received.log
 
 update:
   enabled: true
@@ -80,3 +88,6 @@ update:
     strip-prefix: v
     tag-filter: v
     use-tag: true
+  ignore-regex-patterns:
+    - 'newrelic-infrastructure-'
+    - 'e2e-resources-'

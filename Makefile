@@ -16,15 +16,7 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
-ifeq (${MELANGE_RUNNER},)
-MELANGE_RUNNER = qemu
-$(warning ****************************** WARNING ******************************)
-$(warning *** MELANGE_RUNNER is unset. The default runner is now qemu, which)
-$(warning *** requires chainctl authentication to access the Chainguard kernel.)
-$(warning *** See `melange build --help` for a list of other runner options.)
-$(warning ****************************** WARNING ******************************)
-endif
-
+MELANGE_RUNNER ?= qemu
 MELANGE_OPTS += --runner=${MELANGE_RUNNER}
 MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
 QEMU_KERNEL_IMAGE ?= kernel/$(ARCH)/vmlinuz

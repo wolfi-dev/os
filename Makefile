@@ -139,7 +139,7 @@ pkg_targets = $(foreach name,$(pkgs),package/$(name))
 $(pkg_targets): package/%: cache compiled/%.json
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
+	@echo "Building package $* with version $(pkgver) from file $(yamlfile)"
 	$(MAKE) jsonfile=compiled/$*.json yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
 packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile) $(jsonfile)
@@ -160,7 +160,7 @@ dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP) compiled/%.json
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
+	@echo "Building package $* with version $(pkgver) from file $(yamlfile)"
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
 		./scripts/with-tokens "$*" "compiled/$*.json" \
@@ -171,7 +171,7 @@ $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP) compiled/%.json
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
+	@echo "Testing package $* with version $(pkgver) from file $(yamlfile)"
 	./scripts/with-tokens "$*" "compiled/$*.json" \
 		$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir="./$*/"
 
@@ -185,7 +185,7 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP) compiled/%.jso
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
+	@echo "Testing package $* with version $(pkgver) from file $(yamlfile)"
 	./scripts/with-tokens "$*" "compiled/$*.json" \
 		$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir="./$*/"
 

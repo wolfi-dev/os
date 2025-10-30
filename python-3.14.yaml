@@ -43,8 +43,30 @@ environment:
       - xz-dev
       - zlib-dev
 
+vars:
+  python-config: |
+    --host=__host_triplet_gnu__ \
+    --build=__host_triplet_gnu__ \
+    --target=__host_triplet_gnu__ \
+    --prefix=/usr \
+    --enable-ipv6 \
+    --enable-loadable-sqlite-extensions \
+    --enable-shared \
+    --with-lto \
+    --with-computed-gotos \
+    --with-dbmliborder=gdbm:ndbm \
+    --with-system-expat \
+    --with-system-libmpdec \
+    --without-ensurepip \
+    --with-builtin-hashlib-hashes=blake2 \
+    --with-wheel-pkg-dir=/usr/share/python-wheels
+
 # creates helpful python3.M and 3.M variables
 var-transforms:
+  - from: ${{vars.python-config}}
+    match: '__host_triplet_gnu__'
+    replace: ${{host.triplet.gnu}}
+    to: python-config
   - from: ${{package.name}}
     match: '-'
     replace: ''
@@ -81,6 +103,11 @@ pipeline:
     with:
       patches: gh-118224.patch gh-127301.patch
 
+  - name: Clone patched source for no-GIL build
+    runs: |
+      mkdir no-gil
+      tar -cf - --exclude=no-gil . | (cd no-gil; tar -xf -)
+
   # Experimental JIT support
   #
   # --enable-optimizations with clang requires PGO support (in particular,
@@ -90,23 +117,9 @@ pipeline:
     with:
       opts: |
         CC=clang \
-        --host=${{host.triplet.gnu}} \
-        --build=${{host.triplet.gnu}} \
-        --target=${{host.triplet.gnu}} \
-        --prefix=/usr \
         --enable-experimental-jit=yes-off \
-         --with-tail-call-interp \
-        --enable-ipv6 \
-        --enable-loadable-sqlite-extensions \
-        --enable-shared \
-        --with-lto \
-        --with-computed-gotos \
-        --with-dbmliborder=gdbm:ndbm \
-        --with-system-expat \
-        --with-system-libmpdec \
-        --without-ensurepip \
-        --with-builtin-hashlib-hashes=blake2 \
-        --with-wheel-pkg-dir=/usr/share/python-wheels
+        --with-tail-call-interp \
+        ${{vars.python-config}}
 
   - uses: autoconf/make
 
@@ -156,106 +169,66 @@ subpackages:
         # which is provided by tk.  melange SCA does not find this dependency.
         - tk
     pipeline:
-      # Hopefully this is cached. If not, we could copy it after checking out
-      # in the main package build.
-      - uses: git-checkout
-        working-directory: no-gil
-        with:
-          expected-commit: ebf955df7a89ed0c7968f79faec1de49f61ed7cb
-          repository: https://github.com/python/cpython.git
-          tag: v${{package.version}}
-          cherry-picks: |
-            3.14/d11e69d6203080e3ec450446bfed0516727b85c3: Fix CVE-2025-8291
-      - name: Force use of system libraries
-        working-directory: no-gil
-        runs: |
-          rm -rf Modules/expat \
-            Modules/_ctypes/darwin* \
-            Modules/_ctypes/libffi*
-      - uses: patch
-        working-directory: no-gil
-        with:
-          patches: ../gh-118224.patch ../gh-127301.patch
-      - uses: autoconf/configure
-        working-directory: no-gil
-        with:
-          opts: |
-            --host=${{host.triplet.gnu}} \
-            --build=${{host.triplet.gnu}} \
-            --target=${{host.triplet.gnu}} \
-            --prefix=/usr \
-            --enable-ipv6 \
-            --enable-loadable-sqlite-extensions \
-            $([ -d /usr/lib/oldglibc ] || echo --enable-optimizations) \
-            --enable-shared \
-            --with-lto \
-            --with-computed-gotos \
-            --with-dbmliborder=gdbm:ndbm \
-            --with-system-expat \
-            --with-system-libmpdec \
-            --without-ensurepip \
-            --with-builtin-hashlib-hashes=blake2 \
-            --with-wheel-pkg-dir=${{targets.subpkgdir}}/usr/share/python-wheels \
-            --disable-gil
-      - uses: autoconf/make
-        working-directory: no-gil
-      - uses: autoconf/make-install
-        working-directory: no-gil
-      - name: "Clean out base items"
-        working-directory: no-gil
-        runs: |
-          find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
-          find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
-          find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+      - working-directory: no-gil
+        pipeline:
+          - uses: autoconf/configure
+            with:
+              opts: |
+                --disable-gil \
+                --enable-optimizations \
+                ${{vars.python-config}}
+          - uses: autoconf/make
+          - uses: autoconf/make-install
+          - name: "Clean out base items"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
 
-          cd ${{targets.subpkgdir}}/usr/bin
-          rm idle3*
-          rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
+              cd ${{targets.subpkgdir}}/usr/bin
+              rm idle3*
+              rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
 
-          # add dubious python -> python3 link
-          ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
+              # add dubious python -> python3 link
+              ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
 
-          # Drop site-packages README.txt to avoid SCA dep on python3~3.M
-          rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/site-packages
+              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/site-packages
 
-          rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/idlelib
-          rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/ensurepip/_bundled/
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/idlelib
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/ensurepip/_bundled/
 
-          rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
-          rm -R ${{targets.subpkgdir}}/usr/include
-          rm -R ${{targets.subpkgdir}}/usr/share
-          rm ${{targets.subpkgdir}}/usr/lib/pkgconfig/python-3.14-*.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/python3-*.pc
-      # AFAIK the .pyc/.pyo files are compatible between GIL/no-GIL builds, but
-      # the .so files are not, so we include everything in here out of an
-      # abundance of caution.
-      - name: "Precompile .py files"
-        working-directory: no-gil
-        runs: |
-          find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
-          find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+              rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
+              rm -R ${{targets.subpkgdir}}/usr/include
+              rm -R ${{targets.subpkgdir}}/usr/share
+              rm ${{targets.subpkgdir}}/usr/lib/pkgconfig/python-3.14-*.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/python3-*.pc
+          # AFAIK the .pyc/.pyo files are compatible between GIL/no-GIL builds, but
+          # the .so files are not, so we include everything in here out of an
+          # abundance of caution.
+          - name: "Precompile .py files"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
 
-          export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-          ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -m compileall --invalidation-mode=unchecked-hash \
-              -r100 ${{targets.subpkgdir}}/usr/lib/
-      - uses: strip
+              export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+              ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -m compileall --invalidation-mode=unchecked-hash \
+                  -r100 ${{targets.subpkgdir}}/usr/lib/
+          - uses: strip
     test:
       pipeline:
-        - uses: test/tw/ldd-check
-          working-directory: no-gil
-        - uses: test/tw/symlink-check
-          working-directory: no-gil
-        - uses: test/tw/ver-check
-          working-directory: no-gil
-          with:
-            bins: python ${{vars.python}} ${{vars.python-t}}
-        - uses: test/tw/help-check
-          working-directory: no-gil
-          with:
-            bins: python ${{vars.python}} ${{vars.python-t}}
-        - name: Verify no-GIL build
-          working-directory: no-gil
-          runs: |
-            ${{vars.python-t}} -c 'import sysconfig; assert(sysconfig.get_config_var("Py_GIL_DISABLED"))'
+        - working-directory: no-gil
+          pipeline:
+            - uses: test/tw/ldd-check
+            - uses: test/tw/symlink-check
+            - uses: test/tw/ver-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+            - uses: test/tw/help-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+            - name: Verify no-GIL build
+              runs: |
+                ${{vars.python-t}} -c 'import sysconfig; assert(sysconfig.get_config_var("Py_GIL_DISABLED"))'
 
   - name: "${{package.name}}-base"
     description: "${{package.name}} without /usr/bin/python3"

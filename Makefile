@@ -16,15 +16,7 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
-ifeq (${MELANGE_RUNNER},)
-MELANGE_RUNNER = qemu
-$(warning ****************************** WARNING ******************************)
-$(warning *** MELANGE_RUNNER is unset. The default runner is now qemu, which)
-$(warning *** requires chainctl authentication to access the Chainguard kernel.)
-$(warning *** See `melange build --help` for a list of other runner options.)
-$(warning ****************************** WARNING ******************************)
-endif
-
+MELANGE_RUNNER ?= qemu
 MELANGE_OPTS += --runner=${MELANGE_RUNNER}
 MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
 QEMU_KERNEL_IMAGE ?= kernel/$(ARCH)/vmlinuz
@@ -144,13 +136,15 @@ kernel/%/vmlinuz: kernel/%/linux.apk
 yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
-$(pkg_targets): package/%:
+$(pkg_targets): package/%: cache
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
-packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
+packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile)
+	@[ -n "$(pkgname)" ] || { echo "$@: pkgname is not set"; exit 1; }
+	@[ -n "$(yamlfile)" ] || { echo "$@: yamlfile is not set"; exit 1; }
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)

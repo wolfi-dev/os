@@ -68,6 +68,15 @@ WOLFI_REPO ?= https://packages.wolfi.dev/os
 WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
 
+DOCKER_PLATFORM_ARG := $(shell \
+  case $(ARCH) in \
+	(aarch64) darch=arm64;; \
+	(x86_64) darch=amd64;; \
+	(*) echo "unknown-docker-platform-arch-$(ARCH)"; exit 1;; \
+  esac ; \
+  echo "--platform=linux/$$darch" \
+)
+
 ifeq (${BOOTSTRAP}, yes)
 	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
 	MELANGE_OPTS += -r ${BOOTSTRAP_REPO}
@@ -197,12 +206,13 @@ $(compile_targets): compile/%:
 
 .PHONY: dev-container
 dev-container:
-	docker run --pull=always --privileged --rm -it \
+	docker run $(DOCKER_PLATFORM_ARG) --pull=always --privileged --rm -it \
+		--entrypoint="/bin/bash" \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
 	    -e HTTP_AUTH \
-	    ghcr.io/wolfi-dev/sdk:latest
+	    ghcr.io/wolfi-dev/sdk:latest -il
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -216,12 +226,13 @@ local-wolfi: $(KEY)
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --pull=always --rm -it \
+	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
+		--entrypoint="/bin/sh" \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		cgr.dev/chainguard/wolfi-base:latest
+		cgr.dev/chainguard/wolfi-base:latest -il
 	rm "$(TMP_REPOS_FILE)"
 	rmdir "$(TMP_REPOS_DIR)"
 
@@ -266,14 +277,15 @@ dev-container-wolfi: $(KEY)
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --pull=always --rm -it \
+	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
+		--entrypoint="/bin/bash" \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest
+		ghcr.io/wolfi-dev/sdk:latest -il
 	rm "$(TMP_REPOS_FILE)"
 	rmdir "$(TMP_REPOS_DIR)"
 

@@ -1,7 +1,7 @@
 package:
   name: python-3.14
   version: "3.14.0"
-  epoch: 4
+  epoch: 5
   description: "the Python programming language"
   copyright:
     - license: PSF-2.0
@@ -43,16 +43,46 @@ environment:
       - xz-dev
       - zlib-dev
 
+vars:
+  python-config: |
+    --host=__host_triplet_gnu__ \
+    --build=__host_triplet_gnu__ \
+    --target=__host_triplet_gnu__ \
+    --prefix=/usr \
+    --enable-ipv6 \
+    --enable-loadable-sqlite-extensions \
+    --enable-shared \
+    --with-lto \
+    --with-computed-gotos \
+    --with-dbmliborder=gdbm:ndbm \
+    --with-system-expat \
+    --with-system-libmpdec \
+    --without-ensurepip \
+    --with-builtin-hashlib-hashes=blake2 \
+    --with-wheel-pkg-dir=/usr/share/python-wheels
+
 # creates helpful python3.M and 3.M variables
 var-transforms:
+  - from: ${{vars.python-config}}
+    match: '__host_triplet_gnu__'
+    replace: ${{host.triplet.gnu}}
+    to: python-config
   - from: ${{package.name}}
     match: '-'
     replace: ''
     to: python
+  - from: ${{vars.python}}
+    match: (.*)
+    replace: '${1}t'
+    to: python-t
   - from: ${{package.version}}
     match: (\d).(\d+).(\d+)
     replace: '$1.$2'
     to: pyversion
+  - from: ${{vars.pyversion}}
+    match: (.*)
+    replace: '${1}t'
+    to: pyversion-t
 
 pipeline:
   - uses: git-checkout
@@ -73,32 +103,23 @@ pipeline:
     with:
       patches: gh-118224.patch gh-127301.patch
 
+  - name: Clone patched source for no-GIL build
+    runs: |
+      mkdir no-gil
+      tar -cf - --exclude=no-gil . | (cd no-gil; tar -xf -)
+
   # Experimental JIT support
   #
   # --enable-optimizations with clang requires PGO support (in particular,
   # we're missing libclang_rt.profile). This build configuration won't be
   # optimal and might not produce any performance gains.
-  - name: Configure
-    runs: |
-      ./configure \
-         CC=clang \
-         --host=${{host.triplet.gnu}} \
-         --build=${{host.triplet.gnu}} \
-         --target=${{host.triplet.gnu}} \
-         --prefix=/usr \
-         --enable-experimental-jit=yes-off \
-         --with-tail-call-interp \
-         --enable-ipv6 \
-         --enable-loadable-sqlite-extensions \
-         --enable-shared \
-         --with-lto \
-         --with-computed-gotos \
-         --with-dbmliborder=gdbm:ndbm \
-         --with-system-expat \
-         --with-system-libmpdec \
-         --without-ensurepip \
-         --with-builtin-hashlib-hashes=blake2 \
-         --with-wheel-pkg-dir=/usr/share/python-wheels
+  - uses: autoconf/configure
+    with:
+      opts: |
+        CC=clang \
+        --enable-experimental-jit=yes-off \
+        --with-tail-call-interp \
+        ${{vars.python-config}}
 
   - uses: autoconf/make
 
@@ -122,14 +143,11 @@ pipeline:
       rm site-packages/README.txt
       rmdir site-packages
 
-  - name: "remove idle (python IDE)"
-    runs: |
+  - runs: |
       rm -R "${{targets.destdir}}/usr/lib/${{vars.python}}/idlelib"
 
-  - runs: |
       rm -R ${{targets.destdir}}/usr/lib/${{vars.python}}/ensurepip/_bundled/
 
-  - runs: |
       find ${{targets.destdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
       find ${{targets.destdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
 
@@ -140,6 +158,78 @@ pipeline:
   - uses: strip
 
 subpackages:
+  - name: "${{package.name}}t"
+    description: "Python with the GIL disabled (free threading)"
+    dependencies:
+      provides:
+        - python3t=${{package.full-version}}
+        - python-3t=${{package.full-version}}
+      runtime:
+        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
+        # which is provided by tk.  melange SCA does not find this dependency.
+        - tk
+    pipeline:
+      - working-directory: no-gil
+        pipeline:
+          - uses: autoconf/configure
+            with:
+              opts: |
+                --disable-gil \
+                --enable-optimizations \
+                ${{vars.python-config}}
+          - uses: autoconf/make
+          - uses: autoconf/make-install
+          - name: "Clean out base items"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+
+              cd ${{targets.subpkgdir}}/usr/bin
+              rm idle3*
+              rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
+
+              # add dubious python -> python3 link
+              ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
+
+              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/site-packages
+
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/idlelib
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/ensurepip/_bundled/
+
+              rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
+              rm -R ${{targets.subpkgdir}}/usr/include
+              rm -R ${{targets.subpkgdir}}/usr/share
+              rm ${{targets.subpkgdir}}/usr/lib/pkgconfig/python-3.14-*.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/python3-*.pc
+          # AFAIK the .pyc/.pyo files are compatible between GIL/no-GIL builds, but
+          # the .so files are not, so we include everything in here out of an
+          # abundance of caution.
+          - name: "Precompile .py files"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+              export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+              ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -m compileall --invalidation-mode=unchecked-hash \
+                  -r100 ${{targets.subpkgdir}}/usr/lib/
+          - uses: strip
+    test:
+      pipeline:
+        - working-directory: no-gil
+          pipeline:
+            - uses: test/tw/ldd-check
+            - uses: test/tw/symlink-check
+            - uses: test/tw/ver-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+            - uses: test/tw/help-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+            - name: Verify no-GIL build
+              runs: |
+                ${{vars.python-t}} -c 'import sysconfig; assert(sysconfig.get_config_var("Py_GIL_DISABLED"))'
+
   - name: "${{package.name}}-base"
     description: "${{package.name}} without /usr/bin/python3"
     dependencies:
@@ -297,27 +387,21 @@ subpackages:
 
 test:
   pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/symlink-check
+    - uses: test/tw/ver-check
+      with:
+        bins: python ${{vars.python}}
+    - uses: test/tw/help-check
+      with:
+        bins: pydoc3 python ${{vars.python}}
     - name: Verify Python names
       runs: |
         # main package should provide 'python' and 'python3'.
         python version-check.py ${{package.version}}
         python3 version-check.py ${{package.version}}
-    - uses: test/tw/ver-check
-      with:
-        bins: python python3
-    - uses: test/tw/help-check
-      with:
-        bins: pydoc3 python python3
     - name: Verify working python3 -m venv
       runs: |
-        d=$(mktemp -d)
-        python3 -m venv "$d"
-        $d/bin/pip list
-        $d/bin/pip check
-        rm -Rf "$d"
-    - name: (free-threaded) Verify working python3 -m venv
-      runs: |
-        export PYTHON_JIT=1
         d=$(mktemp -d)
         python3 -m venv "$d"
         $d/bin/pip list
@@ -327,6 +411,14 @@ test:
       runs: |
         export PYTHON_JIT=1
         python3 jit-check.py
+    - name: (free-threaded) Verify working python3 -m venv
+      runs: |
+        export PYTHON_JIT=1
+        d=$(mktemp -d)
+        python3 -m venv "$d"
+        $d/bin/pip list
+        $d/bin/pip check
+        rm -Rf "$d"
 
 update:
   enabled: true

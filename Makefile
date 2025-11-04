@@ -16,15 +16,7 @@ KEY ?= local-melange.rsa
 REPO ?= $(shell pwd)/packages
 QEMU_KERNEL_REPO := https://apk.cgr.dev/chainguard-private/
 
-ifeq (${MELANGE_RUNNER},)
-MELANGE_RUNNER = qemu
-$(warning ****************************** WARNING ******************************)
-$(warning *** MELANGE_RUNNER is unset. The default runner is now qemu, which)
-$(warning *** requires chainctl authentication to access the Chainguard kernel.)
-$(warning *** See `melange build --help` for a list of other runner options.)
-$(warning ****************************** WARNING ******************************)
-endif
-
+MELANGE_RUNNER ?= qemu
 MELANGE_OPTS += --runner=${MELANGE_RUNNER}
 MELANGE_TEST_OPTS += --runner=${MELANGE_RUNNER}
 QEMU_KERNEL_IMAGE ?= kernel/$(ARCH)/vmlinuz
@@ -76,6 +68,15 @@ WOLFI_REPO ?= https://packages.wolfi.dev/os
 WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
 
+DOCKER_PLATFORM_ARG := $(shell \
+  case $(ARCH) in \
+	(aarch64) darch=arm64;; \
+	(x86_64) darch=amd64;; \
+	(*) echo "unknown-docker-platform-arch-$(ARCH)"; exit 1;; \
+  esac ; \
+  echo "--platform=linux/$$darch" \
+)
+
 ifeq (${BOOTSTRAP}, yes)
 	MELANGE_OPTS += -k ${BOOTSTRAP_KEY}
 	MELANGE_OPTS += -r ${BOOTSTRAP_REPO}
@@ -83,10 +84,6 @@ else
 	MELANGE_OPTS += -k ${WOLFI_KEY}
 	MELANGE_OPTS += -r ${WOLFI_REPO}
 endif
-
-# Evaluate all package manifests and packages
-yamls := $(wildcard *.yaml)
-pkgs := $(subst .yaml,,$(yamls))
 
 ${KEY}:
 	${MELANGE} keygen ${KEY}
@@ -104,37 +101,14 @@ clean:
 clean-cache:
 	rm -rf ${CACHEDIR}
 
-%/.guarded-repo.token:
-	$(eval pkgname := $*)
-	tmpf=$(shell mktemp) && \
-	chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev > $${tmpf} && \
-	mkdir -p $(pkgname) && \
-	mv $${tmpf} ./$(pkgname)/.guarded-repo.token
+${CACHEDIR}/.libraries_token.txt: cache
+	tmpf=$(shell mktemp); \
+	chainctl auth login --audience libraries.cgr.dev; \
+	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
+	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
 
-repo_token_targets = $(foreach name,$(pkgs),repo-token/$(name))
-$(repo_token_targets): repo-token/%: %/.guarded-repo.token
-
-%/.libraries.token:
-	$(eval pkgname := $*)
-	tmpf=$(shell mktemp) && \
-	chainctl auth token --audience libraries.cgr.dev > $${tmpf} && \
-	mkdir -p $(pkgname) && \
-	mv $${tmpf} ./$(pkgname)/.libraries.token
-
-libraries_token_targets = $(foreach name,$(pkgs),lib-token/$(name))
-$(libraries_token_targets): lib-token/%: %/.libraries.token
-
-.PHONY: tokens-if-needed/%
-tokens-if-needed/%:
-	$(eval pkgname := $*)
-	$(MAKE) compile/$(pkgname)
-	$(call repo_token_if_needed,$(pkgname))
-	$(call libraries_token_if_needed,$(pkgname))
-
-.PHONY: clean-tokens/%
-clean-tokens/%:
-	$(eval pkgname := $*)
-	rm -rf ./$(pkgname)/.*.token
+.PHONY: lib-token
+lib-token: ${CACHEDIR}/.libraries_token.txt
 
 .PHONY: fetch-kernel
 fetch-kernel:
@@ -168,20 +142,22 @@ kernel/%/vmlinuz: kernel/%/linux.apk
 		rc=$$?; rm -Rf $$tmpd; exit $$rc
 	touch $@
 
+yamls := $(wildcard *.yaml)
+pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
-$(pkg_targets): package/%:
+$(pkg_targets): package/%: cache
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
-packages/$(ARCH)/%.apk: cache $(KEY) $(QEMU_KERNEL_DEP)
-	$(MAKE) tokens-if-needed/$(pkgname)
+packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile)
+	@[ -n "$(pkgname)" ] || { echo "$@: pkgname is not set"; exit 1; }
+	@[ -n "$(yamlfile)" ] || { echo "$@: yamlfile is not set"; exit 1; }
 	mkdir -p ./$(pkgname)/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
-	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/"
-	$(MAKE) clean-tokens/$(pkgname)
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
@@ -191,26 +167,20 @@ $(docker_pkg_targets): docker-package/%:
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
-	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) tokens-if-needed/$(pkgname)
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
-	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/"
-	$(MAKE) clean-tokens/$(pkgname)
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
 $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
-	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) tokens-if-needed/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/"
-	$(MAKE) clean-tokens/$(pkgname)
+	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
 
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
 $(docker_test_targets): docker-test/%:
@@ -221,31 +191,28 @@ testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
 $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
-	$(eval pkgname := $*)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	$(MAKE) tokens-if-needed/$(pkgname)
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	bash -xc "trap 'trap - SIGINT SIGTERM ERR; $(MAKE) clean-tokens/$(pkgname); exit 1' SIGINT SIGTERM ERR; $(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/"
-	$(MAKE) clean-tokens/$(pkgname)
+	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
 
+# Please do not print any additional content via this target
+# so that we can parse output directly with jq
 compile_targets = $(foreach name,$(pkgs),compile/$(name))
 $(compile_targets): compile/%:
-	mkdir -p ./compiled ./$(*)/
-	$(eval jsonfile := compiled/$*.json)
+	@$(MAKE) $(KEY) >/dev/null 2>&1
+	@mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
-	$(eval pkgname := $*)
-	$(MELANGE) compile $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(*)/ > $(jsonfile)
-	@printf "Compiled manifest for $(pkgname) written to $(jsonfile)"
+	@$(MELANGE) compile $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(*)/
 
 .PHONY: dev-container
 dev-container:
-	docker run --pull=always --privileged --rm -it \
+	docker run $(DOCKER_PLATFORM_ARG) --pull=always --privileged --rm -it \
+		--entrypoint="/bin/bash" \
 	    -v "${PWD}:${PWD}" \
-	    -v "${CACHEDIR}:/tmp/melange-cache" \
 	    -w "${PWD}" \
 	    -e SOURCE_DATE_EPOCH=0 \
 	    -e HTTP_AUTH \
-	    ghcr.io/wolfi-dev/sdk:latest
+	    ghcr.io/wolfi-dev/sdk:latest -il
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
 # This target spins up a docker container that is helpful for testing local
@@ -259,12 +226,16 @@ local-wolfi: $(KEY)
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --pull=always --rm -it \
+ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
+	echo "$(LOCAL_WOLFI_EXTRA_REPO)" >> $(TMP_REPOS_FILE)
+endif
+	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
+		--entrypoint="/bin/sh" \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		cgr.dev/chainguard/wolfi-base:latest
+		cgr.dev/chainguard/wolfi-base:latest -il
 	rm "$(TMP_REPOS_FILE)"
 	rmdir "$(TMP_REPOS_DIR)"
 
@@ -309,14 +280,18 @@ dev-container-wolfi: $(KEY)
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
-	docker run --pull=always --rm -it \
+ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
+	echo "$(LOCAL_WOLFI_EXTRA_REPO)" >> $(TMP_REPOS_FILE)
+endif
+	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
+		--entrypoint="/bin/bash" \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \
 		--mount type=bind,source="${OS_DIR}",destination="$(OS_LOCAL_DIR)",readonly \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
 		--mount type=bind,source="${PWD}/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
 		--mount type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
 		-w "$(PACKAGES_CONTAINER_FOLDER)" \
-		ghcr.io/wolfi-dev/sdk:latest
+		ghcr.io/wolfi-dev/sdk:latest -il
 	rm "$(TMP_REPOS_FILE)"
 	rmdir "$(TMP_REPOS_DIR)"
 
@@ -327,35 +302,9 @@ check-bootstrap:
 		-k ${BOOTSTRAP_KEY} \
 		-r ${BOOTSTRAP_REPO}
 
-define authget
-tok=$$(chainctl auth token --audience=$(1)) || \
-{ echo "failed token from $(1) for target $@"; exit 1; }; \
-mkdir -p $$(dirname $(2)) && \
-echo "auth-download[$(1)] to $(2) from $(3)" && \
-curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
-mv "$(2).tmp" "$(2)"
-endef
-
-define repo_token_if_needed
-$(eval jsonfile := compiled/$1.json)
-$(eval pkgname := $1)
-
-@if jq -er '.. | .uses? | strings | select(test("auth/guarded-repo"))' $(jsonfile); then \
-	echo "Creating guarded repo token for $(pkgname)…"; \
-	$(MAKE) repo-token/$(pkgname); \
-else \
-	echo "$(pkgname) does not use a guarded repo. Skipping token creation."; \
-fi
-endef
-
-define libraries_token_if_needed
-$(eval jsonfile := compiled/$1.json)
-$(eval pkgname := $1)
-
-@if jq -er '.. | .uses? | strings | select(test("auth/(?!guarded-repo)"))' $(jsonfile); then \
-	echo "Creating guarded libraries token for $(pkgname)…"; \
-	$(MAKE) lib-token/$(pkgname); \
-else \
-	echo "$(pkgname) does not use guarded libraries. Skipping token creation."; \
-fi
-endef
+authget = tok=$$(chainctl auth token --audience=$(1)) || \
+  { echo "failed token from $(1) for target $@"; exit 1; }; \
+  mkdir -p $$(dirname $(2)) && \
+  echo "auth-download[$(1)] to $(2) from $(3)" && \
+  curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
+	mv "$(2).tmp" "$(2)"

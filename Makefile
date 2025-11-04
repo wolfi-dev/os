@@ -226,6 +226,9 @@ local-wolfi: $(KEY)
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
+ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
+	echo "$(LOCAL_WOLFI_EXTRA_REPO)" >> $(TMP_REPOS_FILE)
+endif
 	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
 		--entrypoint="/bin/sh" \
 		--mount type=bind,source="${PWD}/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
@@ -277,6 +280,9 @@ dev-container-wolfi: $(KEY)
 	$(eval OUT_DIR := $(shell echo $${OUT_DIR:-$$(mktemp --tmpdir -d "$@-out.XXXXXX")}))
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
+ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
+	echo "$(LOCAL_WOLFI_EXTRA_REPO)" >> $(TMP_REPOS_FILE)
+endif
 	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
 		--entrypoint="/bin/bash" \
 		--mount type=bind,source="${OUT_DIR}",destination="$(OUT_LOCAL_DIR)" \

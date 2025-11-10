@@ -1,38 +1,18 @@
 package:
   name: docker
-  version: "28.5.1"
-  epoch: 2
+  version: "28.5.2"
+  epoch: 3
   description: A meta package for Docker Engine and Docker CLI
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
-      - btrfs-progs
-      # Include busybox because dockerd-oci-entrypoint is a shell script that execs the input params given.
-      - busybox
-      - ca-certificates
-      - containerd
-      - ctr
       - docker-cli
       - docker-cli-buildx
       - docker-compose
-      - e2fsprogs
-      - e2fsprogs-extra
-      - fuse-overlayfs
-      - git
-      - ip6tables
-      - iproute2
-      # docker dind also needs a couple of runtime dependencies mentioned here (https://github.com/moby/moby/blob/0eecd59153c03ced5f5ddd79cc98f29e4d86daec/project/PACKAGERS.md#runtime-dependencies) below are those dependencies.
-      - iptables
-      - openssh-client
-      - openssl
-      - pigz
-      - procps
-      - shadow-subids # equivalent of shadow-uidmap in wolfi
-      - tini-static
-      - xfsprogs
-      - xz
-      - zfs
+      - docker-init
+      - dockerd
+      - openssh-client # used by docker-cli
   checks:
     disabled:
       # docker is a meta package pulling in several subpackages at runtime
@@ -59,7 +39,7 @@ pipeline:
     with:
       repository: https://github.com/moby/moby
       tag: v${{package.version}}
-      expected-commit: f8215cc266744ef195a50a70d427c345da2acdbb
+      expected-commit: 89c5e8fd66634b6128fc4c0e6f1236e2540e46e0
 
   - runs: |
       # moby/moby uses a non-standard `vendor.mod` and helper scripts instead
@@ -80,6 +60,8 @@ pipeline:
         github.com/opencontainers/runtime-spec@v1.2.1
         github.com/rootless-containers/rootlesskit/v2@v2.3.4
         github.com/golang-jwt/jwt/v5@v5.2.2
+        github.com/opencontainers/selinux@v1.13.0
+        github.com/containerd/containerd/v2@v2.1.5
 
   - runs: |
       # setting back to original so we can run moby specific hack
@@ -90,7 +72,7 @@ pipeline:
       # Replicate the environment setup performed by docker
       export DOCKER_BUILDTAGS="seccomp"
 
-      ./hack/make.sh dynbinary
+      VERSION="${{package.version}}" ./hack/make.sh dynbinary
 
   # Independently managed from moby/moby, but contains many utility scripts needed for the official docker images.
   # TODO: Figure out a way to autobump this as required
@@ -106,13 +88,6 @@ pipeline:
           unzip -q 7d789f6d3ca9d6cef6c7cbcbbefbd6483ee3d2cd.zip
           mv */** .
 
-  - name: "install additional content"
-    runs: |
-      install -Dm755 bundles/dynbinary-daemon/docker-proxy ${{targets.destdir}}/usr/bin/docker-proxy
-      install -Dm755 bundles/dynbinary-daemon/dockerd ${{targets.destdir}}/usr/bin/dockerd
-      ln -sf /sbin/tini-static ${{targets.destdir}}/usr/bin/docker-init
-      mkdir -p ${{targets.destdir}}/usr/lib/docker/plugins
-
   # Docker is vehemenetly against stripping the resulting binary
   # Ref: https://github.com/moby/moby/blob/d8a51d2887cbc465ab8d76ed98f7a86996ab3c22/project/PACKAGERS.md#stripping-binaries
   # - uses: strip
@@ -120,11 +95,68 @@ pipeline:
       # this exists to appease yam
 
 subpackages:
+  - name: dockerd
+    description: "Docker Engine (dockerd)"
+    dependencies:
+      runtime:
+        # https://github.com/docker/docker/blob/master/project/PACKAGERS.md#runtime-dependencies
+        - btrfs-progs
+        - ca-certificates
+        - containerd
+        - ctr
+        - e2fsprogs
+        - e2fsprogs-extra
+        - fuse-overlayfs
+        - git
+        - ip6tables
+        - iproute2
+        - iptables
+        - openssl
+        - pigz
+        - procps
+        - shadow-subids # equivalent of shadow-uidmap in wolfi
+        - xfsprogs
+        - xz
+        - zfs
+    pipeline:
+      - runs: |
+          install -Dm755 bundles/dynbinary-daemon/docker-proxy ${{targets.contextdir}}/usr/bin/docker-proxy
+          install -Dm755 bundles/dynbinary-daemon/dockerd ${{targets.contextdir}}/usr/bin/dockerd
+          mkdir -p ${{targets.destdir}}/usr/lib/docker/plugins
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: dockerd
+            help-flag: "--help"
+        - uses: test/tw/ver-check
+          with:
+            bins: dockerd docker-proxy
+            version-flag: "--version"
+
+  - name: docker-init
+    description: "Docker init"
+    dependencies:
+      runtime:
+        - tini-static
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          ln -sf ../../sbin/tini-static ${{targets.contextdir}}/usr/bin/docker-init
+    test:
+      pipeline:
+        - runs: |
+            [ -f /usr/bin/docker-init ]
+            [ -x /usr/bin/docker-init ]
+
   - name: docker-oci-entrypoint
     description: "docker OCI entrypoint"
     pipeline:
       - runs: |
           install -Dm755 /home/docker-library/docker-entrypoint.sh "${{targets.subpkgdir}}"/usr/bin/docker-entrypoint.sh
+    dependencies:
+      runtime:
+        - busybox
     test:
       pipeline:
         - runs: |
@@ -134,6 +166,7 @@ subpackages:
     description: "dockerd OCI entrypoint"
     dependencies:
       runtime:
+        - busybox
         # Used as a fallback in the dockerd-entrypoint.sh script
         - docker-oci-entrypoint
         # Used as a fallback in the dockerd-entrypoint.sh script
@@ -150,6 +183,7 @@ subpackages:
     description: "dockerd rootless"
     dependencies:
       runtime:
+        - busybox
         - rootlesskit
     pipeline:
       - runs: |
@@ -239,10 +273,25 @@ test:
   pipeline:
     - name: Smoke check
       runs: |
-        docker -v
-        dockerd --version
-        docker-init --version
-        docker-init -h
-        docker-proxy --version
-        docker-proxy --help
-        dockerd --help
+        set -x
+        bad=""
+        checks="
+        docker
+        docker-compose
+        docker-init
+        docker-proxy
+        dockerd
+        "
+        for b in ${checks} ; do
+           p="/usr/bin/$b"
+           [ -e "$p" ] ||
+             { echo "FAIL: $p - does not exist"; bad="$bad $b"; continue; }
+           [ -f "$p" ] ||
+             { echo "FAIL: $p - not a file"; bad="$bad $b"; continue; }
+           [ -x "$p" ] ||
+             { echo "FAIL: $p - not executable"; bad="$bad $b"; continue; }
+           echo "PASS: $p looks good"
+        done
+        bad=${bad# }
+        [ -z "$bad" ] || { echo "FATAL: smoke failed - $bad"; exit 1; }
+        exit 0

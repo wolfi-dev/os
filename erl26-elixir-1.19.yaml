@@ -1,0 +1,159 @@
+package:
+  name: erl26-elixir-1.19
+  version: "1.19.2"
+  epoch: 0
+  description: General-purpose programming language and runtime environment
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provider-priority: ${{vars.erlMM}}
+    runtime:
+      - erlang-${{vars.erlMM}}
+    provides:
+      - elixir=${{package.full-version}}
+      - elixir-1.19=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - erlang-${{vars.erlMM}}-dev
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^erl(\d\d+)-.*
+    replace: $1
+    to: erlMM
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 87cbf06ff1323fb4d67d1f3984120eef244e4005
+      repository: https://github.com/elixir-lang/elixir
+      tag: v${{package.version}}
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: elixir-lang/elixir
+    strip-prefix: v
+    tag-filter-prefix: v1.19
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - erlang-${{vars.erlMM}}-dev
+        - erl${{vars.erlMM}}-rebar3
+        - wait-for-it
+  pipeline:
+    - uses: test/virtualpackage
+      with:
+        real-pkg-name: "${{package.name}}"
+        virtual-pkg-name: "elixir"
+    - name: Smoke test
+      runs: |
+        elixir --version | grep -F -e "compiled with Erlang/OTP ${{vars.erlMM}}"
+        elixir --version | grep -F -e "${{package.version}}"
+        elixirc --version | grep -F -e "${{package.version}}"
+        iex --version | grep -F -e "${{package.version}}"
+        mix --version | grep -F -e "${{package.version}}"
+        mix --help | grep -e "Mix is a build tool for Elixir"
+    - name: Basic script test
+      runs: |
+        ELIXIR_FILE="$(mktemp)"
+        printf "%s" 'IO.puts("Hello, Wolfi!")' | tee "${ELIXIR_FILE}"
+
+        elixir "${ELIXIR_FILE}" | grep -e "^Hello, Wolfi!$"
+    - name:
+      runs: |
+        mkdir -p ./zzz/lib/zzz ./zzz/test
+
+        tee ./zzz/lib/zzz.ex <<'EOF'
+        defmodule Zzz.Router do
+          use Plug.Router
+
+          plug :match
+          plug :dispatch
+
+          get "/" do
+            send_resp(conn, 200, "Hello, Elixir!")
+          end
+
+          match _ do
+            send_resp(conn, 404, "Not Found")
+          end
+        end
+        EOF
+
+        tee ./zzz/mix.exs <<'EOF'
+        defmodule Zzz.MixProject do
+          use Mix.Project
+
+          def project do
+            [
+              app: :zzz,
+              version: "0.1.0",
+              elixir: "~> 1.17",
+              start_permanent: Mix.env() == :prod,
+              deps: deps()
+            ]
+          end
+
+          def application do
+            [
+              extra_applications: [:logger],
+              mod: {Zzz.Application, []}
+            ]
+          end
+
+          defp deps do
+            [
+              {:plug_cowboy, "~> 2.7"}
+            ]
+          end
+        end
+        EOF
+
+        HOST_IP=localhost
+        HARDCODED_PORT=8888
+
+        tee ./zzz/lib/zzz/application.ex <<EOF
+        defmodule Zzz.Application do
+          # See https://hexdocs.pm/elixir/Application.html
+          # for more information on OTP Applications
+          @moduledoc false
+
+          use Application
+
+          @impl true
+          def start(_type, _args) do
+            children = [
+              {Plug.Cowboy, scheme: :http, plug: Zzz.Router, options: [port: ${HARDCODED_PORT}]}
+            ]
+
+            IO.puts("Starting server on http://${HOST_IP}:${HARDCODED_PORT}")
+            # See https://hexdocs.pm/elixir/Supervisor.html
+            # for other strategies and supported options
+            opts = [strategy: :one_for_one, name: Zzz.Supervisor]
+            Supervisor.start_link(children, opts)
+          end
+        end
+        EOF
+
+        printf "%s" "ExUnit.start()" | tee ./zzz/test/test_helper.exs
+
+        cd zzz
+        mix local.rebar rebar3 /usr/bin/rebar3
+        mix deps.get
+        mix release
+        _build/dev/rel/zzz/bin/zzz daemon
+        wait-for-it --strict -t 10 "${HOST_IP}:${HARDCODED_PORT}"
+        curl -s "${HOST_IP}:${HARDCODED_PORT}" | grep "Hello, Elixir!"

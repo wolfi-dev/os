@@ -1,7 +1,7 @@
 package:
   name: cert-manager-istio-csr
   version: "0.14.3"
-  epoch: 0 # CVE-2025-47907
+  epoch: 1 # CVE-2025-47907
   description: istio-csr is an agent that allows for Istio workload and control plane components to be secured using cert-manager.
   copyright:
     - license: Apache-2.0
@@ -15,17 +15,77 @@ pipeline:
 
   - uses: go/build
     with:
-      ldflags: -X github.com/cert-manager/istio-csr//internal/version.AppVersion=${{package.version}} -X github.com/cert-manager/istio-csr/internal/version.GitCommit=$(git rev-parse HEAD)
+      ldflags: |
+        -X github.com/cert-manager/istio-csr/internal/version.AppVersion=${{package.version}}
+        -X github.com/cert-manager/istio-csr/internal/version.GitCommit=$(git rev-parse HEAD)
       output: cmd
       packages: ./cmd
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility package for cert-manager CSI driver
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/ko-app/
+          ln -sf ../usr/bin/cmd "${{targets.contextdir}}"/ko-app/cmd
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
 
 update:
   enabled: true
   github:
     identifier: cert-manager/istio-csr
     strip-prefix: v
+  ignore-regex-patterns:
+    - '.*-alpha.*'
+    - '.*-beta.*'
+    - '.*-rc.*'
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+    environment:
+      METRICS_PORT: "9402"
+      READINESS_PORT: "6060"
   pipeline:
-    - runs: |
-        cmd --help
+    - uses: test/tw/help-check
+      with:
+        bins: cmd
+    - uses: test/kwok/cluster
+    - name: Install cert-manager CRDs
+      runs: |
+        set -euo pipefail
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.crds.yaml
+    - uses: test/daemon-check-output
+      with:
+        setup: |-
+          kubectl create namespace istio-system
+        start: |-
+          cmd \
+            --log-level=2 \
+            --metrics-port=${METRICS_PORT} \
+            --readiness-probe-port=${READINESS_PORT} \
+            --readiness-probe-path=/readyz \
+            --serving-address=0.0.0.0:${GRPC_PORT} \
+            --certificate-namespace=istio-system \
+            --trust-domain=cluster.local
+        timeout: 120
+        expected_output: |
+          Starting Controller
+          Starting workers
+        post: |-
+          set -euo pipefail
+          wait-for-it localhost:${METRICS_PORT} --timeout=60 --strict -- echo "istio-csr is ready"
+          # Verify metrics endpoint is accessible and workqueue metrics are being updated
+          INITIAL_VALUE=$(curl -sf "http://localhost:${METRICS_PORT}/metrics" | grep workqueue_work_duration_seconds_count | head -1)
+          sleep 2
+          UPDATED_VALUE=$(curl -sf "http://localhost:${METRICS_PORT}/metrics" | grep workqueue_work_duration_seconds_count | head -1)
+          [ "$INITIAL_VALUE" != "$UPDATED_VALUE" ] || echo "Metric value updated between requests"

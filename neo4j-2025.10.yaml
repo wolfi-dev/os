@@ -1,0 +1,176 @@
+package:
+  name: neo4j-2025.10
+  version: "2025.10.1"
+  epoch: 0
+  description:
+  copyright:
+    - license: GPL-3.0-or-later
+  dependencies:
+    runtime:
+      - ${{package.name}}-browser
+      - bash
+      - openjdk-21-default-jvm
+    provides:
+      - neo4j=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.0*(\d+)\.(\d+)$
+    replace: $1.$2.$3
+    to: trimmed-version
+
+environment:
+  environment:
+    NODE_OPTIONS: "--openssl-legacy-provider"
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - maven
+      - nodejs-20
+      - openjdk-21-default-jdk
+      - openssl-provider-legacy
+      - posix-libc-utils # getconf
+      - wolfi-base
+      - wolfi-baselayout
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/neo4j/neo4j
+      tag: ${{package.version}}
+      expected-commit: 503a3228c34cb48495838fb7866b46d1a7a49640
+
+  - runs: |
+      export LANG=en_US.UTF-8
+      export MAVEN_OPTS="-Xmx2048m"
+
+      mvn package -DskipTests=true -T$(nproc)C -q -Doverwrite=true
+
+      mkdir -p ${{targets.contextdir}}/var/lib/neo4j
+      # https://github.com/neo4j/docker-neo4j-publish/blob/b8c0ca2e8dd585e338d74b191a2e370c0da14d92/5.26.0/bullseye/community/Dockerfile#L20
+      tar --strip-components=1 -xf packaging/standalone/target/neo4j-*.tar.gz -C ${{targets.contextdir}}/var/lib/neo4j
+
+      rm -rf ${{targets.contextdir}}/var/lib/neo4j/data
+      rm -rf ${{targets.contextdir}}/var/lib/neo4j/logs
+
+      mkdir -p ${{targets.contextdir}}/data/databases
+      mkdir -p ${{targets.contextdir}}/data/transactions
+      ln -s /data ${{targets.contextdir}}/var/lib/neo4j/
+
+      mkdir -p ${{targets.contextdir}}/logs
+      ln -s /logs ${{targets.contextdir}}/var/lib/neo4j/
+      mkdir -p ${{targets.contextdir}}/opt/java
+      ln -s /usr/lib/jvm/default-jvm ${{targets.contextdir}}/opt/java/openjdk
+
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      for i in neo4j neo4j-admin cypher-shell; do
+        ln -sf /var/lib/neo4j/bin/$i ${{targets.contextdir}}/usr/bin/$i
+      done
+
+# docker-neo4j-publish repository has a Dockerfile for each version of Neo4j
+# so we need to make sure we are using the correct version here and its available in the repository.
+# I'm using `${{package.version}}` as the directory name but that doesn't mean that the directory exists because
+# the repository might not have the version yet, so, we need to make sure that the directory exists before we bump the version of the package.
+subpackages:
+  - name: ${{package.name}}-docker-publish
+    description: Docker image for Neo4j
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/neo4j/docker-neo4j-publish
+          branch: master
+          expected-commit: d6fef47d8a1732f2b0b0975ef07c436850825910
+      - working-directory: ${{package.version}}/bullseye/community
+        runs: |
+          mkdir -p ${{targets.contextdir}}/startup
+          # If this step fails, try updating the expected-commit for docker-neo4j-publish above.
+          cp -r local-package/* ${{targets.contextdir}}/startup/
+          ls -latr ${{targets.contextdir}}/startup
+          mkdir -p ${{targets.contextdir}}/var/lib/neo4j/bin
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          mv ${{targets.contextdir}}/startup/neo4j-admin-report.sh ${{targets.contextdir}}/var/lib/neo4j/bin/neo4j-admin-report
+          ln -sf /var/lib/neo4j/bin/neo4j-admin-report ${{targets.contextdir}}/usr/bin/neo4j-admin-report
+    dependencies:
+      runtime:
+        - su-exec
+        - tini
+      provides:
+        - neo4j-docker-publish=${{package.full-version}}
+
+  - name: ${{package.name}}-browser
+    description: Neo4j Browser is the general purpose user interface for working with Neo4j.
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/neo4j/neo4j-browser
+          # Upstream uses a variety of tags and forgets to push some of them sometimes.
+          # Tags like "neo4j-2025.09.0" or "2025.9.0" are equivalent
+          tag: neo4j-${{package.version}}
+          expected-commit: ff8ed858f50b095d00c0fba725487f192900b964
+      - uses: auth/maven
+      - runs: |
+          yarn install --frozen-lockfile
+          yarn build
+          node ./scripts/prepare-mvn-package.js
+          mvn package -DskipTests=true
+          mkdir -p ${{targets.contextdir}}/var/lib/neo4j/lib/
+          find target/ -maxdepth 1 -type f -name 'neo4j-browser-*.jar' ! -name '*-tests.jar' -exec mv {} ${{targets.contextdir}}/var/lib/neo4j/lib/ \;
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - neo4j=${{package.version}}
+            - curl
+        environment:
+          JAVA_HOME: /usr/lib/jvm/java-21-openjdk
+      pipeline:
+        - name: check jar
+          runs: |
+            stat /var/lib/neo4j/lib/neo4j-browser*.jar
+        - uses: test/daemon-check-output
+          with:
+            start: /usr/bin/neo4j console
+            timeout: 30
+            expected_output: |
+              Starting Neo4j
+              Starting
+              Bolt enabled on localhost
+            post: |-
+              #!/bin/sh -e
+              curl -fsSL localhost:7474/browser | grep "<title>Neo4j Browser</title>"
+
+update:
+  enabled: true
+  github:
+    identifier: neo4j/neo4j
+    use-tag: true
+    tag-filter: 2025.10.
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-21-default-jvm
+        - curl
+        - wait-for-it
+    environment:
+      JAVA_HOME: /usr/lib/jvm/default-jvm
+  pipeline:
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/neo4j console
+        timeout: 30
+        expected_output: |
+          Starting Neo4j
+          Starting
+          Bolt enabled on localhost
+        post: |
+          #!/bin/sh -e
+          neo4j status | grep -i "Neo4j is running"
+          neo4j-admin server status | grep -i "Neo4j is running"
+          curl -fsSL localhost:7474/browser | grep "<title>Neo4j Browser</title>"

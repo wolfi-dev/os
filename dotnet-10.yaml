@@ -1,0 +1,260 @@
+package:
+  name: dotnet-10
+  version: "10.0.100"
+  epoch: 0
+  description: ".NET ${{vars.major-version}} host"
+  copyright:
+    - license: MIT
+  resources:
+    cpu: 32
+    memory: 64Gi
+  dependencies:
+    runtime:
+      - icu
+    provider-priority: ${{vars.major-version}}
+    provides:
+      - dotnet=${{package.full-version}}
+
+vars:
+  clang-version: 20
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+environment:
+  environment:
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    CFLAGS: "-Wno-error=used-but-marked-unused"
+  contents:
+    packages:
+      - bash
+      - brotli-dev
+      - busybox
+      - clang-${{vars.clang-version}}
+      - cmake
+      - curl
+      - dotnet-bootstrap-${{vars.major-version}}
+      - file
+      - icu-dev
+      - krb5-dev
+      - libunwind-dev
+      - lttng-ust-dev
+      - make
+      - openssl-dev
+      - python3
+      - rapidjson-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/dotnet/dotnet
+      tag: v${{package.version}}
+      expected-commit: b0f34d51fccc69fd334253924abd8d6853fad7aa
+      cherry-picks: |
+        main/77ee357638bcd8fa66a1c16fa588dcd5818068d2: source-build-toolset-init.sh: fix tempDir no longer defined when EXIT trap is executed.
+
+  - runs: |
+      # Setup bootstrap .NET SDK
+      mkdir -p prereqs/packages/archive
+      ln -sf /usr/share/dotnet-bootstrap/dotnet .dotnet
+      ln -sf /usr/share/dotnet-bootstrap/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz \
+        prereqs/packages/archive/Private.SourceBuilt.Artifacts.Bootstrap.tar.gz
+
+      if [ ${{build.arch}} = "aarch64" ]; then
+        # Dotnet does not have support for PAC/BTI which Axion uses
+        # See: https://github.com/dotnet/runtime/pull/110472
+        # EXTRA_${FLAG} is supposed to work, but it doesn't
+        # so directly override the values which is supposedly a no-no
+        # See also: https://github.com/dotnet/runtime/issues/61859
+        export CFLAGS="-mbranch-protection=none"
+        export CXXFLAGS="-mbranch-protection=none"
+      fi
+
+      # The .NET runtime is built with O0 so we cannot enable FORTIFY_SOURCE
+      sed -i 's/-D_FORTIFY_SOURCE=3//g' /etc/clang-${{vars.clang-version}}/common.cfg
+
+      # Build .NET
+      ./build.sh \
+        --clean-while-building \
+        --source-only \
+        --branding rtm \
+        -- \
+        /v:minimal \
+        /p:LogVerbosity=minimal \
+        /p:ContinueOnPrebuiltBaselineError=true \
+        /p:MinimalConsoleLogOutput=true \
+        /p:SkipPortableRuntimeBuild=true \
+        /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind
+
+      # Install .NET
+      mkdir -p ${{targets.contextdir}}/usr/share/dotnet
+      cp -R artifacts/obj/extracted-dotnet-sdk/* ${{targets.contextdir}}/usr/share/dotnet
+
+      # Symlink .NET host to path
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      ln -s /usr/share/dotnet/dotnet ${{targets.contextdir}}/usr/bin/dotnet
+
+  - uses: strip
+
+subpackages:
+  - name: dotnet-${{vars.major-version}}-sdk
+    description: ".NET ${{vars.major-version}} SDK"
+    dependencies:
+      runtime:
+        - aspnet-${{vars.major-version}}-runtime=${{package.full-version}}
+        - aspnet-${{vars.major-version}}-targeting-pack=${{package.full-version}}
+        - dotnet-${{vars.major-version}}-runtime=${{package.full-version}}
+        - dotnet-${{vars.major-version}}-targeting-pack=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet
+          for i in sdk sdk-manifests templates; do
+            mv ${{targets.destdir}}/usr/share/dotnet/$i \
+               ${{targets.contextdir}}/usr/share/dotnet/
+          done
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: dotnet tool install -g Microsoft.Web.LibraryManager.Cli
+
+  - name: dotnet-${{vars.major-version}}-runtime
+    description: "The .NET ${{vars.major-version}} Core Runtime"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/shared
+          mv ${{targets.destdir}}/usr/share/dotnet/shared/Microsoft.NETCore.App ${{targets.contextdir}}/usr/share/dotnet/shared/
+    dependencies:
+      provides:
+        - dotnet-runtime=${{package.full-version}}
+      runtime:
+        - dotnet
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: aspnet-${{vars.major-version}}-runtime
+    description: "The ASP.NET ${{vars.major-version}} Core Runtime"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/shared
+          mv ${{targets.destdir}}/usr/share/dotnet/shared/Microsoft.AspNetCore.App ${{targets.contextdir}}/usr/share/dotnet/shared/
+    dependencies:
+      provides:
+        - aspnet-runtime=${{package.full-version}}
+      runtime:
+        - dotnet-${{vars.major-version}}-runtime=${{package.full-version}}
+        - libexpat1
+        - libbrotlidec1
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: aspnet-runtime
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: dotnet-${{vars.major-version}}-targeting-pack
+    description: "The .NET ${{vars.major-version}} Core targeting pack"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/packs
+          mv ${{targets.destdir}}/usr/share/dotnet/packs/Microsoft.NETCore.App.* ${{targets.contextdir}}/usr/share/dotnet/packs/
+    dependencies:
+      provides:
+        - dotnet-targeting-pack=${{package.full-version}}
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: dotnet-targeting-pack
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: aspnet-${{vars.major-version}}-targeting-pack
+    description: "The ASP.NET ${{vars.major-version}} targeting pack"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/packs
+          mv ${{targets.destdir}}/usr/share/dotnet/packs/Microsoft.AspNetCore.App.* ${{targets.contextdir}}/usr/share/dotnet/packs/
+    dependencies:
+      provides:
+        - aspnet-targeting-pack=${{package.full-version}}
+      runtime:
+        - dotnet-${{vars.major-version}}-targeting-pack
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: aspnet-targeting-pack
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: dotnet-${{vars.major-version}}-aot
+    description: "Ahead-of-Time (AOT) support for the .NET ${{vars.major-version}} SDK"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/dotnet/packs
+          mv ${{targets.destdir}}/usr/share/dotnet/packs/runtime.*.Microsoft.DotNet.ILCompiler ${{targets.contextdir}}/usr/share/dotnet/packs/
+    dependencies:
+      provides:
+        - dotnet-aot=${{package.full-version}}
+      runtime:
+        - dotnet-${{vars.major-version}}-targeting-pack=${{package.full-version}}
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: dotnet-aot
+            real-pkg-name: ${{subpkg.name}}
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - 10\.0\.101
+  git:
+    strip-prefix: v
+    tag-filter-prefix: "v10"
+
+test:
+  environment:
+    contents:
+      packages:
+        - dotnet-${{vars.major-version}}-sdk=${{package.full-version}}
+  pipeline:
+    - name: Basic .NET command test
+      runs: |
+        dotnet --info
+    - name: Compile and run a simple .NET application
+      runs: |
+        cat <<'EOF' > HelloWorld.cs
+        using System;
+
+        class Program
+        {
+            static void Main()
+            {
+                Console.WriteLine("Hello, World!");
+            }
+        }
+        EOF
+        dotnet new console -o HelloWorldApp --force
+        mv HelloWorld.cs HelloWorldApp/Program.cs
+        dotnet run --project HelloWorldApp
+    - name: Compile and run a .NET application with arguments
+      runs: |
+        cat <<'EOF' > ArgumentEcho.cs
+        using System;
+
+        class Program
+        {
+            static void Main(string[] args)
+            {
+                Console.WriteLine("Arguments: " + String.Join(", ", args));
+            }
+        }
+        EOF
+        dotnet new console -o ArgumentEchoApp --force
+        mv ArgumentEcho.cs ArgumentEchoApp/Program.cs
+        dotnet run --project ArgumentEchoApp -- arg1 arg2 arg3
+    - uses: test/tw/ldd-check

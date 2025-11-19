@@ -1,10 +1,25 @@
 package:
   name: kube-logging-operator
   version: "6.1.0"
-  epoch: 1 # CVE-2025-58187
+  epoch: 2
   description: Logging operator for Kubernetes
   copyright:
     - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - geoip-dev
+      - git
+      - libmaxminddb-dev
+      - libtool
+      - pkgconf
+      - ruby-3.2
+      - ruby-3.2-dev
 
 pipeline:
   - uses: git-checkout
@@ -56,6 +71,136 @@ subpackages:
     test:
       pipeline:
         - runs: test "$(readlink /config-reloader)" = "/usr/bin/config-reloader"
+
+  - name: ${{package.name}}-fluentd-outputs
+    description: "Fluentd output plugins for the kube-logging operator"
+    options:
+      no-provides: true
+    dependencies:
+      runtime:
+        - ruby-3.2
+    pipeline:
+      - runs: |
+          # Install fluentd plugins (outputs + filters) with all transitive dependencies
+          # Install to /usr/local/bundle to avoid conflicts with ruby-3.2 default gems
+          # Match upstream image structure exactly
+          # Note: fluentd itself should be provided by ruby3.2-fluentd-X.XX package
+
+          GEM_DIR="${{targets.contextdir}}/usr/local/bundle"
+          BIN_DIR="$GEM_DIR/bin"
+
+          # Install output plugins from outputs/Gemfile
+          grep "^gem " images/fluentd/outputs/Gemfile | while read -r line; do
+            GEM_NAME=$(echo "$line" | sed -n "s/^gem '\([^']*\)'.*/\1/p")
+            GEM_VERSION=$(echo "$line" | sed -n "s/^gem '[^']*', '\([^']*\)'.*/\1/p")
+
+            if [ -n "$GEM_NAME" ] && [ -n "$GEM_VERSION" ]; then
+              echo "Installing $GEM_NAME version $GEM_VERSION"
+              gem install --install-dir="$GEM_DIR" \
+                --bindir="$BIN_DIR" \
+                --no-document \
+                "$GEM_NAME" -v "$GEM_VERSION"
+            fi
+          done
+
+          # Install filter plugins from filters/Gemfile
+          grep "^gem " images/fluentd/filters/Gemfile | while read -r line; do
+            GEM_NAME=$(echo "$line" | sed -n "s/^gem '\([^']*\)'.*/\1/p")
+            GEM_VERSION=$(echo "$line" | sed -n "s/^gem '[^']*', '\([^']*\)'.*/\1/p")
+
+            if [ -n "$GEM_NAME" ] && [ -n "$GEM_VERSION" ]; then
+              echo "Installing $GEM_NAME version $GEM_VERSION"
+              gem install --install-dir="$GEM_DIR" \
+                --bindir="$BIN_DIR" \
+                --no-document \
+                "$GEM_NAME" -v "$GEM_VERSION"
+            fi
+          done
+
+          # Install additional plugins from base Dockerfile
+          echo "Installing label-router plugin..."
+          gem install --install-dir="$GEM_DIR" \
+            --bindir="$BIN_DIR" \
+            --no-document \
+            fluent-plugin-label-router -v 0.5.0
+
+          # Install syslog_rfc5424 from git using specific_install to match upstream
+          gem install --install-dir="$GEM_DIR" \
+            --bindir="$BIN_DIR" \
+            --no-document \
+            specific_install -v 0.3.8
+
+          GEM_HOME="$GEM_DIR" gem specific_install -l https://github.com/kube-logging/fluent-plugin-syslog_rfc5424.git \
+            --ref 4ab9f7df3757b0e31e4bc209acab05a518efdce3
+
+          # Install fluent-logger
+          gem install --install-dir="$GEM_DIR" \
+            --bindir="$BIN_DIR" \
+            --no-document \
+            fluent-logger
+
+          # Set environment variables to match upstream
+          mkdir -p "${{targets.contextdir}}/etc/profile.d"
+          echo 'export GEM_HOME=/usr/local/bundle' > "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
+          echo 'export BUNDLE_APP_CONFIG=/usr/local/bundle' >> "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
+          echo 'export BUNDLE_SILENCE_ROOT_WARNING=1' >> "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
+          echo 'export PATH=/usr/local/bundle/bin:$PATH' >> "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
+
+          # Fix world-writable files
+          find "$GEM_DIR" -type f -perm -002 -exec chmod o-w {} \;
+      - uses: ruby/clean
+    test:
+      environment:
+        contents:
+          packages:
+            - ruby-3.2
+            - ruby3.2-fluentd-1.17
+        environment:
+          BUNDLE_APP_CONFIG: /usr/local/bundle
+          BUNDLE_SILENCE_ROOT_WARNING: "1"
+          GEM_HOME: /usr/local/bundle
+          PATH: /usr/local/bundle/bin:/usr/bin:/bin
+      pipeline:
+        - name: Verify fluentd is available
+          runs: |
+            fluentd --version | grep -q "fluentd"
+        - name: Verify all output plugins can be loaded
+          runs: |
+            ruby -e "require 'fluent/plugin/out_oss'"
+            ruby -e "require 'fluent/plugin/out_kafka'"
+            ruby -e "require 'fluent/plugin/out_loki'"
+            ruby -e "require 'fluent/plugin/out_kinesis_streams'"
+            ruby -e "require 'fluent/plugin/out_splunk_hec'"
+            ruby -e "require 'fluent/plugin/out_newrelic'"
+            ruby -e "require 'fluent/plugin/out_cloudwatch_logs'"
+            ruby -e "require 'fluent/plugin/out_opensearch'"
+            ruby -e "require 'fluent/plugin/out_logzio_buffered'"
+            ruby -e "require 'fluent/plugin/out_datadog'"
+            ruby -e "require 'fluent/plugin/out_redis'"
+            ruby -e "require 'fluent/plugin/in_sqs'"
+            ruby -e "require 'fluent/plugin/out_sqs'"
+            ruby -e "require 'fluent/plugin/out_mattermost'"
+            ruby -e "require 'fluent/plugin/out_webhdfs'"
+            ruby -e "require 'fluent/plugin/out_vmware_loginsight'"
+            ruby -e "require 'fluent/plugin/out_vmware_log_intelligence'"
+            ruby -e "require 'fluent/plugin/out_lm'"
+            ruby -e "require 'fluent/plugin/out_gelf'"
+            ruby -e "require 'fluent/plugin/out_s3'"
+            ruby -e "require 'fluent/plugin/out_gcs'"
+            ruby -e "require 'fluent/plugin/out_rabbitmq'"
+        - name: Verify filter plugins can be loaded
+          runs: |
+            ruby -e "require 'fluent/plugin/out_detect_exceptions'"
+            ruby -e "require 'fluent/plugin/filter_prometheus'"
+            ruby -e "require 'fluent/plugin/filter_dedot'"
+            ruby -e "require 'fluent/plugin/filter_geoip'"
+            ruby -e "require 'fluent/plugin/filter_concat'"
+            ruby -e "require 'fluent/plugin/parser_grok'"
+            ruby -e "require 'fluent/plugin/parser_multi_format'"
+            ruby -e "require 'fluent/plugin/filter_record_modifier'"
+            ruby -e "require 'fluent/plugin/out_rewrite_tag_filter'"
+            ruby -e "require 'fluent/plugin/out_label_router'"
+            # Note: syslog_rfc5424 is installed from git and works in runtime,
 
 update:
   enabled: true

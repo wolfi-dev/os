@@ -1,0 +1,179 @@
+package:
+  name: istio-envoy-1.28
+  version: "1.28.0"
+  epoch: 0
+  description: Envoy with additional Istio plugins (wasm, telemetry, etc)
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: 20
+    memory: 50Gi
+  dependencies:
+    provides:
+      - istio-envoy=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      # We don't use automake/autoconf directly, but the Bazel rule uses them
+      - autoconf
+      - automake
+      - bash
+      - bazel-7
+      - binutils
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-18
+      - cmake
+      - coreutils
+      - git
+      - libtool
+      - llvm-18
+      - llvm-18-dev
+      - llvm-libcxx-18
+      - llvm-libcxx-18-dev
+      - llvm-libcxxabi-18
+      - llvm-lld-18~18
+      - openjdk-21
+      - openssl-dev
+      - patch
+      - python3-dev
+      - samurai
+      - wolfi-baselayout
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/istio/proxy
+      tag: ${{package.version}}
+      expected-commit: 50c73beaed934536017c84120b9a466c3ff903cf
+
+  - runs: |
+      export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+      mkdir -p .cache/bazel/_bazel_root
+
+      # -Wno-macro-redefined is passed to avoid errors where `_FORTIFY_SOURCE`
+      # is redefined from (I assume) our defaults to the value defined by the
+      # liburing is built without builtins and fails to link with -ftrivial-auto-var-init=zero
+      # Bazel build tasks
+
+      # isitio-envoy won't build with FORTIFY_SOURCE set to 3 which our clang-18 version is setting
+      sed -i 's/-D_FORTIFY_SOURCE=3//g' /etc/clang-18/common.cfg
+
+      bazel build \
+        --verbose_failures \
+        -c opt \
+        --action_env=LIBURING_CFLAGS="-ftrivial-auto-var-init=uninitialized" \
+        envoy
+
+      mkdir -p ${{targets.destdir}}/usr/bin/
+      mv bazel-bin/envoy ${{targets.destdir}}/usr/bin/envoy
+
+      # We no longer need this cache dir, which has some writable files.
+      rm -rf .cache/bazel
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          # link /usr/bin/envoy /usr/local/bin/envoy because Istio proxy-agent expects Envoy here
+          # See https://github.com/istio/istio/blob/1.18.0/pkg/config/constants/constants.go#L59-L60
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          ln -sf /usr/bin/envoy ${{targets.subpkgdir}}/usr/local/bin/envoy
+    dependencies:
+      provides:
+        - istio-envoy-compat=${{package.full-version}}
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: istio-envoy-compat
+            real-pkg-name: ${{subpkg.name}}
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - "-rc"
+    - "-beta"
+  github:
+    identifier: istio/proxy
+    tag-filter-prefix: 1.28.
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - curl
+        - netcat-openbsd
+        - procps
+        - jq
+  pipeline:
+    - name: "Verify binary installation"
+      runs: |
+        envoy --version
+        envoy --help
+    - name: "Test Envoy admin interface startup"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          #!/bin/sh -e
+          cat > /tmp/minimal.yaml <<EOF
+          admin:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 9901
+          static_resources:
+            listeners: []
+            clusters: []
+          EOF
+        start: envoy --config-path /tmp/minimal.yaml --admin-address-path /tmp/admin.txt
+        timeout: 30
+        expected_output: |
+          starting main dispatch loop
+          all dependencies initialized
+        post: |
+          #!/bin/sh -e
+          # Get admin address
+          ADMIN_ADDR=$(cat /tmp/admin.txt)
+
+          # Test admin endpoints
+          curl -s "http://${ADMIN_ADDR}/server_info" | jq . || exit 1
+          curl -s "http://${ADMIN_ADDR}/stats" | grep envoy || exit 1
+          curl -s "http://${ADMIN_ADDR}/clusters" | jq . || exit 1
+    - name: "Test hot restart capability"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          #!/bin/sh -e
+          cat > /tmp/minimal.yaml <<EOF
+          admin:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 9901
+          static_resources:
+            listeners: []
+            clusters: []
+          EOF
+        start: envoy --config-path /tmp/minimal.yaml --restart-epoch 0
+        timeout: 30
+        expected_output: |
+          starting main dispatch loop
+          all dependencies initialized
+        post: |
+          #!/bin/sh -e
+          first_pid=$(pgrep -f "restart-epoch 0")
+          envoy --config-path /tmp/minimal.yaml --restart-epoch 1 > /dev/null 2>&1 &
+          sleep 2
+
+          # Verify both processes exist
+          if ! ps -p $first_pid > /dev/null; then
+            echo "Original Envoy process not found"
+            exit 1
+          fi

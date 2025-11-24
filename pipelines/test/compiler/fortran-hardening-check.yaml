@@ -1,0 +1,88 @@
+name: compiler-fortran-hardening-check
+
+needs:
+  packages:
+    - glibc-dev
+    - hardening-check
+    - openssf-compiler-options
+
+inputs:
+  fc:
+    description: |
+      Fortran compiler to use
+    required: true
+  args:
+    description: |
+      arguments to pass to hardening-check
+    default:
+
+pipeline:
+  - name: Fortran compiler hardening check
+    runs: |
+      tmpdir="$(mktemp -t -d hardchk.XXXXXXXXXX)"
+      cd "$tmpdir"
+      # This is a rough translation of the C test in
+      # pipelines/test/compiler/hardening-check.yaml.
+      cat >hello.f08 <<"EOF"
+      integer :: argc
+      character(64) :: argv0
+      character(5000) :: buffer
+      character(:), allocatable :: dynbuffer
+      print '(A)', 'hello-fortran'
+      argc = command_argument_count()
+      call get_command_argument(0, argv0)
+      buffer = argv0
+      allocate(character(argc * 1000) :: dynbuffer)
+      dynbuffer = argv0
+      call exit(ichar(buffer(argc+1:argc+1)) + ichar(dynbuffer(argc+1:argc+1)))
+      end
+      EOF
+      ${{inputs.fc}} -v -o hello-default hello.f08
+      out=$(./hello-default 1 || true)
+      [ "$out" = "hello-fortran" ]
+
+      if [ -d /usr/lib/oldglibc ]; then
+        nullspec="/usr/lib/oldglibc/gcc.spec"
+      else
+        nullspec="/dev/null"
+      fi
+      nullfc="env GCC_SPEC_FILE=$nullspec ${{inputs.fc}}"
+      softfc="env GCC_SPEC_FILE=no-hardening.spec ${{inputs.fc}}"
+      $nullfc -v -o hello-disabled.null hello.f08
+      out=$(./hello-disabled.null 1 || true)
+      [ "$out" = "hello-fortran" ]
+
+      $softfc -v -o hello-disabled.spec hello.f08
+      out=$(./hello-disabled.spec 1 || true)
+      [ "$out" = "hello-fortran" ]
+
+      # Compile without bind now. Test for -fhardened support (introduced in
+      # gcc 14), and no-op the test if unsupported.
+      $nullfc -fhardened -Wl,-z,lazy -v -o hello-lazy hello.f08 || cp hello-disabled.spec hello-lazy
+      out=$(./hello-lazy 1 || true)
+      [ "$out" = "hello-fortran" ]
+
+      arch_skip=
+      # full cfprotection is x86 only for now
+      if [ "${{build.arch}}" = "aarch64" ]; then
+          arch_skip=--nocfprotection
+      fi
+
+      # the branch protection check is ARM only for now
+      [ "${{build.arch}}" = "aarch64" ] || arch_skip=--nobranchprotection
+
+      # It's not currently clear whether source fortification can even
+      # theoretically apply to Fortran (e.g. via compiler intrinsics written
+      # in C); so far I haven't been able to trigger it, so we just run
+      # hardening-check with --nofortify.
+
+      # Test disabling hardening flags
+      hardening-check --nostackprotector --nofortify $arch_skip ${{inputs.args}} --color hello-disabled.null && exit 1
+      hardening-check --nostackprotector --nofortify $arch_skip ${{inputs.args}} --color hello-disabled.spec && exit 1
+
+      # Test disabling bindnow
+      hardening-check --nostackprotector --nofortify $arch_skip ${{inputs.args}} --color hello-lazy && exit 1
+
+      # Test default build
+      hardening-check --nostackprotector --nofortify $arch_skip ${{inputs.args}} --color hello-default
+      rm -rf "$tmpdir"

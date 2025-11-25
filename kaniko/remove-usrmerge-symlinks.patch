@@ -1,43 +1,92 @@
-# Fixes: https://github.com/chainguard-dev/customer-issues/issues/2579
-# Internal Issue to investigate long-term fix: https://github.com/chainguard-dev/internal-dev/issues/21302
+diff --git a/pkg/executor/build.go b/pkg/executor/build.go
+index ccdfd17e..ff67eca8 100644
 --- a/pkg/executor/build.go
 +++ b/pkg/executor/build.go
-@@ -691,6 +691,8 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
+@@ -691,6 +691,9 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
  // DoBuild executes building the Dockerfile
  func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
  	t := timing.Start("Total Build Time")
 +	fixUsrMergeSymlinks()
++	removeUnusedBaselayoutFiles()
 +
  	digestToCacheKey := make(map[string]string)
  	stageIdxToDigest := make(map[string]string)
  
-@@ -827,6 +829,31 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
+@@ -830,6 +833,79 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
  	return nil, err
  }
  
 +// remove usrmerge symlinks to avoid circular dependencies
-+func fixUsrMergeSymlinks() error {
-+	for _, link := range []string{"/bin", "/lib", "/sbin", "/lib64"} {
-+		info, err := os.Lstat(link)
-+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
++func fixUsrMergeSymlinks() {
++	logrus.Info("Fixing usrmerge symlinks")
++
++	// Remove symlinks and recreate as directories
++	for _, link := range []string{"/bin", "/lib", "/sbin", "/lib64", "/usr/sbin"} {
++		if !removeSymlinkIfExists(link) {
 +			continue
 +		}
 +
-+		if err := os.Remove(link); err != nil {
-+			return err
++		// Recreate as directory after removing symlink
++		logrus.Infof("Creating directory: %s", link)
++		if err := os.MkdirAll(link, 0755); err != nil {
++			logrus.Warnf("Failed to create directory %s: %v", link, err)
 +		}
 +	}
 +
-+	// Recreate /bin directory and /bin/sh symlink needed by kaniko
-+	if err := os.MkdirAll("/bin", 0755); err != nil {
-+		return err
-+	}
-+
++	// Recreate /bin/sh symlink needed by kaniko
++	logrus.Info("Creating /bin/sh symlink to /busybox/sh")
 +	if err := os.Symlink("/busybox/sh", "/bin/sh"); err != nil {
-+		return err
++		logrus.Warnf("Failed to create /bin/sh symlink: %v", err)
++	}
++}
++
++// removeUnusedBaselayoutFiles removes unnecessary files and symlinks from the
++// base layout.
++// These are created by wolfi-baselayout but are not needed by kaniko,
++// and their presence can cause issues with kaniko functionality.
++func removeUnusedBaselayoutFiles() {
++	logrus.Info("Checking for unused baselayout files to remove")
++
++	// Remove files created by wolfi-baselayout that kaniko doesn't need.
++	for _, file := range []string{
++		"/etc/protocols",
++		"/etc/services",
++		"/etc/shells",
++		"/etc/rpc",
++	} {
++		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
++			logrus.Warnf("Failed to remove unused baselayout file %s: %v", file, err)
++		}
 +	}
 +
-+	return nil
++	// Remove symlinks created by wolfi-baselayout that kaniko doesn't need.
++	for _, symlink := range []string{
++		"/var/spool/cron/crontabs", // symlink to /etc/crontabs
++		"/var/spool/mail",          // symlink to /var/mail
++	} {
++		removeSymlinkIfExists(symlink)
++	}
++}
++
++// removeSymlinkIfExists removes the symlink at the given path if it exists.
++// It returns true if the symlink was removed, false otherwise.
++func removeSymlinkIfExists(path string) bool {
++	info, err := os.Lstat(path)
++	if err != nil {
++		logrus.Debugf("Symlink %s does not exist, skipping", path)
++		return false
++	}
++	if info.Mode()&os.ModeSymlink == 0 {
++		logrus.Debugf("%s is not a symlink, skipping", path)
++		return false
++	}
++
++	logrus.Infof("Removing unused baselayout symlink: %s", path)
++	if err := os.Remove(path); err != nil {
++		logrus.Warnf("Failed to remove symlink %s: %v", path, err)
++		return false
++	}
++	return true
 +}
 +
  // filesToSave returns all the files matching the given pattern in deps.

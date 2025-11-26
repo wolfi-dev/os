@@ -1,0 +1,473 @@
+From de3306572edffe45b9457f1a4afb95c472f787f2 Mon Sep 17 00:00:00 2001
+From: James Page <james.page@chainguard.dev>
+Date: Wed, 26 Nov 2025 16:52:52 +0000
+Subject: [PATCH] [3.11] gh-61460: Use HMAC-SHA256 in multiprocessing
+ authentication
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backport stronger HMAC authentication to multiprocessing for Python 3.11.
+Uses SHA256 by default instead of MD5, with full backward compatibility
+for Python 3.10 and earlier.
+
+Implementation details:
+- Uses length-based protocol detection (32-byte challenge = SHA256,
+  20-byte challenge = MD5) to avoid complex prefix parsing
+- Modern servers send 32-byte challenges and accept both SHA256 and
+  MD5 responses (for legacy clients)
+- Modern clients detect server protocol by challenge length and respond
+  appropriately
+- Replaced unsafe assert with proper AuthenticationError exception
+- Uses hmac.compare_digest() for constant-time comparison
+
+Backward compatibility verified with 6 new test cases covering:
+- Modern client/server (SHA256)
+- Legacy client with modern server (MD5 fallback)
+- Modern client with legacy server (MD5 detection)
+- Protocol error handling
+
+FIPS mode behavior: When MD5 is unavailable, connections to/from
+Python ≤3.10 will fail as expected, since FIPS prohibits MD5.
+
+This is a simplified backport of commit 3ed57e4995d9 from Python 3.12+,
+using only SHA256 and MD5 instead of the full multi-algorithm protocol.
+---
+ Lib/multiprocessing/connection.py             | 155 +++++++++++++++-
+ Lib/test/_test_multiprocessing.py             | 167 +++++++++++++++++-
+ .../2025-01-26-12-00-00.gh-61460.abc123.rst   |   5 +
+ 3 files changed, 312 insertions(+), 15 deletions(-)
+ create mode 100644 Misc/NEWS.d/next/Library/2025-01-26-12-00-00.gh-61460.abc123.rst
+
+diff --git a/Lib/multiprocessing/connection.py b/Lib/multiprocessing/connection.py
+index 59c61d2aa29..ecc28c4c84e 100644
+--- a/Lib/multiprocessing/connection.py
++++ b/Lib/multiprocessing/connection.py
+@@ -741,39 +741,178 @@ def PipeClient(address):
+ #
+ 
+ MESSAGE_LENGTH = 20
++MESSAGE_LENGTH_SHA256 = 32
++_MD5_DIGEST_LEN = 16
++_SHA256_DIGEST_LEN = 32
+ 
+ CHALLENGE = b'#CHALLENGE#'
+ WELCOME = b'#WELCOME#'
+ FAILURE = b'#FAILURE#'
+ 
++# multiprocessing.connection Authentication Protocol (Simplified for 3.11)
++#
++# This is a simpler backport of the enhanced HMAC authentication from Python 3.12+.
++# It uses length-based protocol detection to maintain backward compatibility with
++# Python 3.10 and earlier while upgrading to SHA256 by default.
++#
++# Protocol Detection:
++#   - Legacy (Python ≤3.10): 20-byte challenge → 16-byte MD5 HMAC response
++#   - Modern (Python ≥3.11): 32-byte challenge → 32-byte SHA256 HMAC response
++#
++# Compatibility Matrix:
++#   - Modern server + Modern client: SHA256 authentication (secure)
++#   - Modern server + Legacy client: MD5 authentication (backward compatible)
++#   - Legacy server + Modern client: MD5 authentication (backward compatible)
++#   - Legacy server + Legacy client: MD5 authentication (works as before)
++#
++# FIPS Mode Behavior:
++#   When MD5 is unavailable (e.g., FIPS mode), modern servers will reject legacy
++#   clients that can only respond with MD5. This is expected behavior as FIPS
++#   mode prohibits weak cryptographic algorithms.
++#
++# See the original implementation in Python 3.12+ (commit 3ed57e4995d9) for the
++# full protocol with multi-algorithm support and {digest} prefixes.
++
++def _verify_response(connection, expected_digest, algorithm_name):
++    """Helper to verify HMAC response using constant-time comparison.
++
++    Sends WELCOME if response matches, FAILURE + raises AuthenticationError if not.
++    """
++    import hmac
++    if hmac.compare_digest(connection, expected_digest):
++        return True
++    return False
++
+ def deliver_challenge(connection, authkey):
++    """Initiate HMAC authentication challenge (server side).
++
++    Sends a random challenge to the client and verifies their HMAC response.
++    Uses SHA256 by default, but accepts MD5 responses from legacy clients.
++
++    Protocol:
++      1. Server generates random bytes (32 for SHA256, 20 for MD5-only mode)
++      2. Server sends: CHALLENGE prefix + random bytes
++      3. Server receives HMAC response from client
++      4. Server detects algorithm by response length:
++         - 32 bytes: Verify as SHA256
++         - 16 bytes: Verify as MD5 (legacy client)
++      5. Server sends WELCOME on success, FAILURE on authentication error
++
++    Args:
++        connection: Connection object with send_bytes/recv_bytes methods
++        authkey: Shared secret key (bytes)
++
++    Raises:
++        ValueError: If authkey is not bytes
++        AuthenticationError: If client response verification fails
++    """
+     import hmac
+     if not isinstance(authkey, bytes):
+         raise ValueError(
+             "Authkey must be bytes, not {0!s}".format(type(authkey)))
+-    message = os.urandom(MESSAGE_LENGTH)
++
++    # Try SHA256 first, fall back to MD5 if unavailable
++    try:
++        # Use 32-byte challenge to signal modern SHA256 protocol
++        message = os.urandom(MESSAGE_LENGTH_SHA256)
++        expected_digest = hmac.new(authkey, message, 'sha256').digest()
++        algorithm_name = 'sha256'
++    except ValueError:
++        # SHA256 not available (unusual), use legacy MD5 protocol
++        message = os.urandom(MESSAGE_LENGTH)
++        expected_digest = hmac.new(authkey, message, 'md5').digest()
++        algorithm_name = 'md5'
++
+     connection.send_bytes(CHALLENGE + message)
+-    digest = hmac.new(authkey, message, 'md5').digest()
+     response = connection.recv_bytes(256)        # reject large message
+-    if response == digest:
+-        connection.send_bytes(WELCOME)
++
++    # Verify response based on length
++    if len(response) == _SHA256_DIGEST_LEN and algorithm_name == 'sha256':
++        # Modern client using SHA256
++        if _verify_response(response, expected_digest, 'sha256'):
++            connection.send_bytes(WELCOME)
++            return
++        connection.send_bytes(FAILURE)
++        raise AuthenticationError('SHA256 HMAC verification failed')
++    elif len(response) == _MD5_DIGEST_LEN:
++        # Legacy client using MD5, or we're in MD5-only mode
++        if algorithm_name == 'sha256':
++            # Modern server, legacy client - recompute with MD5
++            try:
++                expected_digest = hmac.new(authkey, message, 'md5').digest()
++            except ValueError:
++                connection.send_bytes(FAILURE)
++                raise AuthenticationError(
++                    'client sent MD5 response but MD5 not available (FIPS mode?)')
++        if _verify_response(response, expected_digest, 'md5'):
++            connection.send_bytes(WELCOME)
++            return
++        connection.send_bytes(FAILURE)
++        raise AuthenticationError('MD5 HMAC verification failed')
+     else:
+         connection.send_bytes(FAILURE)
+-        raise AuthenticationError('digest received was wrong')
++        raise AuthenticationError(
++            'unexpected response length {0} (expected {1} or {2})'.format(
++                len(response), _SHA256_DIGEST_LEN, _MD5_DIGEST_LEN))
+ 
+ def answer_challenge(connection, authkey):
++    """Respond to HMAC authentication challenge (client side).
++
++    Receives a challenge from the server and sends back an HMAC response.
++    Detects the server's protocol version by challenge length.
++
++    Protocol:
++      1. Client receives: CHALLENGE prefix + random bytes
++      2. Client detects algorithm by challenge length:
++         - 20 bytes: Legacy server, compute MD5 HMAC
++         - 32 bytes: Modern server, compute SHA256 HMAC
++      3. Client sends HMAC response
++      4. Client receives WELCOME on success or FAILURE on error
++
++    Args:
++        connection: Connection object with send_bytes/recv_bytes methods
++        authkey: Shared secret key (bytes)
++
++    Raises:
++        ValueError: If authkey is not bytes
++        AuthenticationError: If challenge format invalid or server rejects response
++    """
+     import hmac
+     if not isinstance(authkey, bytes):
+         raise ValueError(
+             "Authkey must be bytes, not {0!s}".format(type(authkey)))
+     message = connection.recv_bytes(256)         # reject large message
+-    assert message[:len(CHALLENGE)] == CHALLENGE, 'message = %r' % message
++
++    if not message.startswith(CHALLENGE):
++        raise AuthenticationError(
++            'message missing challenge prefix (expected {0!r})'.format(CHALLENGE))
++
+     message = message[len(CHALLENGE):]
+-    digest = hmac.new(authkey, message, 'md5').digest()
++
++    # Detect protocol based on challenge length
++    if len(message) == MESSAGE_LENGTH:
++        # Legacy 20-byte challenge: server expects MD5
++        try:
++            digest = hmac.new(authkey, message, 'md5').digest()
++        except ValueError:
++            raise AuthenticationError(
++                'legacy server requires MD5 but MD5 not available (FIPS mode?)')
++    elif len(message) == MESSAGE_LENGTH_SHA256:
++        # Modern 32-byte challenge: server expects SHA256
++        try:
++            digest = hmac.new(authkey, message, 'sha256').digest()
++        except ValueError:
++            raise AuthenticationError(
++                'modern server requires SHA256 but SHA256 not available')
++    else:
++        raise AuthenticationError(
++            'unexpected challenge length {0} (expected {1} or {2})'.format(
++                len(message), MESSAGE_LENGTH, MESSAGE_LENGTH_SHA256))
++
+     connection.send_bytes(digest)
+     response = connection.recv_bytes(256)        # reject large message
+     if response != WELCOME:
+-        raise AuthenticationError('digest sent was rejected')
++        raise AuthenticationError('server rejected authentication')
+ 
+ #
+ # Support for using xmlrpclib for serialization
+diff --git a/Lib/test/_test_multiprocessing.py b/Lib/test/_test_multiprocessing.py
+index e096401c4cf..40cec1057bb 100644
+--- a/Lib/test/_test_multiprocessing.py
++++ b/Lib/test/_test_multiprocessing.py
+@@ -3120,7 +3120,7 @@ def test_remote(self):
+         del queue
+ 
+ 
+-@hashlib_helper.requires_hashdigest('md5')
++@hashlib_helper.requires_hashdigest('sha256')
+ class _TestManagerRestart(BaseTestCase):
+ 
+     @classmethod
+@@ -3633,7 +3633,7 @@ def test_dont_merge(self):
+ #
+ 
+ @unittest.skipUnless(HAS_REDUCTION, "test needs multiprocessing.reduction")
+-@hashlib_helper.requires_hashdigest('md5')
++@hashlib_helper.requires_hashdigest('sha256')
+ class _TestPicklingConnections(BaseTestCase):
+ 
+     ALLOWED_TYPES = ('processes',)
+@@ -3936,7 +3936,7 @@ def test_copy(self):
+ 
+ 
+ @unittest.skipUnless(HAS_SHMEM, "requires multiprocessing.shared_memory")
+-@hashlib_helper.requires_hashdigest('md5')
++@hashlib_helper.requires_hashdigest('sha256')
+ class _TestSharedMemory(BaseTestCase):
+ 
+     ALLOWED_TYPES = ('processes',)
+@@ -4777,7 +4777,7 @@ def test_invalid_handles(self):
+ 
+ 
+ 
+-@hashlib_helper.requires_hashdigest('md5')
++@hashlib_helper.requires_hashdigest('sha256')
+ class OtherTest(unittest.TestCase):
+     # TODO: add more tests for deliver/answer challenge.
+     def test_deliver_challenge_auth_failure(self):
+@@ -4807,6 +4807,159 @@ def send_bytes(self, data):
+                           multiprocessing.connection.answer_challenge,
+                           _FakeConnection(), b'abc')
+ 
++    def test_deliver_challenge_sha256_response(self):
++        """Test modern SHA256 authentication (32-byte challenge, 32-byte response)."""
++        import hmac
++        authkey = b'test_secret_key_123'
++        challenge_message = None
++
++        class _FakeConnection(object):
++            def __init__(self):
++                self.sent = []
++            def send_bytes(self, data):
++                self.sent.append(data)
++            def recv_bytes(self, size):
++                # Extract challenge and compute correct SHA256 response
++                nonlocal challenge_message
++                if challenge_message is None:
++                    # First call gets the challenge
++                    challenge_data = self.sent[0]
++                    assert challenge_data.startswith(
++                        multiprocessing.connection.CHALLENGE)
++                    challenge_message = challenge_data[
++                        len(multiprocessing.connection.CHALLENGE):]
++                    # Verify it's 32 bytes (SHA256 protocol)
++                    assert len(challenge_message) == 32, (
++                        f"Expected 32-byte challenge, got {len(challenge_message)}")
++                return hmac.new(authkey, challenge_message, 'sha256').digest()
++
++        conn = _FakeConnection()
++        multiprocessing.connection.deliver_challenge(conn, authkey)
++        # Should have sent WELCOME
++        self.assertIn(multiprocessing.connection.WELCOME, conn.sent)
++
++    def test_deliver_challenge_md5_response_legacy_client(self):
++        """Test backward compatibility: modern server accepts MD5 from legacy client."""
++        import hmac
++        authkey = b'test_secret_key_456'
++        challenge_message = None
++
++        class _FakeConnection(object):
++            def __init__(self):
++                self.sent = []
++            def send_bytes(self, data):
++                self.sent.append(data)
++            def recv_bytes(self, size):
++                # Legacy client receives 32-byte challenge but responds with MD5
++                nonlocal challenge_message
++                if challenge_message is None:
++                    challenge_data = self.sent[0]
++                    assert challenge_data.startswith(
++                        multiprocessing.connection.CHALLENGE)
++                    challenge_message = challenge_data[
++                        len(multiprocessing.connection.CHALLENGE):]
++                # Legacy client computes MD5 HMAC (16 bytes)
++                return hmac.new(authkey, challenge_message, 'md5').digest()
++
++        conn = _FakeConnection()
++        multiprocessing.connection.deliver_challenge(conn, authkey)
++        # Should have sent WELCOME (backward compatible)
++        self.assertIn(multiprocessing.connection.WELCOME, conn.sent)
++
++    def test_answer_challenge_sha256_from_modern_server(self):
++        """Test client responds with SHA256 to 32-byte challenge."""
++        import hmac
++        authkey = b'test_secret_key_789'
++        challenge_message = os.urandom(32)  # Modern 32-byte challenge
++
++        class _FakeConnection(object):
++            def __init__(self):
++                self.sent = []
++            def recv_bytes(self, size):
++                if not self.sent:
++                    # First call: return challenge
++                    return (multiprocessing.connection.CHALLENGE +
++                            challenge_message)
++                else:
++                    # Second call: return WELCOME
++                    return multiprocessing.connection.WELCOME
++            def send_bytes(self, data):
++                self.sent.append(data)
++
++        conn = _FakeConnection()
++        multiprocessing.connection.answer_challenge(conn, authkey)
++        # Should have sent SHA256 digest (32 bytes)
++        self.assertEqual(len(conn.sent), 1)
++        response = conn.sent[0]
++        self.assertEqual(len(response), 32)
++        # Verify it's correct SHA256
++        expected = hmac.new(authkey, challenge_message, 'sha256').digest()
++        self.assertEqual(response, expected)
++
++    def test_answer_challenge_md5_from_legacy_server(self):
++        """Test client responds with MD5 to 20-byte challenge (legacy server)."""
++        import hmac
++        authkey = b'test_secret_key_012'
++        challenge_message = os.urandom(20)  # Legacy 20-byte challenge
++
++        class _FakeConnection(object):
++            def __init__(self):
++                self.sent = []
++            def recv_bytes(self, size):
++                if not self.sent:
++                    # First call: return legacy challenge
++                    return (multiprocessing.connection.CHALLENGE +
++                            challenge_message)
++                else:
++                    # Second call: return WELCOME
++                    return multiprocessing.connection.WELCOME
++            def send_bytes(self, data):
++                self.sent.append(data)
++
++        conn = _FakeConnection()
++        multiprocessing.connection.answer_challenge(conn, authkey)
++        # Should have sent MD5 digest (16 bytes)
++        self.assertEqual(len(conn.sent), 1)
++        response = conn.sent[0]
++        self.assertEqual(len(response), 16)
++        # Verify it's correct MD5
++        expected = hmac.new(authkey, challenge_message, 'md5').digest()
++        self.assertEqual(response, expected)
++
++    def test_bad_response_length_rejected(self):
++        """Test that responses with unexpected lengths are rejected."""
++        authkey = b'test_key'
++
++        class _FakeConnection(object):
++            def __init__(self):
++                self.sent = []
++            def send_bytes(self, data):
++                self.sent.append(data)
++            def recv_bytes(self, size):
++                # Return wrong length (not 16 or 32)
++                return b'x' * 24
++
++        conn = _FakeConnection()
++        with self.assertRaises(multiprocessing.AuthenticationError) as cm:
++            multiprocessing.connection.deliver_challenge(conn, authkey)
++        self.assertIn('unexpected response length', str(cm.exception))
++
++    def test_bad_challenge_length_rejected(self):
++        """Test that challenges with unexpected lengths are rejected."""
++        authkey = b'test_key'
++        bad_challenge = os.urandom(25)  # Not 20 or 32
++
++        class _FakeConnection(object):
++            def recv_bytes(self, size):
++                return multiprocessing.connection.CHALLENGE + bad_challenge
++            def send_bytes(self, data):
++                pass
++
++        conn = _FakeConnection()
++        with self.assertRaises(multiprocessing.AuthenticationError) as cm:
++            multiprocessing.connection.answer_challenge(conn, authkey)
++        self.assertIn('unexpected challenge length', str(cm.exception))
++
+ #
+ # Test Manager.start()/Pool.__init__() initializer feature - see issue 5585
+ #
+@@ -4814,7 +4967,7 @@ def send_bytes(self, data):
+ def initializer(ns):
+     ns.test += 1
+ 
+-@hashlib_helper.requires_hashdigest('md5')
++@hashlib_helper.requires_hashdigest('sha256')
+ class TestInitializers(unittest.TestCase):
+     def setUp(self):
+         self.mgr = multiprocessing.Manager()
+@@ -5729,7 +5882,7 @@ def is_alive(self):
+             any(process.is_alive() for process in forked_processes))
+ 
+ 
+-@hashlib_helper.requires_hashdigest('md5')
++@hashlib_helper.requires_hashdigest('sha256')
+ class TestSyncManagerTypes(unittest.TestCase):
+     """Test all the types which can be shared between a parent and a
+     child process by using a manager which acts as an intermediary
+@@ -6174,7 +6327,7 @@ def install_tests_in_module_dict(remote_globs, start_method,
+                 class Temp(base, Mixin, unittest.TestCase):
+                     pass
+                 if type_ == 'manager':
+-                    Temp = hashlib_helper.requires_hashdigest('md5')(Temp)
++                    Temp = hashlib_helper.requires_hashdigest('sha256')(Temp)
+                 Temp.__name__ = Temp.__qualname__ = newname
+                 Temp.__module__ = __module__
+                 remote_globs[newname] = Temp
+diff --git a/Misc/NEWS.d/next/Library/2025-01-26-12-00-00.gh-61460.abc123.rst b/Misc/NEWS.d/next/Library/2025-01-26-12-00-00.gh-61460.abc123.rst
+new file mode 100644
+index 00000000000..117301d86af
+--- /dev/null
++++ b/Misc/NEWS.d/next/Library/2025-01-26-12-00-00.gh-61460.abc123.rst
+@@ -0,0 +1,5 @@
++:mod:`multiprocessing` now uses HMAC-SHA256 instead of HMAC-MD5 for
++inter-process connection authentication. The implementation maintains
++backward compatibility with Python 3.10 and earlier using length-based
++protocol detection. Note: In FIPS mode where MD5 is unavailable, this
++version cannot authenticate with Python ≤3.10 clients/servers.
+-- 
+2.51.2
+

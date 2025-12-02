@@ -1,6 +1,6 @@
 package:
-  name: langfuse
-  version: "3.134.0"
+  name: langfuse-3
+  version: "3.135.1"
   epoch: 1
   description: "Langfuse webapp"
   copyright:
@@ -9,6 +9,8 @@ package:
     cpu: 16
     memory: 16Gi
   dependencies:
+    provides:
+      - langfuse=${{package.version}}
     runtime:
       - busybox
       - dumb-init
@@ -32,33 +34,22 @@ environment:
       - pnpm
   environment:
     # Required for langfuse-web
-    CLICKHOUSE_PASSWORD: "test"
-    CLICKHOUSE_USER: "default"
-    CLICKHOUSE_URL: "http://localhost:8123"
     DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/postgres"
-    LANG: "en_US.UTF-8"
-    LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse-event-upload-test"
-    LC_ALL: "en_US.UTF-8"
-    NODE_OPTIONS: "--max-old-space-size=8192"
     NEXTAUTH_SECRET: "test"
     NEXTAUTH_URL: "http://localhost:3000"
     SALT: "test"
-    NEXT_TELEMETRY_DISABLED: "1"
-    # Required for langfuse-worker
-    SKIP_MIGRATE_DATABASE_SCHEMA: "1"
-    SKIP_SEED_PRISMA_DATABASE: "1"
-    HUSKY: "0"
-    # Required to mitigate go CVE
-    ESBUILD_BINARY_PATH: "/usr/bin/esbuild"
+    CLICKHOUSE_URL: "http://localhost:8123"
+    CLICKHOUSE_USER: "default"
+    CLICKHOUSE_PASSWORD: "test"
+    NODE_OPTIONS: "--max-old-space-size=8192"
+    LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse-event-upload-test"
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/langfuse/langfuse.git
       tag: v${{package.version}}
-      expected-commit: d2aaddb6e0b7e99dd703040680dc3b8c2ed97777
-      cherry-picks: |
-        main/c3a1349ed896ca699bbf07dd68f6f0390ce1823e: [GHSA-6465-jgvq-jhgp]
+      expected-commit: f40cd99ba8a4115604b921bc485cccdce139edc3
 
   - name: "Bump deps and install"
     runs: |
@@ -77,6 +68,10 @@ pipeline:
         "pnpm.overrides.undici=^6.21.2" \
         "pnpm.overrides.vite=^5.4.21" \
         "pnpm.overrides.vitest=^2.1.9" \
+        "pnpm.overrides.@sentry/nextjs=^10.27.0" \
+        "pnpm.overrides.@sentry/node-core=^10.27.0" \
+        "pnpm.overrides.@sentry/node=^10.27.0" \
+        "pnpm.overrides.body-parser=^2.2.1" \
         "pnpm.overrides.ws=^8.17.1" \
         "pnpm.overrides.brace-expansion=^4.0.1" \
         "pnpm.overrides.dompurify=^3.2.4" \
@@ -89,8 +84,7 @@ pipeline:
         "pnpm.overrides.jsondiffpatch=^0.7.2" \
         "pnpm.overrides.tar-fs=3.1.1" \
         "pnpm.overrides.playwright=^1.55.1" \
-        "pnpm.overrides.js-yaml=^4.1.1" \
-        "pnpm.overrides.body-parser=^2.2.1"
+        "pnpm.overrides.js-yaml=^4.1.1"
 
       pnpm install --ignore-scripts --no-frozen-lockfile
 
@@ -179,12 +173,14 @@ test:
         sudo -u postgres createdb ${PGDB}
         redis-server --daemonize yes > /tmp/redis-server.log 2>&1 &
         dumb-init -- ./web/entrypoint.sh node ./web/server.js > /tmp/web.log 2>&1 &
-        sleep 5
-        wait-for-it localhost:3030 --timeout=60 || exit 1
+        wait-for-it localhost:3030 --timeout=60
 
 subpackages:
   - name: ${{package.name}}-compat
     description: "Compatibility package to place binaries in the location expected by entrypoint"
+    dependencies:
+      provides:
+        - langfuse-compat=${{package.version}}
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/local/bin/
@@ -193,6 +189,8 @@ subpackages:
   - name: ${{package.name}}-worker
     description: Langfuse worker background service
     dependencies:
+      provides:
+        - langfuse-worker=${{package.version}}
       runtime:
         - bash
         - busybox
@@ -234,8 +232,7 @@ subpackages:
           cp -r packages/shared/node_modules "${{targets.contextdir}}"/app/packages/shared/node_modules/
 
           # Copy entrypoint
-          cp worker/entrypoint.sh "${{targets.contextdir}}"/app/worker/entrypoint.sh
-          chmod +x "${{targets.contextdir}}"/app/worker/entrypoint.sh
+          install -m755 worker/entrypoint.sh "${{targets.contextdir}}"/app/worker/entrypoint.sh
 
           # use our esbuild binary to remove cve
           cp /usr/bin/esbuild $(find "${{targets.contextdir}}"/app/node_modules/.pnpm -path '*@esbuild+linux*bin/esbuild')
@@ -252,13 +249,15 @@ subpackages:
       - name: remove unneeded packages and tests that may introduce CVE's
         runs: |
           # monorepo-symlink-test vulnerability
-          find ${{targets.contextdir}}/app/node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null || true
+          find ${{targets.contextdir}}/app/node_modules -path "*/test/resolver/multirepo" -type d -exec rm -rf {} + 2>/dev/null
 
           #CVE-2025-27789 and CVE-2025-48068
           find ${{targets.contextdir}}/app/node_modules -type d \( \
             -name "next" -o \
             -name "@next" \
-          \) -exec rm -rf {} + 2>/dev/null || true
+          \) -exec rm -rf {} + 2>/dev/null
+          # Remove ai package from worker (CVE-2025-48985) not needed in worker
+          find ${{targets.contextdir}}/app/node_modules -type d -name "ai" -path "*/node_modules/ai" -exec rm -rf {} + 2>/dev/null
     test:
       environment:
         contents:
@@ -335,15 +334,17 @@ subpackages:
               fi
             start: |
               dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js
-            timeout: 60
             expected_output: |
               Listening: http://
               Finished upserting default model prices
+            post: |
+              WORKER_HOST=$(hostname)
+              echo "Worker is running on hostname: $WORKER_HOST"
+              curl -fsS  http://${WORKER_HOST}:3030/ | grep -F "Langfuse Worker API"
 
 update:
   enabled: true
-  schedule:
-    period: daily
-    reason: langfuse cuts a high number of tags every day.
-  git:
-    strip-prefix: v
+  github:
+    identifier: langfuse/langfuse
+    use-tag: true
+    tag-filter-prefix: v3

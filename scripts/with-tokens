@@ -1,0 +1,96 @@
+#!/bin/sh
+# shellcheck disable=SC3043
+WITH_TOKENS_DEBUG=${WITH_TOKENS_DEBUG:-false}
+MYNAME="${0##*/}"
+TOKEN_FILES=""
+Usage(){
+    cat <<EOF
+Usage: $MYNAME package-dir json command args
+EOF
+}
+
+fail() { stderr "$@"; exit 1; }
+
+debug() {
+    [ "$WITH_TOKENS_DEBUG" = "true" ] || return
+    stderr "$@"
+}
+
+stderr() {
+    echo "[$MYNAME]" "$@" 1>&2
+}
+
+json_uses() {
+    local jsonf="$1" thing="$2" out="" exp=""
+    exp='.. | .uses? | strings | select(test("'"$thing"'"))'
+    out=$(jq -r "$exp" "$jsonf") ||
+        fail "jq command failed [$?]: jq -r '$exp' '$jsonf'"
+    [ -n "$out" ] && return 0
+    return 1
+}
+
+capture_stdout() {
+    local outf="$1" tmpf="$1.$$" rc=0
+    shift
+    ( umask 066 && : > "$tmpf" ) ||
+        { stderr "could not create $tmpf"; return 1; }
+
+    "$@" >> "$tmpf" && mv "$tmpf" "$outf" &&
+        { debug "created $outf from $*"; return 0; }
+    rc=$?
+    rm -f "$tmpf"
+    return $rc
+}
+
+cleanup() {
+    # shellcheck disable=SC2086
+    set -- $TOKEN_FILES
+    [ $# -eq 0 ] && return 0
+    debug "removing tokens: $*"
+    local tok=""
+    for tok in "$@"; do
+        rm "$tok" || stderr "WARN: could not remove token $tok"
+    done
+}
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    Usage
+    exit 0
+fi
+
+if [ $# -lt 3 ]; then
+    Usage 1>&2
+    fail "got $# args, expected 3+"
+fi
+
+case "$WITH_TOKENS_DEBUG" in
+    true|false) :;;
+    *) fail "Invalid value for WITH_TOKENS_DEBUG: '$WITH_TOKENS_DEBUG'";;
+esac
+
+pkgd=${1%/}
+jsonf=$2
+shift 2
+[ -e "$jsonf" ] || fail "json file $jsonf: did not exist"
+[ -f "$jsonf" ] || fail "json file $jsonf: not a file"
+[ -d "$pkgd" ] || mkdir -p "$pkgd" ||
+    fail "could not create dir $pkgd"
+trap cleanup EXIT
+
+tokf="$pkgd/.guarded-repo.token"
+if json_uses "$jsonf" "auth/github"; then
+    capture_stdout "$tokf" \
+        chainctl auth octo-sts --identity=guarded-package-repos --scope=chainguard-dev ||
+        fail "Could not create token in $tokf"
+    TOKEN_FILES="${TOKEN_FILES:+${TOKEN_FILES} }$tokf"
+fi
+
+tokf="$pkgd/.libraries.token"
+if json_uses "$jsonf" "auth/(?!github)"; then
+    capture_stdout "$tokf" \
+	    chainctl auth token --audience=libraries.cgr.dev ||
+        fail "could not create token in $tokf"
+    TOKEN_FILES="${TOKEN_FILES:+${TOKEN_FILES} }$tokf"
+fi
+
+"$@"

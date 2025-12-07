@@ -155,7 +155,7 @@ packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile)
 	@[ -n "$(pkgname)" ] || { echo "$@: pkgname is not set"; exit 1; }
 	@[ -n "$(yamlfile)" ] || { echo "$@: yamlfile is not set"; exit 1; }
 	mkdir -p ./$(pkgname)/
-	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
+	$(eval SOURCE_DATE_EPOCH ?= $(shell git --no-pager log -1 --pretty=%ct))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
@@ -170,7 +170,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
-	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
+	$(eval SOURCE_DATE_EPOCH ?= $(shell git --no-pager log -1 --pretty=%ct))
 	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
@@ -206,11 +206,12 @@ $(compile_targets): compile/%:
 
 .PHONY: dev-container
 dev-container:
+	$(eval SOURCE_DATE_EPOCH ?= $(shell git --no-pager log -1 --pretty=%ct))
 	docker run $(DOCKER_PLATFORM_ARG) --pull=always --privileged --rm -it \
-		--entrypoint="/bin/bash" \
+	    --entrypoint="/bin/bash" \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
-	    -e SOURCE_DATE_EPOCH=0 \
+	    -e SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
 	    -e HTTP_AUTH \
 	    ghcr.io/wolfi-dev/sdk:latest -il
 

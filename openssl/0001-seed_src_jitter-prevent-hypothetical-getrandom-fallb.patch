@@ -1,0 +1,80 @@
+From c290f0bd2a592f7260b1b96a556c7d192af34f19 Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@surgut.co.uk>
+Date: Wed, 26 Nov 2025 11:51:33 +0000
+Subject: [PATCH] seed_src_jitter: prevent hypothetical getrandom fallback
+
+In a hypothetical scenario that jent_entropy_init_ex fails, or if
+get_jitter_random-value fails, there are a few unexpected
+posibilities.
+
+If jent_entropy_init_ex fails, the seed initialisation may return NULL
+and then DRBG will be initiated with NULL seed, which will
+automatically fallback to os-seed, which will escape module boundary
+(if this jitter rng is from the fips module), and call getrandom
+syscall.
+
+And separately if get_jitter_random_value fails, it may put DRBG in an
+error state, but it might not put the FIPS module in error state, like
+it should as per the ISO standard.
+
+To instrument these things, I had to create tampered
+jitterentropy-library that always returns errors for init_ex and
+read_entropy apis, and then use gdb tracing on both libcrypto.so and
+fips.so.
+
+The most minimal solution to above hypothetical error code paths, is
+to simply call ossl_set_error_state. It is either harmless, or in case
+of fips-jitter will correctly put the FIPS module into error state and
+prevent any further operation; and cruitially prevent silent fallback
+to getrandom syscall.
+
+Note it is unlikely that this ever was out of compliance, as often
+enough getrandom syscall goes to a kernel with validated entropy
+source; and openssl fips module still did reject sampling which is too
+entropy source compliant.
+
+Nonetheless it is good to fix this hypothetical error path, and
+backport this to 3.5 and up.
+
+This is similar / additional fixes, to this previous change:
+- https://github.com/openssl/openssl/pull/25957
+- https://github.com/openssl/openssl/commit/b9886a6f3483e0525596d3b3956416282038da82
+---
+ providers/implementations/rands/seed_src_jitter.c.in | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/providers/implementations/rands/seed_src_jitter.c.in b/providers/implementations/rands/seed_src_jitter.c.in
+index fe2bdedfb1..efc3bb2dc9 100644
+--- a/providers/implementations/rands/seed_src_jitter.c.in
++++ b/providers/implementations/rands/seed_src_jitter.c.in
+@@ -104,10 +104,8 @@ static size_t get_jitter_random_value(PROV_JITTER *s,
+          * Permanent Failure
+          * https://github.com/smuellerDD/jitterentropy-library/blob/master/doc/jitterentropy.3#L234
+          */
+-        if (result < -5) {
+-            ossl_set_error_state(OSSL_SELF_TEST_TYPE_CRNG);
++        if (result < -5)
+             break;
+-        }
+ 
+         /* Success */
+         if (result >= 0 && (size_t)result == len)
+@@ -116,6 +114,7 @@ static size_t get_jitter_random_value(PROV_JITTER *s,
+ 
+     /* Permanent failure or too many intermittent failures */
+     s->state = EVP_RAND_STATE_ERROR;
++    ossl_set_error_state(OSSL_SELF_TEST_TYPE_CRNG);
+     ERR_raise_data(ERR_LIB_RAND, RAND_R_ERROR_RETRIEVING_ENTROPY,
+                    "jent_read_entropy (%d)", result);
+     return 0;
+@@ -158,6 +157,7 @@ static int jitter_instantiate(void *vseed, unsigned int strength,
+         ERR_raise_data(ERR_LIB_RAND, RAND_R_ERROR_RETRIEVING_ENTROPY,
+                        "jent_entropy_init_ex (%d)", ret);
+         s->state = EVP_RAND_STATE_ERROR;
++        ossl_set_error_state(OSSL_SELF_TEST_TYPE_CRNG);
+         return 0;
+     }
+ 
+-- 
+2.51.0
+

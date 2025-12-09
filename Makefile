@@ -145,19 +145,20 @@ kernel/%/vmlinuz: kernel/%/linux.apk
 yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
-$(pkg_targets): package/%: cache
+$(pkg_targets): package/%: cache compiled/%.json
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
+	@echo "Building package $* with version $(pkgver) from file $(yamlfile)"
+	$(MAKE) jsonfile=compiled/$*.json yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
 
-packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile)
+packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile) $(jsonfile)
 	@[ -n "$(pkgname)" ] || { echo "$@: pkgname is not set"; exit 1; }
 	@[ -n "$(yamlfile)" ] || { echo "$@: yamlfile is not set"; exit 1; }
-	mkdir -p ./$(pkgname)/
+	@[ -n "$(jsonfile)" ] || { echo "$@: jsonfile is not set"; exit 1; }
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
-	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
+		./scripts/with-tokens "$(pkgname)" "$(jsonfile)" \
+			$(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir="./$*/"
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
@@ -165,22 +166,23 @@ $(docker_pkg_targets): docker-package/%:
 	MELANGE_RUNNER=docker make package/$*
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
-$(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
+$(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP) compiled/%.json
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
-	mkdir -p ./"$*"/
+	@echo "Building package $* with version $(pkgver) from file $(yamlfile)"
 	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
-	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
+		./scripts/with-tokens "$*" "compiled/$*.json" \
+			$(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir="./$*/"
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
-$(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
+$(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP) compiled/%.json
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir ./$(*)/
+	@echo "Testing package $* with version $(pkgver) from file $(yamlfile)"
+	./scripts/with-tokens "$*" "compiled/$*.json" \
+		$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir="./$*/"
 
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
 $(docker_test_targets): docker-test/%:
@@ -188,21 +190,16 @@ $(docker_test_targets): docker-test/%:
 	MELANGE_RUNNER=docker make test/$*
 
 testdbg_targets = $(foreach name,$(pkgs),test-debug/$(name))
-$(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
+$(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP) compiled/%.json
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
-	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
+	@echo "Testing package $* with version $(pkgver) from file $(yamlfile)"
+	./scripts/with-tokens "$*" "compiled/$*.json" \
+		$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir="./$*/"
 
-# Please do not print any additional content via this target
-# so that we can parse output directly with jq
-compile_targets = $(foreach name,$(pkgs),compile/$(name))
-$(compile_targets): compile/%:
-	@$(MAKE) $(KEY) >/dev/null 2>&1
-	@mkdir -p ./$(*)/
-	$(eval yamlfile := $*.yaml)
-	@$(MELANGE) compile $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(*)/
+compiled/%.json: %.yaml
+	@$(call capture_stdout,$@,$(MELANGE) compile $*.yaml $(MELANGE_OPTS) --source-dir="./$*")
 
 .PHONY: dev-container
 dev-container:
@@ -308,3 +305,7 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
   curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
 	mv "$(2).tmp" "$(2)"
+
+capture_stdout = rm -f "$(1)" && mkdir -p "$(dir $(1))" && \
+  tmpf="$(1).tmp.$$$$" && trap "rm -f $$tmpf" EXIT && \
+  echo "$(2) > $(1)" && $(2) > "$$tmpf" && mv "$$tmpf" "$(1)"

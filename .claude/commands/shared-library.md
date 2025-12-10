@@ -43,42 +43,57 @@ vars:
 
 ### 2. Create or rename library subpackages
 
-There are two approaches depending on the package structure:
+Use the `split/lib` pipeline to automatically split out shared libraries. The pipeline supports optional filtering via patterns.
 
-**Approach A: Multiple library subpackages (one per library)**
-
-Use this when a package provides multiple distinct libraries that may be used independently:
-
-```yaml
-  - name: libprotoc${{vars.soversion}}
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/lib
-          mv ${{targets.destdir}}/usr/lib/libprotoc*.so.* ${{targets.subpkgdir}}/usr/lib/
-
-  - name: libprotobuf${{vars.soversion}}
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/lib
-          mv ${{targets.destdir}}/usr/lib/libprotobuf.so.* ${{targets.subpkgdir}}/usr/lib/
-```
-
-**Approach B: Single library subpackage (all libraries together)**
+**Single library subpackage (most common):**
 
 Use this when a package provides one primary library or multiple libraries that are always used together:
 
 ```yaml
   - name: libfoo${{vars.soversion}}
     pipeline:
-      - runs: |
-          mkdir -p ${{targets.subpkgdir}}/usr/lib
-          mv ${{targets.destdir}}/usr/lib/*.so.* ${{targets.subpkgdir}}/usr/lib/
+      - uses: split/lib
 ```
 
-**Choosing the right approach:**
-- Use **Approach A** when libraries are logically separate (e.g., protobuf has libprotoc, libprotobuf, libprotobuf-lite)
-- Use **Approach B** when there's a single library or tightly coupled libraries (e.g., libzstd, libisal)
-- The wildcard pattern `*.so.*` in Approach B captures all shared libraries without hardcoding names
+This automatically moves all `*.so.*` files from `lib/` and `usr/lib/` to the subpackage.
+
+**Multiple library subpackages (filtering with patterns):**
+
+Use this when a package provides multiple distinct libraries that should be in separate subpackages:
+
+```yaml
+  - name: libprotoc${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
+        with:
+          patterns: protoc
+
+  - name: libprotobuf${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
+        with:
+          patterns: |
+            protobuf
+            protobuf-lite
+```
+
+The `patterns` input matches `lib<pattern>.so.*` for each pattern. For example:
+- `protoc` matches `libprotoc*.so.*`
+- `ssl` and `crypto` would match `libssl.so.*` and `libcrypto.so.*`
+
+**Advanced: Custom library paths**
+
+If libraries are in non-standard locations (beyond the default `lib/` and `usr/lib/`):
+
+```yaml
+  - name: libfoo${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
+        with:
+          paths: |
+            usr/lib64
+            opt/lib
+```
 
 ### 3. Runtime dependencies
 
@@ -138,7 +153,7 @@ Always run the linter after making changes:
 
 ## Examples
 
-### Example 1: protobuf (X.Y version format)
+### Example 1: protobuf (X.Y version format, multiple libraries)
 
 ```yaml
 package:
@@ -153,8 +168,22 @@ var-transforms:
 
 subpackages:
   - name: libprotoc${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
+        with:
+          patterns: protoc
+
   - name: libprotobuf${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
+        with:
+          patterns: protobuf
+
   - name: libprotobuf-lite${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
+        with:
+          patterns: protobuf-lite
 
   - name: protobuf-dev
     pipeline:
@@ -166,7 +195,7 @@ subpackages:
         - libprotobuf-lite${{vars.soversion}}=${{package.full-version}}
 ```
 
-### Example 2: fmt (X.Y.Z version format, major only)
+### Example 2: fmt (X.Y.Z version format, single library)
 
 ```yaml
 package:
@@ -181,6 +210,8 @@ var-transforms:
 
 subpackages:
   - name: lib${{package.name}}${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
 
   - name: ${{package.name}}-dev
     pipeline:
@@ -202,6 +233,8 @@ vars:
 
 subpackages:
   - name: libjemalloc${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
 
   - name: jemalloc-dev
     pipeline:

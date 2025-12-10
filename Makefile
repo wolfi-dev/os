@@ -155,8 +155,7 @@ packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile)
 	@[ -n "$(pkgname)" ] || { echo "$@: pkgname is not set"; exit 1; }
 	@[ -n "$(yamlfile)" ] || { echo "$@: yamlfile is not set"; exit 1; }
 	mkdir -p ./$(pkgname)/
-	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
+	$(call set_source_date_epoch $(yamlfile))
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
@@ -170,8 +169,7 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
-	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
+	$(call set_source_date_epoch $(yamlfile))
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
@@ -308,3 +306,10 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
   curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
 	mv "$(2).tmp" "$(2)"
+
+define set_source_date_epoch
+   $(eval SOURCE_DATE_EPOCH ?= $(shell \
+	git ls-files --error-unmatch $1 >/dev/null 2>&1 && \
+	git log -1 --pretty=%ct --follow $1 || \
+	echo 315532900))
+endef

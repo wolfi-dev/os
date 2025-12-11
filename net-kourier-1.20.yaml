@@ -1,0 +1,98 @@
+package:
+  name: net-kourier-1.20
+  version: "1.20.0"
+  epoch: 1 # CVE-2025-61729
+  description: Purpose-built Knative Ingress implementation using just Envoy with no additional CRDs
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - net-kourier=${{package.full-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 1848911e8b7da436271fe6d9aeeb8b219b21b648
+      repository: https://github.com/knative-extensions/net-kourier
+      tag: knative-v${{package.version}}
+
+  - uses: go/build
+    with:
+      output: kourier
+      packages: ./cmd/kourier
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "To match with the upstream image entrypoint"
+    dependencies:
+      provides:
+        - net-kourier-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/ko-app
+          ln -sf /usr/bin/kourier ${{targets.contextdir}}/ko-app/kourier
+    test:
+      pipeline:
+        - runs: test "$(readlink /ko-app/kourier)" = "/usr/bin/kourier"
+
+# Uses knative-v tags for consistency with other Knative packages and to follow the official Knative release process.
+update:
+  enabled: true
+  github:
+    identifier: knative-extensions/net-kourier
+    strip-prefix: knative-v
+    tag-filter: knative-v1.20
+
+test:
+  environment:
+    environment:
+      NAMESPACE: knative-serving
+      POD_NAME: test-kourier
+      CONTAINER_NAME: kourier
+      KOURIER_HTTPOPTION_DISABLED: "true"
+      ENVOY_ADMIN_PORT: "9901"
+      SYSTEM_NAMESPACE: knative-serving
+      METRICS_DOMAIN: knative.dev/samples
+      KOURIER_GATEWAY_NAMESPACE: kourier-system
+      ENABLE_SECRET_INFORMER_FILTERING_BY_CERT_UID: "false"
+      KUBE_API_BURST: "200"
+      KUBE_API_QPS: "200"
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+  pipeline:
+    - uses: test/kwok/cluster
+    - name: Running daemon logs check tests
+      runs: |
+        # Workaround fix for: "To create in-cluster Kubernetes config"
+        DIR=/var/run/secrets/kubernetes.io/serviceaccount
+        mkdir -p "$DIR"
+        kwokctl --name kwok kubectl create serviceaccount kourier
+        kwokctl --name kwok kubectl -n default create token kourier --duration=8760h > "$DIR/token"
+        CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+        cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        echo knative-serving > "$DIR/namespace"
+    - name: Test kourier binary
+      runs: |
+        kourier --help 2>&1  | grep -q "Usage of kourier"
+    - name: Start kourier daemon
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl create namespace knative-serving
+          kubectl create namespace kourier-system
+          kubectl apply -f https://github.com/knative/serving/releases/download/knative-v${{package.version}}/serving-crds.yaml
+          kubectl apply -f ./test-configmap.yaml
+        start: "kourier"
+        timeout: 30
+        expected_output: |
+          Registering
+          Running with Standard leader election
+          Started workers
+          has started leading
+        post: |
+          wait-for-it localhost:9090 -t 15
+          curl -fsSL http://localhost:9090/metrics | grep -q "net_kourier_controller_client_latency"
+          curl -fsSL http://localhost:9090/metrics | grep -q "net_kourier_controller_workqueue_"
+          curl -fsSL http://localhost:9090/metrics | grep -q "ingress.Reconciler"

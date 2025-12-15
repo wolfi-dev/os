@@ -252,16 +252,20 @@ subpackages:
         runs: |
           # https://github.com/goharbor/harbor/blob/main/Makefile#L113
           grep -qF "REGISTRY_SRC_TAG=release/${{vars.harbor-distribution-release-branch}}" Makefile
+      - name: "Add entrypoint scripts to match upstream"
+        runs: |
+          # As per upstream: https://github.com/goharbor/harbor/blob/v2.14.1/make/photon/registry/Dockerfile#L5-L6
+          # This script basically triggers option install_cert.sh script which will be skipped if the OS is not Photon and run registry binary
+          mkdir -p ${{targets.subpkgdir}}/home/harbor
+          cp ./make/photon/common/install_cert.sh ${{targets.subpkgdir}}/home/harbor/install_cert.sh
+          cp ./make/photon/registry/entrypoint.sh ${{targets.subpkgdir}}/home/harbor/entrypoint.sh
       - uses: git-checkout
         with:
           repository: https://github.com/goharbor/distribution
           branch: release/${{vars.harbor-distribution-release-branch}}
           expected-commit: ${{vars.harbor-distribution-expected-commit}} # needs to be updated with each package release
-      - runs: |
-          # Adds source modules to $GOPATH
-          mkdir -p "${DISTRIBUTION_DIR}"
-          cp -rf . "${DISTRIBUTION_DIR}"
-      - runs: |
+      - name: "Build"
+        runs: |
           # distribution v2.8.3 does not have go.mod file and therefore, it's not supported by Melange's go/build pipelines
           set -eux
           # GOPATH-style build
@@ -269,22 +273,25 @@ subpackages:
           install_dir="${{targets.subpkgdir}}/usr/bin"
           mkdir -p "${install_dir}"
 
-          cd "${DISTRIBUTION_DIR}"
-          # Copy vendored dependencies to GOPATH so Go can find them
-          # The vendor directory uses old-style vendoring that's incompatible with newer Go
-          cp -r vendor/* /usr/lib/go/src/
-          rm -rf vendor
+          # Set up GOPATH structure for old-style Go build
+          # GOPATH is already configured, create symlink to expected location
+          mkdir -p ${GOPATH}/src/github.com/docker
+          ln -sf $(pwd) ${GOPATH}/src/${DISTRIBUTION_PKG}
+
+          # As per upstream: https://github.com/goharbor/distribution/blob/release/2.8/Makefile#L5-L6
+          REVISION=$(git rev-parse HEAD)$(if ! git diff --no-ext-diff --quiet --exit-code; then echo .m; fi)
+          VERSION=$(git describe --match 'v[0-9]*' --dirty='.m' --always)
 
           GO111MODULE="off" go build \
             -tags "include_oss,include_gcs" \
-            -ldflags "-w -X ${DISTRIBUTION_DIR}/version.Version=${{vars.custom-distribution-version}} -X ${DISTRIBUTION_DIR}/version.Revision=$(git rev-parse --short HEAD) -X ${DISTRIBUTION_DIR}/version.Package=${DISTRIBUTION_PKG}" \
+            -ldflags "-w -X ${DISTRIBUTION_PKG}/version.Version=${VERSION} -X ${DISTRIBUTION_PKG}/version.Revision=${REVISION} -X ${DISTRIBUTION_PKG}/version.Package=${DISTRIBUTION_PKG}" \
             -o "${install_dir}/harbor-registry" \
             ./cmd/registry
       - uses: strip
-      - runs: |
+      - name: "Add components for registry"
+        runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/bin
           mkdir -p ${{targets.subpkgdir}}/etc/registry
-
           # Create compatibility symlink for legacy registry binary name
           ln -sf /usr/bin/harbor-registry ${{targets.subpkgdir}}/usr/bin/registry_DO_NOT_USE_GC
           # Use example config as registry config
@@ -306,6 +313,10 @@ subpackages:
             [ "$(readlink -f /usr/bin/registry_DO_NOT_USE_GC)" = "/usr/bin/harbor-registry" ]
             registry_DO_NOT_USE_GC --version | grep -q ${{vars.custom-distribution-version}}
             registry_DO_NOT_USE_GC --help | grep -q "Available Commands"
+        - name: "Check Entrypoint files"
+          runs: |
+            stat /home/harbor/install_cert.sh
+            stat /home/harbor/entrypoint.sh
         - uses: test/daemon-check-output
           with:
             start: "harbor-registry serve /etc/registry/config.yml"

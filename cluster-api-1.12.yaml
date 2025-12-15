@@ -1,0 +1,173 @@
+package:
+  name: cluster-api-1.12
+  version: "1.12.0"
+  epoch: 0 # GHSA-j5w8-q4qc-rx2x
+  description: Cluster API meta package
+  dependencies:
+    provides:
+      - cluster-api=${{package.full-version}}
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: b52de697d29fff53556697504c1ca68205841383
+      repository: https://github.com/kubernetes-sigs/cluster-api
+      tag: v${{package.version}}
+
+data:
+  - name: backends-go-builds
+    items:
+      kubeadm-bootstrap-controller: bootstrap/kubeadm
+      kubeadm-control-plane-controller: controlplane/kubeadm
+      clusterctl: cmd/clusterctl
+      controller: .
+
+  - name: test-go-builds
+    items:
+      capd-manager: infrastructure/docker
+
+subpackages:
+  - range: backends-go-builds
+    name: ${{package.name}}-${{range.key}}
+    description: cluster-api core components
+    dependencies:
+      provides:
+        - cluster-api-${{range.key}}=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          output: ${{range.key}}
+          packages: ./${{range.value}}
+          ldflags: |
+            -X sigs.k8s.io/cluster-api/version.gitVersion=${{package.version}} \
+            -X sigs.k8s.io/cluster-api/version.gitCommit=${GIT_COMMIT} \
+            -X sigs.k8s.io/cluster-api/version.gitTreeState=$(shell git diff --quiet >/dev/null 2>&1 || echo "dirty" || echo "clean") \
+            -X sigs.k8s.io/cluster-api/version.buildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')
+    test:
+      pipeline:
+        - runs: test -x /usr/bin/${{range.key}}
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: cluster-api-${{range.key}}
+            real-pkg-name: ${{subpkg.name}}
+
+  - range: backends-go-builds
+    name: ${{package.name}}-${{range.key}}-compat
+    description: cluster-api core ${{range.key}} compat packages
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          if [[ "${{range.key}}" == "clusterctl" ]]; then
+              ln -sf /usr/bin/${{range.key}} ${{targets.contextdir}}/${{range.key}}
+          else
+              ln -sf /usr/bin/${{range.key}} ${{targets.contextdir}}/manager
+          fi
+    test:
+      pipeline:
+        - runs: |
+            if [[ "${{range.key}}" == "clusterctl" ]]; then
+                test -L /${{range.key}}
+            else
+                test -L /manager
+            fi
+
+  - range: test-go-builds
+    name: ${{package.name}}-${{range.key}}
+    description: cluster-api core components
+    dependencies:
+      provides:
+        - cluster-api-${{range.key}}=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        working-directory: ./test
+        with:
+          tidy: true # this is needed despite go/bump above calling go mod tidy as well
+          output: ${{range.key}}
+          packages: ./${{range.value}}
+          ldflags: |
+            -X sigs.k8s.io/cluster-api/version.gitVersion=${{package.version}} \
+            -X sigs.k8s.io/cluster-api/version.gitCommit=${GIT_COMMIT} \
+            -X sigs.k8s.io/cluster-api/version.gitTreeState=$(shell git diff --quiet >/dev/null 2>&1 || echo "dirty" || echo "clean") \
+            -X sigs.k8s.io/cluster-api/version.buildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')
+    test:
+      pipeline:
+        - runs: test -x /usr/bin/${{range.key}}
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: cluster-api-${{range.key}}
+            real-pkg-name: ${{subpkg.name}}
+
+  - range: test-go-builds
+    name: ${{package.name}}-${{range.key}}-compat
+    description: cluster-api core ${{range.key}} compat packages
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf /usr/bin/${{range.key}} ${{targets.contextdir}}/manager
+    test:
+      pipeline:
+        - runs: test -L /manager
+
+## The package requires a full blown kubernetes cluster for complete testing so most of the tests are just to test the execution of the binaries for each component
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-controller
+        - ${{package.name}}-kubeadm-bootstrap-controller
+        - ${{package.name}}-kubeadm-control-plane-controller
+        - ${{package.name}}-clusterctl
+        - ${{package.name}}-capd-manager
+        - git
+  pipeline:
+    - runs: |
+        git clone --branch v${{package.version}} --depth 1 https://github.com/kubernetes-sigs/cluster-api.git
+    - uses: test/kwok/cluster
+    - runs: kubectl apply -f cluster-api/config/crd/bases/
+    - runs: kubectl apply -f cluster-api/test/infrastructure/docker/config/crd/bases/
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/controller --profiler-address=127.0.0.1:8080 --health-addr=127.0.0.1:8081
+        expected_output: |
+          Starting workers
+          Starting webhook server
+          Starting EventSource
+          All workers finished
+        timeout: 30
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/kubeadm-control-plane-controller
+        expected_output: |
+          Registering webhook
+          Conversion webhook enabled
+          Starting manager
+          problem running manager
+        timeout: 30
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/kubeadm-bootstrap-controller
+        expected_output: |
+          Stopping and waiting for webhooks
+          Stopping and waiting for HTTP servers
+        timeout: 30
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/capd-manager
+        expected_output: |
+          Registering webhook
+          Conversion webhook enabled
+          Starting manager
+          Problem running manager
+        timeout: 30
+    - runs: |
+        /usr/bin/clusterctl version | grep -q ${{package.version}}
+        /usr/bin/clusterctl --help | grep -q "Get started with Cluster API using clusterctl"
+        /usr/bin/clusterctl config repositories | grep helm
+
+update:
+  enabled: true
+  git:
+    tag-filter-prefix: v1.12
+    strip-prefix: v

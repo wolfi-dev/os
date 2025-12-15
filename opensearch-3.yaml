@@ -5,7 +5,7 @@
 package:
   name: opensearch-3
   version: "3.3.2"
-  epoch: 0
+  epoch: 1
   description: Open source distributed and RESTful search engine.
   copyright:
     - license: Apache-2.0
@@ -31,13 +31,25 @@ environment:
   contents:
     packages:
       - bash
+      - build-base
       - busybox
       - ca-certificates-bundle
+      - cmake-3
       - curl
+      - gcc-14
+      - gcc-14-default
+      - gfortran
+      - git
       - gradle-8
+      - libgomp
+      - liblapack
+      - liblapacke
+      - openblas
+      - openblas-dev
       - openjdk-21-default-jdk
       - patch
       - unzip
+      - zlib-dev
   environment:
     JAVA_HOME: /usr/lib/jvm/java-21-openjdk
     LANG: "en_US.UTF-8"
@@ -201,7 +213,67 @@ subpackages:
           # to the last line
           echo >> gradle.properties
           echo "org.gradle.daemon=false" >> gradle.properties
-          ./gradlew clean assemble -Dbuild.snapshot="false" -Dbuild.version_qualifier="" -Dopensearch.version="${{package.version}}" -x check -x integTest -x javadoc -PfailOnJavadocWarning=false --stacktrace
+
+          # k-nn plugin requires special handling for building JNI native libraries
+          if [ "${{range.key}}" = "k-nn" ]; then
+            # Disable static BLAS linking and use OpenBLAS
+            sed -i 's/set(BLA_STATIC ON)/set(BLA_VENDOR OpenBLAS)\nset(BLA_STATIC OFF)/' ./jni/cmake/init-faiss.cmake
+
+            # Set NMSLIB_SIMD_FLAGS based on architecture
+            if [ "${{build.arch}}" = "x86_64" ]; then
+              NMSLIB_SIMD_FLAGS="x86-64"
+            else
+              NMSLIB_SIMD_FLAGS="armv8-a"
+            fi
+
+            # Build the Java plugin first
+            ./gradlew build \
+              --no-daemon \
+              --refresh-dependencies \
+              -Dbuild.snapshot=false \
+              -Dbuild.version_qualifier= \
+              -Dopensearch.version=${{package.version}} \
+              -Dbuild.lib.commit_patches=false \
+              -Dnmslib_simd_flags=$NMSLIB_SIMD_FLAGS \
+              -x check \
+              -x integTest \
+              -x test \
+              -x javadoc \
+              -PfailOnJavadocWarning=false \
+              --stacktrace
+
+            # Build Faiss base library (without AVX)
+            ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dbuild.lib.commit_patches=false -Dnproc.count=4 --stacktrace
+
+            # Clear CMake cache before building nmslib
+            rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+
+            # Build Nmslib library
+            ./gradlew :buildJniLib -Pknn_libs=opensearchknn_nmslib -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+
+            # AVX variants only for x86_64
+            if [ "${{build.arch}}" = "x86_64" ]; then
+              rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+              ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx2.enabled=true -Davx512.enabled=false -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+
+              rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+              ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=true -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+
+              rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+              ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512_spr.enabled=true -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+            fi
+          else
+            # For other plugins, single gradle run
+            ./gradlew clean assemble \
+              -Dbuild.snapshot="false" \
+              -Dbuild.version_qualifier="" \
+              -Dopensearch.version="${{package.version}}" \
+              -x check \
+              -x integTest \
+              -x javadoc \
+              -PfailOnJavadocWarning=false \
+              --stacktrace
+          fi
 
           # useful for finding generated zip file we use to extract into the final apk
           find . -name "*.zip"
@@ -234,6 +306,9 @@ subpackages:
           case "${{range.key}}" in
               "alerting")
                   zip_dir="./alerting"
+                  ;;
+              "k-nn")
+                  zip_dir="."
                   ;;
               "ml-commons"|"sql")
                   zip_dir="./plugin"
@@ -271,7 +346,35 @@ subpackages:
 
           # Unzip the main plugin distribution
           unzip "${zip_dir}/build/distributions/${plugin_name}-${{vars.plugin_version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/plugins/${plugin_name}"
+
+          # Copy JNI native libraries for k-nn plugin
+          if [ "${{range.key}}" = "k-nn" ]; then
+            mkdir -p "${destination_base}/plugins/${plugin_name}/lib"
+            cp ./jni/build/release/libopensearchknn*.so "${destination_base}/plugins/${plugin_name}/lib/"
+            cp /usr/lib/libgomp.so* "${destination_base}/plugins/${plugin_name}/lib/"
+          fi
       - uses: strip
+    test:
+      pipeline:
+        - runs: |
+            # Verify k-nn JNI native libraries are present
+            if [ "${{range.key}}" = "k-nn" ]; then
+              # Common libraries (all architectures)
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_common.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_nmslib.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_util.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libgomp.so.1
+
+              # x86_64-specific AVX variant libraries
+              if [ "${{build.arch}}" = "x86_64" ]; then
+                stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss_avx2.so
+                stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss_avx512.so
+                stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss_avx512_spr.so
+              fi
+
+              echo "All k-nn JNI native libraries verified"
+            fi
 
 update:
   enabled: true

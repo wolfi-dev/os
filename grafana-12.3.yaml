@@ -1,0 +1,166 @@
+package:
+  name: grafana-12.3
+  version: "12.3.0"
+  epoch: 2 # CVE-2025-61729
+  # When bumping, check if we can unpin nodejs-22.
+  # Remove this comment when nodejs-22 is unpinned.
+  description: The open and composable observability and data visualization platform.
+  copyright:
+    - license: AGPL-3.0-or-later
+  dependencies:
+    runtime:
+      - bash
+    provides:
+      - grafana=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - findutils
+      - go
+      # Dear traveler, if you find yourself looking at this package
+      # and you find why is this pinned, this is because upstream is having
+      # issues compiling webpacks with latest nodejs-22.18.0.
+      # More information can be found in upstream issue:
+      # https://github.com/grafana/grafana/issues/109218
+      # If by any chance you find that the issue is fixed, please do unpin.
+      # And remove these comments.
+      - nodejs-22=~22.17.1
+      - npm
+      - posix-libc-utils
+      - py3-setuptools
+      - python3
+      - yarn
+      - zlib-dev
+  environment:
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 1
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+\.\d+)\.(\d+)$
+    replace: "${1}+security-${2}"
+    to: mangled-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 20051fb1fc604fc54aae76356da1c14612af41d0
+      repository: https://github.com/grafana/grafana
+      tag: v${{vars.mangled-package-version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+        github.com/openfga/openfga@v1.11.1
+
+  - uses: patch
+    with:
+      patches: append-buildvcs-false-to-go-build.patch
+
+  - runs: |
+      # Update the workspace to the Go version required by dependencies: `make
+      # build` fails without this, and we can't use `go work use` because it's
+      # a noop until some parts of `make build` have run
+      # Get the current go version from the go.mod file and then update go.work
+      GO_VERSION=$(grep '^go ' go.mod | awk '{print $2}')
+      sed -i "s/go [0-9]\+\.[0-9]\+\.[0-9]\+/go ${GO_VERSION}/" go.work
+
+  - name: Build
+    runs: |
+      yarn install
+
+      # Builds frontend and backend (build-go build-js)
+      make build
+
+  - name: package
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/bin
+      mkdir -p ${{targets.destdir}}/usr/share/grafana
+      mkdir -p ${{targets.destdir}}/etc/grafana
+
+      cp bin/linux-*/* ${{targets.destdir}}/usr/bin/
+      cp -r conf public ${{targets.destdir}}/usr/share/grafana/
+
+      mkdir -p ${{targets.destdir}}/usr/share/grafana/scripts
+      mkdir -p ${{targets.destdir}}/usr/share/grafana/bin
+
+      cp conf/sample.ini ${{targets.destdir}}/etc/grafana/grafana.ini
+      cp conf/sample.ini ${{targets.destdir}}/etc/grafana/grafana.ini.example
+
+subpackages:
+  - name: ${{package.name}}-oci-compat
+    dependencies:
+      provides:
+        - grafana-oci-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/opt/grafana
+          mv ./packaging/docker/run.sh ${{targets.subpkgdir}}/opt/grafana/
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: grafana-oci-compat
+            real-pkg-name: ${{subpkg.name}}
+
+update:
+  enabled: true
+  version-transform:
+    - match: ^(\d+\.\d+\.\d+)\+security-(\d+)
+      replace: $1.$2
+  github:
+    identifier: grafana/grafana
+    strip-prefix: v
+    tag-filter-prefix: v12.3.
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - curl
+        - jq
+        - procps
+        - shadow
+  pipeline:
+    - name: "Check Grafana version"
+      runs: |
+        grafana -v
+        grafana --version
+        grafana --help
+        grafana-cli --version
+        grafana-cli --help
+        grafana-server --version
+        grafana-server --help
+    - name: "Check Grafana CLI version"
+      runs: |
+        grafana-cli -v
+    - name: "Check Grafana server version"
+      runs: |
+        grafana-server -v
+    - name: "Test Grafana server startup"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          grafana-server \
+            --config /etc/grafana/grafana.ini \
+            --homepath /usr/share/grafana \
+            --packaging=wolfi
+        timeout: 60
+        expected_output: |
+          Starting Grafana
+          HTTP Server Listen
+        post: |
+          curl -s http://localhost:3000/api/health
+          curl -s http://localhost:3000/api/org
+          curl -s http://localhost:3000/api/dashboards/home
+    - name: "Check configuration file"
+      runs: |
+        grep -q "app_mode = production" /etc/grafana/grafana.ini
+    - name: "Test Grafana CLI commands"
+      runs: |
+        grafana-cli plugins list-remote

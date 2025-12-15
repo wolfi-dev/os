@@ -1,0 +1,111 @@
+package:
+  name: php-8.5-protobuf
+  version: "4.33.2"
+  epoch: 0
+  description: "Protocol Buffers - Google's data interchange format"
+  copyright:
+    - license: BSD-3-Clause
+  dependencies:
+    runtime:
+      - ${{package.name}}-config
+      - php-${{vars.phpMM}}
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - build-base
+      - busybox
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-dev
+      - protobuf-dev
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://pecl.php.net/get/protobuf-${{package.version}}.tgz
+      expected-sha512: 147e45892bafe525cbf22e1d14536bac423ae421f506680a65b0fdfe0125eccaed01a0ccae9b93c97718b0f16b54b81798bb36b267674667750aa8607c806f67
+
+  - name: Prepare build
+    runs: phpize
+
+  - name: Configure build
+    runs: ./configure
+
+  # The upstream code enables aarch64-specific optimizations, which later will segfault in our tests
+  # because illegal CPU instructions are being used. I guess this is because different arm64 instructions extensions are
+  # embedded in the code compared to what most arm64 CPU could run.
+  # Disable the arm64-optimized ASM, and hope the non-optimized version can run just fine and not cause other problems.
+  # Before this change, functions call would be:
+  #   encode_varint() --> encode_longvarint_arm64()
+  # After this change, it would be:
+  #   encode_varint() --> encode_longvarint()
+  - if: ${{build.arch}} == "aarch64"
+    name: Disable aarch64 ASM optimizations
+    runs: |
+      find . -type f -name "*.c" -o -name "*.h" | xargs sed -i 's/#ifdef UPB_ARM64_ASM/#if 0/g'
+
+  - name: Build and install
+    runs: |
+      INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
+
+subpackages:
+  - name: ${{package.name}}-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=protobuf.so" > "${{targets.subpkgdir}}/etc/php/conf.d/protobuf.ini"
+
+update:
+  enabled: true
+  release-monitor:
+    identifier: 141406
+
+test:
+  environment:
+    contents:
+      packages:
+        - protobuf
+        - protoc
+  pipeline:
+    - name: "Verify PHP extension is loaded"
+      runs: |
+        php -m | grep -q protobuf
+    - name: "Check extension information"
+      runs: |
+        php --ri protobuf
+    - name: "Test with generated protobuf class"
+      runs: |
+        cat > message.proto << 'EOF'
+        syntax = "proto3";
+        package test;
+        message SimpleMessage {
+          string name = 1;
+          int32 id = 2;
+        }
+        EOF
+        protoc --php_out=. message.proto
+
+        cat > test.php << 'EOF'
+        <?php
+        require_once('GPBMetadata/Message.php');
+        require_once('Test/SimpleMessage.php');
+
+        $message = new Test\SimpleMessage();
+        $message->setName("test");
+        $message->setId(123);
+
+        $data = $message->serializeToString();
+        $newMessage = new Test\SimpleMessage();
+        $newMessage->mergeFromString($data);
+
+        echo ($newMessage->getName() === "test" && $newMessage->getId() === 123) ? "OK" : "FAIL";
+        EOF
+        php test.php | grep -q "OK"
+    - uses: test/tw/ldd-check

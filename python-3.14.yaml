@@ -1,0 +1,434 @@
+package:
+  name: python-3.14
+  version: "3.14.2"
+  epoch: 2
+  description: "the Python programming language"
+  copyright:
+    - license: PSF-2.0
+  resources:
+    cpu: 8
+    memory: 8Gi
+  dependencies:
+    runtime:
+      - ${{package.name}}-base=${{package.full-version}}
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - bzip2-dev
+      - ca-certificates-bundle
+      # This is a year old. Hopefully 3.14.x updates will move this to current.
+      - clang-${{vars.clang-version}}
+      - expat-dev
+      - gdbm-dev
+      - libcap-utils
+      - libffi-dev
+      - libx11-dev
+      - linux-headers
+      # This is a year old. Hopefully 3.14.x updates will move this to current.
+      - llvm-${{vars.clang-version}}
+      - mpdecimal-dev
+      - ncurses-dev
+      - openssl-dev
+      # This is required for the JIT-enabled build. Hopefully 3.14.x updates
+      # will remove this requirement, or it will vanish when the JIT version
+      # becomes the default.
+      - python-3.13
+      - readline-dev
+      - sqlite-dev
+      - tcl-dev
+      - tk-dev
+      - xz-dev
+      - zlib-dev
+      - zstd-dev
+
+vars:
+  clang-version: 19
+  python-config: |
+    --host=__host_triplet_gnu__ \
+    --build=__host_triplet_gnu__ \
+    --target=__host_triplet_gnu__ \
+    --prefix=/usr \
+    --enable-ipv6 \
+    --enable-loadable-sqlite-extensions \
+    --enable-shared \
+    --with-lto \
+    --with-computed-gotos \
+    --with-dbmliborder=gdbm:ndbm \
+    --with-system-expat \
+    --with-system-libmpdec \
+    --without-ensurepip \
+    --with-builtin-hashlib-hashes=blake2 \
+    --with-wheel-pkg-dir=/usr/share/python-wheels
+
+# creates helpful python3.M and 3.M variables
+var-transforms:
+  - from: ${{vars.python-config}}
+    match: '__host_triplet_gnu__'
+    replace: ${{host.triplet.gnu}}
+    to: python-config
+  - from: ${{package.name}}
+    match: '-'
+    replace: ''
+    to: python
+  - from: ${{vars.python}}
+    match: (.*)
+    replace: '${1}t'
+    to: python-t
+  - from: ${{package.version}}
+    match: (\d).(\d+).(\d+)
+    replace: '$1.$2'
+    to: pyversion
+  - from: ${{vars.pyversion}}
+    match: (.*)
+    replace: '${1}t'
+    to: pyversion-t
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: df793163d5821791d4e7caf88885a2c11a107986
+      repository: https://github.com/python/cpython.git
+      tag: v${{package.version}}
+      cherry-picks: |
+        3.14/027f21e417b26eed4505ac2db101a4352b7c51a0: [CVE-2025-12084]
+
+  - name: Force use of system libraries
+    runs: |
+      rm -rf Modules/expat \
+        Modules/_ctypes/darwin* \
+        Modules/_ctypes/libffi*
+
+  - uses: patch
+    with:
+      patches: gh-118224.patch gh-127301.patch
+
+  - name: Clone patched source for no-GIL build
+    runs: |
+      mkdir no-gil
+      tar -cf - --exclude=no-gil . | (cd no-gil; tar -xf -)
+
+  # Experimental JIT support
+  #
+  # --enable-optimizations with clang requires PGO support (in particular,
+  # we're missing libclang_rt.profile). This build configuration won't be
+  # optimal and might not produce any performance gains.
+  - uses: autoconf/configure
+    with:
+      opts: |
+        CC=clang \
+        --enable-experimental-jit=yes-off \
+        --with-tail-call-interp \
+        ${{vars.python-config}}
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - runs: |
+      find ${{targets.destdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'tests' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+
+      cd ${{targets.destdir}}/usr/bin
+      rm -f idle3* 2to3*
+      rm ${{targets.destdir}}/usr/lib/libpython3.so
+
+      # add dubious python -> python3 link
+      ln -s python3 ${{targets.destdir}}/usr/bin/python
+
+      # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+      cd ${{targets.destdir}}/usr/lib/${{vars.python}}
+      rm site-packages/README.txt
+      rmdir site-packages
+
+  - runs: |
+      rm -R "${{targets.destdir}}/usr/lib/${{vars.python}}/idlelib"
+
+      rm -R ${{targets.destdir}}/usr/lib/${{vars.python}}/ensurepip/_bundled/
+
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+      export LD_LIBRARY_PATH="${{targets.destdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      ${{targets.destdir}}/usr/bin/${{vars.python}} -m compileall --invalidation-mode=unchecked-hash \
+          -r100 ${{targets.destdir}}/usr/lib/
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}t"
+    description: "Python with the GIL disabled (free threading)"
+    dependencies:
+      provides:
+        - python3t=${{package.full-version}}
+        - python-3t=${{package.full-version}}
+      runtime:
+        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
+        # which is provided by tk.  melange SCA does not find this dependency.
+        - tk
+    pipeline:
+      - working-directory: no-gil
+        pipeline:
+          - uses: autoconf/configure
+            with:
+              opts: |
+                --disable-gil \
+                --enable-optimizations \
+                ${{vars.python-config}}
+          - uses: autoconf/make
+          - uses: autoconf/make-install
+          - name: "Clean out base items"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+
+              cd ${{targets.subpkgdir}}/usr/bin
+              rm idle3*
+              rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
+
+              # add dubious python -> python3 link
+              ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
+
+              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/site-packages
+
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/idlelib
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/ensurepip/_bundled/
+
+              rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
+              rm -R ${{targets.subpkgdir}}/usr/include
+              rm -R ${{targets.subpkgdir}}/usr/share
+              rm ${{targets.subpkgdir}}/usr/lib/pkgconfig/python-3.14-*.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/python3-*.pc
+          # AFAIK the .pyc/.pyo files are compatible between GIL/no-GIL builds, but
+          # the .so files are not, so we include everything in here out of an
+          # abundance of caution.
+          - name: "Precompile .py files"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+              export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+              ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -m compileall --invalidation-mode=unchecked-hash \
+                  -r100 ${{targets.subpkgdir}}/usr/lib/
+          - uses: strip
+    test:
+      pipeline:
+        - working-directory: no-gil
+          pipeline:
+            - uses: test/tw/ldd-check
+            - uses: test/tw/symlink-check
+            - uses: test/tw/ver-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+            - uses: test/tw/help-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+            - name: Verify no-GIL build
+              runs: |
+                ${{vars.python-t}} -c 'import sysconfig; assert(sysconfig.get_config_var("Py_GIL_DISABLED"))'
+
+  - name: "${{package.name}}-base"
+    description: "${{package.name}} without /usr/bin/python3"
+    dependencies:
+      runtime:
+        - py3-pip-wheel
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/bin/${{vars.python}} \
+              ${{targets.destdir}}/usr/bin/pydoc${{vars.pyversion}} \
+              ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/lib/${{vars.python}} \
+             ${{targets.subpkgdir}}/usr/lib
+          mv -v ${{targets.destdir}}/usr/lib/libpython${{vars.pyversion}}.so.* \
+             ${{targets.subpkgdir}}/usr/lib
+
+          # pyconfig.h is needed at runtime... ugh.
+          d=usr/include/${{vars.python}}
+          mkdir -p "${{targets.subpkgdir}}"/$d
+          mv "${{targets.destdir}}"/$d/pyconfig.h "${{targets.subpkgdir}}"/$d/
+
+          # move usr/lib/python3.X/config-3.X-x86_64-linux-gnu
+          # back into main package so the -base-dev can take it below.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.destdir}}/$d"
+          mv -v "${{targets.subpkgdir}}/$d"/config-${{vars.pyversion}}* \
+              "${{targets.destdir}}/$d"
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: Version check
+          runs: |
+            ${{vars.python}} version-check.py ${{package.version}}
+        - name: Verify venv installs expected packages
+          runs: |
+            set +x
+            d=$(mktemp -d)
+            echo "$ ${{vars.python}} -m venv $d"
+            ${{vars.python}} -m venv "$d"
+            echo "$ $d/bin/pip list"
+            $d/bin/pip list | tee "$d/list.txt"
+            wd=/usr/share/python-wheels
+            for pkg in pip ; do
+              set -- "$wd"/$pkg-*.whl
+              [ $# -eq 1 ] || {
+                echo "ERROR: found $# wheels in $wd matching $pkg-*.whl";
+                exit 1;
+              }
+              [ -f "$1" ] || {
+                echo "ERROR: $wd/$pkg-*.whl ('$1') was not a file"
+                exit 1
+              }
+              # name is like pip-24.2-py3-none-any.whl. second token is version.
+              wheel=${1}
+              tmp=${wheel##*/}
+              tmp=${tmp#*-}
+              ver=${tmp%%-*}
+              if ! grep -q "${pkg}[ ]\+${ver}$" "$d/list.txt"; then
+                  echo "FAIL: did not find '$pkg==$ver' in venv"
+                  echo "pip list had:"
+                  sed 's,^,>,' "$d/list.txt"
+                  exit 1
+              fi
+              echo "PASS: venv installed '$pkg==$ver'"
+            done
+
+            rm -Rf "$d"
+
+  - name: "${{package.name}}-privileged-netbindservice"
+    description: "Allows Python to bind to ports less than 1024"
+    options:
+      # This replaces the Python binary and depends on base. We don't want
+      # to generate any dependencies or provide anything that would clash
+      # with the rest of Python
+      no-depends: true
+      no-provides: true
+    dependencies:
+      replaces:
+        - ${{package.name}}-base
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/usr/bin"
+          cp "${{targets.outdir}}/${{package.name}}-base/usr/bin/${{vars.python}}" "${{targets.contextdir}}/usr/bin/"
+          # Note this sets the capability the test using getcap fails but the
+          # capability is set in images with this package.
+          setcap cap_net_bind_service=+eip "${{targets.contextdir}}/usr/bin/${{vars.python}}"
+
+  - name: "${{package.name}}-tk"
+    dependencies:
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
+        # which is provided by tk.  melange SCA does not find this dependency.
+        - tk
+    pipeline:
+      - runs: |
+          # these got moved by python-3.xx-base from ${{targets.destdir}}
+          fromd="${{targets.destdir}}-base"
+          tod=${{targets.contextdir}}
+          d=usr/lib/${{vars.python}}
+
+          mkdir -p "$tod/$d/lib-dynload"
+          mv "$fromd/$d/lib-dynload"/_tkinter.*.so "$tod/$d/lib-dynload/"
+          mv "$fromd/$d/tkinter" "$tod/$d/"
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: python/import
+          with:
+            python: python${{vars.pyversion}}
+            import: tkinter
+
+  - name: "${{package.name}}-doc"
+    description: "python3.14 documentation"
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/docs
+
+  - name: "${{package.name}}-dev"
+    description: "python3.14 development headers"
+    dependencies:
+      runtime:
+        - clang-${{vars.clang-version}}
+        - ${{package.name}}=${{package.full-version}}
+        - ${{package.name}}-base-dev=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/bin/python3-config ${{targets.subpkgdir}}/usr/bin
+
+          d="usr/lib/pkgconfig"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v \
+             "${{targets.destdir}}"/$d/python3-embed.pc \
+             "${{targets.destdir}}"/$d/python3.pc \
+             "${{targets.subpkgdir}}/$d/"
+
+  - name: "${{package.name}}-base-dev"
+    description: "python3 development headers"
+    dependencies:
+      runtime:
+        - clang-${{vars.clang-version}}
+        - ${{package.name}}-base=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # usr/lib/python3.X/config-3.X-x86_64-linux-gnu
+          # split/dev will only move 2 files from it, but we want all of it.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v "${{targets.destdir}}"/$d/config-${{vars.pyversion}}* \
+             "${{targets.subpkgdir}}"/$d
+      - uses: split/dev
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/symlink-check
+    - uses: test/tw/ver-check
+      with:
+        bins: python ${{vars.python}}
+    - uses: test/tw/help-check
+      with:
+        bins: pydoc3 python ${{vars.python}}
+    - name: Verify Python names
+      runs: |
+        # main package should provide 'python' and 'python3'.
+        python version-check.py ${{package.version}}
+        python3 version-check.py ${{package.version}}
+    - name: Verify working python3 -m venv
+      runs: |
+        d=$(mktemp -d)
+        python3 -m venv "$d"
+        $d/bin/pip list
+        $d/bin/pip check
+        rm -Rf "$d"
+    - name: Verify functioning JIT
+      runs: |
+        export PYTHON_JIT=1
+        python3 jit-check.py
+    - name: (free-threaded) Verify working python3 -m venv
+      runs: |
+        export PYTHON_JIT=1
+        d=$(mktemp -d)
+        python3 -m venv "$d"
+        $d/bin/pip list
+        $d/bin/pip check
+        rm -Rf "$d"
+
+update:
+  enabled: true
+  shared: true
+  github:
+    identifier: python/cpython
+    strip-prefix: v
+    tag-filter: v3.14
+    use-tag: true

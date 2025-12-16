@@ -1,10 +1,16 @@
 package:
   name: apisix-ingress-controller
   version: "1.8.4"
-  epoch: 3 # CVE-2025-47907
+  epoch: 7
   description: APISIX Ingress Controller for Kubernetes.
   copyright:
     - license: Apache-2.0
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
 
 pipeline:
   - uses: git-checkout
@@ -16,10 +22,16 @@ pipeline:
   - uses: go/bump
     with:
       deps: |-
-        golang.org/x/crypto@v0.35.0
+        golang.org/x/crypto@v0.45.0
+      modroot: test/e2e
+
+  - uses: go/bump
+    with:
+      deps: |-
         golang.org/x/net@v0.38.0
         golang.org/x/oauth2@v0.27.0
         google.golang.org/grpc@v1.57.1
+        golang.org/x/crypto@v0.45.0
 
   - uses: go/build
     with:
@@ -45,6 +57,60 @@ subpackages:
         - runs: |
             stat /ingress-apisix/apisix-ingress-controller
 
+  - name: ${{package.name}}-iamguarded-compat
+    description: Compat package for iamguarded apisix-ingress-controller image
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: apisix-ingress-controller
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/bin
+          ln -sf ../../../../usr/bin/apisix-ingress-controller ${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/bin/apisix-ingress-controller
+          install -Dpm0644 -t "${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/conf/" ./conf/apisix-schema.json
+      - uses: iamguarded/finalize-compat
+        with:
+          package: apisix-ingress-controller
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+            - curl
+            - wait-for-it
+        environment:
+          PATH: "/opt/iamguarded/apisix-ingress-controller/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          IAMGUARDED_APP_NAME: "apisix-ingress-controller"
+      pipeline:
+        - pipeline:
+            - uses: test/tw/symlink-check
+            - uses: test/tw/ver-check
+              with:
+                bins: apisix-ingress-controller
+            - uses: test/kwok/cluster
+            - uses: test/daemon-check-output
+              with:
+                setup: |
+                  kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+                start: |
+                  /opt/iamguarded/apisix-ingress-controller/bin/apisix-ingress-controller ingress \
+                    --default-apisix-cluster-base-url http://apisix-service:9180/apisix/admin \
+                    --kubeconfig /tmp/kubeconfig.yaml
+                timeout: 30
+                expected_output: |
+                  start leader election
+                  start api server
+                post: |
+                  wait-for-it localhost:8080
+                  DURATION_ONE="$(curl -fsSL http://127.0.0.1:8080/metrics | grep -F -e go_gc_duration_seconds)"
+                  sleep 2
+                  DURATION_TWO="$(curl -fsSL http://127.0.0.1:8080/metrics | grep -q go_gc_duration_seconds)"
+                  if [ "${DURATION_ONE}" == "${DURATION_TWO}" ] ; then
+                      echo "Expected durations to be different, output may be garbled"
+                      exit 1
+                  fi
+
 update:
   enabled: true
   github:
@@ -56,6 +122,7 @@ test:
     contents:
       packages:
         - curl
+        - wait-for-it
   pipeline:
     - runs: |
         set -o pipefail
@@ -73,4 +140,11 @@ test:
           start leader election
           start api server
         post: |
-          curl -fsSL http://127.0.0.1:8080/metrics | grep -q go_gc_duration_seconds && echo "Metrics endpoint is live"
+          wait-for-it localhost:8080
+          DURATION_ONE="$(curl -fsSL http://127.0.0.1:8080/metrics | grep -F -e go_gc_duration_seconds)"
+          sleep 2
+          DURATION_TWO="$(curl -fsSL http://127.0.0.1:8080/metrics | grep -q go_gc_duration_seconds)"
+          if [ "${DURATION_ONE}" == "${DURATION_TWO}" ] ; then
+              echo "Expected durations to be different, output may be garbled"
+              exit 1
+          fi

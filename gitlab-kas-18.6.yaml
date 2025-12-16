@@ -1,0 +1,140 @@
+package:
+  name: gitlab-kas-18.6
+  version: "18.6.2"
+  epoch: 0 # CVE-2025-61729
+  description: GitLab KAS is a component installed together with GitLab. It is required to manage the GitLab agent for Kubernetes.
+  copyright:
+    - license: MIT
+  dependencies:
+    provides:
+      - gitlab-kas=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.com/gitlab-org/cluster-integration/gitlab-agent
+      tag: v${{package.version}}
+      expected-commit: 29e5ab9689e401e9a2992e4e3115da726d760ab4
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+
+  - uses: go/build
+    with:
+      packages: ./cmd/kas
+      output: kas
+      ldflags: |
+        -w -X gitlab.com/gitlab-org/cluster-integration/gitlab-agent/v${{vars.major-version}}/internal/cmd.Version=v${{package.version}}
+        -X gitlab.com/gitlab-org/cluster-integration/gitlab-agent/v${{vars.major-version}}/internal/cmd.GitRef=$(git rev-parse HEAD)
+
+subpackages:
+  - name: gitlab-agent-${{vars.major-minor-version}}
+    description: GitLab Agent for Kubernetes allows to integrate your cluster with GitLab in a secure way.
+    dependencies:
+      provides:
+        - gitlab-agent=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/agentk
+          output: agentk
+          ldflags: |
+            -w
+            -X gitlab.com/gitlab-org/cluster-integration/gitlab-agent/v${{vars.major-version}}/internal/cmd.Version=v${{package.version}}
+            -X gitlab.com/gitlab-org/cluster-integration/gitlab-agent/v${{vars.major-version}}/internal/cmd.GitRef=$(git rev-parse HEAD)
+    test:
+      pipeline:
+        - name: "Test agentk version and help"
+          runs: |
+            set -euo pipefail
+            agentk --help | grep "kas-address"
+            agentk --version | grep "${{package.version}}"
+            agentk --help | grep "token-file"
+            agentk --help | grep "GitLab Agent for Kubernetes"
+
+test:
+  environment:
+    contents:
+      packages:
+        - wait-for-it
+        - curl
+        - valkey
+        - valkey-cli
+  pipeline:
+    - name: "Version and help tests for KAS and Agent"
+      runs: |
+        set -euo pipefail
+        kas --version | grep "${{package.version}}"
+        kas --help | grep "GitLab Kubernetes Agent Server"
+    - name: "Test KAS daemon with Valkey (Redis)"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          openssl rand -base64 32 > /tmp/auth_secret
+          openssl rand -base64 48 > /tmp/websocket_secret
+
+          valkey-server --port 6379 --daemonize yes --pidfile /tmp/valkey.pid --logfile /tmp/valkey.log
+
+          sleep 5
+
+          # Create KAS configuration with Redis
+          cat > /tmp/kas-config.yaml <<EOF
+          gitlab:
+            address: http://localhost:3000
+            authentication_secret_file: /tmp/auth_secret
+          redis:
+            server:
+              address: 127.0.0.1:6379
+          agent:
+            listen:
+              address: 127.0.0.1:8150
+              network: tcp
+            kubernetes_api:
+              listen:
+                address: 127.0.0.1:8154
+                network: tcp
+              websocket_token_secret_file: /tmp/websocket_secret
+          observability:
+            listen:
+              address: 127.0.0.1:8151
+              network: tcp
+          api:
+            listen:
+              address: 127.0.0.1:8153
+              network: tcp
+              authentication_secret_file: /tmp/auth_secret
+          private_api:
+            listen:
+              address: 127.0.0.1:8155
+              network: tcp
+              authentication_secret_file: /tmp/auth_secret
+          EOF
+        start: kas --configuration-file=/tmp/kas-config.yaml
+        timeout: 30
+        expected_output: |
+          Running KAS
+          endpoint is up
+        post: |
+          set -o pipefail
+          wait-for-it 127.0.0.1:8151 -t 10
+
+          curl -fsSL -o /dev/null -w "%{http_code}" http://127.0.0.1:8151/liveness | grep -F "200"
+          curl -fsSL -o /dev/null -w "%{http_code}" http://127.0.0.1:8151/readiness | grep -F "200"
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: v18.6

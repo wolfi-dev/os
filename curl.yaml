@@ -1,7 +1,7 @@
 package:
   name: curl
-  version: "8.16.0"
-  epoch: 1
+  version: "8.17.0"
+  epoch: 0
   description: "URL retrieval utility and library"
   copyright:
     - license: MIT
@@ -27,8 +27,9 @@ environment:
       - libpsl-dev
       - libtool
       - nghttp2-dev
+      - nghttp3-dev
       - openldap-dev
-      - openssl-dev
+      - openssl-hardened-dev
       - perl
       - wolfi-base
       - zlib-dev
@@ -44,7 +45,7 @@ pipeline:
     with:
       repository: https://github.com/curl/curl.git
       tag: curl-${{vars.mangled-package-version}}
-      expected-commit: 11b991232fbcaa88e2b1faecac224416b0001e35
+      expected-commit: 400fffa90f30c7a2dc762fa33009d24851bd2016
 
   - runs: autoreconf -vif
 
@@ -61,6 +62,7 @@ pipeline:
         --without-rustls \
         --with-nghttp2 \
         --with-pic \
+        --with-openssl-quic \
         --enable-ldap \
         --disable-ntlm \
         --without-libssh2 \
@@ -86,9 +88,7 @@ subpackages:
     pipeline:
       - uses: split/dev
       # cd2nroff is needed by trurl
-      - runs: |
-          mkdir -p "${{targets.contextdir}}"/usr/bin
-          mv scripts/cd2nroff "${{targets.contextdir}}"/usr/bin
+      - runs: install -Dpm0755 -t "${{targets.contextdir}}"/usr/bin ./scripts/cd2nroff
     dependencies:
       runtime:
         - brotli-dev
@@ -97,11 +97,14 @@ subpackages:
         - openssl-dev
     test:
       pipeline:
-        - runs: |
-            curl-config --version
-            curl-config --help
         - uses: test/pkgconf
         - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: curl-config
+        - uses: test/tw/help-check
+          with:
+            bins: curl-config
 
   - name: "curl-doc"
     description: "documentation for curl"
@@ -131,6 +134,22 @@ subpackages:
             virtual-pkg-name: "libcurl-abi"
             real-pkg-name: "${{subpkg.name}}"
 
+  - name: ${{package.name}}-oci-entrypoint
+    description: "Entrypoint subpackage for official curl image"
+    dependencies:
+      runtime:
+        - curl
+    pipeline:
+      - uses: git-checkout
+        with:
+          repository: https://github.com/curl/curl-container
+          branch: main
+      - runs: |
+          install -Dm755 etc/entrypoint.sh ${{targets.subpkgdir}}/entrypoint.sh
+    test:
+      pipeline:
+        - uses: test/tw/symlink-check
+
 update:
   enabled: true
   version-separator: _
@@ -140,14 +159,62 @@ update:
 
 test:
   environment:
+    accounts:
+      groups:
+        - groupname: nginx
+          gid: 65532
+      users:
+        - username: nginx
+          gid: 65532
+          uid: 65532
     contents:
       packages:
         - git
+        - nginx
+        - wait-for-it
   pipeline:
+    - uses: test/tw/ver-check
+      with:
+        bins: curl
+    - uses: test/tw/help-check
+      with:
+        bins: curl
     - runs: |
-        curl --version
-        curl --version | grep 'ldap ldaps'
-        curl -v https://example.com
-        curl -s --output /dev/null --compressed https://aur.archlinux.org
-        git clone https://github.com/chainguard-dev/lots-of-refs.git
-        curl --help
+        curl --version | grep "ldap ldaps"
+        curl --version | grep "HTTP3"
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          tee /etc/nginx/nginx.conf <<EOF
+          daemon off;
+
+          events {
+              worker_connections 1024;
+          }
+
+          http {
+            server {
+              listen       8080 default_server;
+              listen       [::]:8080 default_server;
+              server_name  _;
+              root         /usr/share/nginx/html;
+              location /hello {
+                add_header Content-Type text/html;
+
+                return 200 "Hello, Linky!";
+              }
+              location /redirect {
+                return 301 /hello;
+              }
+            }
+          }
+          EOF
+
+          nginx -t
+        start: nginx
+        expected_output: " "
+        post: |
+          set -x
+          wait-for-it localhost:8080
+          curl http://localhost:8080/hello | grep -F -e "Hello, Linky!"
+          curl -L http://localhost:8080/redirect | grep -F -e "Hello, Linky!"

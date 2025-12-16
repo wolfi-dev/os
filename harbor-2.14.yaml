@@ -1,13 +1,19 @@
 package:
   name: harbor-2.14
-  version: "2.14.0"
-  epoch: 1 # GHSA-rq77-p4h8-4crw
+  version: "2.14.1"
+  epoch: 2
   description: An open source trusted cloud native registry project that stores, signs, and scans content
   copyright:
     - license: Apache-2.0
   dependencies:
     provides:
       - harbor=${{package.full-version}}
+
+# To be updated as upstream harbor distribution requirements, when drift check fails for harbor-distribution subpackage.
+vars:
+  custom-distribution-version: 2.8.3
+  harbor-distribution-release-branch: 2.8
+  harbor-distribution-expected-commit: 0c62ec3ec8df7ea91c819448236a67f0777f929f # needs to be updated with each package release
 
 environment:
   contents:
@@ -17,16 +23,18 @@ environment:
       - npm
       - py3-setuptools
       - python3
-      - swagger
+      - swagger<0.33
   environment:
     CGO_ENABLED: "0"
+    DISTRIBUTION_PKG: "github.com/docker/distribution"
+    DISTRIBUTION_DIR: "/usr/lib/go/src/github.com/docker/distribution"
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/goharbor/harbor
       tag: v${{package.version}}
-      expected-commit: 44a74424697a494e4fa1fa1d8d9baa240f3ad466
+      expected-commit: f1393edcdb24f734f9dd77f5b18895deff0d1f1b
 
   - runs: |
       # Fixes CVE-2025-24358, can not use go/bump block doing so from modroot of dependency breaks build.
@@ -230,6 +238,96 @@ subpackages:
             expected_output: |
               artifact annotation version v1alpha1 registered
               Registering database: type-PostgreSQL
+
+  # Sub-package to serve harbor-registry/distribution version from goharbor/distribution repo(Harbor's Fork for distribution)
+  # To be updated when the drift check fails.
+  # If the drift check test fails, this means that the upstream images no longer use older Distribution version and have succesfully migrated to using the next release branch.
+  - name: ${{package.name}}-photon-registry
+    description: harbor registry custom package built using Distribution v2.8.3
+    dependencies:
+      provides:
+        - harbor-photon-registry=${{package.full-version}}
+    pipeline:
+      - name: "Drift Check"
+        runs: |
+          # https://github.com/goharbor/harbor/blob/main/Makefile#L113
+          grep -qF "REGISTRY_SRC_TAG=release/${{vars.harbor-distribution-release-branch}}" Makefile
+      - name: "Add entrypoint scripts to match upstream"
+        runs: |
+          # As per upstream: https://github.com/goharbor/harbor/blob/v2.14.1/make/photon/registry/Dockerfile#L5-L6
+          # This script basically triggers option install_cert.sh script which will be skipped if the OS is not Photon and run registry binary
+          mkdir -p ${{targets.subpkgdir}}/home/harbor
+          cp ./make/photon/common/install_cert.sh ${{targets.subpkgdir}}/home/harbor/install_cert.sh
+          cp ./make/photon/registry/entrypoint.sh ${{targets.subpkgdir}}/home/harbor/entrypoint.sh
+      - uses: git-checkout
+        with:
+          repository: https://github.com/goharbor/distribution
+          branch: release/${{vars.harbor-distribution-release-branch}}
+          expected-commit: ${{vars.harbor-distribution-expected-commit}} # needs to be updated with each package release
+      - name: "Build"
+        runs: |
+          # distribution v2.8.3 does not have go.mod file and therefore, it's not supported by Melange's go/build pipelines
+          set -eux
+          # GOPATH-style build
+          # We can't use melange's go/build pipeline because it primarily requires go.mod file which does not exist in source code for Distribution v2.8.3
+          install_dir="${{targets.subpkgdir}}/usr/bin"
+          mkdir -p "${install_dir}"
+
+          # Set up GOPATH structure for old-style Go build
+          # GOPATH is already configured, create symlink to expected location
+          mkdir -p ${GOPATH}/src/github.com/docker
+          ln -sf $(pwd) ${GOPATH}/src/${DISTRIBUTION_PKG}
+
+          # As per upstream: https://github.com/goharbor/distribution/blob/release/2.8/Makefile#L5-L6
+          REVISION=$(git rev-parse HEAD)$(if ! git diff --no-ext-diff --quiet --exit-code; then echo .m; fi)
+          VERSION=$(git describe --match 'v[0-9]*' --dirty='.m' --always)
+
+          GO111MODULE="off" go build \
+            -tags "include_oss,include_gcs" \
+            -ldflags "-w -X ${DISTRIBUTION_PKG}/version.Version=${VERSION} -X ${DISTRIBUTION_PKG}/version.Revision=${REVISION} -X ${DISTRIBUTION_PKG}/version.Package=${DISTRIBUTION_PKG}" \
+            -o "${install_dir}/harbor-registry" \
+            ./cmd/registry
+      - uses: strip
+      - name: "Add components for registry"
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mkdir -p ${{targets.subpkgdir}}/etc/registry
+          # Create compatibility symlink for legacy registry binary name
+          ln -sf /usr/bin/harbor-registry ${{targets.subpkgdir}}/usr/bin/registry_DO_NOT_USE_GC
+          # Use example config as registry config
+          cp ./cmd/registry/config-example.yml ${{targets.subpkgdir}}/etc/registry/config.yml
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+            - wait-for-it
+      pipeline:
+        - name: "Basic checks"
+          runs: |
+            # Basic version and help validation
+            harbor-registry --version | grep -qF ${{vars.custom-distribution-version}}
+            harbor-registry --help | grep -qF "Available Commands"
+
+            # Test compatibility symlink
+            [ "$(readlink -f /usr/bin/registry_DO_NOT_USE_GC)" = "/usr/bin/harbor-registry" ]
+            registry_DO_NOT_USE_GC --version | grep -q ${{vars.custom-distribution-version}}
+            registry_DO_NOT_USE_GC --help | grep -q "Available Commands"
+        - name: "Check Entrypoint files"
+          runs: |
+            stat /home/harbor/install_cert.sh
+            stat /home/harbor/entrypoint.sh
+        - uses: test/daemon-check-output
+          with:
+            start: "harbor-registry serve /etc/registry/config.yml"
+            expected_output: |
+              level=info
+              service=registry
+              listening on
+            post: |
+              set -o pipefail
+              wait-for-it localhost:5000 -t 10
+              curl -fsSL -I localhost:5000 | grep -q "HTTP/1.1 200"
 
 test:
   pipeline:

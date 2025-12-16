@@ -81,6 +81,7 @@ EOF
 
     
     kubectl create ns kubeflow-user-example-com
+    sleep 5
     cat <<EOF | kubectl apply -f -
   apiVersion: v1
   kind: Pod

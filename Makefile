@@ -68,6 +68,12 @@ WOLFI_REPO ?= https://packages.wolfi.dev/os
 WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
 
+SOURCE_DATE_EPOCH := $(shell git --no-pager log -1 --pretty=%ct || echo no-git)
+ifeq ($(SOURCE_DATE_EPOCH),no-git)
+$(error setting SOURCE_DATE_EPOCH failed - $(SOURCE_DATE_EPOCH))
+endif
+export SOURCE_DATE_EPOCH
+
 DOCKER_PLATFORM_ARG := $(shell \
   case $(ARCH) in \
 	(aarch64) darch=arm64;; \
@@ -155,9 +161,7 @@ packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile)
 	@[ -n "$(pkgname)" ] || { echo "$@: pkgname is not set"; exit 1; }
 	@[ -n "$(yamlfile)" ] || { echo "$@: yamlfile is not set"; exit 1; }
 	mkdir -p ./$(pkgname)/
-	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/)
-	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
+	$(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(pkgname)/
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
@@ -170,9 +174,8 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
 	mkdir -p ./"$*"/
-	$(eval SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct --follow $(yamlfile)))
-	$(info @SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/)
-	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
+	$(call set_source_date_epoch $(yamlfile))
+	$(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir ./$(*)/
 
 test_targets = $(foreach name,$(pkgs),test/$(name))
 $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
@@ -210,7 +213,7 @@ dev-container:
 		--entrypoint="/bin/bash" \
 	    -v "${PWD}:${PWD}" \
 	    -w "${PWD}" \
-	    -e SOURCE_DATE_EPOCH=0 \
+	    -e SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
 	    -e HTTP_AUTH \
 	    ghcr.io/wolfi-dev/sdk:latest -il
 
@@ -308,3 +311,4 @@ authget = tok=$$(chainctl auth token --audience=$(1)) || \
   echo "auth-download[$(1)] to $(2) from $(3)" && \
   curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
 	mv "$(2).tmp" "$(2)"
+

@@ -1,12 +1,22 @@
 # Contributing to wolfi-dev/os
 
 <!-- toc -->
+- [Contribution Guidelines](#contribution-guidelines)
 - [Criteria for packages in Wolfi](#criteria-for-packages-in-wolfi)
 - [Setup development environment](#setup-development-environment)
 - [Write your first Wolfi package](#write-your-first-wolfi-package)
 - [Package versioning](#package-versioning)
 - [Some tips](#some-tips)
 <!-- /toc -->
+
+## Contribution Guidelines
+
+Whether you want to add a new package, or provide a change to an existing package, please follow these guidelines:
+
+1. Create an issue with the details about the change. Use the appropriate template for the type of change you’re making. 
+2. Create the PR referencing the issue. 
+
+To get these changes merged requires engagement from a Chainguard Engineer. On a best effort, we will help shepherd changes through our process.
 
 ## Criteria for packages in Wolfi
 

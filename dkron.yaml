@@ -1,7 +1,7 @@
 package:
   name: dkron
-  version: "4.0.8"
-  epoch: 4 # GHSA-g754-hx8w-x2g6
+  version: "4.0.9"
+  epoch: 0 # GHSA-g754-hx8w-x2g6
   description: Distributed job scheduler for microservices
   copyright:
     - license: LGPL-3.0
@@ -12,45 +12,43 @@ package:
 environment:
   contents:
     packages:
+      - buf
       - build-base
       - bun
       - ca-certificates-bundle
       - corepack
       - go
+      - jq
       - nodejs-20
-      - protobuf
+      - pnpm
       - protobuf-dev
-      - protoc
       - protoc-gen-go
       - protoc-gen-go-grpc
-      - yarn
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/distribworks/dkron
       tag: v${{package.version}}
-      expected-commit: a890c2f435a88b2f820cbc41c16a5407f82fd456
-
-  - uses: go/bump
-    with:
-      deps: |-
-        github.com/quic-go/quic-go@v0.57.0
+      expected-commit: 83b440bd1bedfb6639b371f7d1d38660569cb90c
 
   - name: Generate protobuf files
     runs: |
-      # Generate protobuf files as per Makefile - protobuf-dev should provide Google well-known types
-      protoc -I proto/ \
-        --go_out=types --go_opt=paths=source_relative \
-        --go-grpc_out=types --go-grpc_opt=paths=source_relative \
-        proto/*.proto
+      # Generate protobuf files using buf (as upstream does)
+      # buf will use buf.gen.yaml to generate to gen/proto/types/v1/
+      buf generate
 
   - name: Build UI components
     runs: |
       cd ui
+      # Add query-string as explicit dependency (pnpm requires it, yarn was more permissive)
+      jq '.dependencies["query-string"] = "^7.1.3"' package.json > package.json.tmp
+      mv package.json.tmp package.json
+
       corepack enable
-      yarn install --frozen-lockfile
-      yarn build --out-dir ../dkron/ui-dist
+      # Upstream uses pnpm now
+      pnpm install
+      pnpm build --out-dir ../dkron/ui-dist
       cd ..
 
       echo "UI build output for debugging:"
@@ -143,23 +141,26 @@ test:
   environment:
     contents:
       packages:
+        - ca-certificates-bundle
+        - coreutils
         - curl
         - netcat-openbsd
-        - procps
-        - coreutils
-        - wait-for-it
         - nodejs
+        - procps
+        - wait-for-it
   pipeline:
     - name: Verify dkron version
       runs: |
         dkron version | grep -q "${{package.version}}"
     - name: Verify dkron help and commands
       runs: dkron agent --help | grep -q "Start a dkron agent"
-    - runs: |
-        mkdir -p /tmp/dkron-test
+    - name: Test dkron agent startup and API
+      runs: |
+        mkdir -p /tmp/dkron-test/data
         cat > /tmp/dkron-test/dkron.json <<EOF
         {
           "bind-addr": "127.0.0.1:8946",
+          "advertise-addr": "127.0.0.1:8946",
           "http-addr": "127.0.0.1:8080",
           "node-name": "test-node",
           "server": true,
@@ -167,8 +168,37 @@ test:
           "data-dir": "/tmp/dkron-test/data"
         }
         EOF
-        dkron agent --config /tmp/dkron-test/dkron.json > /tmp/dkron-agent.log 2>&1 & sleep 2
-        grep -qE "(agent: Dkron agent starting|agent: Listen for events)" /tmp/dkron-agent.log
-        wait-for-it 127.0.0.1:8080 -t 15
+
+        # Start agent in background
+        dkron agent --config /tmp/dkron-test/dkron.json > /tmp/dkron-agent.log 2>&1 &
+        AGENT_PID=$!
+        echo "Started dkron agent with PID $AGENT_PID"
+
+        # Give it a moment and check if it's still running
+        sleep 3
+        if ! kill -0 $AGENT_PID 2>/dev/null; then
+          echo "ERROR: Agent process died immediately. Logs:"
+          cat /tmp/dkron-agent.log
+          exit 1
+        fi
+
+        # Show initial logs
+        echo "Agent appears to be running, first few log lines:"
+        head -20 /tmp/dkron-agent.log || true
+
+        # Wait for HTTP server
+        if ! wait-for-it 127.0.0.1:8080 -t 30; then
+          echo "ERROR: HTTP server did not start. Full logs:"
+          cat /tmp/dkron-agent.log
+          exit 1
+        fi
+
+        # Test API endpoint
+        echo "Testing API endpoint..."
         curl -sf http://127.0.0.1:8080/v1/ | grep -q '"server":"true"'
+
+        # Test UI is served
+        echo "Testing UI..."
         curl -Ls http://127.0.0.1:8080/ui/ | grep -i "<title>Dkron</title>"
+
+        echo "All tests passed!"

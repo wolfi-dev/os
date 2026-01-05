@@ -1,0 +1,188 @@
+package:
+  name: redpanda-25.3
+  version: "25.3.4"
+  epoch: 0 # GHSA-j5w8-q4qc-rx2x
+  description: "Redpanda is a streaming platform based on Apache Kafka API"
+  resources:
+    cpu: 63
+    memory: 140Gi
+  copyright:
+    - license: "Apache-2.0"
+  dependencies:
+    provides:
+      - redpanda=${{package.full-version}}
+    runtime:
+      - bash
+      - busybox
+      - curl
+      - e2fsprogs
+      - glibc
+      - krb5-libs
+      - libaio
+      - numactl
+      - openssl
+      - rpk-${{package.version}}
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - bash
+      - bazelisk-default
+      - binutils
+      - bison
+      - boost-dev
+      - build-base
+      - busybox
+      - c-ares-dev
+      - coreutils
+      - crane
+      - fmt-dev
+      - go
+      - libtool
+      - llvm-lld-18
+      - lz4-dev
+      - numactl-dev
+      - pkgconf-dev
+      - ragel
+      - re2-dev
+      - snappy-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: "https://github.com/redpanda-data/redpanda.git"
+      expected-commit: "4127e17813e52c16c853309ddb6bac05f69884f6"
+      tag: "v${{package.version}}"
+      destination: redpanda
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+      modroot: redpanda/src/go/rpk
+
+  - uses: go/bump
+    with:
+      deps: |-
+        github.com/docker/docker@v28.0.0
+        golang.org/x/crypto@v0.45.0
+      modroot: redpanda/src/transform-sdk/tests
+
+  - working-directory: redpanda
+    uses: patch
+    with:
+      patches: ../0001-build-update-krb5-configuration-to-include-system-er.patch
+
+  - working-directory: redpanda
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/bin
+      bazel build --verbose_failures --show_loading_progress --config=release --config=stamp --strategy=sandboxed --jobs=16 --local_ram_resources=128000 --local_cpu_resources=48 //src/v/redpanda:redpanda
+      mv bazel-bin/src/v/redpanda/redpanda ${{targets.destdir}}/usr/bin/
+      # Copy redpanda config file to default location /etc/redpanda
+      mkdir -p ${{targets.destdir}}/etc/redpanda
+      cp conf/redpanda.yaml ${{targets.destdir}}/etc/redpanda/redpanda.yaml
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    dependencies:
+      provides:
+        - redpanda-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          expected_sha=c61cfb940c3a534e79c5ae94c56da37ce11a8451bd74d132c7a96f579d1fe2bbf7d02fa555fe8b6c4dba0ee3fe5a873671bbbd9c1b756cf4e5031daac7f548c0
+          tag=v${{package.version}}
+
+          # Try current version, fallback to previous patch if new image is not available
+          if ! digest="$(crane digest redpandadata/redpanda:${tag} 2>/dev/null)"; then
+            patch=$(echo "${{package.version}}" | cut -d. -f3)
+            if [ "$patch" -eq 0 ]; then # There might be changes between major/minor versions, so we only respect patch downgrades
+              echo "FATAL: No Docker image found for ${tag} and patch version is already 0" >&2
+              exit 1
+            fi
+            prev_patch=$((patch - 1))
+            prev_version=$(echo "${{package.version}}" | cut -d. -f1,2).${prev_patch}
+            tag=v${prev_version}
+            echo "Image not found for v${{package.version}}, trying fallback ${tag}"
+            digest="$(crane digest redpandadata/redpanda:${tag})"
+          fi
+
+          crane export redpandadata/redpanda@${digest} - | tar -xvf - entrypoint.sh
+          actual_sha="$(sha512sum entrypoint.sh | awk '{print $1}')"
+          if [ "${actual_sha}" != "${expected_sha}" ]; then
+            echo "FATAL: entrypoint.sh checksum mismatch!" >&2
+            exit 1
+          fi
+          mkdir -p ${{targets.subpkgdir}}/
+          mv entrypoint.sh ${{targets.subpkgdir}}/
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: redpanda-compat
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: ${{package.name}}-dev
+    dependencies:
+      runtime:
+        - ${{package.name}}
+      provides:
+        - redpanda-dev=${{package.full-version}}
+    pipeline:
+      - uses: split/dev
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: rpk-${{package.version}}
+    dependencies:
+      provides:
+        - rpk=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/rpk
+          modroot: ./redpanda/src/go/rpk
+          output: rpk
+          ldflags: "-X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.version=${{package.version}}"
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: rpk
+            real-pkg-name: ${{subpkg.name}}
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: "Verify binary versions"
+      runs: |
+        redpanda --version 2>&1 | grep ${{package.version}}
+        rpk --version 2>&1 | grep ${{package.version}}
+    - name: "Test rpk commands"
+      runs: |
+        # A full blown redpanda cluster requires resources that the CI cluster cannot provide
+        rpk redpanda start --mode dev-container --smp 1 --memory 1G --node-id 0 > /tmp/redpanda.log 2>&1 &
+        sleep 5
+        rpk cluster health | grep -iE '^Healthy:[[:space:]]+true$'
+        rpk topic create tutorial 2>&1
+        rpk topic list 2>&1| grep tutorial
+    - name: "test entrypoint usage"
+      runs: |
+        /entrypoint.sh --help > /dev/null 2>&1
+
+update:
+  ignore-regex-patterns:
+    - '-rc\d+$'
+    - '-dev\d*$'
+  enabled: true
+  git:
+    strip-prefix: "v"
+    tag-filter-prefix: v25.3.

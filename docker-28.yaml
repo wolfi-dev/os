@@ -1,0 +1,329 @@
+package:
+  name: docker-28
+  version: "28.5.2"
+  epoch: 11 # GHSA-jv3w-x3r3-g6rm
+  description: A meta package for Docker Engine and Docker CLI
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - busybox
+      - docker-cli
+      - docker-cli-buildx
+      - docker-compose
+      - docker-init-${{vars.major-version}}
+      - dockerd-${{vars.major-version}}
+      - openssh-client # used by docker-cli
+    provides:
+      - docker=${{package.full-version}}
+  checks:
+    disabled:
+      # docker is a meta package pulling in several subpackages at runtime
+      - empty
+
+var-transforms:
+  - from: ${{package.name}}
+    match: docker-(\d+)
+    replace: $1
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - btrfs-progs-dev
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - containerd
+      - coreutils
+      - go
+      - libseccomp-dev
+      - libtool
+      - linux-headers
+      - lvm2-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/moby/moby
+      tag: v${{package.version}}
+      expected-commit: 89c5e8fd66634b6128fc4c0e6f1236e2540e46e0
+
+  - runs: |
+      # moby/moby uses a non-standard `vendor.mod` and helper scripts instead
+      # of the standard `go.mod`. the only way to modify dependencies is to
+      # manually change them in the provided `vendor.mod`. To ensure we don't
+      # pin to older dependencies when this package auto updates, we temp change the
+      # vendor.mod file to go.mod to use go/bump so we don't have to use a tool like sed.
+
+      mv vendor.mod go.mod
+      go mod tidy
+
+  - uses: go/bump
+    with:
+      deps: |-
+        github.com/cloudflare/cfssl@v1.6.5
+        github.com/hashicorp/go-memdb@v1.3.5
+        github.com/opencontainers/image-spec@v1.1.1
+        github.com/opencontainers/runtime-spec@v1.2.1
+        github.com/rootless-containers/rootlesskit/v2@v2.3.4
+        github.com/golang-jwt/jwt/v5@v5.2.2
+        github.com/opencontainers/selinux@v1.13.0
+        github.com/containerd/containerd/v2@v2.1.5
+        golang.org/x/crypto@v0.45.0
+        github.com/containernetworking/plugins@v1.9.0
+
+  - runs: |
+      # setting back to original so we can run moby specific hack
+      mv go.mod vendor.mod
+      mv go.sum vendor.sum
+      ./hack/vendor.sh
+
+      # Replicate the environment setup performed by docker
+      export DOCKER_BUILDTAGS="seccomp"
+
+      VERSION="${{package.version}}" ./hack/make.sh dynbinary
+
+  # Independently managed from moby/moby, but contains many utility scripts needed for the official docker images.
+  # TODO: Figure out a way to autobump this as required
+  # https://github.com/docker-library/docker/tree/master
+  - working-directory: /home/docker-library
+    pipeline:
+      - uses: fetch
+        with:
+          uri: https://github.com/docker-library/docker/archive/7d789f6d3ca9d6cef6c7cbcbbefbd6483ee3d2cd.zip
+          expected-sha256: a324d2e31bda34998f6366977812db4bbe5118def671703498bb1ac19d329cfc
+          extract: false
+      - runs: |
+          unzip -q 7d789f6d3ca9d6cef6c7cbcbbefbd6483ee3d2cd.zip
+          mv */** .
+
+  # Docker is vehemenetly against stripping the resulting binary
+  # Ref: https://github.com/moby/moby/blob/d8a51d2887cbc465ab8d76ed98f7a86996ab3c22/project/PACKAGERS.md#stripping-binaries
+  # - uses: strip
+  - runs: |
+      # this exists to appease yam
+
+subpackages:
+  - name: dockerd-${{vars.major-version}}
+    description: "Docker Engine (dockerd)"
+    dependencies:
+      runtime:
+        # https://github.com/docker/docker/blob/master/project/PACKAGERS.md#runtime-dependencies
+        - btrfs-progs
+        - ca-certificates
+        - containerd
+        - ctr
+        - e2fsprogs
+        - e2fsprogs-extra
+        - fuse-overlayfs
+        - git
+        - iproute2
+        - ip6tables
+        - iptables
+        - openssl
+        - pigz
+        - procps
+        - shadow-subids # equivalent of shadow-uidmap in wolfi
+        - xfsprogs
+        - xz
+        - zfs
+      provides:
+        - dockerd=${{package.full-version}}
+    pipeline:
+      - runs: |
+          install -Dm755 bundles/dynbinary-daemon/docker-proxy ${{targets.contextdir}}/usr/bin/docker-proxy
+          install -Dm755 bundles/dynbinary-daemon/dockerd ${{targets.contextdir}}/usr/bin/dockerd
+          mkdir -p ${{targets.destdir}}/usr/lib/docker/plugins
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: dockerd
+            help-flag: "--help"
+        - uses: test/tw/ver-check
+          with:
+            bins: dockerd docker-proxy
+            version-flag: "--version"
+
+  - name: docker-init-${{vars.major-version}}
+    description: "Docker init"
+    dependencies:
+      runtime:
+        - tini-static
+      provides:
+        - docker-init=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          ln -sf ../../sbin/tini-static ${{targets.contextdir}}/usr/bin/docker-init
+    test:
+      pipeline:
+        - runs: |
+            [ -f /usr/bin/docker-init ]
+            [ -x /usr/bin/docker-init ]
+
+  - name: docker-oci-entrypoint-${{vars.major-version}}
+    description: "docker OCI entrypoint"
+    pipeline:
+      - runs: |
+          install -Dm755 /home/docker-library/docker-entrypoint.sh "${{targets.subpkgdir}}"/usr/bin/docker-entrypoint.sh
+    dependencies:
+      runtime:
+        - busybox
+      provides:
+        - docker-oci-entrypoint=${{package.full-version}}
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/bin/docker-entrypoint.sh
+
+  - name: dockerd-oci-entrypoint-${{vars.major-version}}
+    description: "dockerd OCI entrypoint"
+    dependencies:
+      runtime:
+        - busybox
+        # Used as a fallback in the dockerd-entrypoint.sh script
+        - docker-oci-entrypoint-${{vars.major-version}}
+        # Used as a fallback in the dockerd-entrypoint.sh script
+        - docker-dind-${{vars.major-version}}
+      provides:
+        - dockerd-oci-entrypoint=${{package.full-version}}
+    pipeline:
+      - runs: |
+          install -Dm755 /home/docker-library/dockerd-entrypoint.sh "${{targets.subpkgdir}}"/usr/bin/dockerd-entrypoint.sh
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/bin/dockerd-entrypoint.sh
+
+  - name: docker-rootless-${{vars.major-version}}
+    description: "dockerd rootless"
+    dependencies:
+      runtime:
+        - busybox
+        - rootlesskit
+      provides:
+        - docker-rootless=${{package.full-version}}
+    pipeline:
+      - runs: |
+          install -Dm755 contrib/dockerd-rootless-setuptool.sh "${{targets.subpkgdir}}"/usr/bin/dockerd-rootless-setuptool.sh
+          install -Dm755 contrib/dockerd-rootless.sh "${{targets.subpkgdir}}"/usr/bin/dockerd-rootless
+    test:
+      pipeline:
+        - runs: |
+            dockerd-rootless-setuptool.sh --help
+
+  # Ref: https://github.com/docker-library/docker/blob/master/Dockerfile-dind.template
+  - name: docker-dind-${{vars.major-version}}
+    description: "Docker in Docker"
+    dependencies:
+      provides:
+        - docker-dind=${{package.full-version}}
+    pipeline:
+      - runs: |
+          install -Dm755 /home/build/hack/dind "${{targets.subpkgdir}}"/usr/bin/dind
+    test:
+      pipeline:
+        - name: "verify dind binary is in the right place"
+          runs: stat /usr/bin/dind
+
+  # ref: https://github.com/docker-library/docker/blob/bce646b7ffd6d126d920a3e06dd59d9192be8d9c/28/dind/dockerd-entrypoint.sh#L229-L231
+  - name: docker-dind-compat-${{vars.major-version}}
+    description: compat package for docker-dind
+    dependencies:
+      provides:
+        - docker-dind-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/local/bin
+          ln -sf ../../bin/dind /usr/local/bin/dind
+    test:
+      environment:
+        contents:
+          packages:
+            - docker-dind
+      pipeline:
+        - uses: test/tw/symlink-check
+
+  - name: docker-config-mirror-gcr-${{vars.major-version}}
+    description: "Docker daemon config to use gcr.io to mirror docker.io"
+    dependencies:
+      provides:
+        - docker-config-mirror-gcr=${{package.full-version}}
+    pipeline:
+      # https://docs.docker.com/docker-hub/image-library/mirror/#configure-the-docker-daemon
+      # https://cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/etc/docker
+          cat <<EOF >"${{targets.subpkgdir}}"/etc/docker/daemon.json
+          {
+            "registry-mirrors": [
+              "https://mirror.gcr.io"
+            ]
+          }
+          EOF
+
+  - name: dockerd-service-${{vars.major-version}}
+    description: "Systemd services for docker"
+    dependencies:
+      runtime:
+        - docker-${{vars.major-version}}
+        - containerd-service
+        - systemd
+      provides:
+        - dockerd-service=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/systemd/system/
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/systemd/system-preset/
+          install -Dm644 contrib/init/systemd/docker.socket "${{targets.subpkgdir}}"/usr/lib/systemd/system/
+          install -Dm644 contrib/init/systemd/docker.service "${{targets.subpkgdir}}"/usr/lib/systemd/system/
+          sed -i "s|\[Service\]|[Service]\nEnvironment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"|g" "${{targets.subpkgdir}}"/usr/lib/systemd/system/docker.service
+          echo "enable docker.service" > "${{targets.subpkgdir}}/usr/lib/systemd/system-preset/81-docker.preset"
+          echo "enable docker.socket" >> "${{targets.subpkgdir}}/usr/lib/systemd/system-preset/81-docker.preset"
+
+          # Create docker group
+          mkdir -p ${{targets.contextdir}}/usr/lib/sysusers.d/
+          cat <<EOF >${{targets.contextdir}}/usr/lib/sysusers.d/docker.conf
+          g docker 125
+          EOF
+    test:
+      pipeline:
+        - name: "ensure expected systemd service file exists"
+          runs: stat /usr/lib/systemd/system/docker.service
+
+update:
+  enabled: true
+  github:
+    identifier: moby/moby
+    strip-prefix: v
+    tag-filter-prefix: v28.
+
+test:
+  pipeline:
+    - name: Smoke check
+      runs: |
+        set -x
+        bad=""
+        checks="
+        docker
+        docker-compose
+        docker-init
+        docker-proxy
+        dockerd
+        "
+        for b in ${checks} ; do
+           p="/usr/bin/$b"
+           [ -e "$p" ] ||
+             { echo "FAIL: $p - does not exist"; bad="$bad $b"; continue; }
+           [ -f "$p" ] ||
+             { echo "FAIL: $p - not a file"; bad="$bad $b"; continue; }
+           [ -x "$p" ] ||
+             { echo "FAIL: $p - not executable"; bad="$bad $b"; continue; }
+           echo "PASS: $p looks good"
+        done
+        bad=${bad# }
+        [ -z "$bad" ] || { echo "FATAL: smoke failed - $bad"; exit 1; }
+        exit 0

@@ -1,7 +1,7 @@
 package:
   name: teleport-18
   version: "18.4.0"
-  epoch: 0 # GHSA-47m2-4cr7-mhcw
+  epoch: 1 # add teleport-operator subpackage
   description: The easiest, and most secure way to access and protect all of your infrastructure.
   copyright:
     - license: AGPL-3.0-only
@@ -87,6 +87,162 @@ pipeline:
       install -Dm755 target/release/fdpass-teleport "${{targets.contextdir}}"/usr/local/bin/
 
   - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-operator
+    description: Kubernetes operator for managing Teleport resources
+    dependencies:
+      provides:
+        - teleport-operator=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./integrations/operator
+          output: teleport-operator
+          tags: kustomize_disable_go_plugin_support
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+            - wait-for-it
+            - curl
+        environment:
+          METRICS_PORT: "8080"
+          HEALTH_PORT: "8081"
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: teleport-operator
+            expect-contains: "namespace metrics-bind-address health-probe-bind-address log-level"
+        - uses: test/kwok/cluster
+        - name: "Functional test with live Teleport auth server"
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              set -euo pipefail
+              mkdir -p /tmp/teleport /var/lib/teleport
+
+              # Create Teleport auth server config
+              tee /tmp/teleport-auth.yaml << 'EOF'
+              version: v3
+              teleport:
+                data_dir: /tmp/teleport
+                log:
+                  output: stderr
+                  severity: INFO
+              auth_service:
+                enabled: "yes"
+                cluster_name: "test-cluster"
+                listen_addr: 127.0.0.1:3025
+              proxy_service:
+                enabled: "no"
+              ssh_service:
+                enabled: "no"
+              EOF
+
+              # Initialize Teleport with static UUID
+              echo "00000000-0000-0000-0000-000000000000" > /var/lib/teleport/host_uuid
+              chmod 644 /var/lib/teleport/host_uuid
+
+              teleport start --config=/tmp/teleport-auth.yaml --roles=auth &
+              TELEPORT_PID=$!
+              echo $TELEPORT_PID > /tmp/teleport.pid
+
+              wait-for-it 127.0.0.1:3025 -t 60
+
+              tee /tmp/teleport-resources.yaml << 'EOF'
+              kind: role
+              metadata:
+                name: operator
+              spec:
+                allow:
+                  rules:
+                    - resources: [role, user]
+                      verbs: [list, create, read, update, delete]
+                deny: {}
+              version: v7
+              ---
+              kind: bot
+              version: v1
+              metadata:
+                name: operator
+              spec:
+                roles:
+                  - operator
+              ---
+              kind: token
+              version: v2
+              metadata:
+                name: operator-bot-token
+              spec:
+                roles:
+                  - Bot
+                bot_name: operator
+                join_method: token
+              EOF
+
+              # Retry creating teleport resources (up to 30 seconds)
+              for i in $(seq 1 30); do
+                if tctl --config=/tmp/teleport-auth.yaml create -f /tmp/teleport-resources.yaml; then
+                  break
+                fi
+                sleep 1
+              done
+
+              mkdir -p ~/.kube
+              cp $HOME/.kwok/clusters/kwok/kubeconfig.yaml ~/.kube/config
+
+              # Install the TeleportRole CRD (minimal CRD for testing)
+              kubectl apply -f https://raw.githubusercontent.com/gravitational/teleport/v${{package.version}}/integrations/operator/config/crd/bases/resources.teleport.dev_roles.yaml
+              kubectl wait --for=condition=Established --timeout=30s crd/teleportroles.resources.teleport.dev
+            start: |
+              teleport-operator \
+                -auth-server 127.0.0.1:3025 \
+                -join-method token \
+                -token operator-bot-token \
+                -insecure \
+                -namespace default \
+                -metrics-bind-address ":${METRICS_PORT}" \
+                -health-probe-bind-address ":${HEALTH_PORT}"
+            timeout: 90
+            expected_output: |
+              starting manager
+            error_strings: |
+              FATAL
+              panic:
+              Traceback.*most.recent.call
+              Exception in thread
+              command not found
+              unable to build tbot
+              tbot preflight checks failed
+            post: |
+              set -o pipefail
+              wait-for-it "localhost:${HEALTH_PORT}" -t 30
+              curl -fsS "http://localhost:${HEALTH_PORT}/healthz"
+              curl -fsS "http://localhost:${METRICS_PORT}/metrics" | grep -F "controller_runtime"
+
+              # Clean up background processes started in setup (required for QEMU runner)
+              pkill -x teleport || true
+
+  - name: ${{package.name}}-operator-compat
+    description: Compatibility package for teleport-operator
+    dependencies:
+      runtime:
+        - ${{package.name}}-operator
+      provides:
+        - teleport-operator-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/"
+          ln -sf ./usr/bin/teleport-operator "${{targets.contextdir}}/teleport-operator"
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-operator
+      pipeline:
+        - uses: test/tw/symlink-check
 
 update:
   enabled: true

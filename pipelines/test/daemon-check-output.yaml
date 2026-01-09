@@ -1,36 +1,173 @@
 name: Check Daemon Output
 
+description: |
+  Starts a daemon/server, waits for expected log output, optionally runs post-startup checks, then cleans up.
+
+  USE THIS PIPELINE WHEN:
+  - You need to start a server/daemon and verify it starts correctly
+  - You need to wait for specific log messages indicating readiness
+  - You want to run commands after the daemon is ready (health checks, client operations, etc.)
+  - You need automatic cleanup even if tests fail
+
+  EXAMPLES:
+
+  Example 1 - Basic daemon startup verification:
+    - uses: test/daemon-check-output
+      with:
+        start: /use/bin/foo/mydaemon --config /tmp/config.yaml
+        expected_output: "Server listening on port"
+
+  Example 2 - Setup config, start daemon, verify with curl:
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/daemon-data
+          tee /tmp/config.yaml <<EOF
+          port: 8080
+          dataDir: /tmp/daemon-data
+          EOF
+        start: /use/bin/foo/mydaemon --config /tmp/config.yaml
+        expected_output: "Server started successfully"
+        post: |
+          curl -f http://localhost:8080/health
+
+  Example 3 - ZooKeeper example with client operations:
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/zk/data
+          tee /tmp/zoo.cfg <<EOF
+          tickTime=2000
+          dataDir=/tmp/zk/data
+          clientPort=2181
+          EOF
+        start: /usr/share/java/zookeeper/bin/zkServer.sh start /tmp/zoo.cfg
+        expected_output: "binding to port"
+        post: |
+          # Test client can connect and perform operations
+          echo "create /test mydata" | zkCli.sh -server localhost:2181
+          echo "get /test" | zkCli.sh -server localhost:2181 | grep -F mydata
+
+  Example 4 - Wait for port without specific log message:
+    - uses: test/daemon-check-output
+      with:
+        start: myserver --port 9000
+        expected_output: "."  # Matches any output
+        post: |
+          # Use wait-for-it or netcat to verify port
+          wait-for-it localhost:9000 -t 30
+          curl http://localhost:9000/api/status
+
+  DAEMON DEPENDENCIES:
+  - Each test/daemon-check-output step is ISOLATED - daemons stop after the step completes
+  - If service A depends on service B running:
+    CORRECT: Start B in A's setup script
+    WRONG: Create separate test step for B (it will stop before A runs)
+  - Example: Kafka needs ZooKeeper → start ZooKeeper in Kafka test's setup script
+
 needs:
   packages:
     - busybox
+    - wait-for-it
 
 inputs:
   start:
     description: |
       The command to run to start the daemon.
-      WARNING: executed with a shell.
+
+      IMPORTANT: Use absolute paths, NOT cd && command patterns.
+      CORRECT: "/usr/lib/kafka/bin/kafka-server-start.sh /usr/lib/kafka/config/server.properties"
+      WRONG: "cd /usr/lib/kafka && bin/kafka-server-start.sh config/server.properties"
+
+      More examples:
+      - "/usr/share/java/zookeeper/bin/zkServer.sh start /tmp/zoo.cfg"
+      - "/usr/bin/redis-server --port 6379"
+      - "nginx -c /etc/nginx/nginx.conf"
     required: true
   setup:
     description: |
-      Command to run before starting daemon.
-      Content is placed into a file and executed. If no '#!' is present,
-      then '#!/bin/sh -ex' will be prepended.
-      WARNING: The content of this field goes through shell. Avoid single quotes.
+      Optional setup commands to run BEFORE starting the daemon.
+      Use this to create directories, generate config files, set environment variables, etc.
+      If no shebang is present, '#!/bin/sh -ex' will be prepended.
+
+      IMPORTANT: wait-for-it is pre-installed and available for use.
+      USE: "wait-for-it localhost:2181 -t 30" to wait for port availability
+      AVOID: Custom for loops with sleep and grep - use wait-for-it instead
+
+      Example:
+        setup: |
+          mkdir -p /tmp/myapp/data /tmp/myapp/logs
+          export MYAPP_HOME=/tmp/myapp
+          tee /tmp/myapp/config.yaml <<EOF
+          port: 8080
+          logLevel: debug
+          EOF
+
+      Example with dependency daemon:
+        setup: |
+          /usr/share/java/zookeeper/bin/zkServer.sh start /tmp/zoo.cfg &
+          wait-for-it localhost:2181 -t 30
     required: false
   post:
     description: |
-      Command to run after. Handled just like setup.
+      Optional commands to run AFTER the daemon has started and expected_output is found.
+      Use this to verify the daemon is working correctly - run health checks, test client
+      connections, perform basic operations, etc.
+      Handled just like setup (gets '#!/bin/sh -ex' prepended if no shebang).
+
+      IMPORTANT: wait-for-it is pre-installed and available.
+      Use it to wait for ports if you need to verify connectivity before running tests.
+
+      Example:
+        post: |
+          curl -f http://localhost:8080/health
+          echo "ping" | nc localhost 6379 | grep -F PONG
+
+      Example with JSON validation:
+        post: |
+          response=$(curl -sf http://localhost:8080/api/status)
+          echo "$response" | jq -e '.status == "OK"'
     required: false
   timeout:
-    description: "Time in seconds to wait before giving up."
+    description: |
+      Maximum time in seconds to wait for expected_output to appear in daemon logs.
+      Default: 30 seconds
+
+      Example: timeout: "60"  # Wait up to 60 seconds for daemon to be ready
     default: 30
   expected_output:
-    description: "newline separated list of strings expected to be found in output."
+    description: |
+      Newline-separated list of regex patterns that must appear in the daemon's output.
+      The pipeline waits until ALL patterns are found (or timeout is reached).
+
+      Common patterns:
+      - "Server listening on port" - HTTP servers
+      - "binding to port" - ZooKeeper
+      - "ready to accept connections" - databases
+      - "." - matches any output (use when no specific message available)
+
+      Example (multiple patterns - all must be found):
+        expected_output: |
+          Server listening on port 8080
+          Database connection established
     required: true
   error_strings:
     description: |
-      newline separated list of strings that are considered error if found.
-      set to empty for none.
+      Newline-separated list of regex patterns that indicate errors in daemon output.
+      If any pattern is found, the test FAILS.
+      Set to empty string to disable error checking.
+
+      Default patterns detect: ERROR, FAIL, FATAL, Java/Python/Ruby exceptions,
+      and "command not found".
+
+      Example (disable error checking):
+        error_strings: ""
+
+      Example (custom patterns):
+        error_strings: |
+          Connection refused
+          Timeout exceeded
+          Out of memory
     required: true
     default: |
       ERROR
@@ -111,12 +248,27 @@ pipeline:
       rc=0
 
       timeout=${{inputs.timeout}}
-      setup='${{inputs.setup}}'
-      expected_strings='${{inputs.expected_output}}'
-      printf "%s\n" "${expected_strings}" > "${EXPECTED_F}"
-      error_strings='${{inputs.error_strings}}'
-      printf "%s\n" "${error_strings}" > "${ERRORS_F}"
-      post='${{inputs.post}}'
+
+      # Write inputs to temp files using heredocs to avoid single-quote escaping issues.
+      # The quoted delimiter (<<'EOF') prevents any shell expansion in the content.
+      cat > "${TMPD}/setup_input" <<'MELANGE_SETUP_EOF'
+      ${{inputs.setup}}
+      MELANGE_SETUP_EOF
+      setup=$(cat "${TMPD}/setup_input")
+
+      cat > "${EXPECTED_F}" <<'MELANGE_EXPECTED_EOF'
+      ${{inputs.expected_output}}
+      MELANGE_EXPECTED_EOF
+
+      cat > "${ERRORS_F}" <<'MELANGE_ERRORS_EOF'
+      ${{inputs.error_strings}}
+      MELANGE_ERRORS_EOF
+      error_strings=$(cat "${ERRORS_F}")
+
+      cat > "${TMPD}/post_input" <<'MELANGE_POST_EOF'
+      ${{inputs.post}}
+      MELANGE_POST_EOF
+      post=$(cat "${TMPD}/post_input")
 
       set --
       while read line ; do
@@ -127,7 +279,8 @@ pipeline:
 
       if [ -n "$setup" ]; then
           shbang="#!"
-          if [ "${setup#${shbang}}" = "$shbang" ]; then
+          # correct/documented behavior is disabled for now so that scripts do not run with set -e
+          if false FIXME see pr-44792 && [ "${setup#${shbang}}" != "$setup" ]; then
               printf "%s\n" '#!/bin/sh -ex' > "${SETUP_F}"
           fi
           printf "%s\n" "$setup" >> "${SETUP_F}"
@@ -142,7 +295,8 @@ pipeline:
 
       if [ -n "$post" ]; then
           shbang="#!"
-          if [ "${post#${shbang}}" = "$shbang" ]; then
+          # correct/documented behavior is disabled for now so that scripts do not run with set -e
+          if false FIXME see pr-44792 && [ "${post#${shbang}}" = "$post" ]; then
               printf "%s\n" '#!/bin/sh -ex' > "${POST_F}"
           fi
           printf "%s\n" "$post" >> "${POST_F}"

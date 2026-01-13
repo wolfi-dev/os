@@ -1,7 +1,7 @@
 package:
   name: mailpit
-  version: "1.28.1"
-  epoch: 0 # GHSA-j5w8-q4qc-rx2x
+  version: "1.28.2"
+  epoch: 1 # GHSA-j5w8-q4qc-rx2x
   description: An email and SMTP testing tool with API for developers
   copyright:
     - license: MIT
@@ -11,8 +11,6 @@ environment:
     packages:
       - build-base
       - busybox
-      - ca-certificates-bundle
-      - go
       - nodejs-20
       - npm
 
@@ -21,16 +19,17 @@ pipeline:
     with:
       repository: https://github.com/axllent/mailpit
       tag: v${{package.version}}
-      expected-commit: e69a0d75c9e396ba0974c9a65e8746b56d0b5431
+      expected-commit: 585ea1dc3095dfc38997e5ad1edb862f9bbc4f35
 
   - runs: |
       npm install
       npm run package
 
-  - runs: |
-      CGO_ENABLED=0 go build -ldflags "-w -X github.com/axllent/mailpit/config.Version=${{package.version}}" -o mailpit
-      mkdir -p ${{targets.destdir}}/usr/bin
-      mv mailpit ${{targets.destdir}}/usr/bin/
+  - uses: go/build
+    with:
+      packages: .
+      output: mailpit
+      ldflags: -w -X github.com/axllent/mailpit/config.Version=${{package.version}}
 
 subpackages:
   - name: ${{package.name}}-compat
@@ -45,11 +44,56 @@ subpackages:
             readlink -v /mailpit
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - jq
+    environment:
+      HTTP_PORT: "8025"
   pipeline:
-    - name: Verify mailpit binary
-      runs: |
-        mailpit version || exit 1
-        mailpit --help
+    - uses: test/tw/ver-check
+      with:
+        bins: mailpit
+        version: ${{package.version}}
+        version-flag: version
+    - uses: test/tw/help-check
+      with:
+        bins: mailpit
+    - uses: test/daemon-check-output
+      with:
+        start: mailpit
+        timeout: 30
+        expected_output: |
+          accessible via
+        post: |
+          set -euo pipefail
+
+          # Verify HTTP API is listening and get version info
+          curl -sf "http://localhost:${HTTP_PORT}/api/v1/info" | jq .
+
+          # Verify mailbox is empty before sending
+          curl -sf "http://localhost:${HTTP_PORT}/api/v1/messages" | jq -e '.messages | length == 0'
+
+          # Send a test email via HTTP API
+          curl -sf "http://localhost:${HTTP_PORT}/api/v1/send" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "From": {"Email": "sender@test.local", "Name": "Test Sender"},
+              "To": [{"Email": "receiver@test.local", "Name": "Test Receiver"}],
+              "Subject": "Test Email",
+              "Text": "This is a test email body."
+            }'
+
+          # Wait for message to be processed
+          sleep 1
+
+          # Verify the email was received via API
+          curl -sf "http://localhost:${HTTP_PORT}/api/v1/messages" | jq -e '.messages | length > 0'
+
+          # Verify email content
+          MESSAGE_ID=$(curl -sf "http://localhost:${HTTP_PORT}/api/v1/messages" | jq -r '.messages[0].ID')
+          curl -sf "http://localhost:${HTTP_PORT}/api/v1/message/${MESSAGE_ID}" | jq -e '.Subject == "Test Email"'
 
 update:
   enabled: true

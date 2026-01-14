@@ -49,23 +49,23 @@ pipeline:
       # -Dcommons-io.version=2.14.0 moved from 2.11.0 https://github.com/apache/zookeeper/blob/release-3.9.2/pom.xml#L574C5-L574C52
       mvn install -DskipTests -Dnetty.version=4.1.125.Final -Dcommons-io.version=2.14.0
       tar -xf zookeeper-assembly/target/apache-zookeeper-${{package.version}}-bin.tar.gz
-
+      # Create necessary directories
+      mkdir -p ${{targets.destdir}}/usr/share/java/zookeeper
+      mkdir -p ${{targets.destdir}}/usr/share/java/zookeeper/conf
+      mkdir -p ${{targets.destdir}}/usr/share/java/zookeeper/logs
       # Cleanup Windows files
       rm -rf apache-zookeeper-${{package.version}}-bin/bin/*.cmd
-
-      # Install Zookeeper as per upstream
-      mkdir -p ${{targets.destdir}}/apache-zookeeper-${{package.version}}-bin
-      mkdir -p ${{targets.destdir}}/apache-zookeeper-${{package.version}}-bin/conf
-      mv apache-zookeeper-${{package.version}}-bin/lib ${{targets.destdir}}/apache-zookeeper-${{package.version}}-bin
-      mv apache-zookeeper-${{package.version}}-bin/bin ${{targets.destdir}}/apache-zookeeper-${{package.version}}-bin
+      # Install Zookeeper
+      mv apache-zookeeper-${{package.version}}-bin/bin ${{targets.destdir}}/usr/share/java/zookeeper
+      mv apache-zookeeper-${{package.version}}-bin/lib ${{targets.destdir}}/usr/share/java/zookeeper
       mv apache-zookeeper-${{package.version}}-bin/conf ${{targets.destdir}}/
 
 subpackages:
-  - name: ${{package.name}}-oci-entrypoint
-    description: "Entrypoint subpackage for official zookeeper image"
+  - name: ${{package.name}}-compat
+    description: "Compat compat for official zookeeper image"
     dependencies:
       provides:
-        - zookeeper-oci-entrypoint=${{package.full-version}}
+        - zookeeper-compat=${{package.full-version}}
       runtime:
         - ca-certificates-bundle
         - bash
@@ -74,6 +74,13 @@ subpackages:
         - glibc-locale-en
         - netcat-openbsd
     pipeline:
+      - name: "Symlinks as per upstream"
+        runs: |
+          # Create necessary directories as per upstream packaging
+          mkdir -p ${{targets.subpkgdir}}/apache-zookeeper-${{package.version}}-bin
+          ln -sf /usr/share/java/zookeeper/bin ${{targets.subpkgdir}}/apache-zookeeper-${{package.version}}-bin
+          ln -sf /usr/share/java/zookeeper/lib ${{targets.subpkgdir}}/apache-zookeeper-${{package.version}}-bin
+          ln -sf /usr/share/java/zookeeper/conf ${{targets.subpkgdir}}/apache-zookeeper-${{package.version}}-bin
       - uses: git-checkout
         with:
           repository: https://github.com/31z4/zookeeper-docker
@@ -88,9 +95,46 @@ subpackages:
           mkdir -p ${{targets.subpkgdir}}/datalog
           mkdir -p ${{targets.subpkgdir}}/logs
     test:
+      environment:
+        contents:
+          packages:
+            - zookeeper=${{package.full-version}}
+            - wait-for-it
+            - uuidgen
+        environment:
+          LANG: en_US.UTF-8
+          JAVA_HOME: "/usr/lib/jvm/java-17-openjdk"
+          ZK_HOME: "/apache-zookeeper-${{package.version}}-bin"
       pipeline:
         - runs: |
-            test -s /docker-entrypoint.sh
+            stat /docker-entrypoint.sh
+            test -x /docker-entrypoint.sh
+        - runs: |
+            set -euo pipefail
+
+            # Go to installed dir
+            cd "${ZK_HOME}"
+
+            # Use sample config
+            cp ../conf/zoo_sample.cfg conf/zoo.cfg
+
+            # Start Zookeeper
+            bin/zkServer.sh start-foreground > /dev/null 2>&1 &
+
+            # Grab PID
+            ZOOKEEPER_PID=$!
+
+            # wait for server
+            wait-for-it localhost:2181
+
+            # Start the CLI and check output
+            bin/zkCli.sh | grep -q "Welcome to ZooKeeper!"
+
+            # Create a node
+            bin/zkCli.sh create /test-$(uuidgen) "$(uuidgen)"
+
+            # Kill Zookeeper
+            kill "${ZOOKEEPER_PID}"
 
   - name: ${{package.name}}-iamguarded-compat
     description: "Compatibility package for iamguarded variant of Zookeeper"
@@ -119,8 +163,8 @@ subpackages:
           mkdir -p /opt/iamguarded/zookeeper/logs
           mkdir -p /opt/iamguarded/scripts/zookeeper/
 
-          cp -r ${{targets.destdir}}/apache-zookeeper-${{package.version}}-bin/bin/* /opt/iamguarded/zookeeper/bin
-          ln -s /apache-zookeeper-${{package.version}}-bin/lib /opt/iamguarded/zookeeper/lib
+          cp -r ${{targets.destdir}}/usr/share/java/zookeeper/bin/* /opt/iamguarded/zookeeper/bin
+          ln -s /usr/share/java/zookeeper/lib /opt/iamguarded/zookeeper/lib
           cp -r conf/* /opt/iamguarded/zookeeper/conf/
           cp -r conf/* /opt/iamguarded/zookeeper/conf.default
 
@@ -147,17 +191,20 @@ test:
       packages:
         - zookeeper=${{package.full-version}}
         - wait-for-it
+        - uuidgen
     environment:
       LANG: en_US.UTF-8
-      JAVA_HOME: "/usr/lib/jvm/default-jvm"
-      ZK_HOME: "/apache-zookeeper-${{package.version}}-bin"
+      JAVA_HOME: "/usr/lib/jvm/java-17-openjdk"
+      ZK_HOME: "/usr/share/java/zookeeper"
   pipeline:
     - runs: |
+        set -euo pipefail
+
         # Go to installed dir
         cd "${ZK_HOME}"
 
         # Use sample config
-        cp ../conf/zoo_sample.cfg conf/zoo.cfg
+        cp /conf/zoo_sample.cfg conf/zoo.cfg
 
         # Start Zookeeper
         bin/zkServer.sh start-foreground > /dev/null 2>&1 &
@@ -172,7 +219,7 @@ test:
         bin/zkCli.sh | grep -q "Welcome to ZooKeeper!"
 
         # Create a node
-        bin/zkCli.sh create /test-$(uuidgen) '$(uuidgen)'
+        bin/zkCli.sh create /test-$(uuidgen) "$(uuidgen)"
 
         # Kill Zookeeper
         kill "${ZOOKEEPER_PID}"

@@ -1,7 +1,7 @@
 package:
   name: cassandra-5.0
-  version: "5.0.5"
-  epoch: 5 # GHSA-3p8m-j85q-pgmj
+  version: "5.0.6"
+  epoch: 2
   description: Open Source NoSQL Database
   copyright:
     - license: Apache-2.0
@@ -9,7 +9,7 @@ package:
     runtime:
       - curl
       - jemalloc
-      - python-${{vars.py-version}} # needed for cqlsh
+      - python-${{vars.python-version}} # needed for cqlsh
     provides:
       - cassandra=${{package.full-version}}
 
@@ -20,7 +20,7 @@ var-transforms:
     to: major-minor-version
 
 vars:
-  py-version: 3.11
+  python-version: 3.11
   java-version: 17
 
 environment:
@@ -31,13 +31,15 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
+      - curl # for entrypoint verification
       - go # for documentation generation
       - openjdk-${{vars.java-version}}-default-jdk
-      - py${{vars.py-version}}-build
-      - py${{vars.py-version}}-cython-bin
-      - py${{vars.py-version}}-pip
-      - py${{vars.py-version}}-setuptools
-      - python-${{vars.py-version}}-dev
+      - patch
+      - py${{vars.python-version}}-build
+      - py${{vars.python-version}}-cython-bin
+      - py${{vars.python-version}}-pip
+      - py${{vars.python-version}}-setuptools
+      - python-${{vars.python-version}}-dev
   environment:
     JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
 
@@ -45,7 +47,7 @@ pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/apache/cassandra
-      expected-commit: c8abc9f3e1bb46bc4d699c3a167e43df62b9bec8
+      expected-commit: 4cba279af681367de72ddfe1589b4e15870c9a8e
       tag: cassandra-${{package.version}}
 
   - uses: maven/pombump
@@ -102,11 +104,114 @@ subpackages:
             virtual-pkg-name: cassandra-compat
             real-pkg-name: ${{subpkg.name}}
 
+  - name: ${{package.name}}-iamguarded-compat
+    dependencies:
+      provides:
+        - cassandra-iamguarded-compat=${{package.full-version}}
+      runtime:
+        - cassandra-${{vars.major-minor-version}}
+        - python-${{vars.python-version}}
+        - dash-binsh
+        - posix-libc-utils
+        - coreutils
+        - bash
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: cassandra
+          version: ${{vars.major-minor-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/cassandra/bin /iamguarded/cassandra /opt/iamguarded/java
+          chmod g+rwX /opt/iamguarded
+
+          ln -s /usr/bin/cassandra /opt/iamguarded/cassandra/bin/cassandra
+          ln -s /usr/bin/cassandra.in.sh /opt/iamguarded/cassandra/bin/cassandra.in.sh
+          ln -s /usr/bin/cqlsh /opt/iamguarded/cassandra/bin/cqlsh
+          ln -s /usr/bin/cqlsh.py /opt/iamguarded/cassandra/bin/cqlsh.py
+          ln -s /usr/bin/debug-cql /opt/iamguarded/cassandra/bin/debug-cql
+          ln -s /usr/bin/nodetool /opt/iamguarded/cassandra/bin/nodetool
+          ln -s /usr/bin/sstableloader /opt/iamguarded/cassandra/bin/sstableloader
+          ln -s /usr/bin/sstablescrub /opt/iamguarded/cassandra/bin/sstablescrub
+          ln -s /usr/bin/sstableupgrade /opt/iamguarded/cassandra/bin/sstableupgrade
+          ln -s /usr/bin/sstableutil /opt/iamguarded/cassandra/bin/sstableutil
+          ln -s /usr/bin/sstableverify /opt/iamguarded/cassandra/bin/sstableverify
+          ln -s /usr/bin/stop-server /opt/iamguarded/cassandra/bin/stop-server
+
+          ln -s /usr/share/java/cassandra/lib /opt/iamguarded/cassandra/lib
+      - name: copy-files-to-dest
+        runs: |
+          # Create symlinks for all files and directories in /usr/lib/jvm/java-${{vars.java-version}}-openjdk/
+          for item in /usr/lib/jvm/java-${{vars.java-version}}-openjdk/*; do
+            # Get the base name of the item (file or directory)
+            base_item=$(basename "$item")
+            ln -s "$item" /opt/iamguarded/java/$base_item
+          done
+      - name: copy-conf-files
+        runs: |
+          # Copy conf files for iamguarded compatibility
+          mkdir -p /opt/iamguarded/cassandra/
+          cp -r ${{targets.destdir}}/usr/share/java/cassandra/conf /opt/iamguarded/cassandra/conf
+          cp -r ${{targets.destdir}}/usr/share/java/cassandra/conf /opt/iamguarded/cassandra/conf.default
+      - uses: iamguarded/finalize-compat
+        with:
+          package: cassandra
+          version: ${{vars.major-minor-version}}
+    test:
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: cassandra
+            version: ${{vars.major-minor-version}}
+
+  # This subpackage provides compatibility with upstream docker-library/cassandra entrypoint behavior.
+  # It fetches the official entrypoint script from GitHub and verifies its integrity using SHA256.
+  # The entrypoint script processes environment variables (CASSANDRA_SEEDS, CASSANDRA_CLUSTER_NAME,
+  # CASSANDRA_DC, CASSANDRA_RACK, etc.) and writes them to configuration files.
+  #
+  # This is necessary for sustaining because upstream may update the entrypoint script independently
+  # of Cassandra releases. By tracking the SHA256 hash, we can detect when the script changes and
+  # decide whether to update our vendored copy or investigate breaking changes.
+  #
+  # If the hash verification fails, the pipeline will exit 1 to alert that the upstream
+  # entrypoint has changed and requires review before accepting the update.
+  - name: ${{package.name}}-entrypoint-compat
+    description: Entrypoint script for Cassandra environment variable configuration
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+        - findutils
+        - gawk
+        - gosu
+        - iproute2
+        - sed
+      provides:
+        - cassandra-entrypoint-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          ENTRYPOINT_URL="https://raw.githubusercontent.com/docker-library/cassandra/master/5.0/docker-entrypoint.sh"
+          curl -o /tmp/docker-entrypoint.sh "$ENTRYPOINT_URL"
+
+          EXPECTED_SHA256="9a5b895a511bd19512eb19e001196bc458d80201b98e3acca85e8792e99f4aed"
+          ACTUAL_SHA256=$(sha256sum /tmp/docker-entrypoint.sh | cut -d' ' -f1)
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            exit 1
+          fi
+
+          mkdir -p ${{targets.contextdir}}/usr/local/bin/
+          cp docker-entrypoint.sh ${{targets.contextdir}}/usr/local/bin/
+          chmod +x ${{targets.contextdir}}/usr/local/bin/docker-entrypoint.sh
+    test:
+      pipeline:
+        - runs: |
+            # Verify the entrypoint script is executable
+            test -x /usr/local/bin/docker-entrypoint.sh
+
   - name: cqlsh-${{vars.major-minor-version}}
     dependencies:
       runtime:
-        - py${{vars.py-version}}-cassandra-driver
-        - py${{vars.py-version}}-wcwidth
+        - py${{vars.python-version}}-cassandra-driver
+        - py${{vars.python-version}}-wcwidth
       provides:
         - cqlsh=${{package.full-version}}
     pipeline:
@@ -114,12 +219,12 @@ subpackages:
         working-directory: pylib
         uses: py/pip-build-install
         with:
-          python: python${{vars.py-version}}
+          python: python${{vars.python-version}}
       - name: "Install cqlsh executable"
         runs: |
           mkdir -p ${{targets.contextdir}}/usr/bin
           cp ./bin/cqlsh.py ${{targets.contextdir}}/usr/bin/cqlsh
-          python=python${{vars.py-version}}
+          python=python${{vars.python-version}}
           sed -i "1s,.*,#!/usr/bin/$python,g" ${{targets.contextdir}}/usr/bin/cqlsh
           head -n 1 ${{targets.contextdir}}/usr/bin/cqlsh
     test:
@@ -166,8 +271,9 @@ test:
         expected_output: |
           Startup complete
         post: |
+          set -o pipefail
           # Basic connectivity test
-          nodetool status | grep -q "UN"
+          nodetool status | grep -F "UN"
 
           # Run CQL operations
           cqlsh -e "CREATE KEYSPACE IF NOT EXISTS test_ks
@@ -180,7 +286,7 @@ test:
             VALUES (uuid(), 'test_value');"
 
           # Verify data
-          cqlsh -e "SELECT value FROM test_ks.test_table;" | grep -q "test_value"
+          cqlsh -e "SELECT value FROM test_ks.test_table;" | grep -F "test_value"
 
           # Check node tools
-          nodetool info | grep -q "Native Transport active"
+          nodetool info | grep -F "Native Transport active"

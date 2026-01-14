@@ -1,0 +1,102 @@
+package:
+  name: pg_cron-16
+  version: "1.6.7"
+  epoch: 1
+  description: PostgreSQL 16 extension for running jobs on a schedule using cron syntax
+  copyright:
+    - license: PostgreSQL
+
+var-transforms:
+  - from: ${{package.name}}
+    match: '^pg_cron-(\d+)$'
+    replace: $1
+    to: pg-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - clang-19
+      - llvm-19
+      - postgresql-${{vars.pg-version}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/citusdata/pg_cron
+      expected-commit: 465b38c737f584d520229f5a1d69d1d44649e4e5
+      tag: v${{package.version}}
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: citusdata/pg_cron
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql-${{vars.pg-version}}
+        - postgresql-${{vars.pg-version}}-client
+        - shadow
+        - sudo-rs
+        - glibc-locales
+        - wait-for-it
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+  pipeline:
+    - name: Initialize PostgreSQL database
+      runs: |
+        useradd $PGUSER
+        echo -n $PGPASSWORD 2>&1 > /tmp/pwfile
+        sudo -u $PGUSER initdb --pwfile=/tmp/pwfile -D /tmp/pgdata --auth=md5 2>&1
+    - name: Test pg_cron extension
+      runs: |
+        sudo -u $PGUSER pg_ctl start -w -D /tmp/pgdata -o "--shared_preload_libraries=pg_cron --unix_socket_directories=/tmp" -l /tmp/pgdata/log 2>&1
+
+        # Wait for PostgreSQL to be ready
+        wait-for-it localhost:5432 -t 4
+
+        # Test extension creation and basic functionality
+        psql -h /tmp -d postgres -U postgres << 'EOF'
+        -- Create the pg_cron extension
+        CREATE EXTENSION pg_cron;
+
+        -- Verify extension is installed
+        SELECT * FROM pg_extension WHERE extname = 'pg_cron';
+
+        -- Test scheduling a simple job (but don't wait for execution)
+        SELECT cron.schedule('test-job', '* * * * *', 'SELECT 1');
+
+        -- Verify job was scheduled
+        SELECT jobname, schedule, command FROM cron.job WHERE jobname = 'test-job';
+
+        -- Test unscheduling the job
+        SELECT cron.unschedule('test-job');
+
+        -- Verify job was removed
+        SELECT COUNT(*) FROM cron.job WHERE jobname = 'test-job';
+
+        -- Test cron.job_run_details view exists
+        SELECT COUNT(*) FROM cron.job_run_details;
+        EOF
+
+        # Check for any errors in PostgreSQL logs
+        if grep -E '(ERROR|FATAL)' /tmp/pgdata/log/postgresql.log 2>/dev/null | grep -Ev '(no COPY in progress|could not connect to|could not send|the database system is not yet accepting connections|database system is shutting|error reading result of streaming command|database system is starting up)'; then
+          echo "PostgreSQL errors found in logs"
+          exit 1
+        fi
+
+        # Cleanup: Stop PostgreSQL and kill any remaining processes
+        pg_ctl stop -D /tmp/pgdata -m fast 2>/dev/null || true
+    - uses: test/tw/ldd-check

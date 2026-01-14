@@ -1,0 +1,168 @@
+package:
+  name: celeborn-0.6
+  version: "0.6.2"
+  epoch: 3 # GHSA-vc5p-v9hr-52mj
+  description: "Apache Celeborn - A Remote Shuffle Service for Distributed Data Processing Engines"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - celeborn=${{package.full-version}}
+    runtime:
+      - bash
+      - coreutils
+      - glibc-locale-en
+      - libjemalloc2
+      - openjdk-${{vars.java-version}}-default-jvm
+      - openssh
+      - procps
+      - sed
+      - tzdata
+
+vars:
+  base-package-name: celeborn
+  java-version: 8
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - git
+      - libstdc++
+      - maven
+      - openjdk-${{vars.java-version}}-default-jdk
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-1.${{vars.java-version}}-openjdk
+    LANG: en_US.UTF-8
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 1af2849e301512117925eb3b0213995475b4269f
+      repository: https://github.com/apache/celeborn.git
+      tag: v${{package.version}}
+
+  - uses: maven/pombump
+
+  - uses: patch
+    with:
+      patches: commons-lang3-3.18.0.patch
+
+  - name: Build / install Celeborn
+    runs: |
+      # Build parts taken from https://github.com/apache/celeborn/blob/main/build/make-distribution.sh
+
+      dest=${{targets.contextdir}}/usr/share/java/${{vars.base-package-name}}
+      mkdir -p \
+        $dest \
+        $dest/bin \
+        $dest/conf \
+        $dest/jars \
+        $dest/sbin
+
+      SCALA_VERSION="$(mvn help:evaluate -Dexpression=scala.binary.version 2>/dev/null \
+        | grep -v "INFO" \
+        | grep -v "WARNING" \
+        | tail -n 1)"
+      VERSION="$(mvn help:evaluate -Dexpression=project.version 2>/dev/null \
+        | grep -v "INFO" \
+        | grep -v "WARNING" \
+        | tail -n 1)"
+
+      echo "Celeborn ${{package.version}} (git revision $(git rev-parse --short HEAD 2>/dev/null))" > $dest/RELEASE
+
+      mvn clean package -DskipTests -Dmaven.javadoc.skip=true -Dmaven.source.skip -pl master,worker -am
+
+      for dir in master worker
+      do
+        mkdir -p "$dest/$dir-jars"
+
+        cp "$dir"/target/celeborn-"$dir"_"$SCALA_VERSION"-"$VERSION".jar "$dest/$dir-jars/"
+        cp "$dir"/target/scala-"$SCALA_VERSION"/jars/*.jar "$dest/jars/"
+
+        for jar in "$dir/target/scala-$SCALA_VERSION/jars"/*;
+        do
+          (cd "$dest/$dir-jars"; ln -snf "../jars/$(basename $jar)" .)
+        done
+      done
+
+      cp conf/*.template $dest/conf
+      cp -r bin $dest
+      cp -r sbin $dest
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    dependencies:
+      provides:
+        - ${{vars.base-package-name}}-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/${{vars.base-package-name}}
+
+          for dir in bin conf jars master-jars sbin worker-jars
+          do
+            ln -sf /usr/share/java/${{vars.base-package-name}}/$dir ${{targets.contextdir}}/opt/${{vars.base-package-name}}/$dir
+          done
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - name: Test symlinks
+          runs: |
+            for dir in bin conf jars master-jars sbin worker-jars
+            do
+              stat -L /opt/${{vars.base-package-name}}/$dir
+            done
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-compat
+        - wait-for-it
+    # Some of these are set to match defaults in the external counterpart image
+    environment:
+      CELEBORN_HOME: /opt/celeborn
+      CELEBORN_JEMALLOC_PATH: /usr/lib/libjemalloc.so.2
+      CELEBORN_PREFER_JEMALLOC: true
+      JAVA_HOME: /usr/lib/jvm/java-1.${{vars.java-version}}-openjdk
+      LC_ALL: en_US.UTF-8
+  pipeline:
+    - name: Test starting master
+      runs: |
+        cd $CELEBORN_HOME/conf
+        cp log4j2.xml.template log4j2.xml
+
+        cat >> celeborn-defaults.conf <<EOF
+        celeborn.master.host 127.0.0.1
+        celeborn.master.port 9097
+        celeborn.network.bind.preferIpAddress true
+        celeborn.worker.storage.dirs=$CELEBORN_HOME/shuffle
+        EOF
+
+        cd $CELEBORN_HOME
+        ./sbin/start-master.sh
+
+        wait-for-it 127.0.0.1:9097
+
+        timeout 10 tail -f $CELEBORN_HOME/logs/celeborn* | grep "Master: Master started."
+
+        # Get master IP
+        ip="$(grep "Starting RPC Server \[Master\] on" $CELEBORN_HOME/logs/celeborn* | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | head -1)"
+
+        ./sbin/start-worker.sh celeborn://$ip
+
+        timeout 10 tail -f $CELEBORN_HOME/logs/celeborn* | grep "Worker: Worker started."
+
+update:
+  enabled: true
+  github:
+    identifier: apache/celeborn
+    tag-filter: v0.6.
+    strip-prefix: v
+  ignore-regex-patterns:
+    - -rc[0-9]+$

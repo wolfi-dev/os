@@ -1,26 +1,17 @@
 package:
   name: k8ssandra-operator
-  version: "1.26.0"
-  epoch: 1 # CVE-2025-47907
+  version: "1.30.0"
+  epoch: 0 # CVE-2025-61729
   description: The Kubernetes operator for K8ssandra
   copyright:
     - license: Apache-2.0
-
-environment:
-  contents:
-    packages:
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go
-      - wolfi-baselayout
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/k8ssandra/k8ssandra-operator
       tag: v${{package.version}}
-      expected-commit: 53569a6c10ffcbb1d02be6e88e4319eecf1c806b
+      expected-commit: 9e2b956dd1b52dc9fb693f1c214733e60ad05f64
 
   - uses: go/build
     with:
@@ -31,8 +22,6 @@ pipeline:
         -X "main.commit=$(git rev-parse HEAD)"
         -X "main.date=$(date -d@${SOURCE_DATE_EPOCH} +%FT%T)"
 
-  - uses: strip
-
 subpackages:
   - name: "${{package.name}}-compat"
     description: "Compatibility package to place binaries in the location expected by upstream helm charts"
@@ -40,6 +29,9 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"
           ln -sf /usr/bin/manager ${{targets.subpkgdir}}/manager
+    test:
+      pipeline:
+        - runs: test -L /manager && test "$(readlink /manager)" = "/usr/bin/manager"
 
 update:
   enabled: true
@@ -56,34 +48,33 @@ test:
       packages:
         - curl
         - k8ssandra-operator-compat
+        - openssl
     environment:
-      KUBERNETES_SERVICE_HOST: "127.0.0.1"
-      KUBERNETES_SERVICE_PORT: "8080"
+      WATCH_NAMESPACE: default
   pipeline:
     - uses: test/tw/ldd-check
     - runs: |
         ${{vars.bin-name}} --help
     - uses: test/kwok/cluster
-    - name: Launch operator with dummy kubeconfig
+      with:
+        serviceaccount: true
+    - name: Launch operator with kwok cluster
       uses: test/daemon-check-output
       with:
-        start: ${{vars.bin-name}}
+        setup: |
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -keyout /tmp/k8s-webhook-server/serving-certs/tls.key \
+            -out /tmp/k8s-webhook-server/serving-certs/tls.crt \
+            -subj "/CN=k8ssandra-operator-webhook-service.default.svc" \
+            -addext "subjectAltName=DNS:k8ssandra-operator-webhook-service.default.svc"
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/k8ssandra/k8ssandra-operator/v${{package.version}}/charts/k8ssandra-operator/crds/k8ssandra-operator-crds.yaml
+          sleep 1
+        start: ${{vars.bin-name}} --metrics-bind-address ":8080" --health-probe-bind-address ":8081"
         timeout: 30
-        # Ignore ERROR keyword, since it is expected.
-        error_strings: |
-          FAIL
-          FATAL
-          Traceback.*most.recent.call
-          Exception in thread
-          java.lang.NullPointerException
-          java.lang.RuntimeException
-          Gem::MissingSpecError
-          command not found
         expected_output: |
-          starting manager
-          Starting metrics server
-          starting server
+          Starting Controller
+          Starting workers
         post: |
-          echo "Verifying metrics endpoint"
-          curl -sf http://127.0.0.1:8080/metrics
-          echo "Metrics endpoint is serving as expected"
+          curl --silent --fail http://127.0.0.1:8080/metrics
+          curl --silent --fail http://127.0.0.1:8081/healthz

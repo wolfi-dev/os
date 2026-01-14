@@ -1,7 +1,7 @@
 package:
   name: actions-runner-controller
-  version: "0.12.1"
-  epoch: 2 # CVE-2025-47907
+  version: "0.13.1"
+  epoch: 0
   description: Kubernetes controller for GitHub Actions self-hosted runners
   copyright:
     - license: Apache-2.0
@@ -18,7 +18,7 @@ pipeline:
     with:
       repository: https://github.com/actions/actions-runner-controller
       tag: gha-runner-scale-set-${{package.version}}
-      expected-commit: ded39bede6da17f807d0b3430e9970d00216f156
+      expected-commit: a505fb5616f37947f7671dcf23eeae746bab69a0
 
   - uses: go/build
     with:
@@ -42,11 +42,6 @@ pipeline:
       packages: ./cmd/actionsmetricsserver
       output: actions-metrics-server
 
-  - uses: go/build
-    with:
-      packages: ./cmd/sleep
-      output: sleep
-
 subpackages:
   - name: "${{package.name}}-compat"
     description: "Compatibility package to place binaries in the location expected by upstream helm charts"
@@ -55,6 +50,12 @@ subpackages:
           mkdir -p "${{targets.subpkgdir}}"
           ln -sf /usr/bin/manager ${{targets.subpkgdir}}/manager
           ln -sf /usr/bin/ghalistener ${{targets.subpkgdir}}/ghalistener
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /ghalistener
+            readlink -v /manager
 
 update:
   enabled: true
@@ -67,7 +68,9 @@ test:
   environment:
     contents:
       packages:
+        - curl
         - ${{package.name}}-compat
+        - openssl
   pipeline:
     - runs: |
         set +e
@@ -77,8 +80,37 @@ test:
         ghalistener -h
         github-webhook-server -h
         actions-metrics-server -h
-        sleep 1
         actions-metrics-server --help
         github-webhook-server --help
         manager --help
-        sleep --help
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: ghalistener github-webhook-server actions-metrics-server
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Launch manager with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -keyout /tmp/k8s-webhook-server/serving-certs/tls.key \
+            -out /tmp/k8s-webhook-server/serving-certs/tls.crt \
+            -subj "/CN=actions-runner-controller-webhook-service.default.svc" \
+            -addext "subjectAltName=DNS:actions-runner-controller-webhook-service.default.svc"
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_horizontalrunnerautoscalers.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runnerdeployments.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runnerreplicasets.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runners.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runnersets.yaml
+          openssl genrsa -out /tmp/fake-gh-app.key 2048
+        start: manager --github-app-private-key /tmp/fake-gh-app.key --metrics-addr ":8080"
+        timeout: 30
+        expected_output: |
+          Starting Controller
+          Starting workers
+        post: |
+          curl --silent --fail http://127.0.0.1:8080/metrics

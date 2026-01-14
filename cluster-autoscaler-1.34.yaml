@@ -1,0 +1,121 @@
+package:
+  name: cluster-autoscaler-1.34
+  version: "1.34.2"
+  epoch: 1 # GHSA-j5w8-q4qc-rx2x
+  description: Autoscaling components for Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - cluster-autoscaler=${{package.full-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kubernetes/autoscaler
+      tag: cluster-autoscaler-${{package.version}}
+      expected-commit: b8e0634637ff376046eb145b0a4b864ac7a4beb3
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+      modroot: vertical-pod-autoscaler/e2e
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+      modroot: cluster-autoscaler
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+      modroot: cluster-autoscaler/cloudprovider/azure/test
+
+  - uses: go/build
+    with:
+      modroot: cluster-autoscaler
+      packages: .
+      output: cluster-autoscaler
+      vendor: true
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}
+          # The upstream helm chart assumes the binary is in /.
+          ln -sf /usr/bin/cluster-autoscaler ${{targets.subpkgdir}}/cluster-autoscaler
+    dependencies:
+      provides:
+        - cluster-autoscaler-compat=${{package.full-version}}
+    test:
+      pipeline:
+        - runs: |
+            readlink -f /cluster-autoscaler | grep /usr/bin/cluster-autoscaler
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: cluster-autoscaler-compat
+            real-pkg-name: ${{package.name}}-compat
+
+update:
+  enabled: true
+  github:
+    identifier: kubernetes/autoscaler
+    strip-prefix: cluster-autoscaler-
+    use-tag: true
+    # There are other tags like "cluster-autoscaler-chart-FOO"
+    tag-filter: cluster-autoscaler-1.34.
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubectl
+  pipeline:
+    - runs: |
+        # cluster-autoscaler --help exits with exit code 2
+        cluster-autoscaler --help | grep "pflag: help requested"
+    - uses: test/kwok/cluster
+    - runs: |
+        # Create the ConfigMap for autoscaler configuration
+        kubectl create configmap nginx-autoscaler --from-literal=linear='{
+          "coresPerReplica": 2,
+          "nodesPerReplica": 1,
+          "max": 3,
+          "preventSinglePointFailure": true
+        }' --namespace=default
+
+        # Create the Deployment
+        kubectl create deployment nginx-autoscale-example --image=nginx --replicas=1 --namespace=default
+        kubectl expose deployment nginx-autoscale-example --port=80 --target-port=80 --namespace=default
+
+        # Create the ServiceAccount
+        kubectl create serviceaccount nginx-autoscaler --namespace=default
+
+        # Create the ClusterRole
+        kubectl create clusterrole system:nginx-autoscaler \
+          --verb=list,watch --resource=nodes \
+          --verb=get,update --resource=replicationcontrollers/scale \
+          --verb=get,update --resource=deployments/scale,replicasets/scale \
+          --verb=get,create --resource=configmaps
+
+        # Create the ClusterRoleBinding
+        kubectl create clusterrolebinding system:nginx-autoscaler \
+          --clusterrole=system:nginx-autoscaler \
+          --serviceaccount=default:nginx-autoscaler
+
+        kubectl rollout status deployment/nginx-autoscale-example --namespace=default
+
+        # Set up the necessary environment for the autoscaler to communicate with the API
+        mkdir -p /var/run/secrets/kubernetes.io/serviceaccount
+        export KUBERNETES_SERVICE_HOST=127.0.0.1
+        export KUBERNETES_SERVICE_PORT=32764
+        CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+        cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        kubectl create token nginx-autoscaler > /var/run/secrets/kubernetes.io/serviceaccount/token
+
+        # Run the cluster-autoscaler to scale the deployment
+        cluster-autoscaler --namespace=default --configmap=nginx-autoscaler --target=deployment/nginx-autoscale-example --logtostderr=true --v=2 > /dev/null 2>&1 &

@@ -1,0 +1,232 @@
+package:
+  name: jaeger-2
+  version: "2.13.0"
+  epoch: 2 # GHSA-cfpf-hrx2-8rv6
+  description: Jaeger, a Distributed Tracing Platform
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - jaeger=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/jaegertracing/jaeger
+      tag: v${{package.version}}
+      expected-commit: 63b27e1810a710ac54dc4522da0538e540bdc545
+      recurse-submodules: true
+
+  - uses: go/bump
+    with:
+      deps: |-
+        github.com/expr-lang/expr@v1.17.7
+
+  - working-directory: jaeger-ui
+    runs: |
+      npm pkg set resolutions.react-icons=5.0.1
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - nodejs-24
+      - npm
+
+data:
+  - name: jaeger-components
+    items:
+      all-in-one: "."
+      anonymizer: "."
+      collector: "."
+      es-index-cleaner: "."
+      es-rollover: "."
+      esmapping-generator: "."
+      ingester: "."
+      jaeger: "."
+      query: "."
+      remote-storage: "."
+      tracegen: "."
+
+subpackages:
+  - range: jaeger-components
+    name: "${{package.name}}-${{range.key}}"
+    dependencies:
+      provides:
+        - jaeger-${{range.key}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          ## Only run this step if building for all-in-one package
+          ## This builds the ui component of jaeger with npm
+          if [[ "${{range.key}}" = "all-in-one" ]]; then
+            mkdir -p jaeger-ui/packages/jaeger-ui/build
+            rm -rf cmd/query/app/ui/actual/*
+            npm install --prefix jaeger-ui/
+            cd jaeger-ui/packages/jaeger-ui/build
+            npm install
+            npm run build
+          fi
+      - runs: |
+          ## Only run this step if building for all-in-one package
+          ## This copies the build artifact into a go package
+          COMPONENT="${{range.key}}"
+          if [[ "$COMPONENT" = "all-in-one" ]]; then
+            cp -r jaeger-ui/packages/jaeger-ui/build/* cmd/query/app/ui/actual
+            find cmd/query/app/ui/actual -type f | grep -v .gitignore | xargs gzip --no-name
+            touch -t "$(date -r jaeger-ui/packages/jaeger-ui/build/index.html '+%Y%m%d%H%M.%S')" cmd/query/app/ui/actual/index.html.gz
+          fi
+      - runs: |
+          COMPONENT="${{range.key}}"
+          if [[ "$COMPONENT" = "all-in-one" ]]; then
+            mkdir -p "${{targets.contextdir}}/etc/jaeger"
+            install -m644 "./sampling_strategies.json" "${{targets.contextdir}}"/etc/jaeger/sampling_strategies.json
+          fi
+      - uses: go/build
+        with:
+          packages: ./cmd/${{range.key}}
+          ldflags: -X github.com/jaegertracing/jaeger/internal/version.latestVersion=v${{package.version}} -X github.com/jaegertracing/jaeger/internal/version.commitSHA=$(git rev-parse HEAD) -X github.com/jaegertracing/jaeger/internal/version.date=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+          output: ${{range.key}}
+    test:
+      pipeline:
+        - name: "basic binary check"
+          runs: ${{range.key}} --help
+        - name: "basic version check"
+          runs: |
+            COMPONENT="${{range.key}}"
+            if [[ "$COMPONENT" != "es-index-cleaner" && "$COMPONENT" != "es-rollover" ]]; then
+              echo "Checking version of ${{range.key}}"
+              ${{range.key}} version 2>&1| grep ${{package.version}}
+            fi
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: "jaeger-${{range.key}}"
+            real-pkg-name: "${{subpkg.name}}"
+
+  - range: jaeger-components
+    name: "${{package.name}}-${{range.key}}-compat"
+    dependencies:
+      provides:
+        - jaeger-${{range.key}}-compat=${{package.full-version}}
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts for all Jaeger components"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/go/bin"
+          ln -sf /usr/bin/${{range.key}} ${{targets.contextdir}}/go/bin/${{range.key}}-linux
+    test:
+      pipeline:
+        - name: "verify compat binary is in place"
+          runs: readlink -v /go/bin/${{range.key}}-linux
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: "jaeger-${{range.key}}-compat"
+            real-pkg-name: "${{subpkg.name}}"
+
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package with iamguarded jaeger image"
+    dependencies:
+      provides:
+        - jaeger-iamguarded-compat=${{package.full-version}}
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: jaeger
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/jaeger/bin/
+          chmod g+rwX /opt/iamguarded
+          ln -sf /usr/bin/all-in-one /opt/iamguarded/jaeger/bin/jaeger-all-in-one
+          ln -sf /usr/bin/collector /opt/iamguarded/jaeger/bin/jaeger-collector
+          ln -sf /usr/bin/ingester /opt/iamguarded/jaeger/bin/jaeger-ingester
+          ln -sf /usr/bin/query /opt/iamguarded/jaeger/bin/jaeger-query
+          ln -sf /usr/bin/jaeger /opt/iamguarded/jaeger/bin/jaeger-jaeger
+      - uses: iamguarded/finalize-compat
+        with:
+          package: jaeger
+          version: ${{vars.major-version}}
+    test:
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: jaeger
+            version: ${{vars.major-version}}
+
+  - name: ${{package.name}}-iamguarded-cassandra-schema
+    description: "Cassandra schema files for Jaeger"
+    dependencies:
+      provides:
+        - jaeger-iamguarded-cassandra-schema=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/opt/iamguarded/jaeger/cassandra-schema
+          cp -r internal/storage/v1/cassandra/schema/* "${{targets.contextdir}}"/opt/iamguarded/jaeger/cassandra-schema/
+    test:
+      pipeline:
+        - name: Verify cassandra schema files
+          runs: |
+            stat /opt/iamguarded/jaeger/cassandra-schema/README.md
+            stat /opt/iamguarded/jaeger/cassandra-schema/create.sh
+            stat /opt/iamguarded/jaeger/cassandra-schema/docker.sh
+            stat /opt/iamguarded/jaeger/cassandra-schema/v001.cql.tmpl
+            stat /opt/iamguarded/jaeger/cassandra-schema/migration/v001tov002part1.sh
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-all-in-one
+        - ${{package.name}}-anonymizer
+        - ${{package.name}}-collector
+        - ${{package.name}}-es-index-cleaner
+        - ${{package.name}}-es-rollover
+        - ${{package.name}}-esmapping-generator
+        - ${{package.name}}-ingester
+        - ${{package.name}}-query
+        - ${{package.name}}-remote-storage
+        - ${{package.name}}-tracegen
+        - jq
+  pipeline:
+    - name: "Check all in one status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/all-in-one"
+        timeout: 60
+        expected_output: |
+          Starting HTTP server
+    - name: "Check connector status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/collector"
+        timeout: 60
+        expected_output: |
+          Admin server started
+    - name: "Check query status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/query"
+        timeout: 60
+        expected_output: |
+          Admin server started
+    - name: "Check ingester status"
+      uses: test/daemon-check-output
+      with:
+        start: "/usr/bin/query"
+        timeout: 60
+        expected_output: |
+          Admin server started
+
+update:
+  enabled: true
+  github:
+    use-tag: true
+    identifier: jaegertracing/jaeger
+    strip-prefix: v
+    tag-filter-prefix: v2

@@ -1,62 +1,56 @@
 package:
   name: newrelic-fluent-bit-output
-  version: "2.4.0"
-  epoch: 2 # CVE-2025-4674
+  version: "3.3.0"
+  epoch: 0 # CVE-2025-61729
   description: A Fluent Bit output plugin that sends logs to New Relic
   copyright:
     - license: Apache-2.0
-
-environment:
-  contents:
-    packages:
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go-1.20
-      - wolfi-baselayout
-      # We need go-1.20 because of the bug mentioned in this PR: https://github.com/newrelic/newrelic-fluent-bit-output/pull/144/files
-      # If their go.mod file ever removes 1.20, we can remove -1.20 from here.
+  dependencies:
+    runtime:
+      - libpq # New Relic Fluent Bit plugin depends on libpq at runtime otherwise it will fail with "libpq.so.5: cannot open shared object file: No such file or directory"
 
 pipeline:
-  # We can't use go/install because this requires specific ldflags to set the version
   - uses: git-checkout
     with:
       repository: https://github.com/newrelic/newrelic-fluent-bit-output
       tag: v${{package.version}}
-      expected-commit: cc6bcc1e735a8812dd2eab8022a575b44f8366c8
+      expected-commit: da5dee699d5429c14e57db3791254a3abbc253f0
 
-  # PRISMA-2023-0056 was not picked up by Grype but the vulnerable version of the logrus package was present
   - uses: go/bump
     with:
       deps: |-
         github.com/sirupsen/logrus@v1.9.3
-      go-version: "1.20"
 
-  - uses: patch
+  - uses: go/build
     with:
-      patches: fix-archs.patch
-
-  - runs: |
-      ARCH=$(go env GOARCH)
-      make VERSION=v${{ package.version }} linux/${ARCH}
-      mkdir -p ${{targets.destdir}}/fluent-bit/bin
-      cp ./out_newrelic-linux-${ARCH}-v${{ package.version }}.so ${{targets.destdir}}/fluent-bit/bin/out_newrelic.so
-
-  - uses: strip
+      output: out_newrelic.so
+      buildmode: c-shared
+      packages: .
 
 subpackages:
-  - name: newrelic-fluent-bit-output-compat
+  - name: ${{package.name}}-compat
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/fluent-bit/bin/
+          mkdir -p ${{targets.contextdir}}/fluent-bit/bin/
           # The upstream chart expects the fluent-bit binary to be in /fluent-bit/bin/fluent-bit
-          ln -sf /usr/bin/fluent-bit ${{targets.subpkgdir}}/fluent-bit/bin/fluent-bit
-    dependencies:
-      runtime:
-        - newrelic-fluent-bit-output
+          ln -sf /usr/bin/out_newrelic.so ${{targets.contextdir}}/fluent-bit/bin/out_newrelic.so
+          ln -sf /usr/bin/fluent-bit ${{targets.contextdir}}/fluent-bit/bin/fluent-bit
+    test:
+      environment:
+        contents:
+          packages:
+            - fluent-bit
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
 
 update:
   enabled: true
+  ignore-regex-patterns:
+    - "-beta"
   github:
     identifier: newrelic/newrelic-fluent-bit-output
     strip-prefix: v
@@ -64,5 +58,83 @@ update:
     tag-filter: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - fluent-bit
+        - fluent-bit-compat
+        - procps
+        - ${{package.name}}-compat
   pipeline:
     - uses: test/tw/ldd-check
+    - name: "Verify plugin binary exists"
+      runs: |
+        PLUGIN_PATH="/fluent-bit/bin/out_newrelic.so"
+        test -f "$PLUGIN_PATH"
+    - name: "Verify plugin loads in fluent-bit"
+      runs: |
+        # Create a basic config that loads the plugin
+        cat > /tmp/test-load.conf <<EOF
+        [SERVICE]
+            Flush        1
+            Daemon       Off
+            Log_Level    info
+
+        [INPUT]
+            Name   dummy
+            Dummy  {"message": "test"}
+            Rate   1
+
+        [OUTPUT]
+            Name   stdout
+            Match  *
+        EOF
+
+        # Test that fluent-bit can load the plugin and check output
+        OUTPUT=$(timeout 3 fluent-bit -e /fluent-bit/bin/out_newrelic.so -c /tmp/test-load.conf 2>&1)
+        echo "$OUTPUT"
+
+        # Verify plugin loaded successfully - check for either successful load message or no error
+        if echo "$OUTPUT" | grep -Eq "(loaded.*plugin|registered|out_newrelic|Fluent Bit.*started)"; then
+          echo "SUCCESS: New Relic plugin loaded successfully"
+        elif echo "$OUTPUT" | grep -Eq "(failed|error.*loading|cannot.*load|dlopen.*failed)"; then
+          echo "ERROR: Plugin failed to load"
+          echo "$OUTPUT"
+          exit 1
+        else
+          # If fluent-bit started without errors, plugin loaded successfully
+          echo "SUCCESS: Plugin loaded (fluent-bit started without errors)"
+        fi
+    - name: "Test plugin with mock New Relic endpoint"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          #!/bin/sh
+          # Create config with New Relic output
+          cat > /tmp/newrelic-test.conf <<EOF
+          [SERVICE]
+              Flush        1
+              Daemon       Off
+              Log_Level    debug
+
+          [INPUT]
+              Name   dummy
+              Dummy  {"test": "message", "hostname": "test-host", "service": "test-service"}
+              Rate   1
+              Tag    test.logs
+
+          [OUTPUT]
+              Name   newrelic
+              Match  *
+              licenseKey  test_license_key_12345678901234567890123456789012
+              endpoint    https://log-api.newrelic.com/log/v1
+          EOF
+        start: fluent-bit -e /fluent-bit/bin/out_newrelic.so -c /tmp/newrelic-test.conf
+        timeout: 10
+        expected_output: |
+          Fluent Bit
+        post: |
+          #!/bin/sh
+          set -o pipefail
+          # Verify fluent-bit is running with the plugin
+          pgrep -f "fluent-bit"

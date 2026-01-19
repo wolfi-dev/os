@@ -1,8 +1,7 @@
-#nolint:forbidden-repository-used,forbidden-keyring-used
 package:
   name: openssl
-  version: "3.5.2"
-  epoch: 1
+  version: "3.6.0"
+  epoch: 6
   description: "the OpenSSL cryptography suite"
   copyright:
     - license: Apache-2.0
@@ -41,22 +40,24 @@ pipeline:
     with:
       repository: https://github.com/openssl/openssl
       tag: openssl-${{package.version}}
-      expected-commit: 0893a62353583343eb712adef6debdfbe597c227
+      expected-commit: 7b371d80d959ec9ab4139d09d78e83c090de9779
 
   - uses: patch
     with:
-      patches: fix-jitter.patch 0001-baseprovider-add-MD5-and-SHA1.patch
+      patches: |
+        fix-jitter.patch
+        0001-baseprovider-add-MD5-and-SHA1.patch
+        0001-fips-block-HMAC-calculation-with-unapproved-digests.patch
 
-  - name: Create dbg sourcecode
+  - name: Perform throw-away canary tests of jitter and non-validated fips
     runs: |
-      SRCDIR=$(mktemp -d)
-      cp -r . $SRCDIR/
-      mkdir -p ${{targets.destdir}}-dbg/usr/src/
-      mv $SRCDIR ${{targets.destdir}}-dbg/usr/src/${{package.name}}
-      # Note that mktemp -d created it as 700, whilst the contents
-      # inside is 644 for files and 755 for dirs, without this gdb
-      # doesn't work for non-root user, fix this up.
-      chmod 755 ${{targets.destdir}}-dbg/usr/src/${{package.name}}
+      mkdir -p build-jitter-fips-tests/
+      cd build-jitter-fips-tests/
+      ../Configure --with-rand-seed=none enable-jitter enable-fips -DOPENSSL_DEFAULT_SEED_SRC=JITTER --debug
+      make -s -j$(nproc)
+      make tests HARNESS_JOBS=10
+      cd ../
+      rm -rf build-jitter-fips-tests/
 
   - name: Configure and build
     runs: |
@@ -83,6 +84,21 @@ pipeline:
          no-weak-ssl-ciphers \
          -Wa,--noexecstack
       perl configdata.pm --dump
+
+      # Create generated .c from .c.in
+      make build_all_generated
+
+      # Create debug sources after creating all the generated .c from .c.in
+      SRCDIR=$(mktemp -d)
+      cp -r . $SRCDIR/
+      mkdir -p ${{targets.destdir}}-dbg/usr/src/
+      mv $SRCDIR ${{targets.destdir}}-dbg/usr/src/${{package.name}}
+      # Note that mktemp -d created it as 700, whilst the contents
+      # inside is 644 for files and 755 for dirs, without this gdb
+      # doesn't work for non-root user, fix this up.
+      chmod 755 ${{targets.destdir}}-dbg/usr/src/${{package.name}}
+
+      # Continue building everything
       make -j$(nproc)
       make tests HARNESS_JOBS=10
 
@@ -103,18 +119,13 @@ pipeline:
       rm ${{targets.destdir}}/etc/ssl/ct_log_list.cnf
       # Second copy of CT log
       rm ${{targets.destdir}}/etc/ssl/ct_log_list.cnf.dist
+      # Remove engines, deprecated and will be removed in OpenSSL 4
+      rm -r "${{targets.destdir}}"/usr/lib/engines-3
       # Keeping etc/ssl/misc CA.pl & tsget perl scripts
       # without depending on perl, here in openssl package
       # This now makes openssl-config empty package, remove it
       # This also removes the need to have things coupled with
       # openssl-config-fipshardened going forward.
-
-data:
-  - name: engines
-    items:
-      afalg: Linux AF_ALG engine
-      capi: CAPI engine
-      padlock: VIA Padlock engine
 
 subpackages:
   - name: "openssl-dbg"
@@ -170,27 +181,6 @@ subpackages:
     test:
       pipeline:
         - uses: test/pkgconf
-        - uses: test/tw/ldd-check
-
-  - range: engines
-    name: "openssl-engine-${{range.key}}"
-    description: "OpenSSL ${{range.value}}"
-    pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/lib/engines-3
-          mv "${{targets.destdir}}"/usr/lib/engines-3/${{range.key}}.so "${{targets.subpkgdir}}"/usr/lib/engines-3/
-    test:
-      pipeline:
-        - uses: test/tw/ldd-check
-
-  - name: "openssl-engine-loader-attic"
-    description: "OpenSSL Loader Attic internal test engine"
-    pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/lib/engines-3
-          mv "${{targets.destdir}}"/usr/lib/engines-3/loader_attic.so "${{targets.subpkgdir}}"/usr/lib/engines-3/
-    test:
-      pipeline:
         - uses: test/tw/ldd-check
 
   - name: "openssl-provider-legacy"
@@ -296,9 +286,9 @@ test:
         run genrsa -out /dev/null
         EOF
         gdb --batch --command ./openssl.gdb openssl
-        # Assert that jitter entropy was not used
+        # Assert that jitter entropy was used
         grep -q 'Breakpoint 1,' jitter.log || exit 1
-        # Assert that getrandom syscall wrapper was used
+        # Assert that getrandom syscall wrapper was not used
         grep -q 'Breakpoint 2,' jitter.log && exit 1
     - name: docker-dind certificate generation
       runs: |

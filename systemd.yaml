@@ -1,8 +1,7 @@
 package:
   name: systemd
-  # 35712.patch can be dropped when 258 releases
-  version: "257.8"
-  epoch: 2
+  version: "259"
+  epoch: 0
   description: The systemd System and Service Manager
   copyright:
     - license: LGPL-2.1-or-later AND GPL-2.0-or-later
@@ -13,16 +12,24 @@ package:
     runtime:
       - dbus
       - kmod
+      - libacl1
+      - libarchive
+      - libaudit
+      - libblkid
+      - libmount
+      - libseccomp
+      - libselinux
       - merged-lib
       - merged-sbin
       - merged-usrsbin
       - quota-tools
       - systemd-boot
+      - systemd-systemctl
       - wolfi-baselayout
 
 vars:
   llvm-vers: 19
-  py-version: 3.13
+  python-version: 3.13
 
 data:
   - name: standalone-binaries
@@ -53,7 +60,6 @@ environment:
       - findutils
       - gnutar
       - gperf
-      - iptables-dev
       - kmod
       - kmod-dev
       - libarchive-dev
@@ -66,20 +72,22 @@ environment:
       - libmicrohttpd-dev
       - libmount
       - libseccomp-dev
+      - libselinux-dev
       - libuuid
       - libxslt
       - linux-headers
       - linux-pam-dev
       - llvm-${{vars.llvm-vers}}
       - meson
+      - nftables-dev
       - ninja
       - openssf-compiler-options
       - pcre2-dev
       - posix-libc-utils
-      - py${{vars.py-version}}-jinja2
-      - py${{vars.py-version}}-pefile
-      - py${{vars.py-version}}-pyelftools
-      - python-${{vars.py-version}}
+      - py${{vars.python-version}}-jinja2
+      - py${{vars.python-version}}-pefile
+      - py${{vars.python-version}}-pyelftools
+      - python-${{vars.python-version}}
       - quota-tools
       - rsync
       - tpm2-tss
@@ -92,7 +100,7 @@ pipeline:
     with:
       repository: https://github.com/systemd/systemd
       tag: v${{package.version}}
-      expected-commit: 5e38d199a623563698ab4a69acbbe3afa9135198
+      expected-commit: 9ca433482f2281d71718718705ca8cd3bf562ad6
 
   # systemd-detect is currently broken for aarch64 GCP VM's https://github.com/systemd/systemd/pull/38125
   # https://github.com/chainguard-dev/internal-dev/issues/17776
@@ -130,6 +138,8 @@ subpackages:
         - merged-sbin
         - systemd
         - systemd-container
+        - systemd-journal-gatewayd
+        - systemd-journal-remote
         - wolfi-baselayout
     pipeline:
       - runs: |
@@ -155,7 +165,8 @@ subpackages:
             - tzdata
             - busybox
             - tpm2-tss
-            - libidn2 # There's a lot of dlopen tests
+            - libgcrypt # There's a lot of dlopen tests
+            - libidn2
             - libbpf
             - libzstd1
             - libarchive
@@ -180,6 +191,8 @@ subpackages:
             # 2025/03/28 11:52:30 INFO Assertion 'mkdtemp_malloc("/tmp/test-rm-rf.XXXXXXX", &d) >= 0' failed at src/test/test-rm-rf.c:19, function test_rm_rf_chmod_inner(). Aborting.
             # 2025/03/28 11:52:30 INFO (setresuid) terminated by signal ABRT.
             # 2025/03/28 11:52:30 INFO Assertion 'r >= 0' failed at src/test/test-rm-rf.c:100, function test_rm_rf_chmod(). Aborting.
+            # test-firewall-util - Assertion failed: "r = fw_nftables_add_masquerade(nfnl, true, AF_INET6, &u1, 128)" failed with unexpected error: -2/ENOENT
+            # test-hostname-setup - does not work in Docker (Assertion failed: Expected "unshare(CLONE_NEWUTS)" to succeed, but got errno: 1/EPERM)
             /usr/lib/systemd/tests/run-unit-tests.py -u \
             -s test-sd-device \
             -s test-path-util \
@@ -195,7 +208,9 @@ subpackages:
             -s test-namespace \
             -s test-mount-util \
             -s test-bpf-foreign-programs \
-            -s test-execute
+            -s test-execute \
+            -s test-firewall-util \
+            -s test-hostname-setup
 
   - range: standalone-binaries
     name: ${{range.key}}-standalone
@@ -217,7 +232,7 @@ subpackages:
         - wolfi-baselayout
 
   - name: systemd-shutdown-standalone
-    description: Standalone version of ${{range.key}}
+    description: Standalone version of systemd-shutdown
     # Can't test this with --version because the binary checks the pid before anything else
     pipeline:
       - runs: |
@@ -235,6 +250,7 @@ subpackages:
     dependencies:
       runtime:
         - libudev
+        - libudev-dev
         - merged-lib
         - merged-sbin
         - merged-usrsbin
@@ -261,6 +277,21 @@ subpackages:
     test:
       pipeline:
         - uses: test/tw/ldd-check
+
+  - name: "libudev-dev"
+    description: "udev library development files"
+    dependencies:
+      provider-priority: 10
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/pkgconfig ${{targets.subpkgdir}}/usr/include
+          mv ./melange-out/systemd-dev/usr/include/libudev.h ${{targets.subpkgdir}}/usr/include/
+          mv ./melange-out/systemd-dev/usr/lib/pkgconfig/libudev.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/
+          mv ./melange-out/systemd-dev/usr/lib/libudev.so ${{targets.subpkgdir}}/usr/lib/
+    test:
+      pipeline:
+        - runs: test -f $(readlink -f /usr/lib/libudev.so)
+        - uses: test/pkgconf
 
   - name: "libsystemd"
     description: "systemd library"
@@ -298,13 +329,13 @@ subpackages:
     description: "systemd bootloader (installed for EFI)"
     pipeline:
       - runs: |
-          mkdir -p ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/
+          mkdir -p ${{targets.subpkgdir}}/boot/EFI/BOOT/
       - if: ${{build.arch}} == 'aarch64'
         runs: |
-          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootaa64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTAA64.EFI
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootaa64.efi ${{targets.subpkgdir}}/boot/EFI/BOOT/BOOTAA64.EFI
       - if: ${{build.arch}} == 'x86_64'
         runs: |
-          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootx64.efi ${{targets.subpkgdir}}/boot/efi/EFI/BOOT/BOOTX64.EFI
+          cp ${{targets.destdir}}/usr/lib/systemd/boot/efi/systemd-bootx64.efi ${{targets.subpkgdir}}/boot/EFI/BOOT/BOOTX64.EFI
     test:
       environment:
         contents:
@@ -314,10 +345,10 @@ subpackages:
       pipeline:
         - if: ${{build.arch}} == 'aarch64'
           runs: |
-            file /boot/efi/EFI/BOOT/BOOTAA64.EFI | grep "executable for EFI"
+            file /boot/EFI/BOOT/BOOTAA64.EFI | grep "executable for EFI"
         - if: ${{build.arch}} == 'x86_64'
           runs: |
-            file /boot/efi/EFI/BOOT/BOOTX64.EFI | grep "executable for EFI"
+            file /boot/EFI/BOOT/BOOTX64.EFI | grep "executable for EFI"
     dependencies:
       runtime:
         - merged-lib
@@ -359,11 +390,26 @@ subpackages:
             kernel-install --version
             kernel-install --help
 
+  - name: "systemd-systemctl"
+    description: "systemd systemctl utility"
+    dependencies:
+      runtime:
+        - libsystemd-shared
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin/
+          mv ${{targets.destdir}}/usr/bin/systemctl ${{targets.subpkgdir}}/usr/bin/
+    test:
+      pipeline:
+        - runs: |
+            systemctl --help
+            systemctl --version
+
   - name: systemd-container
     description: "systemd container tools"
     dependencies:
       runtime:
-        - gnutar
+        - libarchive
         - merged-lib
         - merged-sbin
         - merged-usrsbin
@@ -412,13 +458,14 @@ subpackages:
           # Misc utilties
           mv usr/lib/systemd/systemd-pull ${{targets.subpkgdir}}/usr/lib/systemd/
           mv usr/bin/systemd-dissect ${{targets.subpkgdir}}/usr/bin/
+          mv usr/lib/systemd/system/systemd-loop@.service ${{targets.subpkgdir}}/usr/lib/systemd/system/
     test:
       environment:
         contents:
           # without openssl-provider-legacy import errors referencing CRYPTOGRAPHY_OPENSSL_NO_LEGACY
           packages:
             - curl
-            - gnutar
+            - libarchive
       pipeline:
         - uses: test/verify-service
         - runs: |
@@ -501,13 +548,14 @@ subpackages:
       runtime:
         - ${{package.name}}
         - agetty
-        - agetty
         - kbd
         - merged-lib
         - merged-sbin
         - merged-usrsbin
         - mount
+        - time-daemon
         - tzdata
+        - util-linux-login
         - wolfi-baselayout
     pipeline:
       - runs: |
@@ -548,9 +596,12 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/usr/lib/systemd/system/multi-user.target.wants
+          mkdir -p ${{targets.subpkgdir}}/usr/lib/systemd/system/sockets.target.wants
           mv ${{targets.destdir}}/usr/lib/systemd/system/systemd-logind.service ${{targets.subpkgdir}}/usr/lib/systemd/system/
+          mv ${{targets.destdir}}/usr/lib/systemd/system/systemd-logind-varlink.socket ${{targets.subpkgdir}}/usr/lib/systemd/system/
           mv ${{targets.destdir}}/usr/lib/systemd/system/dbus-org.freedesktop.login1.service ${{targets.subpkgdir}}/usr/lib/systemd/system/
           mv ${{targets.destdir}}/usr/lib/systemd/system/multi-user.target.wants/systemd-logind.service ${{targets.subpkgdir}}/usr/lib/systemd/system/multi-user.target.wants/
+          mv ${{targets.destdir}}/usr/lib/systemd/system/sockets.target.wants/systemd-logind-varlink.socket ${{targets.subpkgdir}}/usr/lib/systemd/system/sockets.target.wants/
           mv ${{targets.destdir}}/usr/lib/systemd/systemd-logind ${{targets.subpkgdir}}/usr/lib/systemd/
     test:
       pipeline:
@@ -664,9 +715,9 @@ subpackages:
     description: "tool for creating unified kernel images"
     dependencies:
       runtime:
-        - py${{vars.py-version}}-pefile
-        - py${{vars.py-version}}-cryptography
-        - py${{vars.py-version}}-lz4
+        - py${{vars.python-version}}-pefile
+        - py${{vars.python-version}}-cryptography
+        - py${{vars.python-version}}-lz4
         - systemd-boot
     pipeline:
       - runs: |
@@ -676,7 +727,7 @@ subpackages:
           done
 
           # just replace the first line with '#!/usr/bin/python3.XX'
-          sed -i -e '1s,.*,#!/usr/bin/python${{vars.py-version}},' \
+          sed -i -e '1s,.*,#!/usr/bin/python${{vars.python-version}},' \
             "${{targets.subpkgdir}}/usr/bin/ukify"
     test:
       pipeline:
@@ -689,6 +740,66 @@ subpackages:
 
             ukify --help && echo "PASS: ukify --help exited 0" ||
                fail "ukify --help exited $?"
+
+  - name: "systemd-journal-gatewayd"
+    description: "HTTP server for journal events"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/lib/systemd/system"
+          mv "${{targets.destdir}}/usr/lib/systemd/systemd-journal-gatewayd" "${{targets.subpkgdir}}/usr/lib/systemd/"
+          mv "${{targets.destdir}}/usr/lib/systemd/system/systemd-journal-gatewayd.service" "${{targets.subpkgdir}}/usr/lib/systemd/system/"
+          mv "${{targets.destdir}}/usr/lib/systemd/system/systemd-journal-gatewayd.socket" "${{targets.subpkgdir}}/usr/lib/systemd/system/"
+
+  - name: "systemd-journal-remote"
+    description: "Receive journal messages over the network"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/lib/systemd/system"
+          mv "${{targets.destdir}}/usr/lib/systemd/systemd-journal-remote" "${{targets.subpkgdir}}/usr/lib/systemd/"
+          mv "${{targets.destdir}}/usr/lib/systemd/system/systemd-journal-remote.service" "${{targets.subpkgdir}}/usr/lib/systemd/system/"
+          mv "${{targets.destdir}}/usr/lib/systemd/system/systemd-journal-remote.socket" "${{targets.subpkgdir}}/usr/lib/systemd/system/"
+
+  - name: "systemd-timesyncd"
+    description: "Simple NTP client"
+    dependencies:
+      provider-priority: 10
+      provides:
+        - time-daemon
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/systemd"
+          mkdir -p "${{targets.subpkgdir}}/usr/lib/systemd/ntp-units.d"
+          mkdir -p "${{targets.subpkgdir}}/usr/lib/systemd/system"
+          mkdir -p "${{targets.subpkgdir}}/usr/lib/sysusers.d"
+          mkdir -p "${{targets.subpkgdir}}/usr/share/dbus-1/system-services"
+          mkdir -p "${{targets.subpkgdir}}/usr/share/dbus-1/system.d"
+          mkdir -p "${{targets.subpkgdir}}/usr/share/polkit-1/actions"
+          mv "${{targets.destdir}}/etc/systemd/timesyncd.conf" "${{targets.subpkgdir}}/etc/systemd/timesyncd.conf"
+          mv "${{targets.destdir}}/usr/lib/systemd/systemd-time-wait-sync" "${{targets.subpkgdir}}/usr/lib/systemd/systemd-time-wait-sync"
+          mv "${{targets.destdir}}/usr/lib/systemd/systemd-timesyncd" "${{targets.subpkgdir}}/usr/lib/systemd/systemd-timesyncd"
+          mv "${{targets.destdir}}/usr/lib/systemd/ntp-units.d/80-systemd-timesync.list" "${{targets.subpkgdir}}/usr/lib/systemd/ntp-units.d/80-systemd-timesync.list"
+          mv "${{targets.destdir}}/usr/lib/systemd/system/systemd-time-wait-sync.service" "${{targets.subpkgdir}}/usr/lib/systemd/system/systemd-time-wait-sync.service"
+          mv "${{targets.destdir}}/usr/lib/systemd/system/systemd-timesyncd.service" "${{targets.subpkgdir}}/usr/lib/systemd/system/systemd-timesyncd.service"
+          mv "${{targets.destdir}}/usr/lib/sysusers.d/systemd-timesync.conf" "${{targets.subpkgdir}}/usr/lib/sysusers.d/systemd-timesync.conf"
+          mv "${{targets.destdir}}/usr/share/dbus-1/system-services/org.freedesktop.timesync1.service" "${{targets.subpkgdir}}/usr/share/dbus-1/system-services/org.freedesktop.timesync1.service"
+          mv "${{targets.destdir}}/usr/share/dbus-1/system.d/org.freedesktop.timesync1.conf" "${{targets.subpkgdir}}/usr/share/dbus-1/system.d/org.freedesktop.timesync1.conf"
+          mv "${{targets.destdir}}/usr/share/polkit-1/actions/org.freedesktop.timesync1.policy" "${{targets.subpkgdir}}/usr/share/polkit-1/actions/org.freedesktop.timesync1.policy"
 
 update:
   enabled: true
@@ -704,12 +815,16 @@ test:
         - systemd-dev
         - libsystemd
   pipeline:
+    - runs: |
+        if [ '${{package.version}}-r${{package.epoch}}' != '259-r0' ]; then
+          echo 'Check if unit test test-firewall-util can be enabled now!'
+          exit 1
+        fi
     - uses: test/verify-service
       with:
         skip-files: syslog.socket # intentionally shipped without a corresponding service
     - name: "Check systemctl version"
       runs: |
-        systemctl --version
         busctl --version
         busctl --help
         coredumpctl --version
@@ -730,7 +845,6 @@ test:
         resolvectl --help
         run0 --version
         run0 --help
-        systemctl --help
         systemd-ac-power --version
         systemd-ac-power --help
         systemd-analyze --help
@@ -795,9 +909,7 @@ test:
         reboot --help
         resolvconf --version
         resolvconf --help
-        runlevel --help
         shutdown --help
-        telinit --help
     - name: "Check libsystemd"
       runs: |
         ldconfig -p | grep libsystemd.so

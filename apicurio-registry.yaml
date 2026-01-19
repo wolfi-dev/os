@@ -1,7 +1,7 @@
 package:
   name: apicurio-registry
-  version: "3.0.12"
-  epoch: 1 # GHSA-prj3-ccx8-p6x4
+  version: "3.1.6"
+  epoch: 2
   description: An API/Schema registry - stores APIs and Schemas
   copyright:
     - license: Apache-2.0
@@ -9,6 +9,9 @@ package:
     cpu: 32
     memory: 64Gi
     disk: 200Gi
+
+vars:
+  java-version: '17'
 
 environment:
   contents:
@@ -23,22 +26,20 @@ environment:
       - maven
       - nodejs-20
       - npm
-      - openjdk-17-default-jdk
+      - openjdk-${{vars.java-version}}-default-jdk
   environment:
-    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/Apicurio/apicurio-registry
       tag: v${{package.version}}
-      expected-commit: 18a542a0f82458393807b70f20502ddaf033d2e4
+      expected-commit: 01cf101fa5667bd64c5782f59d6591ab680b9be7
 
   - uses: patch
     with:
       patches: quarkus.patch
-
-  - uses: auth/maven
 
   - uses: maven/pombump
 
@@ -63,11 +64,57 @@ pipeline:
 
       tar -zxf ./app/target/apicurio-registry-app-${{package.version}}-all.tar.gz -C "$dest"
       find . -type f -path "*/target/*-${{package.version}}.jar" -exec cp {} "$dest" \;
-      find . -type f -path "*/target/*-${{package.version}}-runner.jar" -exec cp {} "$dest" \;
 
   - uses: strip
 
 subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility layer for upstream image compatibiliy
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          # The upstream image expects files in /deployments/quarkus-app/
+          # while Wolfi installs to /usr/share/java/apicurio-registry/quarkus-app/
+          # Create symlinks to match the official image layout.
+          mkdir -p "${{targets.contextdir}}/deployments"
+          ln -sf /usr/share/java/apicurio-registry/quarkus-app "${{targets.contextdir}}/deployments/quarkus-app"
+
+          # Create data and meta directories for runtime storage
+          # These are empty in the upstream image but expected to exist
+          mkdir -p "${{targets.contextdir}}/deployments/data"
+          mkdir -p "${{targets.contextdir}}/deployments/meta"
+    test:
+      environment:
+        contents:
+          packages:
+            - openjdk-${{vars.java-version}}-default-jvm
+            - ${{package.name}}
+        environment:
+          JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+      pipeline:
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+        - name: Verify compat directories exist
+          runs: |
+            # Verify data and meta directories exist
+            test -d /deployments/data
+            test -d /deployments/meta
+
+            # Verify quarkus-run.jar is accessible via the compat path
+            test -f /deployments/quarkus-app/quarkus-run.jar
+        - name: Verify can start from compat path
+          uses: test/daemon-check-output
+          with:
+            setup: cd /deployments/quarkus-app
+            start: java -jar /deployments/quarkus-app/quarkus-run.jar
+            timeout: 60
+            expected_output: |
+              constructed successfully
+              Initializing the Apicurio Registry
+
   - name: ${{package.name}}-ui
     description: Web UI for Apicurio Registry (apicurio-registry-ui)
     dependencies:
@@ -91,6 +138,7 @@ subpackages:
     dependencies:
       runtime:
         - docker-nginx
+        - nginx
     pipeline:
       - working-directory: ui
         runs: |
@@ -98,7 +146,7 @@ subpackages:
           config_dest="${{targets.contextdir}}/usr/local/bin/"
           install -Dm644 .docker-scripts/create-config.cjs "${config_dest}/create-config.cjs"
           install -Dm644 .docker-scripts/update-base-href.cjs "${config_dest}/update-base-href.cjs"
-          install -Dm644 .docker-scripts/nginx.conf "${config_dest}/etc/nginx/nginx.conf"
+          install -Dm644 .docker-scripts/nginx.conf "${{targets.contextdir}}/etc/nginx/nginx.conf"
           install -Dm755 .docker-scripts/entrypoint.sh "${config_dest}/entrypoint.sh"
 
 update:
@@ -113,12 +161,12 @@ test:
   environment:
     contents:
       packages:
-        - openjdk-17-default-jvm
+        - openjdk-${{vars.java-version}}-default-jvm
         - bash
         - curl
         - jq
     environment:
-      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
       DEST: /usr/share/java/apicurio-registry
   pipeline:
     - name: Validate essential JARs
@@ -126,15 +174,16 @@ test:
         stat "$DEST/apicurio-registry-app-${{package.version}}.jar"
         stat "$DEST/apicurio-registry-common-${{package.version}}.jar"
     - name: Ensure lib dir
-      runs: stat "$DEST/lib"
+      runs: stat "$DEST/quarkus-app/lib"
     - name: "Test runner"
       uses: test/daemon-check-output
       with:
-        start: "java -jar $DEST/apicurio-registry-app-${{package.version}}-runner.jar --server.port=8080"
+        start: "java -jar $DEST/quarkus-app/quarkus-run.jar --server.port=8080"
         timeout: 60
         expected_output: |
           constructed successfully
           Initializing the Apicurio Registry
           Using the following RegistryStorage implementation
         post: |
+          sleep 2
           curl -s http://localhost:8080/apis/registry/v2 | grep -qi "Core Registry API"

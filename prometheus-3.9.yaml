@@ -1,0 +1,170 @@
+package:
+  name: prometheus-3.9
+  version: "3.9.1"
+  epoch: 0 # CVE-2025-61729
+  description: The Prometheus monitoring system and time series database.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - prometheus=${{package.full-version}}
+    runtime:
+      - merged-usrsbin
+      - wolfi-baselayout
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - go
+      - nodejs
+      - npm
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 64088ce2ad73e4caf589207d3a246e64e329e663
+      repository: https://github.com/prometheus/prometheus
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+      modroot: documentation/examples/remote_storage
+
+  - uses: patch
+    with:
+      patches: disable-pprof.patch
+
+  - runs: |
+      GOLDFLAGS="-X github.com/prometheus/common/version.Version=${{package.version}}
+        -X github.com/prometheus/common/version.Revision=WolfiLinux
+        -X github.com/prometheus/common/version.Branch=master
+        -X github.com/prometheus/common/version.BuildUser=$USER@$(hostname)
+        -X github.com/prometheus/common/version.BuildDate=$(date -u "+%Y%m%d-%H:%M:%S" ${SOURCE_DATE_EPOCH:+-d @$SOURCE_DATE_EPOCH})
+      "
+      if [ -n "$LDFLAGS" ]; then
+        # LDFLAGS (and only LDFLAGS) should be passed to -extldflags.
+        GOLDFLAGS="$GOLDFLAGS -extldflags '$LDFLAGS'"
+      fi
+
+      # set -j1 to run things in the correct order in makefile
+      # actual go building is still parallel
+      make -j1 assets-compress
+
+      go build \
+        -trimpath \
+        -mod=readonly \
+        -ldflags "$GOLDFLAGS" \
+        -tags netgo,builtinassets \
+        ./cmd/prometheus
+      go build \
+        -trimpath \
+        -mod=readonly \
+        -ldflags "$GOLDFLAGS" \
+        ./cmd/promtool
+
+  - runs: |
+      install -Dm755 prometheus "${{targets.destdir}}"/usr/bin/prometheus
+      install -Dm755 promtool "${{targets.destdir}}"/usr/bin/promtool
+
+      install -Dm644 prometheus.confd \
+        "${{targets.destdir}}"/etc/conf.d/prometheus
+
+      install -dm644 "${{targets.destdir}}"/var/lib/prometheus/data
+
+      install -Dm644 -t "${{targets.destdir}}"/etc/prometheus \
+        documentation/examples/prometheus.yml
+
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    dependencies:
+      runtime:
+        - ${{package.name}}
+      provides:
+        - prometheus-iamguarded-compat=${{package.full-version}}
+    description: "compat package for iamguarded"
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: prometheus
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/prometheus/bin/
+          mkdir -p /opt/iamguarded/prometheus/conf
+          mkdir -p /opt/iamguarded/prometheus/data
+
+          chmod g+rwX /opt/iamguarded
+
+          ln -sf /usr/bin/prometheus /opt/iamguarded/prometheus/bin/prometheus
+          ln -sf /usr/bin/promtool /opt/iamguarded/prometheus/bin/promtool
+          cp -r ${{targets.destdir}}/etc/prometheus/* /opt/iamguarded/prometheus/conf/
+          cp -r ${{targets.destdir}}/var/lib/prometheus/data /opt/iamguarded/prometheus/data
+      - uses: iamguarded/finalize-compat
+        with:
+          package: prometheus
+          version: ${{vars.major-version}}
+    test:
+      pipeline:
+        - runs: |
+            stat /opt/iamguarded/prometheus/bin/prometheus
+            stat /opt/iamguarded/prometheus/bin/promtool
+            /opt/iamguarded/prometheus/bin/prometheus --version
+            /opt/iamguarded/prometheus/bin/promtool --version
+        - uses: iamguarded/test-compat
+          with:
+            package: prometheus
+            version: ${{vars.major-version}}
+
+update:
+  ignore-regex-patterns:
+    - '\+stringlabels' # looks like stringlabels are still experimental, let's stick to the main version stream.
+  enabled: true
+  github:
+    identifier: prometheus/prometheus
+    strip-prefix: v
+    tag-filter-prefix: v3.9
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+  pipeline:
+    - name: Check Prometheus Rules
+      runs: |
+        cat << 'EOF' > rules.example
+        groups:
+        - name: http
+          rules:
+          - record: job:http_inprogress_requests:sum
+            expr: sum(http_inprogress_requests) by (job)
+        EOF
+        promtool check rules rules.example
+        prometheus --version
+        prometheus --help
+        promtool --version
+        promtool --help
+    - name: Verify Prometheus Installation and Server Running Capability
+      runs: |
+        cat << 'EOF' > prometheus.yml
+        global:
+          scrape_interval: 15s
+
+        scrape_configs:
+          - job_name: "prometheus"
+            static_configs:
+            - targets: ["localhost:9090"]
+        EOF
+        prometheus --config.file=./prometheus.yml --web.listen-address=127.0.0.1:9090 > /dev/null 2>&1 &
+        sleep 5
+        curl -s "http://127.0.0.1:9090/-/healthy" | grep -q "Prometheus Server is Healthy."

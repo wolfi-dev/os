@@ -1,0 +1,131 @@
+Description: Add glibc compatibility layer for FIPS builds
+ .
+ This patch adds compatibility support for FIPS builds:
+ - Links jitterentropy library for FIPS-approved entropy sources
+ - Adds C23 compatibility functions (__isoc23_strtol, etc.) for newer glibc
+ - Conditionally disables certain functions on aarch64 to avoid conflicts
+ - Fixes Rust target features for ARM NEON support
+Author: Michael Paul <michael.paul@chainguard.dev>
+Forwarded: not-needed
+
+diff --git a/base/glibc-compatibility/CMakeLists.txt b/base/glibc-compatibility/CMakeLists.txt
+index a14f66ce22b..4d94a2980f4 100644
+--- a/base/glibc-compatibility/CMakeLists.txt
++++ b/base/glibc-compatibility/CMakeLists.txt
+@@ -42,6 +42,10 @@ if (GLIBC_COMPATIBILITY)
+ 
+     target_include_directories(glibc-compatibility PRIVATE libcxxabi ${musl_arch_include_dir})
+ 
++    # Find and link with jitterentropy library
++    find_library(JITTER_LIBRARY jitterentropy REQUIRED)
++    target_link_libraries(glibc-compatibility PRIVATE ${JITTER_LIBRARY})
++
+     if (ENABLE_OPENSSL_DYNAMIC)
+         target_compile_options(glibc-compatibility PRIVATE -fPIC)
+     endif ()
+diff --git a/base/glibc-compatibility/glibc-compatibility.c b/base/glibc-compatibility/glibc-compatibility.c
+index 738cda47877..7e28dffa269 100644
+--- a/base/glibc-compatibility/glibc-compatibility.c
++++ b/base/glibc-compatibility/glibc-compatibility.c
+@@ -10,6 +10,7 @@ extern "C" {
+ 
+ #include <signal.h>
+ #include <unistd.h>
++#include <stdint.h>
+ #include <string.h>
+ #include <sys/syscall.h>
+ 
+@@ -163,6 +164,7 @@ const char * __shm_directory(size_t * len)
+  * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
++#if !defined(__aarch64__)
+ void __attribute__((__weak__)) explicit_bzero(void * buf, size_t len)
+ {
+     memset(buf, 0, len);
+@@ -173,8 +175,10 @@ void __explicit_bzero_chk(void * buf, size_t len, size_t unused)
+ {
+     return explicit_bzero(buf, len);
+ }
++#endif
+ 
+ 
++#if !defined(__aarch64__)
+ #include <unistd.h>
+ #include "syscall.h"
+ 
+@@ -188,8 +192,10 @@ long splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out, size_t len, un
+ {
+ 	return syscall(SYS_splice, fd_in, off_in, fd_out, off_out, len, flags);
+ }
++#endif
+ 
+ 
++#if !defined(__aarch64__)
+ #define _BSD_SOURCE
+ #include <sys/stat.h>
+ #include <stdint.h>
+@@ -224,8 +230,10 @@ int statx(int fd, const char *restrict path, int flag,
+ {
+ 	return syscall(SYS_statx, fd, path, flag, mask, statxbuf);
+ }
++#endif
+ 
+ 
++#if !defined(__aarch64__)
+ #include <syscall.h>
+ 
+ ssize_t getrandom(void *buf, size_t buflen, unsigned flags)
+@@ -245,6 +253,7 @@ ssize_t preadv(int __fd, const struct iovec *__iovec, int __count, __off_t __off
+ {
+     return syscall(SYS_preadv, __fd, __iovec, __count, (long)(__offset), (long)(__offset>>32));
+ }
++#endif
+ 
+ #include <errno.h>
+ #include <limits.h>
+@@ -427,6 +436,31 @@ int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *fa) {
+ 	return 0;
+ }
+ 
++/* C23 compatibility functions */
++
++long int __isoc23_strtol(const char *nptr, char **endptr, int base) {
++    return strtol(nptr, endptr, base);
++}
++
++unsigned long int __isoc23_strtoul(const char *nptr, char **endptr, int base) {
++    return strtoul(nptr, endptr, base);
++}
++
++int __isoc23_vsscanf(const char *s, const char *format, va_list args) {
++    return vsscanf(s, format, args);
++}
++
++int __isoc23_sscanf(const char *s, const char *format, ...) {
++    va_list args;
++    int ret;
++    
++    va_start(args, format);
++    ret = vsscanf(s, format, args);
++    va_end(args);
++    
++    return ret;
++}
++
+ #if defined (__cplusplus)
+ }
+ #endif
+diff --git a/cmake/cpu_features.cmake b/cmake/cpu_features.cmake
+index fa58a739611..69d0be80b88 100644
+--- a/cmake/cpu_features.cmake
++++ b/cmake/cpu_features.cmake
+@@ -58,7 +58,7 @@ elseif (ARCH_AARCH64)
+         # crc32 is optional in v8.0 and mandatory in v8.1. Enable it as __crc32()* is used in lot's of places and even very old ARM CPUs
+         # support it.
+         set (COMPILER_FLAGS "${COMPILER_FLAGS} -march=armv8+crc")
+-        list(APPEND RUSTFLAGS_CPU "-C" "target_feature=+crc,-neon")
++        list(APPEND RUSTFLAGS_CPU "-C" "target_feature=+crc,+neon")
+     else ()
+         # ARMv8.2 is quite ancient but the lowest common denominator supported by both Graviton 2 and 3 processors [1, 10]. In particular, it
+         # includes LSE (made mandatory with ARMv8.1) which provides nice speedups without having to fall back to compat flag

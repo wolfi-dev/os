@@ -2,13 +2,19 @@ package:
   name: dex
   # When bumping the version check if the GHSA mitigations below can be removed.
   version: "2.44.0"
-  epoch: 4 # GHSA-j5w8-q4qc-rx2x
+  epoch: 7
   description: OpenID Connect (OIDC) identity and OAuth 2.0 provider with pluggable connectors
   copyright:
     - license: Apache-2.0
   checks:
     disabled:
       - srv
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
 
 environment:
   contents:
@@ -27,6 +33,8 @@ pipeline:
       repository: https://github.com/dexidp/dex
       tag: v${{package.version}}
       expected-commit: 2dce75009acfcd9df77d57f2d144aae999a4c569
+      cherry-picks: |
+        master/7e2225c0e6594dafd049b5cb3a9fe1fd1941f385: Do not wrap Kubernetes Address in brackets
       destination: dex
 
   - uses: go/bump
@@ -63,6 +71,33 @@ pipeline:
 
   - uses: strip
 
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package with iamguarded dex image"
+    dependencies:
+      runtime:
+        - dex
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: dex
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/dex/bin/
+          chmod g+rwX /opt/iamguarded
+          ln -sf /usr/bin/dex /opt/iamguarded/dex/bin/dex
+          ln -sf /srv/dex/web /opt/iamguarded/dex/web
+      - uses: iamguarded/finalize-compat
+        with:
+          package: dex
+          version: ${{vars.major-version}}
+    test:
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: dex
+            version: ${{vars.major-version}}
+
 update:
   enabled: true
   github:
@@ -76,6 +111,9 @@ test:
       packages:
         - curl
         - wait-for-it
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
   pipeline:
     - runs: |
         dex --help
@@ -109,3 +147,45 @@ test:
         post: |
           wait-for-it localhost:5556 --timeout=60
           curl -i http://localhost:5556/dex/healthz | grep -qi "ok"
+    - uses: test/kwok/cluster
+    - name: Confirm in-cluster configuration works correctly (to a point)
+      uses: test/daemon-check-output
+      with:
+        start: dex serve /etc/dex/config.docker.yaml
+        setup: |
+          # Create minimal service account directory
+          DIR=/var/run/secrets/kubernetes.io/serviceaccount
+          mkdir -p "$DIR"
+          echo "fake-token" > "$DIR/token"
+          echo "fake-ca" > "$DIR/ca.crt"
+          echo "dex" > "$DIR/namespace"
+
+          CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+          echo $CA
+          cp $CA /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+          cat > /etc/dex/config.docker.yaml << EOF
+          issuer: http://localhost:5556/dex
+          storage:
+            type: kubernetes
+            config:
+              inCluster: true
+          web:
+            http: 0.0.0.0:5556
+          staticClients:
+            - id: example-app
+              redirectURIs: ["http://localhost:5555/callback"]
+              name: "Example App"
+              secret: ZXhhbXBsZS1hcHAtc2VjcmV0
+          connectors:
+            - type: mockCallback
+              id: mock
+              name: Example
+          oauth2:
+            skipApprovalScreen: true
+          EOF
+        timeout: 30
+        # This error message indicates the in-cluster configuration is being
+        # read correctly: we aren't serving HTTPS on 32764
+        expected_output: |
+          cannot get kubernetes version: Get "https://127.0.0.1:32764/version": net/http: invalid header field

@@ -1,7 +1,7 @@
 package:
   name: keda-2.18
-  version: "2.18.1"
-  epoch: 1 # GHSA-j5w8-q4qc-rx2x
+  version: "2.18.3"
+  epoch: 1 # GHSA-cfpf-hrx2-8rv6
   description: KEDA is a Kubernetes-based Event Driven Autoscaling component. It provides event driven scale for any container running in Kubernetes
   copyright:
     - license: Apache-2.0
@@ -24,58 +24,72 @@ environment:
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 3f590ba6027a67b2d6f79ece605061f6d201c54b
+      expected-commit: 0f98c4775b82df35f5d3bdaf85713e3e478f7a38
       repository: https://github.com/kedacore/keda
       tag: v${{package.version}}
 
   - uses: go/bump
     with:
       deps: |-
-        golang.org/x/crypto@v0.45.0
+        github.com/expr-lang/expr@v1.17.7
 
   - runs: |
-      ARCH=$(go env GOARCH) make build
-      mkdir -p "${{targets.destdir}}/usr/bin"
-      mv bin/keda "${{targets.destdir}}/usr/bin"
+      # Generate code and protobufs; requires go and openssl
+      make generate
 
-  - uses: strip
+  - uses: go/build
+    with:
+      packages: ./cmd/operator
+      output: keda
+      ldflags: |
+        -X github.com/kedacore/keda/v2/version.GitCommit=$(git rev-list -1 HEAD) -X github.com/kedacore/keda/v2/version.Version=${{package.version}} \
+        -X github.com/kedacore/keda/v2/version.Version=${{package.version}}
 
 subpackages:
   - name: "${{package.name}}-metrics-apiserver"
     description: "Metrics adapter for Keda"
     dependencies:
       runtime:
+        - openssl
         - tzdata
       provides:
         - keda-adapter=${{package.full-version}}
         - keda-metrics-apiserver=${{package.full-version}}
     pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}/usr/bin"
-          mv bin/keda-adapter "${{targets.subpkgdir}}/usr/bin"
-      - uses: strip
+      - uses: go/build
+        with:
+          packages: ./cmd/adapter
+          output: keda-adapter
+          ldflags: |
+            -X github.com/kedacore/keda/v2/version.GitCommit=$(git rev-list -1 HEAD) -X github.com/kedacore/keda/v2/version.Version=${{package.version}} \
+            -X github.com/kedacore/keda/v2/version.Version=${{package.version}}
     test:
       pipeline:
         - runs: |
-            ls -halF /usr/bin/keda-adapter
-            keda-adapter --help 2>&1 | grep ^Usage
+            # outputs to stderr
+            keda-adapter --help 2>&1 | grep -q "kubeconfig"
 
   - name: "${{package.name}}-admission-webhooks"
     description: "Webhooks for Keda"
     dependencies:
       runtime:
+        - openssl
         - tzdata
       provides:
         - keda-admission-webhooks=${{package.full-version}}
     pipeline:
-      - runs: |
-          mkdir -p "${{targets.subpkgdir}}/usr/bin"
-          mv bin/keda-admission-webhooks "${{targets.subpkgdir}}/usr/bin"
-      - uses: strip
+      - uses: go/build
+        with:
+          packages: ./cmd/webhooks
+          output: keda-admission-webhooks
+          ldflags: |
+            -X github.com/kedacore/keda/v2/version.GitCommit=$(git rev-list -1 HEAD) -X github.com/kedacore/keda/v2/version.Version=${{package.version}} \
+            -X github.com/kedacore/keda/v2/version.Version=${{package.version}}
     test:
       pipeline:
         - runs: |
-            keda-admission-webhooks --help 2>&1 | grep ^Usage
+            # outputs to stderr
+            keda-admission-webhooks --help 2>&1 | grep -q "kubeconfig"
 
   - name: "${{package.name}}-compat"
     description: "Compatibility package to place binaries in the location expected by upstream helm charts"
@@ -91,17 +105,11 @@ subpackages:
           ln -sf /usr/bin/keda-adapter ${{targets.subpkgdir}}/keda-adapter
       - uses: strip
     test:
-      environment:
-        contents:
-          packages:
-            - "${{package.name}}"
-            - "${{package.name}}-admission-webhooks"
-            - "${{package.name}}-metrics-apiserver"
       pipeline:
-        - runs: |
-            /keda --help 2>&1 | grep ^Usage
-            /keda-admission-webhooks --help 2>&1 | grep ^Usage
-            /keda-adapter --help 2>&1 | grep ^Usage
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: keda-compat
+            real-pkg-name: ${{subpkg.name}}
 
 update:
   enabled: true
@@ -111,6 +119,52 @@ update:
     tag-filter: v2.18.
 
 test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}
+        - ${{package.name}}-metrics-apiserver
+        - ${{package.name}}-admission-webhooks
+        - ${{package.name}}-compat
+    environment:
+      WATCH_NAMESPACE: keda
   pipeline:
-    - runs: |
-        keda --help 2>&1 | grep ^Usage
+    - name: "Binary checks"
+      runs: |
+        # outputs to stderr
+        keda --help 2>&1 | grep -q "k8s-cluster-domain"
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: false
+    # Minimal package test, for endpoint testing, CRD installation would be required
+    - name: "Test KEDA operator startup"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # Create minimal service account directory
+          DIR=/var/run/secrets/kubernetes.io/serviceaccount
+          mkdir -p "$DIR"
+          echo "fake-token" > "$DIR/token"
+          echo "fake-ca" > "$DIR/ca.crt"
+          echo "keda" > "$DIR/namespace"
+          # Create certs directory that KEDA expects
+          mkdir -p /certs
+          cp "$DIR/ca.crt" /certs/ca.crt
+          # Create dummy TLS certificate for webhooks
+          openssl req -x509 -newkey rsa:2048 -keyout /certs/tls.key -out /certs/tls.crt -days 1 -nodes -subj "/CN=keda-webhooks"
+        start: keda --zap-log-level=info --zap-encoder=console
+        timeout: 30
+        expected_output: |
+          KEDA Version: ${{package.version}}
+          Starting manager
+          Starting metrics server
+          Starting EventSource
+        error_strings: |
+          # expects CRD related errors
+          FAIL
+          FATAL
+          Traceback.*most.recent.call
+          Exception in thread
+          java.lang.NullPointerException
+          java.lang.RuntimeException
+          Gem::MissingSpecError

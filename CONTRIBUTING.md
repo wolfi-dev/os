@@ -1,12 +1,22 @@
 # Contributing to wolfi-dev/os
 
 <!-- toc -->
+- [Contribution Guidelines](#contribution-guidelines)
 - [Criteria for packages in Wolfi](#criteria-for-packages-in-wolfi)
 - [Setup development environment](#setup-development-environment)
 - [Write your first Wolfi package](#write-your-first-wolfi-package)
 - [Package versioning](#package-versioning)
 - [Some tips](#some-tips)
 <!-- /toc -->
+
+## Contribution Guidelines
+
+Whether you want to add a new package, or provide a change to an existing package, please follow these guidelines:
+
+1. Create an issue with the details about the change. Use the appropriate template for the type of change you’re making. 
+2. Create the PR referencing the issue. 
+
+To get these changes merged requires engagement from a Chainguard Engineer. On a best effort, we will help shepherd changes through our process. If you are a Chainguard customer, reach out to your Customer Success rep for additional support.
 
 ## Criteria for packages in Wolfi
 
@@ -50,7 +60,7 @@ For example, if your package name is "foo", run `make package/foo`.
 
 This will build the package by invoking [melange](https://github.com/chainguard-dev/melange) in a particular way. This invocation is defined in the [Makefile](Makefile), if you're interested to see how this is wired up. Also, you can run Melange _directly_ without using `make` if you understand what you're doing.
 
-**Note:** The buildsystem has a cache of source files that may help reduce the time your build takes. Feel free to see if this cache helps you by adding `USE_CACHE=yes` to the command above. If you encounter issues with this approach, the best advice is to remove the `USE_CACHE=no` from your command and carry on with your builds.
+**Note:** The build system has a cache of source files that may help reduce the time your build takes. Feel free to see if this cache helps you by adding `USE_CACHE=yes` to the command above. If you encounter issues with this approach, the best advice is to remove the `USE_CACHE=no` from your command and carry on with your builds.
 
 When the build finishes, your package(s) should be found in the generated `./packages` directory.
 
@@ -66,7 +76,7 @@ Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CV
 
 ## Package versioning
 
-- When bumping version of a package, you will need to update the version, epoch & shasum (sha256 or sha512) in package YAML file. The version and epoch also need to be bumped in Makefile.
+- When bumping the version of a package, you will need to update the version, epoch & shasum (sha256 or sha512) in the package YAML file. The version and epoch also need to be bumped in Makefile.
 
 - `epoch` needs to be bumped when the package version remains the same but something else changes. `epoch` needs to be reset to 0 when it's a new version of the package.
 

@@ -1,0 +1,145 @@
+# cinc-auditor is a free distribution of the open source Chef Software
+# Inc. inspec tool. See https://cinc.sh/start/auditor/
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: cinc-auditor
+  version: "7.0.95"
+  epoch: 3
+  description: cinc-auditor is an OSS tool for applying inspec profiles
+  copyright:
+    - license: Apache-2.0
+      license-path: LICENSE
+    - license: LicenseRef-Third-Party
+      license-path: NOTICE.TXT
+  dependencies:
+    runtime:
+      # needed for the shell wrapper script in /usr/bin
+      - busybox
+      # both kubernetes transport (train-) plugins need kubectl installed
+      - kubectl
+      # additional gem dependencies added in the upstream cinc-auditor
+      # habitat/plan.sh script that can't be listed as part of the Gemfile
+      # for some reason
+      - ruby${{vars.ruby-version}}-bcrypt_pbkdf
+      - ruby${{vars.ruby-version}}-ed25519
+
+vars:
+  ruby-version: 3.4
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - gcc
+      - make
+      - ruby${{vars.ruby-version}}-bcrypt_pbkdf
+      - ruby${{vars.ruby-version}}-ed25519
+      - ruby-${{vars.ruby-version}}
+      - ruby-${{vars.ruby-version}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 588ebe3baf241c11a6a4d2827964bb72e9063edc
+      repository: https://gitlab.com/cinc-project/upstream/inspec/
+      branch: stable/cinc-v${{package.version}}
+
+  - name: build inspec gem
+    uses: ruby/build
+    with:
+      gem: inspec
+
+  - name: build inspec-core gem
+    uses: ruby/build
+    with:
+      gem: inspec-core
+
+  - name: build cinc-auditor-bin gem
+    uses: ruby/build
+    with:
+      dir: inspec-bin
+      gem: cinc-auditor-bin
+
+  # cinc-auditor needs around 260 gems as dependencies, which is too
+  # much to package. Instead, vender the needed gems under
+  # /usr/lib/cinc-auditor/gems/
+  - name: install inspec gems
+    runs: |
+      INSTALLED_BIN_DIR="/usr/lib/cinc-auditor/bin"
+      INSTALLED_GEMS_DIR="$(ruby -e 'puts Gem.default_dir.sub("\/ruby\/", "\/cinc-auditor\/")')/"
+      TARGET_DIR_BIN="${{targets.contextdir}}${INSTALLED_BIN_DIR}"
+      TARGET_DIR_INSTALL="${{targets.contextdir}}${INSTALLED_GEMS_DIR}"
+      mkdir -p "${TARGET_DIR_BIN}"
+      mkdir -p "${TARGET_DIR_INSTALL}"
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+
+      export GEM_PATH="$(ruby -e 'puts Gem.default_dir')"
+
+      gem install inspec*.gem \
+        --install-dir "${TARGET_DIR_INSTALL}"  \
+        --bindir "${TARGET_DIR_BIN}" \
+        --no-document
+
+      (cd inspec-bin && gem install cinc-auditor-bin-${{package.version}}.gem \
+        --install-dir "${TARGET_DIR_INSTALL}"  \
+        --bindir "${TARGET_DIR_BIN}" \
+        --no-document )
+
+      # this is an additional plugin useful for querying containers in k8s.
+      gem install train-k8s-container-mitre \
+        --install-dir "${TARGET_DIR_INSTALL}"  \
+        --bindir "${TARGET_DIR_BIN}" \
+        --no-document
+
+      # create a wrapper script around cinc-auditor that sets the
+      # gem path correctly for the vendered dependencies
+      cat <<EOF > "cinc-auditor"
+      #!/bin/sh
+      set -e
+
+      # Set Ruby paths defined from 'do_setup_environment()'
+      export GEM_HOME="${INSTALLED_GEMS_DIR}"
+      export GEM_PATH="$(ruby -e 'puts Gem.default_dir'):\$GEM_HOME"
+
+      exec /usr/bin/ruby "${INSTALLED_BIN_DIR}/cinc-auditor" "\$@"
+      EOF
+      install -m755 cinc-auditor -t "${{targets.contextdir}}/usr/bin/"
+
+      # Pre-populate Chef UUID to suppress runtime warning from Cinc Auditor
+      mkdir -p "${{targets.contextdir}}/etc/chef"
+      echo "00000000-0000-0000-0000-000000000000" > "${{targets.contextdir}}/etc/chef/chef_guid"
+
+update:
+  enabled: true
+  # cinc-auditor repo doesn't use git tags, but instead a versioned
+  # branch, so rely on the release-monitor of the release tarballs.
+  release-monitor:
+    identifier: 387942
+
+test:
+  pipeline:
+    - runs: |
+        set -o pipefail
+        cinc-auditor --help
+        cinc-auditor version
+        cinc-auditor shell --backend local -c 'describe file("/etc/passwd") do it { should exist } end'
+        cinc-auditor shell --backend local -c \
+           'describe passwd("/etc/passwd") do its("count") { should_not eq 0 } ; its("users") { should_not be_empty } end'
+
+        # Ensure the k8s-container transport plugin can be found.
+        # The cinc-auditor command will fail because it doesn't have a
+        # valid kube configuration configuration, hence the complex test
+        # check.
+        if cinc-auditor detect -t k8s-container:// > k8s-test-output 2>&1 ; then
+            echo "cinc-auditor suceeded when it should have failed" > /dev/stderr
+            cat k8s-test-output
+            exit 1
+        fi
+        if ! grep 'Missing Parameter `pod`' k8s-test-output ; then
+            cat k8s-test-output
+            exit 1
+        fi
+
+        # both k8s train backends need kubectl installed
+        kubectl version --client

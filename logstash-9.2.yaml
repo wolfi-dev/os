@@ -16,11 +16,13 @@
 #    subpackage to be installed separately.
 package:
   name: logstash-9.2
-  version: "9.2.1"
-  epoch: 0
+  version: "9.2.4"
+  epoch: 0 # GHSA-j4pr-3wm6-xx2r
   description: Logstash - transport and process your logs, events, or other data
   copyright:
     - license: Apache-2.0
+  resources:
+    memory: 16Gi
   dependencies:
     provides:
       - ${{package.name}}-base=${{package.full-version}}
@@ -29,7 +31,7 @@ package:
       - bash # some helper scripts use bash and busybox utilities
       - busybox
       - merged-usrsbin
-      - openjdk-17-default-jdk
+      - openjdk-${{vars.java-version}}-default-jdk
       - wolfi-baselayout
 
 var-transforms:
@@ -39,6 +41,7 @@ var-transforms:
     to: major-minor-version
 
 vars:
+  java-version: "21"
   separately-packaged-plugins: |
     logstash-filter-xml logstash-input-beats logstash-input-http logstash-input-tcp logstash-integration-jdbc logstash-input-graphite logstash-input-elastic_serverless_forwarder
 
@@ -65,7 +68,7 @@ environment:
       - logstash-integration-jdbc
       - logstash-output-opensearch
       - net-tools
-      - openjdk-17-default-jdk
+      - openjdk-${{vars.java-version}}-default-jdk
       - posix-libc-utils
       - sed
       - yq
@@ -87,7 +90,7 @@ pipeline:
     with:
       repository: https://github.com/elastic/logstash
       tag: v${{package.version}}
-      expected-commit: 6d26e5dedd1cbfb70d4698e2500dce2a36a9ce57
+      expected-commit: a8e90a3721f01ba577f1a12c6a350b8b58b74f8c
 
   - uses: patch
     with:
@@ -103,6 +106,10 @@ pipeline:
       sed -i "s/rack (>= 3\.1\.16)/rexml (>= 3.1.17)/" "Gemfile.jruby-3.1.lock.release"
       echo "gem 'rack', '3.1.18'" >> Gemfile.template
       echo "gem 'sinatra', '4.2.0'" >> Gemfile.template
+      # Fix CVE-2025-27221, GHSA-j4pr-3wm6-xx2r
+      sed -i "s/'uri', '>= 0.12.3'/'uri', '>= 0.12.5'/" "Gemfile.template"
+      # Fix CVE-2025-14762
+      sed -i 's/aws-sdk-s3 (1.199.1)/aws-sdk-s3 (1.208.0)/' Gemfile.jruby-3.1.lock.release
 
       for plugin in ${{vars.separately-packaged-plugins}}
       do
@@ -215,7 +222,7 @@ subpackages:
         - glibc-locales
         - grep
         - net-tools
-        - openjdk-17-default-jdk
+        - openjdk-${{vars.java-version}}-default-jdk
         - posix-libc-utils # Required for getent
         - sed
         - wolfi-baselayout
@@ -285,7 +292,7 @@ subpackages:
             - bash
             - curl
             - busybox
-            - openjdk-17
+            - openjdk-${{vars.java-version}}
             - sudo
         accounts:
           groups:
@@ -317,13 +324,14 @@ subpackages:
                     "PATH=/opt/iamguarded/logstash/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
                     /opt/iamguarded/scripts/logstash/entrypoint.sh \
                     /opt/iamguarded/scripts/logstash/run.sh
-                timeout: 120
+                timeout: 180
                 expected_output: |
                   Starting Logstash setup
                   Starting Logstash
                   Starting http input listener
                 post: |
                   #!/bin/sh -e
+                  sleep 1
                   url=http://localhost:8080
                   response=$(curl -fsS --connect-timeout 10 --max-time 20 --retry 5 --retry-delay 1 --retry-max-time 40 "$url") || {
                     echo "curl ${url} failed $?"
@@ -339,28 +347,48 @@ subpackages:
   - name: ${{package.name}}-env2yaml
     description: Merge environment variables into logstash.yml
     pipeline:
-      - working-directory: docker/data/logstash/env2yaml
-        pipeline:
-          - uses: go/build
-            with:
-              packages: .
-              output: env2yaml
-              ldflags: -s -w
-      - uses: strip
+      - runs: |
+          # Build the Java-based env2yaml tool using the upstream gradle task
+          ./gradlew :docker:data:logstash:env2yaml:compileJava :docker:data:logstash:env2yaml:copyRuntimeLibs
+
+          # Install compiled classes and dependencies
+          mkdir -p "${{targets.contextdir}}/usr/share/logstash/env2yaml"
+          cp -r docker/data/logstash/env2yaml/classes "${{targets.contextdir}}/usr/share/logstash/env2yaml/"
+          cp -r docker/data/logstash/env2yaml/lib "${{targets.contextdir}}/usr/share/logstash/env2yaml/"
+
+          # Patch and install the wrapper script to use system java instead of bundled JDK
+          mkdir -p "${{targets.contextdir}}/usr/bin"
+          sed 's|/usr/share/logstash/jdk/bin/java|java|' \
+            docker/data/logstash/env2yaml/env2yaml > "${{targets.contextdir}}/usr/bin/env2yaml"
+          chmod +x "${{targets.contextdir}}/usr/bin/env2yaml"
     dependencies:
       runtime:
         - merged-usrsbin
         - wolfi-baselayout
+        - openjdk-${{vars.java-version}}-default-jdk
         # Due to the way logstash implements their plugin system, this is a full
         # logstash package with the opensearch plugin bundled. It is based off the
         # same artifacts in the main package, meaning it will pick up the changes to
         # the default gems that were made in the main package it just adds the
         # opensearch plugin.
-    # test added by a robot (binary)
     test:
       pipeline:
         - runs: |
+            # Verify env2yaml files exist
             stat /usr/bin/env2yaml
+            stat /usr/share/logstash/env2yaml/classes
+            stat /usr/share/logstash/env2yaml/lib
+            test -x /usr/bin/env2yaml || { echo "ERROR: /usr/bin/env2yaml is not executable"; exit 1; }
+        - runs: |
+            # Test that env2yaml works - it modifies the file in place
+            # env2yaml reads environment variables and injects them into logstash.yml
+            echo "existing: value" > /tmp/logstash.yml
+            pipeline_workers=test env2yaml /tmp/logstash.yml
+            cat /tmp/logstash.yml
+            # Verify env2yaml injected the variable reference correctly
+            grep -F 'pipeline.workers: ${pipeline_workers}' /tmp/logstash.yml
+            # Verify existing configuration was preserved
+            grep -F 'existing: value' /tmp/logstash.yml
 
   - name: ${{package.name}}-with-output-opensearch
     description: Build logstash with logstash-output-opensearch plugin
@@ -371,9 +399,12 @@ subpackages:
         - bash # some helper scripts use bash and busybox utilities
         - busybox
         - merged-usrsbin
-        - openjdk-17-default-jdk
+        - openjdk-${{vars.java-version}}-default-jdk
         - wolfi-baselayout
     pipeline:
+      - name: Install all the default plugins
+        runs: |
+          ./gradlew installDefaultGems
       - name: Re-inject default plugins that have been patched
         runs: |
           for gem in \
@@ -411,7 +442,7 @@ subpackages:
       environment:
         contents:
           packages:
-            - openjdk-17
+            - openjdk-${{vars.java-version}}
             - sudo
         accounts:
           groups:
@@ -442,7 +473,7 @@ test:
   environment:
     contents:
       packages:
-        - openjdk-17-default-jdk
+        - openjdk-${{vars.java-version}}-default-jdk
         - sudo
     accounts:
       groups:

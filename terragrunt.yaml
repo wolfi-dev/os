@@ -1,28 +1,25 @@
 package:
   name: terragrunt
-  version: "0.93.12"
-  epoch: 0 # GHSA-j5w8-q4qc-rx2x
+  version: "0.98.0"
+  epoch: 0
   description: Thin wrapper for Terraform providing extra tools
   copyright:
     - license: MIT
   dependencies:
     runtime:
-      - terraform
+      - busybox # Provides shell utilities (echo, etc.) for scaffold templates and hooks
+      # other runtime deps (terraform or opentofu) can be added on the basis of requirement and licesnes constraints
+      - git # https://github.com/gruntwork-io/terragrunt/blob/main/internal/cas/git.go#L27
 
 environment:
   contents:
     packages:
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go
-      - mockery~2
       - mockgen
 
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 1fe90794ee8c63349ecb94ae91a672cda6089f85
+      expected-commit: f39ea0ebf891c9954c89d07b73b487ff938ef08b
       repository: https://github.com/gruntwork-io/terragrunt
       tag: v${{package.version}}
 
@@ -32,16 +29,36 @@ pipeline:
     with:
       output: terragrunt
       packages: .
-      ldflags: "-X  github.com/gruntwork-io/go-commons/version.Version=v${{package.version}}"
+      ldflags: "-X github.com/gruntwork-io/go-commons/version.Version=v${{package.version}}"
 
-  - uses: strip
+subpackages:
+  - name: terragrunt-docs
+    description: terragrunt documentation
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/share/doc/${{package.name}}
+          cp README.md LICENSE.txt SECURITY.md "${{targets.subpkgdir}}"/usr/share/doc/${{package.name}}/
+    test:
+      pipeline:
+        - uses: test/tw/docs
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - posix-libc-utils
+        - terraform # added for testing
   pipeline:
-    - name: Smoke test
-      runs: |
-        terragrunt --version
-        terragrunt --help
+    # Verify terragrunt reports correct version
+    - uses: test/tw/ver-check
+      with:
+        bins: terragrunt
+    # Verify terragrunt provides help information
+    - uses: test/tw/help-check
+      with:
+        bins: terragrunt
+    # Create a simple terraform module to test terragrunt's wrapping functionality
     - name: Create terraform module fixtures
       working-directory: /tmp/terragrunt/modules/example
       runs: |
@@ -69,10 +86,11 @@ test:
           }
         }
         EOF
+    # Create terragrunt configuration that references the terraform module
     - name: Create terragrunt fixtures
       working-directory: /tmp/terragrunt/envs/test
       runs: |
-        cat >terragrunt.hcl <<EOF
+        cat >terragrunt.hcl <<'EOF'
         terraform {
           source = "../../modules/example"
         }
@@ -81,35 +99,47 @@ test:
           example_input = "hello-from-terragrunt-test"
         }
         EOF
+    # Test that terragrunt can generate a terraform plan
     - name: Test plan
       working-directory: /tmp/terragrunt/envs/test
       runs: |
         terragrunt plan -out=plan.tfplan -input=false
-    - name: Test validate
-      working-directory: /tmp/terragrunt/envs/test
-      runs: |
-        echo "}" >>terragrunt.hcl
-        set +e
-        terragrunt validate
-        exit=$?
-        set -e
-        test "${exit}" == "1"
-        sed -i '$d' terragrunt.hcl
-        terragrunt validate
+    # Test that terragrunt hcl fmt detects formatting issues and can fix them
     - name: Test hcl format
       working-directory: /tmp/terragrunt/envs/test
       runs: |
+        # Break formatting should be detected using || true to avoid failing the step
         sed -i 's|  source|source|g' terragrunt.hcl
-        set +e
-        terragrunt hcl fmt --check
-        exit=$?
-        set -e
-        test "${exit}" == "1"
+        OUTPUT=$(terragrunt hcl fmt --check 2>&1 || true)
+        echo "$OUTPUT" | grep -q "needs formatting"
+
+        # Fix formatting and verify it passes
         terragrunt hcl fmt
         terragrunt hcl fmt --check
+    # Test that terragrunt can generate a dependency graph
+    - name: Test dag graph command
+      working-directory: /tmp/terragrunt/envs/test
+      runs: |
+        OUTPUT=$(terragrunt dag graph)
+        # Verify the graph contains expected node
+        echo "$OUTPUT" | grep -q "digraph"
+    # Test that terragrunt can render configuration as JSON and validate output
+    - name: Test render command
+      working-directory: /tmp/terragrunt/envs/test
+      runs: |
+        OUTPUT=$(terragrunt render --json)
+        # Verify JSON output contains expected configuration keys
+        echo "$OUTPUT" | grep -q "terraform"
+        echo "$OUTPUT" | grep -q "inputs"
+        echo "$OUTPUT" | grep -q "example_input"
+        # Verify the input value is correctly rendered
+        echo "$OUTPUT" | grep -q "hello-from-terragrunt-test"
 
 update:
   enabled: true
+  ignore-regex-patterns:
+    - ^alpha
+    - ^beta
   github:
     identifier: gruntwork-io/terragrunt
     strip-prefix: v

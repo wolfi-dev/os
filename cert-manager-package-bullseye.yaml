@@ -1,0 +1,202 @@
+package:
+  name: cert-manager-package-bullseye
+  version: 20210119.3 # Tracks Debian bullseye ca-certificates version
+  epoch: 0
+  description: cert-manager trust package with Debian Bullseye CA certificates
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - tini
+
+environment:
+  contents:
+    packages:
+      - binutils
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - gnutar
+      - jq
+      - trust-package
+      - xz
+
+pipeline:
+  # Check version drift with upstream - fail build if mismatch
+  - runs: |
+      set -euo pipefail
+
+      # Get upstream version from Debian Bullseye
+      UPSTREAM_VERSION=$(curl -sL https://raw.githubusercontent.com/cert-manager/trust-manager/main/make/00_debian_bullseye_version.mk | \
+        grep "DEBIAN_BULLSEYE_BUNDLE_VERSION :=" | \
+        cut -d'=' -f2 | \
+        tr -d ' ')
+
+      # Compare with our version
+      if [ "${{package.version}}" != "$UPSTREAM_VERSION" ]; then
+        echo "ERROR: Version mismatch!"
+        echo "  Our version: ${{package.version}}"
+        echo "  Upstream:    $UPSTREAM_VERSION"
+        echo "Update package version to match upstream"
+        exit 1
+      fi
+      echo "Version matches upstream: $UPSTREAM_VERSION"
+
+  # Copy copyandmaybepause from trust-package runtime dependency to root level
+  - runs: |
+      mkdir -p ${{targets.destdir}}
+      # The trust-package provides copyandmaybepause at /usr/bin/copyandmaybepause
+      # We need it at the root level to match upstream structure
+      cp /usr/bin/copyandmaybepause ${{targets.destdir}}/copyandmaybepause
+      chmod +x ${{targets.destdir}}/copyandmaybepause
+
+  # Fetch and process the Debian ca-certificates package
+  # Replicates upstream: make/debian-trust-package-fetch.sh
+  - name: Process Debian CA certificates
+    runs: |
+      set -euo pipefail
+
+      # Create the debian-package directory
+      mkdir -p "${{targets.destdir}}/debian-package"
+
+      # Replicate upstream script variables
+      # Production always uses ACTION="exact" - see:
+      # https://github.com/cert-manager/trust-manager/blob/c6deaf7acb0e4871e6fc0189d72c793cf644685c/make/debian-bullseye-trust-package.mk#L24
+      ACTION="exact"  # Production uses "exact" not "latest"
+      TARGET_DEBIAN_BUNDLE_VERSION="${{package.version}}"  # e.g., 20210119.3
+      target_ca_certificates_version="${TARGET_DEBIAN_BUNDLE_VERSION%.*}"  # e.g., 20210119
+
+      # Download and extract Debian ca-certificates
+      DEB_URL="https://deb.debian.org/debian/pool/main/c/ca-certificates/ca-certificates_${target_ca_certificates_version}_all.deb"
+      echo "Fetching Debian ca-certificates from: $DEB_URL"
+      curl -fLO "$DEB_URL"
+
+      # Extract the .deb package using ar
+      ar x "ca-certificates_${target_ca_certificates_version}_all.deb"
+      tar -xf data.tar.xz
+
+      # Concatenate all mozilla certificates Debian default
+      > ca-bundle.crt
+      for cert in usr/share/ca-certificates/mozilla/*.crt; do
+        [ -f "$cert" ] && cat "$cert" >> ca-bundle.crt
+      done
+
+      installed_version="${target_ca_certificates_version}"
+
+      # Build JSON package with upstream version logic
+      PACKAGE_NAME="cert-manager-debian-bullseye"
+      # https://github.com/cert-manager/trust-manager/blob/c6deaf7acb0e4871e6fc0189d72c793cf644685c/make/debian-trust-package-fetch.sh#L113
+      version_suffix=".0"  # ACTION="exact" keeps .0
+      json_version="${installed_version}${version_suffix}"  # 20210119.0
+
+      echo "Creating JSON bundle with version: $json_version"
+      echo "{}" | jq \
+        --rawfile bundle ca-bundle.crt \
+        --arg name "$PACKAGE_NAME" \
+        --arg version "$json_version" \
+        '.name = $name | .bundle = $bundle | .version = $version' \
+        > "${{targets.destdir}}/debian-package/cert-manager-package-debian.json"
+
+      # Cleanup temporary files
+      rm -f ca-certificates_${target_ca_certificates_version}_all.deb control.tar.* data.tar.* debian-binary ca-bundle.crt
+      rm -rf usr etc
+
+update:
+  enabled: true
+  # We track trust-manager releases for awareness, but version updates are manual
+  # Upstream pushes debian packages to quay.io which we cannot monitor via release-monitor
+  # Version must match: https://github.com/cert-manager/trust-manager/blob/main/make/00_debian_bullseye_version.mk
+  github:
+    identifier: cert-manager/trust-manager
+    strip-prefix: v
+    tag-filter: v
+  ignore-regex-patterns:
+    - '.*' # Ignore all versions - we only update manually when upstream changes debian package version
+  # Weekly rebuilds ensure we always have the latest Debian CA certificates
+  # Even with same version (20210119), the certificates themselves get updated regularly
+  schedule:
+    period: weekly
+    reason: Weekly rebuild to fetch latest Debian CA certificates - certificates are updated more frequently than the package version
+
+test:
+  environment:
+    contents:
+      packages:
+        - jq
+        - openssl # For certificate validation
+        - git
+        - go
+        - build-base
+  pipeline:
+    # Validate JSON bundle with trust-manager's official validator
+    - name: Validate with trust-manager validator
+      runs: |
+        set -euo pipefail
+        git clone --depth 1 --branch v0.20.3 https://github.com/cert-manager/trust-manager /tmp/trust-manager
+        cd /tmp/trust-manager
+
+        # Build the validator
+        go build -o /tmp/validate-trust-package ./cmd/validate-trust-package
+
+        # Validate the JSON bundle
+        /tmp/validate-trust-package < /debian-package/cert-manager-package-debian.json
+
+        # Cleanup
+        rm -rf /tmp/trust-manager /tmp/validate-trust-package
+    - name: Verify JSON bundle structure
+      runs: |
+        set -euo pipefail
+
+        # Check the JSON file exists
+        stat /debian-package/cert-manager-package-debian.json
+
+        # Validate JSON structure
+        jq -e '.name == "cert-manager-debian-bullseye"' /debian-package/cert-manager-package-debian.json
+        jq -e '.version | startswith("20210119.")' /debian-package/cert-manager-package-debian.json
+    - name: Validate CA certificates content
+      runs: |
+        set -euo pipefail
+
+        # Extract and validate certificates
+        jq -r '.bundle' /debian-package/cert-manager-package-debian.json > /tmp/ca-bundle.crt
+
+        # Count certificates
+        CERT_COUNT=$(grep -c "BEGIN CERTIFICATE" /tmp/ca-bundle.crt)
+        [ "$CERT_COUNT" -lt 0 ] || { echo "Too few certificates: $CERT_COUNT"; exit 1; }
+
+        # Validate certificate format
+        openssl crl2pkcs7 -nocrl -certfile /tmp/ca-bundle.crt | openssl pkcs7 -print_certs -noout
+    - name: Test copyandmaybepause functionality
+      runs: |
+        set -euo pipefail
+
+        # Test the copy functionality
+        mkdir -p /tmp/source /tmp/dest
+        cp /debian-package/cert-manager-package-debian.json /tmp/source/
+
+        # Run copyandmaybepause
+        /copyandmaybepause /tmp/source /tmp/dest
+
+        # Verify the file was copied
+        stat /tmp/dest/cert-manager-package-debian.json
+
+        # Verify content is identical
+        diff /tmp/source/cert-manager-package-debian.json /tmp/dest/cert-manager-package-debian.json
+    - name: Integration test - Package deployment simulation
+      runs: |
+        set -euo pipefail
+
+        # Simulate an init container scenario
+        mkdir -p /tmp/packages
+
+        # Use copyandmaybepause as an init container would
+        /copyandmaybepause /debian-package /tmp/packages
+
+        # Verify the package was copied correctly
+        stat /tmp/packages/cert-manager-package-debian.json
+
+        # Validate the copied JSON
+        jq -e '.name and .version and .bundle' /tmp/packages/cert-manager-package-debian.json
+
+        # Extract and count certificates from copied file
+        CERT_COUNT=$(jq -r '.bundle' /tmp/packages/cert-manager-package-debian.json | grep -c "BEGIN CERTIFICATE")

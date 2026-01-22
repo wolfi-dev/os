@@ -108,15 +108,6 @@ clean:
 clean-cache:
 	rm -rf ${CACHEDIR}
 
-${CACHEDIR}/.libraries_token.txt: cache
-	tmpf=$(shell mktemp); \
-	chainctl auth login --audience libraries.cgr.dev; \
-	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
-	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
-
-.PHONY: lib-token
-lib-token: ${CACHEDIR}/.libraries_token.txt
-
 .PHONY: fetch-kernel
 fetch-kernel:
 	rm -rf kernel/$(ARCH)

@@ -3,7 +3,7 @@ package:
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
   version: "7.73.3"
-  epoch: 0 # GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53
+  epoch: 2 # GHSA-xrwg-mqj6-6m22
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -18,9 +18,11 @@ package:
       - blkid
       - findutils
       - grep
+      - krb5 # Required by msodbcsql18 for Kerberos authentication
       - libpcap
       - libseccomp
       - shadow
+      - unixodbc # ODBC driver manager required by msodbcsql18
 
 capabilities:
   add:
@@ -29,6 +31,10 @@ capabilities:
 vars:
   python-version: "3.13"
   destd: /opt/datadog-agent
+  # Microsoft ODBC Driver 18 for SQL Server - required for SQL Server integration
+  # When upgrading datadog-agent, check the version used in the omnibus build:
+  # https://github.com/DataDog/datadog-agent/blob/main/omnibus/config/software/msodbcsql18.rb
+  msodbcsql18-version: "18.3.3.1-1"
 
 var-transforms:
   - from: ${{package.version}}
@@ -46,6 +52,16 @@ var-transforms:
     match: ^(\d+\.\d+)\.\d+$
     replace: "$1"
     to: major-minor-version
+  # Transform msodbcsql18-version (e.g., "18.3.3.1-1") to library suffix (e.g., "18.3.so.3.1")
+  - from: ${{vars.msodbcsql18-version}}
+    match: ^(\d+\.\d+)\.(\d+\.\d+)-\d+$
+    replace: "$1.so.$2"
+    to: msodbcsql18-libsuffix
+  # Extract major.minor version (e.g., "18.3.3.1-1" -> "18.3") for symlink naming
+  - from: ${{vars.msodbcsql18-version}}
+    match: ^(\d+\.\d+)\.\d+\.\d+-\d+$
+    replace: "$1"
+    to: msodbcsql18-major-minor
 
 environment:
   contents:
@@ -84,10 +100,12 @@ environment:
       - linux-headers
       - ninja
       - openssf-compiler-options
+      - patchelf # Required to patch RPATH of msodbcsql18 library
       - procps-dev
       - py${{vars.python-version}}-build-base-dev
       - py${{vars.python-version}}-semver
       - systemd-dev
+      - unixodbc-dev # Required to build with ODBC support for SQL Server integration
       - util-linux-misc # unshare
       - wget # Required for downloading clang-12 and kernel headers from debian
   environment:
@@ -124,12 +142,13 @@ pipeline:
 
   - uses: go/bump
     with:
-      go-version: "1.24.7" # package built w/ go-1.24 - keeps tidy at 1.24.7, otherwise go mod tidy fails
+      go-version: "1.24.11" # package built w/ go-1.24 - keeps tidy at 1.24.11, otherwise go mod tidy fails
       replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       show-diff: true
       # GHSA-f6x5-jh6r-wrfv, GHSA-j5w8-q4qc-rx2x
       deps: |-
         golang.org/x/crypto@v0.45.0
+        github.com/envoyproxy/gateway@v1.5.7
 
   # Ensure that we don't run into nvidia GPU issues at runtime.
   - runs: |
@@ -344,6 +363,48 @@ pipeline:
 
       # Install trace-loader binary
       install -Dm755 bin/trace-loader/trace-loader ${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-loader
+
+  # Install Microsoft ODBC Driver 18 for SQL Server integration
+  # Version and SHA256 hashes sourced from the omnibus build configuration.
+  # When upgrading, check: https://github.com/DataDog/datadog-agent/blob/main/omnibus/config/software/msodbcsql18.rb
+  - if: ${{build.arch}} == 'aarch64'
+    uses: fetch
+    with:
+      uri: https://packages.microsoft.com/debian/11/prod/pool/main/m/msodbcsql18/msodbcsql18_${{vars.msodbcsql18-version}}_arm64.deb
+      expected-sha256: 37e692b1517f1229042c743d0f2a7191e0dcb956bbc3785a895aaa6dc328467e
+      extract: false
+
+  - if: ${{build.arch}} == 'x86_64'
+    uses: fetch
+    with:
+      uri: https://packages.microsoft.com/debian/11/prod/pool/main/m/msodbcsql18/msodbcsql18_${{vars.msodbcsql18-version}}_amd64.deb
+      expected-sha256: f91004ce72fcd92e686154f90e2a80f4f86469e7cb5f42ef79cba79dc6727890
+      extract: false
+
+  - name: Install msodbcsql18 ODBC driver
+    runs: |
+      mkdir -p /tmp/msodbcsql18
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/lib
+
+      # Extract the deb package
+      if [ "${{build.arch}}" = "aarch64" ]; then
+        dpkg-deb -R msodbcsql18_${{vars.msodbcsql18-version}}_arm64.deb /tmp/msodbcsql18
+      else
+        dpkg-deb -R msodbcsql18_${{vars.msodbcsql18-version}}_amd64.deb /tmp/msodbcsql18
+      fi
+
+      # Patch RPATH to use the agent's embedded lib directory
+      patchelf --force-rpath --set-rpath '${{vars.destd}}/embedded/lib' /tmp/msodbcsql18/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-${{vars.msodbcsql18-libsuffix}}
+
+      # Install the driver to the embedded directory
+      cp -r /tmp/msodbcsql18/opt/microsoft/msodbcsql18/* ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/
+
+      # Create symlink for library compatibility
+      ln -sf ${{vars.destd}}/embedded/msodbcsql/lib64/libmsodbcsql-${{vars.msodbcsql18-libsuffix}} ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/lib/libmsodbcsql-${{vars.msodbcsql18-major-minor}}.so
+
+      # Install license and documentation
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/share
+      cp -r /tmp/msodbcsql18/usr/share/* ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/share/
 
   - uses: strip
 

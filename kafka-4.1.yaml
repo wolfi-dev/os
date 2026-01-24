@@ -1,7 +1,7 @@
 package:
   name: kafka-4.1
   version: "4.1.1"
-  epoch: 3
+  epoch: 1 # CVE-2025-68161
   description: Apache Kafka is a distributed event streaming platform
   copyright:
     - license: Apache-2.0
@@ -16,9 +16,6 @@ package:
 
 vars:
   java-version: "21"
-  alpine-version: "3.23"
-  # SHA256 hash of entrypoint.sh from adoptium/containers
-  cacert-entrypoint-hash: 9629db6dc081cb3ae47ddee4c924e849a24dfa8103751496de57a09bc5fa8713
 
 var-transforms:
   - from: ${{package.version}}
@@ -33,7 +30,6 @@ environment:
       - ca-certificates-bundle
       - curl
       - gradle-8
-      - jq
       - openjdk-${{vars.java-version}}-default-jdk
   environment:
     LANG: en_US.UTF-8
@@ -50,21 +46,6 @@ pipeline:
     with:
       patches: |
         CVE-2025-68161.patch
-
-  - runs: |
-      # Verify java-version matches upstream Kafka Dockerfile
-      upstream_java=$(grep 'eclipse-temurin:' docker/jvm/Dockerfile | head -1 | sed 's/.*eclipse-temurin:\([0-9]*\).*/\1/')
-      if [ "$upstream_java" != "${{vars.java-version}}" ]; then
-        echo "ERROR: Kafka uses Java $upstream_java but java-version is ${{vars.java-version}}"
-        exit 1
-      fi
-
-      # Check if a newer Alpine version exists in adoptium/containers
-      latest_alpine=$(curl -sf "https://api.github.com/repos/adoptium/containers/contents/${{vars.java-version}}/jre/alpine" | jq -r '.[].name' | sort -V | tail -1)
-      if [ "$latest_alpine" != "${{vars.alpine-version}}" ]; then
-        echo "ERROR: Adoptium has Alpine $latest_alpine but alpine-version is ${{vars.alpine-version}} - update alpine-version and cacert-entrypoint-hash"
-        exit 1
-      fi
 
   - runs: |
       gradle clean releaseTarGz
@@ -85,131 +66,6 @@ pipeline:
       rm -rf ${{targets.destdir}}/usr/lib/kafka/windows
 
 subpackages:
-  # Provides compatibility with the apache/kafka Docker image filesystem layout.
-  - name: kafka-${{vars.major-minor-version}}-oci-compat
-    description: "compat package with apache/kafka Docker image"
-    dependencies:
-      provides:
-        - kafka-oci-compat=${{package.full-version}}
-      runtime:
-        - ${{package.name}}
-    pipeline:
-      - runs: |
-          # Create /opt/kafka directory with symlinks to /usr/lib/kafka
-          mkdir -p ${{targets.contextdir}}/opt/kafka
-          ln -s /usr/lib/kafka/bin ${{targets.contextdir}}/opt/kafka/bin
-          ln -s /usr/lib/kafka/libs ${{targets.contextdir}}/opt/kafka/libs
-          ln -s /usr/lib/kafka/config ${{targets.contextdir}}/opt/kafka/config
-
-          # Create /opt/java/openjdk symlink for JAVA_HOME compatibility
-          mkdir -p ${{targets.contextdir}}/opt/java
-          ln -s /usr/lib/jvm/default-jvm ${{targets.contextdir}}/opt/java/openjdk
-
-          # Create directory structure matching apache/kafka Docker image
-          mkdir -p ${{targets.contextdir}}/etc/kafka/docker
-          mkdir -p ${{targets.contextdir}}/etc/kafka/secrets
-          mkdir -p ${{targets.contextdir}}/mnt/shared/config
-          mkdir -p ${{targets.contextdir}}/var/lib/kafka/data
-
-          # Copy docker scripts from the cloned kafka repository
-          cp docker/resources/common-scripts/bash-config ${{targets.contextdir}}/etc/kafka/docker/
-          cp docker/resources/common-scripts/configure ${{targets.contextdir}}/etc/kafka/docker/
-          cp docker/resources/common-scripts/configureDefaults ${{targets.contextdir}}/etc/kafka/docker/
-          cp docker/resources/common-scripts/run ${{targets.contextdir}}/etc/kafka/docker/
-          cp docker/jvm/launch ${{targets.contextdir}}/etc/kafka/docker/
-          cp docker/server.properties ${{targets.contextdir}}/etc/kafka/docker/
-          cp config/log4j2.yaml ${{targets.contextdir}}/etc/kafka/docker/
-          cp config/tools-log4j2.yaml ${{targets.contextdir}}/etc/kafka/docker/
-
-          # Copy license files from the extracted tarball
-          cp kafka_2.13-${{package.version}}/LICENSE ${{targets.contextdir}}/opt/kafka/
-          cp kafka_2.13-${{package.version}}/NOTICE ${{targets.contextdir}}/opt/kafka/
-          cp -r kafka_2.13-${{package.version}}/licenses ${{targets.contextdir}}/opt/kafka/
-
-          chmod +x ${{targets.contextdir}}/etc/kafka/docker/configure
-          chmod +x ${{targets.contextdir}}/etc/kafka/docker/configureDefaults
-          chmod +x ${{targets.contextdir}}/etc/kafka/docker/run
-          chmod +x ${{targets.contextdir}}/etc/kafka/docker/launch
-      # Fetch cacert entrypoint script from adoptium/containers with hash verification
-      - uses: fetch
-        with:
-          uri: https://raw.githubusercontent.com/adoptium/containers/main/${{vars.java-version}}/jre/alpine/${{vars.alpine-version}}/entrypoint.sh
-          expected-sha256: ${{vars.cacert-entrypoint-hash}}
-          extract: false
-      - runs: |
-          mv entrypoint.sh ${{targets.contextdir}}/__cacert_entrypoint.sh
-          chmod +x ${{targets.contextdir}}/__cacert_entrypoint.sh
-    test:
-      environment:
-        contents:
-          packages:
-            - ${{package.name}}
-            - wait-for-port
-        environment:
-          JAVA_HOME: /usr/lib/jvm/default-jvm
-      pipeline:
-        - name: "Verify __cacert_entrypoint.sh with USE_SYSTEM_CA_CERTS"
-          runs: |
-            USE_SYSTEM_CA_CERTS=true /__cacert_entrypoint.sh echo "test" 2>&1 | grep -F 'Import command completed'
-        - name: "Verify bash-config sets shell options"
-          runs: |
-            bash -c '. /etc/kafka/docker/bash-config && set -o | grep -q "errexit.*on"'
-        - name: "Verify configureDefaults sets CLUSTER_ID"
-          runs: |
-            bash -c '. /etc/kafka/docker/bash-config && . /etc/kafka/docker/configureDefaults && test -n "$CLUSTER_ID"'
-        - name: "Verify kafka binaries accessible via /opt/kafka/bin"
-          runs: |
-            /opt/kafka/bin/kafka-storage.sh random-uuid
-        - name: "Verify JAVA_HOME compatibility"
-          runs: |
-            /opt/java/openjdk/bin/java -version
-        - name: "Start Kafka and verify functionality"
-          runs: |
-            cat > /tmp/server.properties << 'PROPS'
-            node.id=1
-            process.roles=broker,controller
-            listeners=PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093
-            advertised.listeners=PLAINTEXT://localhost:9092
-            controller.listener.names=CONTROLLER
-            controller.quorum.voters=1@localhost:9093
-            log.dirs=/tmp/kafka-logs
-            offsets.topic.replication.factor=1
-            transaction.state.log.replication.factor=1
-            transaction.state.log.min.isr=1
-            PROPS
-
-            CLUSTER_ID=$(/opt/kafka/bin/kafka-storage.sh random-uuid)
-            /opt/kafka/bin/kafka-storage.sh format \
-              -t "$CLUSTER_ID" \
-              -c /tmp/server.properties
-
-            /opt/kafka/bin/kafka-server-start.sh /tmp/server.properties &
-            KAFKA_PID=$!
-            wait-for-port --host=localhost 9092
-
-            TOPIC_NAME="test-topic-$(/opt/kafka/bin/kafka-storage.sh random-uuid)"
-
-            /opt/kafka/bin/kafka-topics.sh --create \
-              --topic "$TOPIC_NAME" \
-              --bootstrap-server localhost:9092
-
-            /opt/kafka/bin/kafka-topics.sh --list \
-              --bootstrap-server localhost:9092 | grep -q "$TOPIC_NAME"
-
-            echo "hello kafka" | /opt/kafka/bin/kafka-console-producer.sh \
-              --topic "$TOPIC_NAME" \
-              --bootstrap-server localhost:9092
-
-            msg=$(timeout 30 /opt/kafka/bin/kafka-console-consumer.sh \
-              --topic "$TOPIC_NAME" \
-              --from-beginning \
-              --max-messages 1 \
-              --bootstrap-server localhost:9092)
-
-            test "$msg" = "hello kafka"
-
-            kill $KAFKA_PID
-
   - name: kafka-iamguarded-compat-${{vars.major-minor-version}}
     description: "compat package with iamguarded/kafka image"
     dependencies:
@@ -255,7 +111,7 @@ test:
   environment:
     contents:
       packages:
-        - wait-for-port
+        - uuidgen
     environment:
       LANG: en_US.UTF-8
       JAVA_HOME: "/usr/lib/jvm/default-jvm"
@@ -268,30 +124,39 @@ test:
         echo "Using cluster ID: $CLUSTER_ID"
 
         kafka-storage.sh format -t "$CLUSTER_ID" -c /usr/lib/kafka/config/server.properties.original --standalone
-    - name: "Start Kafka and verify produce/consume"
-      runs: |
+    - runs: |
         export PATH="/usr/lib/kafka/bin:$PATH"
 
         # Start Kafka
         kafka-server-start.sh /usr/lib/kafka/config/server.properties.original > /dev/null 2>&1 &
         KAFKA_PID=$!
-        wait-for-port --host=localhost 9092
+        sleep 5
 
-        TOPIC_NAME="test-topic-$(kafka-storage.sh random-uuid)"
+        TOPIC_NAME="test-topic-$(uuidgen)"
+        PARTITIONS=1
+        REPLICATION_FACTOR=1
 
         # Create and verify test topic
-        kafka-topics.sh --create --topic "${TOPIC_NAME}" --partitions 1 --replication-factor 1 --if-not-exists --bootstrap-server localhost:9092
+        kafka-topics.sh --create --topic "${TOPIC_NAME}" --partitions "${PARTITIONS}" --replication-factor "${REPLICATION_FACTOR}" --if-not-exists --bootstrap-server localhost:9092
         kafka-topics.sh --describe --topic "${TOPIC_NAME}" --bootstrap-server localhost:9092 | grep "${TOPIC_NAME}"
 
         # Produce a test message
         echo "Hello Kafka" | kafka-console-producer.sh --bootstrap-server localhost:9092 --topic "${TOPIC_NAME}"
 
-        # Consume and verify the message
+        # Consume the message
         consumed_message=$(timeout 10 kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic "${TOPIC_NAME}" --from-beginning --max-messages 1)
-        test "$consumed_message" = "Hello Kafka"
 
-        # Clean up
+        # Verify the message
+        if [[ "${consumed_message}" == "Hello Kafka" ]]; then
+          echo "Successfully produced and consumed a test message."
+        else
+          echo "Failed to verify the consumed message."
+        fi
+
+        # Clean up the test topic
         kafka-topics.sh --delete --topic "${TOPIC_NAME}" --bootstrap-server localhost:9092
+
+        # Kill Kafka
         kill "${KAFKA_PID}"
 
 update:

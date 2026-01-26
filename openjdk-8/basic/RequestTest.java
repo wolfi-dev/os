@@ -10,8 +10,6 @@ public class RequestTest {
         while (true) {
             URL url = new URL("http://example.org");
             HttpURLConnection urlConnection = (HttpURLConnection) url.openConnection();
-            // Cloudflare sometimes blocks Java<10 User-Agent
-            urlConnection.setRequestProperty("User-Agent", "Chainguard Test");
             if (urlConnection.getResponseCode() == HttpURLConnection.HTTP_OK) {
                 break;
             }

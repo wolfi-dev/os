@@ -1,7 +1,7 @@
 package:
   name: apicurio-registry
   version: "3.1.6"
-  epoch: 0 # GHSA-84h7-rjj3-6jx4
+  epoch: 3
   description: An API/Schema registry - stores APIs and Schemas
   copyright:
     - license: Apache-2.0
@@ -9,6 +9,9 @@ package:
     cpu: 32
     memory: 64Gi
     disk: 200Gi
+
+vars:
+  java-version: '17'
 
 environment:
   contents:
@@ -23,9 +26,9 @@ environment:
       - maven
       - nodejs-20
       - npm
-      - openjdk-17-default-jdk
+      - openjdk-${{vars.java-version}}-default-jdk
   environment:
-    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
 
 pipeline:
   - uses: git-checkout
@@ -65,6 +68,53 @@ pipeline:
   - uses: strip
 
 subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility layer for upstream image compatibiliy
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          # The upstream image expects files in /deployments/quarkus-app/
+          # while Wolfi installs to /usr/share/java/apicurio-registry/quarkus-app/
+          # Create symlinks to match the official image layout.
+          mkdir -p "${{targets.contextdir}}/deployments"
+          ln -sf /usr/share/java/apicurio-registry/quarkus-app "${{targets.contextdir}}/deployments/quarkus-app"
+
+          # Create data and meta directories for runtime storage
+          # These are empty in the upstream image but expected to exist
+          mkdir -p "${{targets.contextdir}}/deployments/data"
+          mkdir -p "${{targets.contextdir}}/deployments/meta"
+    test:
+      environment:
+        contents:
+          packages:
+            - openjdk-${{vars.java-version}}-default-jvm
+            - ${{package.name}}
+        environment:
+          JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+      pipeline:
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+        - name: Verify compat directories exist
+          runs: |
+            # Verify data and meta directories exist
+            test -d /deployments/data
+            test -d /deployments/meta
+
+            # Verify quarkus-run.jar is accessible via the compat path
+            test -f /deployments/quarkus-app/quarkus-run.jar
+        - name: Verify can start from compat path
+          uses: test/daemon-check-output
+          with:
+            setup: cd /deployments/quarkus-app
+            start: java -jar /deployments/quarkus-app/quarkus-run.jar
+            timeout: 60
+            expected_output: |
+              constructed successfully
+              Initializing the Apicurio Registry
+
   - name: ${{package.name}}-ui
     description: Web UI for Apicurio Registry (apicurio-registry-ui)
     dependencies:
@@ -87,7 +137,11 @@ subpackages:
     description: nginx configuration files for upstream configuration
     dependencies:
       runtime:
-        - docker-nginx
+        - nginx-mime-types
+      provides:
+        - nginx-config=0.${{package.full-version}}
+      replaces:
+        - nginx-mainline-config
     pipeline:
       - working-directory: ui
         runs: |
@@ -95,8 +149,29 @@ subpackages:
           config_dest="${{targets.contextdir}}/usr/local/bin/"
           install -Dm644 .docker-scripts/create-config.cjs "${config_dest}/create-config.cjs"
           install -Dm644 .docker-scripts/update-base-href.cjs "${config_dest}/update-base-href.cjs"
-          install -Dm644 .docker-scripts/nginx.conf "${config_dest}/etc/nginx/nginx.conf"
+          install -Dm644 .docker-scripts/nginx.conf "${{targets.contextdir}}/etc/nginx/nginx.conf"
+
+          # Fix SSL cipher configuration - PROFILE=SYSTEM is Red Hat specific and not supported on Wolfi
+          sed -i 's|ssl_ciphers PROFILE=SYSTEM;|# ssl_ciphers removed - using nginx defaults|' "${{targets.contextdir}}/etc/nginx/nginx.conf"
+
+          # Fix deprecated http2 directive (nginx 1.25.1+) - change "listen ... http2" to "listen ..." with separate "http2 on;"
+          sed -i 's|listen\s\+\([0-9]\+\)\s\+ssl\s\+http2;|listen \1 ssl;\n        http2 on;|' "${{targets.contextdir}}/etc/nginx/nginx.conf"
+
+          # Remove TLS server block - it requires certificates that don't exist by default
+          # TLS should be handled by ingress/sidecar if needed
+          sed -i '/^# Settings for a TLS enabled server/,$d' "${{targets.contextdir}}/etc/nginx/nginx.conf"
+          echo "}" >> "${{targets.contextdir}}/etc/nginx/nginx.conf"
+
+          # NOTE: copy entrypoint and replace s2i/run with direct nginx exec. we don't want to maintain
+          # the whole s2i related scripts so we simplify the entrypoint here
           install -Dm755 .docker-scripts/entrypoint.sh "${config_dest}/entrypoint.sh"
+          sed -i 's|source /usr/libexec/s2i/run|exec nginx -g "daemon off;"|' "${config_dest}/entrypoint.sh"
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: nginx-config
+            real-pkg-name: ${{subpkg.name}}
 
 update:
   enabled: true
@@ -110,12 +185,12 @@ test:
   environment:
     contents:
       packages:
-        - openjdk-17-default-jvm
+        - openjdk-${{vars.java-version}}-default-jvm
         - bash
         - curl
         - jq
     environment:
-      JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
       DEST: /usr/share/java/apicurio-registry
   pipeline:
     - name: Validate essential JARs

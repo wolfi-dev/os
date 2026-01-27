@@ -35,6 +35,7 @@ MELANGE_OPTS += --license 'Apache-2.0'
 MELANGE_OPTS += --git-repo-url 'https://github.com/wolfi-dev/os'
 MELANGE_OPTS += --cache-dir ${CACHEDIR}
 MELANGE_OPTS += --pipeline-dir ./pipelines/
+MELANGE_OPTS += --package-append busybox
 MELANGE_OPTS += ${MELANGE_EXTRA_OPTS}
 
 # Enter interactive mode on failure for debug

@@ -103,7 +103,7 @@ function runOpensearch {
     setupPerformanceAnalyzerPlugin
 
     # Start opensearch
-    exec "$@" "${opensearch_opts[@]}"
+    "$@" "${opensearch_opts[@]}"
 
 }
 

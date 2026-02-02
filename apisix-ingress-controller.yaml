@@ -1,13 +1,10 @@
 package:
   name: apisix-ingress-controller
-  version: "2.0.1"
-  epoch: 3 # go/wolfi-rsc/apisix-ingress-controller
+  version: "1.8.4"
+  epoch: 7
   description: APISIX Ingress Controller for Kubernetes.
   copyright:
     - license: Apache-2.0
-  resources:
-    cpu: "4"
-    memory: 5Gi
 
 var-transforms:
   - from: ${{package.version}}
@@ -18,34 +15,47 @@ var-transforms:
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 9b34e1290a6ae5ef7fe73d5afa60507bff9487c8
+      expected-commit: 019d719ef421e97ab47e68c0f34724010b05f1e0
       repository: https://github.com/apache/apisix-ingress-controller
-      tag: ${{package.version}}
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.45.0
+      modroot: test/e2e
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.38.0
+        golang.org/x/oauth2@v0.27.0
+        google.golang.org/grpc@v1.57.1
+        golang.org/x/crypto@v0.45.0
 
   - uses: go/build
     with:
-      packages: cmd/main.go
+      packages: .
       ldflags: |
-        -X=github.com/apache/apisix-ingress-controller/internal/version._buildVersion=${{package.version}}
-        -X=github.com/apache/apisix-ingress-controller/internal/version._buildGitRevision=$(git rev-parse --short HEAD)
-        -X=github.com/apache/apisix-ingress-controller/internal/version._buildOS=$(uname -s)/$(uname -m)
-        -X=github.com/apache/apisix-ingress-controller/internal/manager._minK8sVersion=1.26.0
+        -X=github.com/apache/apisix-ingress-controller/pkg/version._buildVersion=${{package.version}}
+        -X=github.com/apache/apisix-ingress-controller/pkg/version._buildGitRevision=$(git rev-parse --short HEAD)
+        -X=github.com/apache/apisix-ingress-controller/pkg/version._buildOS=$(uname -s)/$(uname -m)
       output: apisix-ingress-controller
 
 subpackages:
+  # NOTE: Upstream v1.8.x uses the "/ingress-apisix" layout with a custom entrypoint.
+  # This package mirrors that structure for compatibility. When bumping to v2.x (currently in RC stage it use "/app/..." layout) and need to update entrypoint and file paths accordingly
   - name: ${{package.name}}-compat
     description: Compatibility package for apisix-ingress-controller to match upstream paths
     pipeline:
       - runs: |
-          mkdir -p ${{targets.contextdir}}/app
-          ln -sf ../../usr/bin/apisix-ingress-controller ${{targets.subpkgdir}}/app/apisix-ingress-controller
+          mkdir -p ${{targets.subpkgdir}}/ingress-apisix/conf
+          ln -sf /usr/bin/apisix-ingress-controller ${{targets.subpkgdir}}/ingress-apisix/apisix-ingress-controller
+          cp ./conf/apisix-schema.json ${{targets.subpkgdir}}/ingress-apisix/conf/apisix-schema.json
     test:
-      environment:
-        contents:
-          packages:
-            - ${{package.name}}
       pipeline:
-        - uses: test/tw/symlink-check
+        - runs: |
+            stat /ingress-apisix/apisix-ingress-controller
 
   - name: ${{package.name}}-iamguarded-compat
     description: Compat package for iamguarded apisix-ingress-controller image
@@ -57,6 +67,7 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/bin
           ln -sf ../../../../usr/bin/apisix-ingress-controller ${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/bin/apisix-ingress-controller
+          install -Dpm0644 -t "${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/conf/" ./conf/apisix-schema.json
       - uses: iamguarded/finalize-compat
         with:
           package: apisix-ingress-controller
@@ -67,8 +78,6 @@ subpackages:
           packages:
             - ${{package.name}}
             - curl
-            - git
-            - kustomize
             - wait-for-it
         environment:
           PATH: "/opt/iamguarded/apisix-ingress-controller/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -84,18 +93,14 @@ subpackages:
               with:
                 setup: |
                   kubectl config view --minify --raw > /tmp/kubeconfig.yaml
-
-                  # Install APISIX CRDs using local kustomization file
-                  sed -i "s/VERSION/${{package.version}}/g" kustomization.yaml
-                  kubectl apply -k .
                 start: |
-                  /opt/iamguarded/apisix-ingress-controller/bin/apisix-ingress-controller --config-path /tmp/kubeconfig.yaml
+                  /opt/iamguarded/apisix-ingress-controller/bin/apisix-ingress-controller ingress \
+                    --default-apisix-cluster-base-url http://apisix-service:9180/apisix/admin \
+                    --kubeconfig /tmp/kubeconfig.yaml
                 timeout: 30
                 expected_output: |
-                  successfully acquired lease
-                  started status update handler
-                  readiness manager started
-                  Ready detected
+                  start leader election
+                  start api server
                 post: |
                   wait-for-it localhost:8080
                   DURATION_ONE="$(curl -fsSL http://127.0.0.1:8080/metrics | grep -F -e go_gc_duration_seconds)"
@@ -106,47 +111,34 @@ subpackages:
                       exit 1
                   fi
 
-# This repo has switched back and forth from a v-prefix to no v-prefix, for future reference
 update:
   enabled: true
-  ignore-regex-patterns:
-    - -rc\d+$
   github:
     identifier: apache/apisix-ingress-controller
-    use-tag: true
+    strip-prefix: v
 
 test:
   environment:
     contents:
       packages:
         - curl
-        - git
-        - kustomize
         - wait-for-it
   pipeline:
-    - uses: test/tw/help-check
-      with:
-        bins: apisix-ingress-controller
-    - uses: test/tw/ver-check
-      with:
-        bins: apisix-ingress-controller
+    - runs: |
+        set -o pipefail
+        apisix-ingress-controller version | grep "${{ package.version }}"
+        apisix-ingress-controller --help 2>&1 | grep -F -e "Yet another Ingress controller"
     - uses: test/kwok/cluster
     - uses: test/daemon-check-output
       with:
         setup: |
           kubectl config view --minify --raw > /tmp/kubeconfig.yaml
-
-          # Install APISIX CRDs using local kustomization file
-          sed -i "s/VERSION/${{package.version}}/g" kustomization.yaml
-          kubectl apply -k .
         start: |
-          apisix-ingress-controller --config-path /tmp/kubeconfig.yaml
-        timeout: 60
+          apisix-ingress-controller ingress --default-apisix-cluster-base-url http://apisix-service:9180/apisix/admin --kubeconfig /tmp/kubeconfig.yaml
+        timeout: 30
         expected_output: |
-          successfully acquired lease
-          started status update handler
-          readiness manager started
-          Ready detected
+          start leader election
+          start api server
         post: |
           wait-for-it localhost:8080
           DURATION_ONE="$(curl -fsSL http://127.0.0.1:8080/metrics | grep -F -e go_gc_duration_seconds)"

@@ -1,7 +1,7 @@
 package:
   name: busybox
   version: 1.37.0
-  epoch: 51
+  epoch: 54 # go/wolfi-rsc/busybox
   description: "swiss-army knife for embedded systems"
   copyright:
     - license: GPL-2.0-only
@@ -22,6 +22,9 @@ package:
       script: |
         #!/usr/bin/busybox sh
         /usr/bin/busybox --install -s
+  resources:
+    cpu: "1"
+    memory: 4Gi
 
 var-transforms:
   - from: ${{package.version}}
@@ -67,6 +70,11 @@ pipeline:
   - uses: patch
     with:
       patches: CVE-2025-46394.patch
+
+  # Patch from SUSE, also see https://github.com/wolfi-dev/os/pull/77355
+  - uses: patch
+    with:
+      patches: CVE-2025-60876.patch
 
   - name: Configure
     runs: |
@@ -138,8 +146,11 @@ subpackages:
         contents:
           packages:
             - wolfi-base
+            - ver-check
+            - python3
       pipeline:
-        - runs: |
+        - name: Verify network utilities are present
+          runs: |
             busybox --help
             busybox --list-full >full.txt
             # These programs are expected to be present
@@ -151,13 +162,108 @@ subpackages:
                 "$p" --help ||
                   { echo "$p --help exited $?. expected pass"; exit 1; }
             done
+        - name: Test wget can download a file
+          runs: |
+            # Create test content for HTTP server
+            mkdir -p /tmp/www
+            echo "wget test content" > /tmp/www/test.txt
+
+            # Start Python HTTP server
+            cd /tmp/www
+            python3 -m http.server 8888 > /tmp/httpd.log 2>&1 &
+            SERVER_PID=$!
+
+            # Wait for server to be ready
+            sleep 2
+
+            # Test wget download
+            wget -O /tmp/downloaded.txt http://127.0.0.1:8888/test.txt
+
+            # Verify downloaded content
+            if ! grep -F "wget test content" /tmp/downloaded.txt; then
+              echo "FAIL: wget did not download expected content"
+              cat /tmp/downloaded.txt
+              kill $SERVER_PID 2>/dev/null || true
+              exit 1
+            fi
+
+            echo "PASS: wget successfully downloaded file"
+
+            # Cleanup
+            kill $SERVER_PID 2>/dev/null || true
+        - name: Test nc can make network connections
+          runs: |
+            # Start nc listening in background, will send test data to first connection
+            echo "nc test data" | nc -l -p 9999 &
+            LISTEN_PID=$!
+
+            # Wait for listener to be ready
+            sleep 1
+
+            # Connect to the listening nc and capture data
+            result=$(nc 127.0.0.1 9999)
+
+            # Wait for listener to finish
+            wait $LISTEN_PID 2>/dev/null || true
+
+            # Verify data was transferred
+            if [ "$result" = "nc test data" ]; then
+              echo "PASS: nc network connection works"
+            else
+              echo "FAIL: nc did not receive expected data"
+              echo "Expected: nc test data"
+              echo "Got: $result"
+              exit 1
+            fi
 
 test:
+  environment:
+    contents:
+      packages:
+        - ver-check
   pipeline:
     - uses: test/hardening-check
       with:
         args: --nocfprotection
-    - runs: |
+    - name: Test echo and grep utilities via pipe
+      runs: |
+        if ! echo "hello world" | grep -F "hello"; then
+          echo "FAIL: echo | grep pipe test failed"
+          exit 1
+        fi
+        echo "PASS: echo | grep pipe works"
+    - name: Test file I/O with echo and cat
+      runs: |
+        echo "test content" > /tmp/testfile.txt
+        if ! cat /tmp/testfile.txt | grep -F "test content"; then
+          echo "FAIL: cat file test failed"
+          exit 1
+        fi
+        echo "PASS: file I/O with echo and cat works"
+    - name: Test ls and grep to find busybox
+      runs: |
+        if ! ls /usr/bin | grep -F "busybox"; then
+          echo "FAIL: busybox not found in /usr/bin"
+          exit 1
+        fi
+        echo "PASS: ls | grep finds busybox"
+    - name: Test shell script execution
+      runs: |
+        tee /tmp/test-script.sh <<'EOF'
+        #!/usr/bin/busybox sh
+        echo "script executed successfully"
+        EOF
+        chmod +x /tmp/test-script.sh
+        output=$(/tmp/test-script.sh)
+        if [ "$output" != "script executed successfully" ]; then
+          echo "FAIL: Shell script execution failed"
+          echo "Expected: script executed successfully"
+          echo "Got: $output"
+          exit 1
+        fi
+        echo "PASS: Shell script execution works"
+    - name: Verify network utilities are not present
+      runs: |
         busybox --help
         busybox --list-full >full.txt
 

@@ -1,26 +1,33 @@
 package:
   name: openbao
   version: "2.4.4"
-  epoch: 1 # CVE-2025-61729
+  epoch: 3 # go/wolfi-rsc/openbao
   description: OpenBao exists to provide a software solution to manage, store, and distribute sensitive data including secrets, certificates, and keys.
   copyright:
     - license: MPL-2.0
+  resources:
+    cpu: "4"
+    memory: 12Gi
   dependencies:
     runtime:
       - merged-bin
       - wolfi-baselayout
 
-# NOTE: openbao UI is not enabled for now ; see https://github.com/openbao/openbao/issues/129
-# several sections need to be uncommented to embed UI in the tool
-# NOTE: uncomment when enabling embedding of UI
-# environment:
-#   contents:
-#     packages:
-#       - busybox
-#       - ca-certificates-bundle
-#       - nodejs
-#       - npm
-#       - yarn
+vars:
+  # Node 25 removed util.isRegExp which clean-css needs for ember build
+  nodejs-version: 22
+
+environment:
+  environment:
+    # --max-old-space-size increases Node.js heap for Ember build
+    NODE_OPTIONS: "--max-old-space-size=16384"
+  contents:
+    packages:
+      - busybox
+      - nodejs-${{vars.nodejs-version}}
+      - npm
+      - yarn
+
 pipeline:
   - uses: git-checkout
     with:
@@ -35,13 +42,14 @@ pipeline:
       modroot: api/auth/jwt
 
   - runs: |
-      # NOTE: uncomment when enabling embedding of UI
-      # make ember-dist
+      # JOBS=1 limits Ember build parallelism to avoid memory issues
+      # See: https://github.com/ember-cli/ember-cli/blob/master/docs/build-concurrency.md
+      export JOBS=1
+      make ember-dist
 
   - uses: go/build
     with:
-      # NOTE: add "ui" tag when enabling embedding of UI
-      tags: "openbao"
+      tags: openbao,ui
       packages: .
       output: bao
       ldflags: |
@@ -86,6 +94,30 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+    environment:
+      BAO_ADDR: 'http://127.0.0.1:8200'
   pipeline:
     - runs: |
         bao --version
+    - name: "test: bao dev server and UI"
+      runs: |
+        # Start bao dev server
+        bao server -dev > /dev/null 2>&1 &
+        export BAO_SERVER=$!
+        wait-for-it 127.0.0.1:8200 -t 30 || (kill $BAO_SERVER; exit 1)
+
+        # Test basic functionality
+        bao status
+        bao kv put -mount=secret foo user="admin" password="s3cr3t"
+        bao token create
+
+        # Test UI is accessible and contains expected content
+        curl -sf http://127.0.0.1:8200/ui/ | grep -q "OpenBao" || (echo "ERROR: UI test failed"; kill -9 $BAO_SERVER; exit 1)
+
+        echo "UI smoke test passed"
+        kill -9 $BAO_SERVER

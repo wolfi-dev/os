@@ -1,7 +1,7 @@
 package:
   name: kong
   version: "3.9.1"
-  epoch: 3
+  epoch: 5 # go/wolfi-rsc/kong
   description: "The Kong Gateway - an API Gateway built on Nginx and OpenResty"
   copyright:
     - license: Apache-2.0
@@ -12,6 +12,15 @@ package:
   dependencies:
     runtime:
       - perl
+  resources:
+    cpu: "8"
+    memory: 16Gi
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
 
 environment:
   contents:
@@ -85,6 +94,111 @@ update:
     identifier: Kong/kong
     use-tag: true
 
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    description: "Compatibility package for iamguarded variant of Kong"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - bash
+        - coreutils
+        - curl
+        - luarocks
+        - perl
+        - procps
+        - wait-for-port
+        - wolfi-baselayout
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: kong
+          version: ${{vars.major-version}}
+      - runs: |
+          # Create iamguarded-compatible directory structure
+          mkdir -p /opt/iamguarded/kong
+          mkdir -p /opt/iamguarded/kong/bin
+          mkdir -p /opt/iamguarded/kong/conf
+          mkdir -p /opt/iamguarded/kong/conf.default
+          mkdir -p /opt/iamguarded/kong/server
+          mkdir -p /opt/iamguarded/kong/server/logs
+          mkdir -p /opt/iamguarded/kong/server.default
+
+          # Link kong binaries from main package installation
+          ln -sf /usr/local/bin/kong /opt/iamguarded/kong/bin/kong
+          ln -sf /usr/local/openresty /opt/iamguarded/kong/openresty
+          # luarocks installs to /usr, symlink so /opt/iamguarded/kong/luarocks/bin/luarocks works
+          ln -sf /usr /opt/iamguarded/kong/luarocks
+
+          # Copy default config
+          cp ${{targets.destdir}}/etc/kong/kong.conf.default /opt/iamguarded/kong/conf/kong.conf
+      - uses: iamguarded/finalize-compat
+        with:
+          package: kong
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+            - bash
+            - curl
+            - jq
+            - shadow
+            - wait-for-it
+        environment:
+          KONG_DATABASE: "off"
+          KONG_DECLARATIVE_CONFIG: /tmp/kong.yml
+          KONG_ADMIN_LISTEN: "127.0.0.1:8001"
+          KONG_PROXY_LISTEN: "127.0.0.1:8000"
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: kong
+            version: ${{vars.major-version}}
+        - uses: test/tw/ldd-check
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: "true"
+        - name: "Verify directory structure"
+          runs: |
+            stat /opt/iamguarded/kong/bin/kong
+            stat /opt/iamguarded/kong/conf
+            stat /opt/iamguarded/scripts/kong/entrypoint.sh
+            stat /opt/iamguarded/scripts/kong/run.sh
+        - name: "Create kong user for iamguarded scripts"
+          runs: |
+            groupadd kong
+            useradd -g kong kong
+            chown -R kong:kong /opt/iamguarded
+        - name: "Test Kong with iamguarded scripts"
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /tmp/kong_prefix
+              tee /tmp/kong.yml << 'EOF'
+              _format_version: "3.0"
+              services:
+                - name: stub
+                  url: http://localhost
+                  routes:
+                    - name: root
+                      paths: [ / ]
+              EOF
+            start: |
+              env IAMGUARDED_APP_NAME=kong \
+                APP_VERSION=${{package.version}} \
+                PATH="/opt/iamguarded/kong/bin:/opt/iamguarded/kong/openresty/bin:/opt/iamguarded/kong/openresty/nginx/sbin:/usr/local/bin:/usr/bin:/bin" \
+                /opt/iamguarded/scripts/kong/entrypoint.sh \
+                /opt/iamguarded/scripts/kong/run.sh
+            timeout: 60
+            expected_output: |
+              Kong setup finished!
+              Starting Kong
+            post: |
+              set -euo pipefail
+              wait-for-it 127.0.0.1:8001 -t 30
+              curl -sf http://127.0.0.1:8001/status | jq -e '.server'
+
 test:
   environment:
     contents:
@@ -99,9 +213,12 @@ test:
       KONG_ADMIN_LISTEN: 127.0.0.1:8001
       KONG_PROXY_LISTEN: 127.0.0.1:8000
   pipeline:
+    - uses: test/tw/ver-check
+      with:
+        bins: kong
+        version: ${{package.version}}
     - name: "Basic Test"
       runs: |
-        kong version | grep -i ${{package.version}}
         kong prepare --v 2>/dev/null | grep -i "preparing nginx"
     - name: "Test Kong Gateway functionality"
       uses: test/daemon-check-output

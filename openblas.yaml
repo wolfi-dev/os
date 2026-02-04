@@ -2,26 +2,13 @@
 package:
   name: openblas
   version: "0.3.31"
-  epoch: 4
+  epoch: 1 # go/wolfi-rsc/openblas
   description: fast BSD-licensed BLAS based on gotoBLAS2, with LAPACK
   copyright:
     - license: BSD-3-Clause
-  dependencies:
-    runtime:
-      - libopenblas-0=${{package.full-version}}
   resources:
     cpu: "12"
     memory: 9Gi
-
-vars:
-  abinum: 0
-
-data:
-  # Build variants: 64 first so standard runs last for lapack
-  - name: variants
-    items:
-      "64": "INTERFACE64=1 LIBNAMESUFFIX=64"
-      "": "INTERFACE64=0"
 
 environment:
   contents:
@@ -30,113 +17,87 @@ environment:
       - automake
       - build-base
       - busybox
+      - ca-certificates-bundle
       - gfortran
       - linux-headers
       - perl
-  environment:
-    OPENBLAS_FLAGS: "MAJOR_VERSION=3 NO_AFFINITY=1 PREFIX=/usr USE_OPENMP=0"
 
 pipeline:
   - uses: fetch
     with:
       expected-sha256: 6dd2a63ac9d32643b7cc636eab57bf4e57d0ed1fff926dfbc5d3d97f2d2be3a6
       uri: https://github.com/xianyi/OpenBLAS/archive/v${{package.version}}/openblas-${{package.version}}.tar.gz
-    working-directory: openblas-src
 
   - uses: patch
     with:
-      patches: ../blas-lapack.patch
-    working-directory: openblas-src
+      patches: blas-lapack.patch
 
-  - assertions:
-      required-steps: 1
-    pipeline:
-      - name: Set x86_64-specific flags
-        if: ${{build.arch}} == 'x86_64'
-        runs: |
-          echo 'export ARCH_FLAGS="DYNAMIC_ARCH=1 TARGET=CORE2"' > .env
-      - name: Set aarch64-specific flags
-        if: ${{build.arch}} == 'aarch64'
-        runs: |
-          echo 'export ARCH_FLAGS="DYNAMIC_ARCH=0 TARGET=ARMV8"' > .env
+  - runs: |
+      _flags="
+        MAJOR_VERSION=3
+        NO_AFFINITY=1
+        USE_OPENMP=0
+        PREFIX=/usr
+        "
+      ARCH=${{build.arch}}
+      if [ "$ARCH" = "x86_64" ]; then
+        _flags="$_flags DYNAMIC_ARCH=1"
+        _flags="$_flags TARGET=CORE2"
+      elif [ "$ARCH" = "aarch64" ]; then
+        _flags="$_flags DYNAMIC_ARCH=0"
+        _flags="$_flags TARGET=ARMV8"
+      fi
+
+      builddir=$(pwd)
+      cd ..
+      export CFLAGS=${CFLAGS/-Os/-O2}
+
+      make -C "$builddir" \
+        $_flags CFLAGS="$CFLAGS"
+
+      make -C "$builddir"/interface \
+        $_flags CFLAGS="$CFLAGS" shared-blas-lapack
+
+
+      cd "$builddir" || exit
+      make $_flags DESTDIR="${{targets.destdir}}" install
+      install -Dm755 interface/liblapack.so.3 \
+        "${{targets.destdir}}"/usr/lib/liblapack.so.3
+      ln -s liblapack.so.3 "${{targets.destdir}}"/usr/lib/liblapack.so
+      install -Dm755 interface/liblapacke.so.3 \
+        "${{targets.destdir}}"/usr/lib/liblapacke.so.3
+      ln -s liblapacke.so.3 "${{targets.destdir}}"/usr/lib/liblapacke.so
+
+      install -Dm 0644 Changelog.txt TargetList.txt USAGE.md \
+        -t "${{targets.destdir}}"/usr/share/doc/${{package.name}}/
+
+  - uses: strip
 
 subpackages:
-  - range: variants
-    name: libopenblas${{range.key}}-${{vars.abinum}}
-    description: OpenBLAS shared library${{range.key == "64" && " (ILP64 interface)" || ""}}
-    pipeline:
-      - runs: |
-          cp -a openblas-src build${{range.key}}
-      - name: Build OpenBLAS
-        working-directory: build${{range.key}}
-        runs: |
-          . ../.env
-          make ${{range.value}} $OPENBLAS_FLAGS $ARCH_FLAGS CFLAGS="${CFLAGS/-Os/-O2}"
-      - if: '"${{range.key}}" == ""'
-        name: Build lapack for standard variant
-        working-directory: build${{range.key}}
-        runs: |
-          . ../.env
-          make -C interface ${{range.value}} $OPENBLAS_FLAGS $ARCH_FLAGS CFLAGS="${CFLAGS/-Os/-O2}" shared-blas-lapack
-      - name: Install OpenBLAS
-        working-directory: build${{range.key}}
-        runs: |
-          . ../.env
-          make ${{range.value}} $OPENBLAS_FLAGS $ARCH_FLAGS DESTDIR="${{targets.contextdir}}" install
-      - if: '"${{range.key}}" == ""'
-        name: Install lapack for standard variant
-        working-directory: build${{range.key}}
-        runs: |
-          install -Dm755 interface/liblapack.so.3 \
-            "${{targets.contextdir}}"/usr/lib/liblapack.so.3
-          ln -s liblapack.so.3 "${{targets.contextdir}}"/usr/lib/liblapack.so
-          install -Dm755 interface/liblapacke.so.3 \
-            "${{targets.contextdir}}"/usr/lib/liblapacke.so.3
-          ln -s liblapacke.so.3 "${{targets.contextdir}}"/usr/lib/liblapacke.so
-
-          install -Dm 0644 Changelog.txt TargetList.txt USAGE.md \
-            -t "${{targets.contextdir}}"/usr/share/doc/${{package.name}}/
-      - uses: strip
-    test:
-      pipeline:
-        - uses: test/tw/ldd-check
-        - runs: |
-            ls -la /usr/lib/libopenblas${{range.key}}*.so*
-
-  - range: variants
-    name: openblas${{range.key}}-static
-    description: OpenBLAS static libraries${{range.key == "64" && " (ILP64 interface)" || ""}}
+  - name: openblas-static
     pipeline:
       - uses: split/static
-        with:
-          package: libopenblas${{range.key}}-${{vars.abinum}}
+    description: openblas static
 
-  - range: variants
-    name: openblas${{range.key}}-dev
-    description: OpenBLAS development headers and libraries${{range.key == "64" && " (ILP64 interface)" || ""}}
+  - name: openblas-dev
     dependencies:
       runtime:
-        - libopenblas${{range.key}}-${{vars.abinum}}
-        - openblas${{range.key}}-static
+        - openblas
+        - openblas-static
     pipeline:
       - uses: split/dev
-        with:
-          package: libopenblas${{range.key}}-${{vars.abinum}}
+    description: openblas dev
     test:
       pipeline:
         - uses: test/pkgconf
         - uses: test/tw/ldd-check
-        - if: '"${{range.key}}" == "64"'
-          name: Verify pkgconfig has ILP64 configuration
-          runs: |
-            pkg-config --variable=openblas_config openblas64 | grep -F "USE_64BITINT=1"
 
   - name: openblas-doc
     pipeline:
       - uses: split/manpages
       - runs: |
           mkdir -p "${{targets.contextdir}}"/usr/share/doc/${{package.name}}
-          mv "${{targets.outdir}}/libopenblas-${{vars.abinum}}"/usr/share/doc/${{package.name}}/* "${{targets.contextdir}}"/usr/share/doc/${{package.name}}/
+          mv Changelog.txt TargetList.txt USAGE.md "${{targets.contextdir}}"/usr/share/doc/${{package.name}}/
     description: openblas manpages
     test:
       pipeline:
@@ -146,7 +107,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib
-          mv "${{targets.outdir}}/libopenblas-${{vars.abinum}}"/usr/lib/liblapack.so* "${{targets.subpkgdir}}"/usr/lib/
+          mv "${{targets.destdir}}"/usr/lib/liblapack.so* "${{targets.subpkgdir}}"/usr/lib
     test:
       pipeline:
         - uses: test/tw/ldd-check
@@ -155,24 +116,14 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib
-          mv "${{targets.outdir}}/libopenblas-${{vars.abinum}}"/usr/lib/liblapacke.so* "${{targets.subpkgdir}}"/usr/lib/
+          mv "${{targets.destdir}}"/usr/lib/liblapacke.so* "${{targets.subpkgdir}}"/usr/lib
     test:
       pipeline:
         - uses: test/tw/ldd-check
 
-  # Compatibility alias for openblas64, for parity with openblas
-  - name: openblas64
-    description: fast BSD-licensed BLAS based on gotoBLAS2 (ILP64 interface)
-    dependencies:
-      runtime:
-        - libopenblas64-${{vars.abinum}}=${{package.full-version}}
-    test:
-      pipeline:
-        - uses: test/emptypackage
-
 test:
   pipeline:
-    - uses: test/emptypackage
+    - uses: test/tw/ldd-check
 
 update:
   enabled: true

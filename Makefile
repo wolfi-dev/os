@@ -108,15 +108,6 @@ clean:
 clean-cache:
 	rm -rf ${CACHEDIR}
 
-${CACHEDIR}/.libraries_token.txt: cache
-	tmpf=$(shell mktemp); \
-	chainctl auth login --audience libraries.cgr.dev; \
-	chainctl auth token --audience libraries.cgr.dev > $${tmpf}; \
-	mv $${tmpf} ${CACHEDIR}/.libraries_token.txt
-
-.PHONY: lib-token
-lib-token: ${CACHEDIR}/.libraries_token.txt
-
 .PHONY: fetch-kernel
 fetch-kernel:
 	rm -rf kernel/$(ARCH)
@@ -198,15 +189,6 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
 	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir ./$(*)/
-
-# Please do not print any additional content via this target
-# so that we can parse output directly with jq
-compile_targets = $(foreach name,$(pkgs),compile/$(name))
-$(compile_targets): compile/%:
-	@$(MAKE) $(KEY) >/dev/null 2>&1
-	@mkdir -p ./$(*)/
-	$(eval yamlfile := $*.yaml)
-	@$(MELANGE) compile $(yamlfile) $(MELANGE_OPTS) --source-dir ./$(*)/
 
 .PHONY: dev-container
 dev-container:

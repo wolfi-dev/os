@@ -1,9 +1,9 @@
 package:
-  name: datadog-agent-7.74
+  name: datadog-agent-7.75
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: "7.74.1"
-  epoch: 6 # Revert msodbcsql18 changes
+  version: "7.75.1"
+  epoch: 0 # GHSA-58pv-8j8x-9vj2
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -16,14 +16,13 @@ package:
       - blkid
       - findutils
       - grep
+      - krb5 # Required by msodbcsql18 for Kerberos authentication
       - libpcap
       - libseccomp
       - shadow
+      - unixodbc # ODBC driver manager required by msodbcsql18
     provides:
       - datadog-agent=${{package.full-version}}
-  resources:
-    cpu: "13"
-    memory: 35Gi
 
 capabilities:
   add:
@@ -32,6 +31,10 @@ capabilities:
 vars:
   python-version: "3.13"
   destd: /opt/datadog-agent
+  # Microsoft ODBC Driver 18 for SQL Server - required for SQL Server integration
+  # When upgrading datadog-agent, check the version used in the omnibus build:
+  # https://github.com/DataDog/datadog-agent/blob/main/omnibus/config/software/msodbcsql18.rb
+  msodbcsql18-version: "18.3.3.1-1"
 
 var-transforms:
   - from: ${{package.version}}
@@ -49,6 +52,16 @@ var-transforms:
     match: ^(\d+\.\d+)\.\d+$
     replace: "$1"
     to: major-minor-version
+  # Transform msodbcsql18-version (e.g., "18.3.3.1-1") to library suffix (e.g., "18.3.so.3.1")
+  - from: ${{vars.msodbcsql18-version}}
+    match: ^(\d+\.\d+)\.(\d+\.\d+)-\d+$
+    replace: "$1.so.$2"
+    to: msodbcsql18-libsuffix
+  # Extract major.minor version (e.g., "18.3.3.1-1" -> "18.3") for symlink naming
+  - from: ${{vars.msodbcsql18-version}}
+    match: ^(\d+\.\d+)\.\d+\.\d+-\d+$
+    replace: "$1"
+    to: msodbcsql18-major-minor
 
 environment:
   contents:
@@ -76,7 +89,7 @@ environment:
       # - gstatus # TODO: Required by gluster
       - gcc-14-default
       - gnutar
-      - go-1.24
+      - go-1.25
       - krb5-dev
       - libbpf-dev
       - libedit-dev
@@ -87,6 +100,7 @@ environment:
       - linux-headers
       - ninja
       - openssf-compiler-options
+      - patchelf # Required to patch RPATH of msodbcsql18 library
       - procps-dev
       - py${{vars.python-version}}-build-base-dev
       - py${{vars.python-version}}-semver
@@ -115,7 +129,7 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: c88a1f7784cc32966b711759fd0d957d08792182
+      expected-commit: 04251dd6c9daa95fdfa3dc7a255f366b2d39b475
 
   - uses: go/bump
     with:
@@ -345,6 +359,48 @@ pipeline:
       # Install trace-loader binary
       install -Dm755 bin/trace-loader/trace-loader ${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-loader
 
+  # Install Microsoft ODBC Driver 18 for SQL Server integration
+  # Version and SHA256 hashes sourced from the omnibus build configuration.
+  # When upgrading, check: https://github.com/DataDog/datadog-agent/blob/main/omnibus/config/software/msodbcsql18.rb
+  - if: ${{build.arch}} == 'aarch64'
+    uses: fetch
+    with:
+      uri: https://packages.microsoft.com/debian/11/prod/pool/main/m/msodbcsql18/msodbcsql18_${{vars.msodbcsql18-version}}_arm64.deb
+      expected-sha256: 37e692b1517f1229042c743d0f2a7191e0dcb956bbc3785a895aaa6dc328467e
+      extract: false
+
+  - if: ${{build.arch}} == 'x86_64'
+    uses: fetch
+    with:
+      uri: https://packages.microsoft.com/debian/11/prod/pool/main/m/msodbcsql18/msodbcsql18_${{vars.msodbcsql18-version}}_amd64.deb
+      expected-sha256: f91004ce72fcd92e686154f90e2a80f4f86469e7cb5f42ef79cba79dc6727890
+      extract: false
+
+  - name: Install msodbcsql18 ODBC driver
+    runs: |
+      mkdir -p /tmp/msodbcsql18
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/lib
+
+      # Extract the deb package
+      if [ "${{build.arch}}" = "aarch64" ]; then
+        dpkg-deb -R msodbcsql18_${{vars.msodbcsql18-version}}_arm64.deb /tmp/msodbcsql18
+      else
+        dpkg-deb -R msodbcsql18_${{vars.msodbcsql18-version}}_amd64.deb /tmp/msodbcsql18
+      fi
+
+      # Patch RPATH to use the agent's embedded lib directory
+      patchelf --force-rpath --set-rpath '${{vars.destd}}/embedded/lib' /tmp/msodbcsql18/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-${{vars.msodbcsql18-libsuffix}}
+
+      # Install the driver to the embedded directory
+      cp -r /tmp/msodbcsql18/opt/microsoft/msodbcsql18/* ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/
+
+      # Create symlink for library compatibility
+      ln -sf ${{vars.destd}}/embedded/msodbcsql/lib64/libmsodbcsql-${{vars.msodbcsql18-libsuffix}} ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/lib/libmsodbcsql-${{vars.msodbcsql18-major-minor}}.so
+
+      # Install license and documentation
+      mkdir -p ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/share
+      cp -r /tmp/msodbcsql18/usr/share/* ${{targets.contextdir}}${{vars.destd}}/embedded/msodbcsql/share/
+
   - uses: strip
 
 subpackages:
@@ -430,7 +486,7 @@ subpackages:
             with:
               repository: https://github.com/DataDog/integrations-core
               branch: ${{vars.datadog-major-minor-x}} # 7.x.y
-              expected-commit: bf9ee89d3cd53e4d01b551ccc9c01eddd1720a7b # needs to be updated with each new release
+              expected-commit: 4e91f2c46ed24a5138b4936616d39556db078def # needs to be updated with each new release
           - name: Verify expected-commit is latest
             runs: |
               # Check if the expected-commit matches the latest commit on the branch
@@ -865,6 +921,6 @@ update:
   enabled: true
   github:
     identifier: DataDog/datadog-agent
-    tag-filter: 7.74.
+    tag-filter: 7.75.
   ignore-regex-patterns:
     - "lambda-extension.*"

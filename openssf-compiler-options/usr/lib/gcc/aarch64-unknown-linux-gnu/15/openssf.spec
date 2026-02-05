@@ -28,7 +28,7 @@
   -z noexecstack \
   -z relro \
   -z now \
-  %{!fuse-ld=gold:-z gcs-report-dynamic=none}
+  -z gcs-report-dynamic=none
 
 %include_noerr </usr/lib/oldglibc/gcc.spec>
 %include_noerr </home/build/.melange.gcc.spec>

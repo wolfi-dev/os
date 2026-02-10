@@ -9,7 +9,6 @@ chmod 0755 /
 mount -t proc proc -o nodev,nosuid,hidepid=2 /proc
 # Fetch settings from cmdline
 DNS="$(tr ' ' '\n' < /proc/cmdline | grep "dns=" | cut -d'=' -f2-)"
-HOSTNAME="$(tr ' ' '\n' < /proc/cmdline | grep "hostname=" | cut -d'=' -f2-)"
 SSHKEY="$(tr ' ' '\n' < /proc/cmdline | grep "sshkey=" | cut -d'=' -f2- | base64 -d)"
 
 # TODO(mattmoor): Check for debug logging and enable "set -x"
@@ -17,6 +16,7 @@ SSHKEY="$(tr ' ' '\n' < /proc/cmdline | grep "sshkey=" | cut -d'=' -f2- | base64
 mount -t devtmpfs -o nosuid,noexec devtmpfs /dev
 mount -t sysfs sys -o nodev,nosuid,noexec /sys
 mount -t tmpfs tmpfs /tmp
+mount -t tmpfs -o mode=1777 tmpfs /run
 mkdir -p -m 0755 /dev/shm
 mount -t tmpfs -o mode=1777 tmpfs /dev/shm
 
@@ -25,47 +25,24 @@ mkdir /dev/pts
 mount -t devpts devpts -o noexec,nosuid,newinstance,ptmxmode=0666,mode=0620,gid=tty /dev/pts/
 mount --bind /dev/pts/ptmx /dev/ptmx
 
-# Fix /dev/fd
-ln -s /proc/kcore /dev/core
-ln -s /proc/self/fd /dev/fd
-ln -s /proc/self/fd/0 /dev/stdin
-ln -s /proc/self/fd/1 /dev/stdout
-ln -s /proc/self/fd/2 /dev/stderr
-
 if [ -z "${SSHKEY}" ]; then
 	echo "Missing default mount for ssh keys"
 	exit 1
 fi
 
-# We can ignore this fail, if we use a kernel with kvm_guest.config, we won't need this
-# and network will work anyway
-# If this fails and we won't have network, the ifconfig command will fail anyway.
-# Also we load cpu acceleration drivers in case those are needed.
-[ -e "/lib/modules/$(uname -r)/" ] && depmod -a
-sort -u /sys/devices/system/cpu/modalias | xargs -n1 modprobe 2>/dev/null || :
-sort -u /sys/devices/pci*/*/virtio*/modalias | xargs -n1 modprobe 2>/dev/null || :
-# modprobe 9p if absent
+# Rest of modules will be taken care by systemd afterwards.
+# modprobe 9p if absent we need to setup our defaultshare
 if ! grep -q 9p /proc/filesystems; then
-	modprobe virtio
-	modprobe virtio_blk
-	modprobe virtio_gpu
-	modprobe virtio_net
-	modprobe virtio_pci
-	modprobe virtio_pci_legacy_dev
-	modprobe virtio_pci_modern_dev
-	modprobe virtio_pmem
-	modprobe virtio_ring
-	modprobe virtio_rng
-	modprobe virtio_scsi
 	modprobe 9pnet_virtio
 	modprobe 9pnet
 	modprobe 9p
 fi
 
+# TODO: move this to systemd unit.
 # If we have an external disk, we want to perform builds in that
 if [ -e /dev/vda ]; then
 	grep -q xfs /proc/filesystems || modprobe xfs
-	mkfs.xfs \
+	mkfs.xfs -q \
 		-f \
 		-b size=4096 \
 		-s size=4096 \
@@ -76,7 +53,8 @@ if [ -e /dev/vda ]; then
 	mkdir -p /mount
 	mount -o noatime,nodiratime,logbufs=8,logbsize=256k -t xfs /dev/vda /mount
 	# Extract build environment in /mount
-	tar --xattrs --xattrs-include='*' -xpf /dev/vdb -m -k --ignore-zeros --record-size=64K --numeric-owner -C /mount/
+	tar --xattrs --xattrs-include='*' -xpf /dev/vdb -m -k --ignore-zeros \
+		--record-size=64K --numeric-owner -C /mount/
 	mkdir -p /mount/mnt
 	# ensure permissions are correct for sshd's ChrootDirectory
 	chown root:root /mount
@@ -86,6 +64,7 @@ if [ -e /dev/vda ]; then
 	chmod 0777 /mount/home/build
 fi
 
+# TODO: move this to mount unit.
 # Setup default mountpoint for 9p shared dir
 mount -t 9p \
 	-o trans=virtio \
@@ -94,6 +73,11 @@ mount -t 9p \
 	-o posixacl=on \
 	-o msize=104857600 \
 	defaultshare /mount/mnt/
+
+# TODO: move this to systemd unit that starts before sshd.service.
+##########################
+# Chroot directory setup #
+##########################
 
 # Allow the user we are running as to copy things to the shared dir
 chmod 0777 /mount/mnt
@@ -111,62 +95,11 @@ mount --bind /mount/dev/pts/ptmx /mount/dev/ptmx
 # Tell software that we're acting more like a container than a full VM
 touch /mount/.dockerenv
 
-# Set default hard limit of open file descriptors to match systemd init
-# behavior. The pam_limit module uses the settings in /proc/1/limit as
-# its default values.
-if [ -f /proc/sys/fs/nr_open ] ; then
-	nofile_limit=$(ulimit -H -n)
-	kernel_max_limit=$(cat /proc/sys/fs/nr_open)
-	# ensure that we are increasing the hard limit
-	if [[ "${kernel_max_limit}" =~ ^[0-9]+$ ]] &&
-		[ "${nofile_limit}" -lt "${kernel_max_limit}" ] ; then
-
-		ulimit -H -n "$kernel_max_limit"
-	fi
-fi
-
 # ldconfig is run to prime ld.so.cache for glibc packages which require it.
 chroot /mount /bin/sh -c "[ -x /sbin/ldconfig ] && /sbin/ldconfig /lib /usr/lib /usr/lib64"
-
-# Setup default network
-interface_name="$(ip -o link show | grep 'BROADCAST,MULTICAST' | head -n 1 | cut -d':' -f2 | tr -d ' ')"
-ip link set lo up
-ip link set "${interface_name:-"eth0"}" up
-ip addr add 10.0.2.15/24 dev "${interface_name:-"eth0"}"
-ip route add default via 10.0.2.2 dev "${interface_name:-"eth0"}"
-
-hostname "${HOSTNAME:-"wolfi-vm"}"
-echo "${HOSTNAME:-"wolfi-vm"}" > /mount/etc/hostname
-echo "127.0.0.1 ${HOSTNAME:-"wolfi-vm"}" >> /mount/etc/hosts
-rm -f /mount/etc/resolv.conf
+# inject DNS inside the chroot
 echo "nameserver ${DNS:-"10.0.2.3"}" > /mount/etc/resolv.conf
 
-#########################
-# INIT.D SCRIPT RUNNER  #
-#########################
-
-echo "[INIT] Checking for init.d scripts..." > /dev/console
-
-# Run scripts from /opt/melange/init.d/ in numeric order
-# Scripts are executed (run in separate process) and must succeed (set -e)
-if [ -d /opt/melange/init.d ]; then
-	for script in /opt/melange/init.d/*; do
-		if [ -f "$script" ] && [ -x "$script" ]; then
-			echo "[INIT] Executing init.d script: $(basename $script)" > /dev/console
-			# Execute the script - runs in separate process
-			# Will halt on error due to 'set -e' at top of this script
-			"$script"
-			echo "[INIT] Completed: $(basename $script)" > /dev/console
-		fi
-	done
-	echo "[INIT] All init.d scripts completed successfully" > /dev/console
-else
-	echo "[INIT] No /opt/melange/init.d directory (optional, skipping)" > /dev/console
-fi
-
-##############
-# Entrypoint #
-##############
 # Setup SSH keys for external access
 mkdir -p -m 0700 /root/.ssh/
 echo "${SSHKEY}" > /root/.ssh/authorized_keys
@@ -186,5 +119,42 @@ for i in $(awk -F: '$7 == "/bin/sh" {print $1}' /etc/passwd); do
 	chown -R "$i":"$group" "$home"
 done
 
-ssh-keygen -A -a 1
-exec /usr/sbin/sshd -D -e
+#################
+# Systemd setup #
+#################
+
+# Mask units not needed in ephemeral build VM
+for unit in \
+      console-getty.service \
+      getty@.service \
+      proc-sys-fs-binfmt_misc.automount \
+      serial-getty@.service \
+      sys-kernel-debug.mount \
+      sys-kernel-tracing.mount \
+      systemd-boot-update.service \
+      systemd-hwdb-update.service \
+      systemd-journal-catalog-update.service \
+      systemd-journal-flush.service \
+      systemd-machine-id-commit.service \
+      systemd-networkd-persistent-storage.service \
+      systemd-networkd-wait-online.service \
+      systemd-nsresourced.socket \
+      systemd-oomd.socket \
+      systemd-remount-fs.service \
+      systemd-tmpfiles-setup-dev-early.service \
+      systemd-tmpfiles-setup-dev.service \
+      systemd-update-done.service \
+      systemd-update-utmp-runlevel.service \
+      systemd-update-utmp.service \
+      systemd-vconsole-setup.service \
+      tmp.mount \
+; do
+      ln -sf /dev/null "/etc/systemd/system/$unit"
+done
+
+##############
+# Entrypoint #
+##############
+sed -i '/ExecStartPre.*/d' /usr/lib/systemd/system/sshd.service
+ln -sf /usr/lib/systemd/system/multi-user.target /etc/systemd/system/default.target
+exec /usr/lib/systemd/systemd

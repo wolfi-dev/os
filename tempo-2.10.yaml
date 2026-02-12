@@ -1,0 +1,116 @@
+package:
+  name: tempo-2.10
+  version: "2.10.0"
+  epoch: 0
+  description: Grafana Tempo is a high volume, minimal dependency distributed tracing backend.
+  copyright:
+    - license: AGPL-3.0-or-later
+  resources:
+    cpu: "6"
+    memory: 12Gi
+  dependencies:
+    provides:
+      - ${{vars.package-basename}}=${{package.full-version}}
+
+vars:
+  package-basename: tempo
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - go
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 5773eb8b0bdd4439a6c065e54f777e4f77d419a1
+      repository: https://github.com/grafana/tempo
+      tag: v${{package.version}}
+
+  - runs: |
+      go mod vendor
+      make ${{vars.package-basename}}
+      install -Dm755 bin/linux/${{vars.package-basename}}-$(go env GOARCH) ${{targets.destdir}}/usr/bin/${{vars.package-basename}}
+
+  - uses: strip
+
+data:
+  - name: components
+    items:
+      query: query
+      vulture: vulture
+      cli: cli
+
+subpackages:
+  - range: components
+    name: "${{package.name}}-${{range.key}}"
+    dependencies:
+      provides:
+        - "${{vars.package-basename}}-${{range.key}}=${{package.full-version}}"
+    pipeline:
+      - runs: |
+          make ${{vars.package-basename}}-${{range.key}}
+          install -Dm755 bin/linux/${{vars.package-basename}}-${{range.key}}-$(go env GOARCH) ${{targets.subpkgdir}}/usr/bin/${{vars.package-basename}}-${{range.key}}
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: "/usr/bin/${{vars.package-basename}}-${{range.key}}"
+        - uses: test/tw/virtualpackage
+          with:
+            virtual-pkg-name: "${{vars.package-basename}}-${{range.key}}"
+
+update:
+  enabled: true
+  github:
+    identifier: grafana/tempo
+    strip-prefix: v
+    tag-filter-prefix: v2.10.
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+  pipeline:
+    - uses: test/tw/virtualpackage
+      with:
+        virtual-pkg-name: "${{vars.package-basename}}"
+    - name: Smoke test for Tempo binary
+      runs: |
+        tempo --version
+        tempo --help
+    - name: Test Tempo server start
+      runs: |
+        # Create a simple tempo.yaml config file
+        cat <<EOF > tempo.yaml
+        auth_enabled: false
+        server:
+          http_listen_port: 3200
+        distributor:
+          receivers:
+            jaeger:
+              protocols:
+                thrift_compact:
+        ingester:
+          trace_idle_period: 10s
+          max_block_bytes: 1048576
+        storage:
+          trace:
+            backend: local
+            local:
+              path: /tmp/tempo/traces
+        EOF
+
+        tempo start -config.file=tempo.yaml > /dev/null 2>&1 &
+
+        attempts=0
+        until curl -f http://localhost:3200/ready || [ $attempts -eq 5 ]; do
+          sleep 10
+          attempts=$((attempts+1))
+        done
+        if [ $attempts -eq 5 ]; then exit 1; fi

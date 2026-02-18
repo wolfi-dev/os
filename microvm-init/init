@@ -20,6 +20,14 @@ mount -t tmpfs tmpfs /tmp
 mkdir -p -m 0755 /dev/shm
 mount -t tmpfs -o mode=1777 tmpfs /dev/shm
 
+# Mount eBPF filesystems in HOST environment (required for tetragon)
+mkdir -p /sys/kernel/debug
+mkdir -p /sys/kernel/tracing
+mkdir -p /sys/fs/bpf
+mount -t debugfs none /sys/kernel/debug && echo "[INIT] ✓ debugfs mounted in host" > /dev/console || echo "[INIT] ✗ debugfs mount failed" > /dev/console
+mount -t tracefs none /sys/kernel/tracing && echo "[INIT] ✓ tracefs mounted in host" > /dev/console || echo "[INIT] ✗ tracefs mount failed" > /dev/console
+mount -t bpf none /sys/fs/bpf && echo "[INIT] ✓ bpf mounted in host" > /dev/console || echo "[INIT] ✗ bpf mount failed" > /dev/console
+
 # Setup tty/pty
 mkdir /dev/pts
 mount -t devpts devpts -o noexec,nosuid,newinstance,ptmxmode=0666,mode=0620,gid=tty /dev/pts/
@@ -104,6 +112,14 @@ mount --rbind /sys /mount/sys
 mount --rbind /tmp /mount/tmp
 mount -t tmpfs -o mode=1777 tmpfs /mount/run
 
+# Mount eBPF filesystems in chroot environment (required for tetragon)
+mkdir -p /mount/sys/kernel/debug
+mkdir -p /mount/sys/kernel/tracing
+mkdir -p /mount/sys/fs/bpf
+mount -t debugfs none /mount/sys/kernel/debug && echo "[INIT] ✓ debugfs mounted at /mount/sys/kernel/debug" > /dev/console || echo "[INIT] ✗ debugfs mount failed" > /dev/console
+mount -t tracefs none /mount/sys/kernel/tracing && echo "[INIT] ✓ tracefs mounted at /mount/sys/kernel/tracing" > /dev/console || echo "[INIT] ✗ tracefs mount failed" > /dev/console
+mount -t bpf none /mount/sys/fs/bpf && echo "[INIT] ✓ bpf mounted at /mount/sys/fs/bpf" > /dev/console || echo "[INIT] ✗ bpf mount failed" > /dev/console
+
 mount -t cgroup2 -o nsdelegate,memory_recursiveprot,nosuid,nodev,noexec cgroup2 /mount/sys/fs/cgroup
 mkdir -p /mount/dev/pts
 mount -t devpts devpts -o noexec,nosuid,newinstance,ptmxmode=0666,mode=0620,gid=tty /mount/dev/pts/
@@ -141,6 +157,86 @@ echo "127.0.0.1 ${HOSTNAME:-"wolfi-vm"}" >> /mount/etc/hosts
 rm -f /mount/etc/resolv.conf
 echo "nameserver ${DNS:-"10.0.2.3"}" > /mount/etc/resolv.conf
 
+#####################
+# OBSERVABILITY STARTUP  #
+#####################
+
+echo "[INIT] Starting tetragon daemon..." > /dev/console
+
+# Create directory for tetragon events
+mkdir -p /tmp/tetragon
+chmod 0777 /tmp/tetragon
+
+# Create egress monitoring policy
+echo "[INIT] Creating TCP egress monitoring policy" > /dev/console
+cat > /tmp/tetragon/egress-policy.yaml <<'POLICY_EOF'
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "monitor-network-activity-outside-cluster-cidr-range"
+spec:
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - 127.0.0.1
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+POLICY_EOF
+
+# Start tetragon daemon in background - Phase 3: without custom policy
+echo "[INIT] Launching tetragon with export to /tmp/tetragon/events.log (Phase 3: no policy)" > /dev/console
+
+(
+	tetragon \
+		--export-filename /tmp/tetragon/events.log \
+		--log-format json \
+		--log-level info \
+		>/dev/null 2>&1
+) &
+
+TETRAGON_PID=$!
+echo "[INIT] Tetragon started with PID: $TETRAGON_PID" > /dev/console
+
+# Start console streamer in background
+# This streams tetragon events to /dev/console which melange captures
+(
+	# Wait for events file to be created (up to 3 seconds)
+	for i in $(seq 1 30); do
+		if [ -f /tmp/tetragon/events.log ]; then
+			break
+		fi
+		sleep 0.1
+	done
+
+	# Stream events to console
+	if [ -f /tmp/tetragon/events.log ]; then
+		echo "[INIT] Starting tetragon event stream to console" > /dev/console
+		chmod 0666 /tmp/tetragon/events.log
+
+		# Use tail -f to stream events, prefix with [TETRAGON], send to console
+		tail -f /tmp/tetragon/events.log 2>/dev/null | while IFS= read -r line; do
+			echo "[TETRAGON] $line" > /dev/console 2>/dev/null || true
+		done
+	else
+		echo "[INIT] Warning: Tetragon events file not created" > /dev/console
+	fi
+) </dev/null >/dev/null 2>&1 &
+
+STREAMER_PID=$!
+echo "[INIT] Tetragon console streamer started with PID: $STREAMER_PID" > /dev/console
+
+# Brief pause to let tetragon initialize
+sleep 1
+
+echo "[INIT] Tetragon initialization complete" > /dev/console
 #########################
 # INIT.D SCRIPT RUNNER  #
 #########################

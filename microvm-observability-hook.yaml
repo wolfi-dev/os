@@ -1,0 +1,108 @@
+package:
+  name: microvm-observability-hook
+  version: 0.0.1
+  epoch: 0
+  description: Init.d hook to start observability framework during microvm-init
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - tetragon
+
+environment:
+  contents:
+    packages:
+      - busybox
+
+pipeline:
+  - runs: |
+      mkdir -p ${{targets.destdir}}/opt/melange/init.d
+      cat > ${{targets.destdir}}/opt/melange/init.d/50-observability.sh <<'OBSERVABILITY_HOOK_EOF'
+      #!/bin/sh
+      # Observability framework startup hook for microvm-init
+      # This script is sourced by microvm-init before chroot
+
+      echo "[INIT.D] Starting observability hook (50-observability.sh)..." > /dev/console
+
+      # Mount eBPF filesystems if not already mounted (required for eBPF-based observability)
+      if ! grep -q debugfs /proc/mounts; then
+          mount -t debugfs none /sys/kernel/debug 2>/dev/null && \
+              echo "[INIT.D] ✓ debugfs mounted" > /dev/console || \
+              echo "[INIT.D] ✗ debugfs mount failed" > /dev/console
+      fi
+
+      if ! grep -q tracefs /proc/mounts; then
+          mount -t tracefs none /sys/kernel/tracing 2>/dev/null && \
+              echo "[INIT.D] ✓ tracefs mounted" > /dev/console || \
+              echo "[INIT.D] ✗ tracefs mount failed" > /dev/console
+      fi
+
+      if ! grep -q bpf /proc/mounts; then
+          mount -t bpf none /sys/fs/bpf 2>/dev/null && \
+              echo "[INIT.D] ✓ bpf mounted" > /dev/console || \
+              echo "[INIT.D] ✗ bpf mount failed" > /dev/console
+      fi
+
+      # Create directory for observability events
+      mkdir -p /tmp/observability
+      chmod 0777 /tmp/observability
+
+      # Start observability framework in background
+      echo "[INIT.D] Launching observability framework with export to /tmp/observability/events.log" > /dev/console
+
+      (
+          tetragon \
+              --export-filename /tmp/observability/events.log \
+              --log-format json \
+              --log-level info \
+              >/dev/null 2>&1
+      ) &
+
+      OBSERVABILITY_PID=$!
+      echo "[INIT.D] Observability framework started with PID: $OBSERVABILITY_PID" > /dev/console
+
+      # Start console streamer in background
+      (
+          # Wait for events file to be created (up to 3 seconds)
+          for i in $(seq 1 30); do
+              if [ -f /tmp/observability/events.log ]; then
+                  break
+              fi
+              sleep 0.1
+          done
+
+          # Stream events to console
+          if [ -f /tmp/observability/events.log ]; then
+              echo "[INIT.D] Starting observability event stream to console" > /dev/console
+              chmod 0666 /tmp/observability/events.log
+
+              # Use tail -f to stream events, prefix with [OBSERVABILITY], send to console
+              tail -f /tmp/observability/events.log 2>/dev/null | while IFS= read -r line; do
+                  echo "[OBSERVABILITY] $line" > /dev/console 2>/dev/null || true
+              done
+          else
+              echo "[INIT.D] Warning: Observability events file not created" > /dev/console
+          fi
+      ) </dev/null >/dev/null 2>&1 &
+
+      STREAMER_PID=$!
+      echo "[INIT.D] Observability console streamer started with PID: $STREAMER_PID" > /dev/console
+
+      # Brief pause to let observability framework initialize
+      sleep 1
+
+      echo "[INIT.D] Observability hook completed successfully" > /dev/console
+      OBSERVABILITY_HOOK_EOF
+
+      chmod +x ${{targets.destdir}}/opt/melange/init.d/50-observability.sh
+
+test:
+  pipeline:
+    - runs: |
+        test -f /opt/melange/init.d/50-observability.sh
+        test -x /opt/melange/init.d/50-observability.sh
+
+update:
+  enabled: false
+  exclude-reason: |
+    This is a custom hook for microvm-init observability integration

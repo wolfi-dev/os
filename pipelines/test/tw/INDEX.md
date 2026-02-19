@@ -12,6 +12,7 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 | `docs` | Validate documentation packages | none |
 | `emptypackage` | Validate empty packages | none |
 | `gem-check` | Verify Ruby gems load correctly | none |
+| `gem-installed` | Verify gem is installed and has content (for gems that can't be required) | none |
 | `header-check` | Verify C/C++ headers compile | none |
 | `help-check` | Verify binaries respond to --help | `bins` |
 | `ldd-check` | Check for missing shared libraries | none |

@@ -15,7 +15,6 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 | `header-check` | Verify C/C++ headers compile | none |
 | `help-check` | Verify binaries respond to --help | `bins` |
 | `ldd-check` | Check for missing shared libraries | none |
-| `lua-syntax-check` | Find and compile all installed Lua files with LuaJIT | none |
 | `metapackage` | Validate meta-packages (deps only) | none |
 | `no-docs` | Ensure package has no documentation | none |
 | `pip-check` | Validate Python package dependencies | none |

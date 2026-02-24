@@ -1,0 +1,237 @@
+package:
+  name: envoy-1.36
+  version: "1.36.4"
+  epoch: 0
+  description: Cloud-native high-performance edge/middle/service proxy
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: 20
+    memory: 50Gi
+  dependencies:
+    provides:
+      - envoy=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - bazel-7
+      - binutils
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-18
+      - cmake
+      - coreutils
+      - git
+      - libtool
+      - linux-headers
+      - llvm-18
+      - llvm-18-dev
+      - llvm-libcxx-18
+      - llvm-libcxx-18-dev
+      - llvm-libcxxabi-18
+      - llvm-lld-18~18
+      - nodejs
+      - openjdk-21
+      - patch
+      - python3-dev
+      - samurai
+      - wolfi-baselayout
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/envoyproxy/envoy
+      tag: v${{package.version}}
+      expected-commit: bad8280de85c25b147a90c1d9b8a8c67a13e7134
+      destination: envoy
+
+  - runs: |
+      export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+      mkdir -p .cache/bazel/_bazel_root
+
+      cd envoy
+      # The Python interpreter complains about being run as root, there's a flag to pass to disable that warning.
+      sed -i 's/envoy_dependencies_extra()/envoy_dependencies_extra(ignore_root_user_error=True)/g' WORKSPACE
+
+      ./bazel/setup_clang.sh /usr
+      echo "build --config=libc++" >> user.bazelrc
+      echo "build --action_env=CC=clang" >> user.bazelrc
+      echo "build --action_env=CXX=clang++" >> user.bazelrc
+
+      # liburing is built without builtins and fails to link with -ftrivial-auto-var-init=zero
+      bazel build --verbose_failures \
+        --action_env=LIBURING_CFLAGS="-ftrivial-auto-var-init=uninitialized" \
+        --action_env=CC=clang \
+        --action_env=CXX=clang++ \
+        -c opt envoy
+
+      mkdir -p ${{targets.destdir}}/usr/bin/
+      mv bazel-bin/source/exe/envoy-static ${{targets.destdir}}/usr/bin/envoy
+
+      # We no longer need this cache dir, which has some writable files.
+      rm -rf ../.cache/bazel/_bazel_root
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint for using Envoy in OCI containers
+    dependencies:
+      runtime:
+        - busybox
+      provides:
+        - envoy-oci-entrypoint=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/var/lib/envoy/init
+          cp envoy/distribution/docker/docker-entrypoint.sh ${{targets.subpkgdir}}/var/lib/envoy/init/envoy-entrypoint.sh
+          chmod +x ${{targets.subpkgdir}}/var/lib/envoy/init/envoy-entrypoint.sh
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: envoy-oci-entrypoint
+            real-pkg-name: "${{subpkg.name}}"
+
+  - name: ${{package.name}}-config
+    description: Default Envoy configuration
+    dependencies:
+      provides:
+        - envoy-config=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc/envoy
+          cp envoy/configs/envoyproxy_io_proxy.yaml ${{targets.subpkgdir}}/etc/envoy/envoy.yaml
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: envoy-config
+            real-pkg-name: "${{subpkg.name}}"
+
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package with iamguarded envoy image"
+    dependencies:
+      provides:
+        - envoy-iamguarded-compat=${{package.full-version}}
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: envoy
+          version: ${{vars.major-minor-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/envoy/bin/
+          mkdir -p /opt/iamguarded/envoy/conf/
+          chmod g+rwX /opt/iamguarded
+          ln -sf /usr/bin/envoy /opt/iamguarded/envoy/bin/envoy
+          cp envoy/configs/envoyproxy_io_proxy.yaml /opt/iamguarded/envoy/conf/envoy.yaml
+      - uses: iamguarded/finalize-compat
+        with:
+          package: envoy
+          version: ${{vars.major-minor-version}}
+    test:
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: envoy
+            version: ${{vars.major-minor-version}}
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: envoy-iamguarded-compat
+            real-pkg-name: "${{subpkg.name}}"
+
+update:
+  enabled: true
+  github:
+    identifier: envoyproxy/envoy
+    strip-prefix: v
+    use-tag: true
+    tag-filter-prefix: v1.36
+
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - curl
+        - netcat-openbsd
+        - procps
+        - jq
+  pipeline:
+    - uses: test/virtualpackage
+      with:
+        virtual-pkg-name: envoy
+        real-pkg-name: "${{package.name}}"
+    - name: "Verify binary installation"
+      runs: |
+        envoy --version
+        envoy --help
+    - name: "Test Envoy admin interface startup"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          #!/bin/sh -e
+          cat > /tmp/minimal.yaml <<EOF
+          admin:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 9901
+          static_resources:
+            listeners: []
+            clusters: []
+          EOF
+        start: envoy --config-path /tmp/minimal.yaml --admin-address-path /tmp/admin.txt
+        timeout: 30
+        expected_output: |
+          starting main dispatch loop
+          all dependencies initialized
+        post: |
+          #!/bin/sh -e
+          # Get admin address
+          ADMIN_ADDR=$(cat /tmp/admin.txt)
+
+          # Test admin endpoints
+          curl -s "http://${ADMIN_ADDR}/server_info" | jq . || exit 1
+          curl -s "http://${ADMIN_ADDR}/stats" | grep envoy || exit 1
+          curl -s "http://${ADMIN_ADDR}/clusters" | jq . || exit 1
+    - name: "Test hot restart capability"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          #!/bin/sh -e
+          cat > /tmp/minimal.yaml <<EOF
+          admin:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 9901
+          static_resources:
+            listeners: []
+            clusters: []
+          EOF
+        start: envoy --config-path /tmp/minimal.yaml --restart-epoch 0
+        timeout: 30
+        expected_output: |
+          starting main dispatch loop
+          all dependencies initialized
+        post: |
+          #!/bin/sh -e
+          first_pid=$(pgrep -f "restart-epoch 0")
+          envoy --config-path /tmp/minimal.yaml --restart-epoch 1 > /dev/null 2>&1 &
+          sleep 2
+
+          # Verify both processes exist
+          if ! ps -p $first_pid > /dev/null; then
+            echo "Original Envoy process not found"
+            exit 1
+          fi

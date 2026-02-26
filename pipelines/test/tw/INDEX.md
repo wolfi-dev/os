@@ -6,7 +6,6 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 
 | Pipeline | Purpose | Required Inputs |
 |----------|---------|-----------------|
-| `configpackage` | Validate configuration packages contain config files | none |
 | `contains-files` | Verify package contains expected files | `files` or `dir`+`name` |
 | `debugpackage` | Validate debug symbol packages | none |
 | `devpackage` | Validate development packages | none |
@@ -36,16 +35,6 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 ## Package Type Validation
 
 Use these pipelines to validate that packages conform to expected structural patterns for their type.
-
-### `configpackage`
-Validates configuration packages contain non-empty text config files in the expected directory.
-
-**When to use:** For `-config` packages that install runtime configuration files.
-
-**Inputs:**
-- `dir` (optional, default: `/etc/`) - Directory to search for config files
-
----
 
 ### `docs`
 Validates documentation packages contain only documentation files under a specified path prefix.

@@ -69,8 +69,8 @@ WOLFI_REPO ?= https://packages.wolfi.dev/os
 WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
 BOOTSTRAP ?= no
 
-SOURCE_DATE_EPOCH := $(shell git --no-pager log -1 --pretty=%ct || echo no-git)
-ifeq ($(SOURCE_DATE_EPOCH),no-git)
+SOURCE_DATE_EPOCH := $(shell git --no-pager log -1 --pretty=%ct 2>/dev/null || jj log -r @ --no-graph -T 'committer.timestamp().utc().format("%s")' 2>/dev/null || echo 0)
+ifeq ($(SOURCE_DATE_EPOCH),0)
 $(error setting SOURCE_DATE_EPOCH failed - $(SOURCE_DATE_EPOCH))
 endif
 export SOURCE_DATE_EPOCH

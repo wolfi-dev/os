@@ -6,7 +6,6 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 
 | Pipeline | Purpose | Required Inputs |
 |----------|---------|-----------------|
-| `configpackage` | Validate configuration packages contain config files | none |
 | `contains-files` | Verify package contains expected files | `files` or `dir`+`name` |
 | `debugpackage` | Validate debug symbol packages | none |
 | `devpackage` | Validate development packages | none |
@@ -23,7 +22,6 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 | `pip-check` | Validate Python package dependencies | none |
 | `shell-deps.check` | Check shell scripts for missing commands | `files` |
 | `shell-deps-check-packages` | Check package shell scripts for deps | `package` |
-| `srcpackage` | Validate source packages contain source files | none |
 | `staticpackage` | Validate static library packages | none |
 | `symlink-check` | Verify symlinks are valid | none |
 | `byproductpackage` | Validate by-product packages | none |
@@ -36,16 +34,6 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 ## Package Type Validation
 
 Use these pipelines to validate that packages conform to expected structural patterns for their type.
-
-### `configpackage`
-Validates configuration packages contain non-empty text config files in the expected directory.
-
-**When to use:** For `-config` packages that install runtime configuration files.
-
-**Inputs:**
-- `dir` (optional, default: `/etc/`) - Directory to search for config files
-
----
 
 ### `docs`
 Validates documentation packages contain only documentation files under a specified path prefix.
@@ -63,17 +51,6 @@ Validates development packages contain headers, static libraries, and developmen
 **When to use:** For `-dev` or `-devel` packages.
 
 **Inputs:** None
-
----
-
-### `srcpackage`
-Validates source packages contain actual source code files in the expected directory.
-
-**When to use:** For `-src` packages that install source code.
-
-**Inputs:**
-- `dir` (optional, default: `/usr/src/`) - Directory to search for source files
-- `name` (optional, default: `*`) - File name pattern (find syntax)
 
 ---
 

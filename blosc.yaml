@@ -1,7 +1,7 @@
 package:
   name: blosc
   version: 1.21.6
-  epoch: 4 # go/wolfi-rsc/blosc
+  epoch: 5 # go/wolfi-rsc/blosc
   description: A blocking, shuffling and loss-less compression library that can be faster than `memcpy()`.
   copyright:
     - license: BSD-3-Clause
@@ -42,9 +42,32 @@ subpackages:
     pipeline:
       - uses: split/dev
     test:
+      environment:
+        contents:
+          packages:
+            - gcc
+            - glibc-dev
+            - blosc
       pipeline:
+        - uses: test/tw/devpackage
         - uses: test/pkgconf
         - uses: test/tw/ldd-check
+        - name: Test header compilation with pkg-config
+          runs: |
+            set -euo pipefail
+
+            # Verify pkg-config can find blosc
+            pkg-config --exists blosc
+
+            # Create a test program that includes blosc.h
+            tee test_header.c <<'EOF'
+            #include <blosc.h>
+            int main() { return 0; }
+            EOF
+
+            # Compile using pkg-config flags
+            gcc $(pkg-config --cflags blosc) test_header.c -c -o test_header.o
+            echo "SUCCESS: blosc.h compiles with pkg-config flags"
 
 update:
   enabled: true
@@ -54,5 +77,116 @@ update:
     tag-filter: v1.
 
 test:
+  environment:
+    contents:
+      packages:
+        - blosc-dev
+        - gcc
+        - glibc-dev
   pipeline:
     - uses: test/tw/ldd-check
+    - name: Test blosc library linkage and initialization
+      runs: |
+        set -euo pipefail
+
+        # Create a test program that initializes and destroys blosc
+        tee test_init.c <<'EOF'
+        #include <blosc.h>
+        #include <stdio.h>
+
+        int main() {
+            blosc_init();
+
+            /* Verify we can query blosc information */
+            const char *version = blosc_get_version_string();
+            if (version == NULL) {
+                fprintf(stderr, "FAIL: blosc_get_version_string returned NULL\n");
+                blosc_destroy();
+                return 1;
+            }
+            printf("Blosc version: %s\n", version);
+
+            int nthreads = blosc_get_nthreads();
+            printf("Number of threads: %d\n", nthreads);
+
+            blosc_destroy();
+            printf("SUCCESS: blosc init/destroy works\n");
+            return 0;
+        }
+        EOF
+
+        gcc test_init.c -lblosc -o test_init
+        output=$(./test_init)
+        echo "$output" | grep -F "SUCCESS: blosc init/destroy works"
+    - name: Test blosc compression and decompression
+      runs: |
+        set -euo pipefail
+
+        # Create a test program that compresses and decompresses data
+        tee test_compress.c <<'EOF'
+        #include <blosc.h>
+        #include <stdio.h>
+        #include <string.h>
+        #include <stdlib.h>
+
+        #define SIZE 1000
+
+        int main() {
+            blosc_init();
+
+            /* Create test data with a repeating pattern (compressible) */
+            int src[SIZE];
+            int dest[SIZE];
+            int i;
+            for (i = 0; i < SIZE; i++) {
+                src[i] = i % 10;
+            }
+
+            /* Allocate buffer for compressed data */
+            int csize = SIZE * sizeof(int) + BLOSC_MAX_OVERHEAD;
+            void *compressed = malloc(csize);
+            if (compressed == NULL) {
+                fprintf(stderr, "FAIL: malloc failed\n");
+                blosc_destroy();
+                return 1;
+            }
+
+            /* Compress */
+            csize = blosc_compress(5, 1, sizeof(int), SIZE * sizeof(int),
+                                   src, compressed, SIZE * sizeof(int) + BLOSC_MAX_OVERHEAD);
+            if (csize <= 0) {
+                fprintf(stderr, "FAIL: blosc_compress returned %d\n", csize);
+                free(compressed);
+                blosc_destroy();
+                return 1;
+            }
+            printf("Compressed %lu bytes to %d bytes\n",
+                   (unsigned long)(SIZE * sizeof(int)), csize);
+
+            /* Decompress */
+            int dsize = blosc_decompress(compressed, dest, SIZE * sizeof(int));
+            if (dsize < 0) {
+                fprintf(stderr, "FAIL: blosc_decompress returned %d\n", dsize);
+                free(compressed);
+                blosc_destroy();
+                return 1;
+            }
+
+            /* Verify round-trip correctness */
+            if (memcmp(src, dest, SIZE * sizeof(int)) != 0) {
+                fprintf(stderr, "FAIL: decompressed data does not match original\n");
+                free(compressed);
+                blosc_destroy();
+                return 1;
+            }
+
+            free(compressed);
+            blosc_destroy();
+            printf("SUCCESS: compression round-trip verified\n");
+            return 0;
+        }
+        EOF
+
+        gcc test_compress.c -lblosc -o test_compress
+        output=$(./test_compress)
+        echo "$output" | grep -F "SUCCESS: compression round-trip verified"

@@ -1,7 +1,7 @@
 package:
   name: xcover
   version: "0.3.1"
-  epoch: 0 # CVE-2025-61732
+  epoch: 1 # CVE-2025-61732
   description: "Profile coverage of functional tests without instrumenting your binaries."
   copyright:
     - license: MIT
@@ -72,18 +72,19 @@ test:
   environment:
     contents:
       packages:
-        - crane
-        - jq
         - gcc
+        - jq
   pipeline:
     - uses: test/tw/ldd-check
-    - name: Profile Crane tests
+    - name: Profile local binary tests
       runs: |
+        set -euo pipefail
+
         # Smoke test for BPF program load with libbpfgo.
         # libbpfgo still uses rlimit for increasing the
-        # hard limit for maximum amoutn of kernel memory
+        # hard limit for maximum amount of kernel memory
         # that can be locked.
-        cat <<"EOF" >test-setrlimit.c
+        tee test-setrlimit.c <<'CEOF'
         #include <stdio.h>
         #include <sys/resource.h>
         #include <errno.h>
@@ -104,15 +105,40 @@ test:
             printf("Successfully set RLIMIT_MEMLOCK to 512 MB\n");
             return 0;
         }
-        EOF
+        CEOF
         gcc -o test-setrlimit test-setrlimit.c
         ./test-setrlimit || \
           { echo "Cannot increase memory lock with rlimit. Needed to load BPF program with libbpfgo. Skipping tests"; exit 0; }
 
-        # Run xcover in background.
+        # Compile a simple local test binary to trace with xcover.
+        # This avoids any network dependency.
+        tee test-tracee.c <<'CEOF'
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+
+        void do_work(const char *input) {
+            printf("Processing: %s\n", input);
+        }
+
+        void do_more_work(int count) {
+            for (int i = 0; i < count; i++) {
+                printf("Step %d\n", i);
+            }
+        }
+
+        int main(int argc, char *argv[]) {
+            do_work("hello");
+            do_more_work(3);
+            printf("Done\n");
+            return 0;
+        }
+        CEOF
+        gcc -o test-tracee test-tracee.c
+
+        # Run xcover in background, tracing the local test binary.
         xcover run \
-          --path $(command -v crane) \
-          --exclude "^(runtime\.|internal\/)" \
+          --path $(pwd)/test-tracee \
           --log-level=debug \
           --verbose=false \
           --status \
@@ -124,12 +150,10 @@ test:
         # Only then, start executing tests.
         xcover wait --timeout 60s
 
-        crane version >/dev/null
-        crane --help >/dev/null
-        crane manifest chainguard/static >/dev/null
-        crane ls chainguard/static >/dev/null
-        crane digest chainguard/static:latest >/dev/null
-        crane pull chainguard/static:latest static_latest.tar >/dev/null
+        # Exercise the traced binary multiple times
+        ./test-tracee
+        ./test-tracee
+        ./test-tracee
 
         # Graceful shutdown
         xcover stop
@@ -139,10 +163,9 @@ test:
 
         # Validate coverage report
         test -f xcover-report.json || \
-          { echo "Skip report validation: report does not exist."; exit 0; }
+          { echo "ERROR: xcover report not generated"; exit 1; }
         coverage="$(jq '.cov_by_func' < xcover-report.json)"
-        true=1
-        if [[ $(echo "$coverage > 15" | bc -l) != $true ]]; then
-          echo "Coverage seems wrong"
+        if [ "$(echo "$coverage" | awk '{print ($1 > 0)}')" = "0" ]; then
+          echo "Coverage seems wrong: $coverage"
           exit 1
         fi

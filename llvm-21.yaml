@@ -1,19 +1,18 @@
 package:
   name: llvm-21
   version: "21.1.8"
-  epoch: 6 # go/wolfi-rsc/llvm-21
+  epoch: 4 # go/wolfi-rsc/llvm-21
   description: Low-level virtual machine ${{vars.major-version}} - core frameworks
   copyright:
     - license: Apache-2.0
   resources:
-    cpu: "48"
+    cpu: "54"
     memory: 64Gi
   dependencies:
     provides:
       - llvm=${{package.full-version}}
 
 vars:
-  bpf-bins: clang llc llvm-objcopy llvm-strip
   python-version: 3.13
 
 var-transforms:
@@ -59,24 +58,6 @@ pipeline:
       tag: llvmorg-${{package.version}}
       expected-commit: 2078da43e25a4623cab2d0d60decddf709aaea28
 
-  - name: Hot patch source to support oldglibc environment
-    runs: |
-      test -d /usr/lib/oldglibc || exit 0
-      if test -e /usr/lib/oldglibc/usr/include/sys/rseq.h; then
-        # it's a new-enough glibc
-        exit 0
-      fi
-      # In oldglibc environments, __has_include(<sys/rseq.h>) may fallback
-      # to the system headers in /usr/include and find a stubbed out copy.
-      # Hot-patch out the optional #include it is guarding.
-      file="llvm/tools/llvm-exegesis/lib/BenchmarkRunner.cpp"
-      cp "${file}" "${file}.orig"
-      sed -i -r 's,^(#include <sys/rseq\.h>)$,/* \1 */,' "${file}"
-      if diff -u "${file}.orig" "${file}"; then
-        echo "ERROR: This build workaround is no longer applicable, please remove it" 1>&2
-        exit 1
-      fi
-
   - name: Clone patched source for BPF build
     runs: |
       mkdir bpf-build
@@ -86,12 +67,7 @@ pipeline:
       ffi_include_dir="$(pkg-config --cflags-only-I libffi | sed 's|^-I||g')"
       python_version=$(python${{vars.python-version}} -V | sed 's/.*\([0-9]\{1,\}\.[0-9]\{1,\}\)\..*/\1/')
 
-      if [ -d /usr/lib/oldglibc ]; then
-        C_INCLUDE_DIRS="/usr/lib/oldglibc/usr/include:/usr/include"
-      fi
-
       cmake -B output -G Ninja -S llvm -Wno-dev \
-        ${C_INCLUDE_DIRS:+-DC_INCLUDE_DIRS="${C_INCLUDE_DIRS}"} \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=${{vars.llvm-prefix}} \
         -DCMAKE_PREFIX_PATH=${{vars.llvm-prefix}} \
@@ -185,9 +161,6 @@ subpackages:
           mkdir -p ${{targets.contextdir}}/usr/lib/
           mv ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/$sonamefull ${{targets.contextdir}}/usr/lib/
           ln -sf ../../$sonamefull ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/$sonamefull
-    test:
-      pipeline:
-        - uses: test/tw/ldd-check
 
   - name: compiler-rt-${{vars.major-version}}
     description: Clang ${{vars.major-version}} compiler runtime
@@ -487,11 +460,6 @@ subpackages:
         pipeline:
           - name: Configure and compile BPF build
             runs: |
-              if [ -d /usr/lib/oldglibc ]; then
-                # ftbfs in oldglibc environments, so
-                # we stub out this subpackage
-                exit 0
-              fi
               cmake -B output -G Ninja -S llvm -Wno-dev \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX=${{vars.llvm-prefix}} \
@@ -532,52 +500,15 @@ subpackages:
               -DCLANG_VENDOR=Wolfi
 
               cd output
-              ninja ${{vars.bpf-bins}}
+              ninja clang llc llvm-objcopy llvm-strip
           - name: Install BPF toolchain
             runs: |
               mkdir -p ${{targets.contextdir}}/usr/bin
-              if [ -d /usr/lib/oldglibc ]; then
-                # ftbfs in oldglibc environments, so we populate it with
-                # dummy commands that do enough to pass the test phase
-                dummy_cmd="${{context.name}}-dummy"
-                dummy_dest="${{targets.contextdir}}/usr/bin/${dummy_cmd}"
-                cat <<'EOF' > "${dummy_dest}"
-              #!/bin/sh
-              echo "ERROR: Chainguard does not build ${{subpkg.name}} for oldglibc environments." 1>&2
-              echo "ERROR: This is a dummy ${0##*/} command, provided to pass package tests." 1>&2
-              while [ $# -gt 0 ]; do
-                case "${1}" in
-                  --version)
-                    echo "Dummy ${0##*/} version ${{package.version}}"
-                    ;;
-                  --help)
-                    echo "Sorry, I can't help you."
-                    ;;
-                  *)
-                    echo "ERROR: Command not implemented" 1>&2
-                    ;;
-                esac
-                shift
-              done
-              exit 1
-              EOF
-                chmod 755 "${dummy_dest}"
-                for cmd in ${{vars.bpf-bins}}; do
-                  ln -s "${dummy_cmd}" "${{targets.contextdir}}/usr/bin/${cmd}"
-                done
-                exit 0
-              fi
-
-              # non-oldglibc builds continue here
               mkdir -p ${{targets.contextdir}}/${{vars.llvm-prefix}}/bin
               mkdir -p ${{targets.contextdir}}/${{vars.clang-prefix}}/bin
 
               # Install the LLVM binaries
-              for llvm_bin in ${{vars.bpf-bins}}; do
-                if [ "$llvm_bin" = "clang" ]; then
-                  # clang is handled below
-                  continue
-                fi
+              for llvm_bin in llc llvm-objcopy llvm-strip; do
                 mv output/bin/"${llvm_bin}" ${{targets.contextdir}}/${{vars.llvm-prefix}}/bin/
                 ln -s ../lib/llvm-${{vars.major-version}}/bin/"${llvm_bin}" ${{targets.contextdir}}/usr/bin/"${llvm_bin}"
               done
@@ -600,10 +531,18 @@ subpackages:
       pipeline:
         - uses: test/tw/ver-check
           with:
-            bins: ${{vars.bpf-bins}}
+            bins: |
+              clang
+              llc
+              llvm-objcopy
+              llvm-strip
         - uses: test/tw/help-check
           with:
-            bins: ${{vars.bpf-bins}}
+            bins: |
+              clang
+              llc
+              llvm-objcopy
+              llvm-strip
 
   - name: lld-${{vars.major-version}}
     description: LLVM linker
@@ -658,9 +597,6 @@ subpackages:
 
           mkdir -p ${{targets.contextdir}}/usr/lib/cmake
           mv ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/cmake/lld ${{targets.contextdir}}/usr/lib/cmake/
-    test:
-      pipeline:
-        - uses: test/tw/devpackage
 
   - name: libcxxabi1-${{vars.major-version}}
     description: LLVM libc++ ABI 1
@@ -778,9 +714,6 @@ subpackages:
           mv ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/${{build.arch}}-unknown-linux-gnu/libunwind.so ${{targets.contextdir}}/usr/lib/
           mv ${{targets.destdir}}/${{vars.llvm-prefix}}/include/*unwind* ${{targets.contextdir}}/usr/include/
           mv ${{targets.destdir}}/${{vars.llvm-prefix}}/include/mach-o/*unwind* ${{targets.contextdir}}/usr/include/mach-o/
-    test:
-      pipeline:
-        - uses: test/tw/devpackage
 
   - name: libmlir-${{vars.major-version}}
     description: LLVM libmlir

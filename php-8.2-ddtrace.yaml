@@ -1,7 +1,7 @@
 package:
   name: php-8.2-ddtrace
   version: "1.16.0"
-  epoch: 3 # go/wolfi-rsc/php-8.2-ddtrace
+  epoch: 4 # go/wolfi-rsc/php-8.2-ddtrace
   description: "Datadog PHP Clients"
   copyright:
     - license: Apache-2.0 OR BSD-3-Clause
@@ -11,8 +11,8 @@ package:
       - ${{package.name}}-src
       - php-${{vars.phpMM}}
   resources:
-    cpu: "8"
-    memory: 14Gi
+    cpu: "9"
+    memory: 20Gi
 
 var-transforms:
   - from: ${{package.name}}
@@ -26,7 +26,10 @@ environment:
       - autoconf
       - build-base
       - busybox
+      - clang-19
+      - cmake
       - curl-dev
+      - libclang-cpp-19
       - pcre2-dev
       - php-${{vars.phpMM}}
       - php-${{vars.phpMM}}-dev
@@ -51,6 +54,24 @@ pipeline:
 
   - name: Make install
     runs: INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
+
+  - name: Build appsec extension
+    runs: |
+      # Upstream uses -Werror but has GCC 15 compat issues:
+      # - deprecated std::atomic_load_explicit(shared_ptr*) in the helper
+      # - anonymous structs in components-rs/common.h flagged by -pedantic
+      cmake -S appsec -B tmp/build_appsec \
+        -DDD_APPSEC_TESTING=OFF \
+        -DDD_APPSEC_BUILD_HELPER=ON \
+        -DDD_APPSEC_BUILD_EXTENSION=ON \
+        -DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations -Wno-error=pedantic" \
+        -DCMAKE_C_FLAGS="-Wno-error=pedantic"
+      cmake --build tmp/build_appsec -j$(nproc) --target extension --target ddappsec-helper
+
+  - name: Build profiling extension
+    runs: |
+      cd profiling
+      CARGO_TARGET_DIR="$(pwd)/../tmp/build_profiler" cargo build --release
 
 subpackages:
   - name: ${{package.name}}-config
@@ -77,6 +98,106 @@ subpackages:
         - uses: test/tw/srcpackage
           with:
             dir: /usr/share/dd-trace-php/src/
+
+  - name: ${{package.name}}-appsec
+    description: "Datadog PHP Application Security extension"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - ${{package.name}}-appsec-config
+        - php-${{vars.phpMM}}
+    pipeline:
+      - runs: |
+          extdir="${{targets.subpkgdir}}/usr/lib/php/modules"
+          sharedir="${{targets.subpkgdir}}/usr/share/dd-trace-php/etc"
+          mkdir -p "$extdir" "$sharedir"
+          install -Dm755 tmp/build_appsec/ddappsec.so "$extdir/ddappsec.so"
+          install -Dm755 tmp/build_appsec/libddappsec-helper.so "$extdir/libddappsec-helper.so"
+          install -Dm644 appsec/recommended.json "$sharedir/recommended.json"
+    test:
+      environment:
+        contents:
+          packages:
+            - php-${{vars.phpMM}}
+            - ${{package.name}}
+            - ${{package.name}}-config
+            - ${{package.name}}-appsec-config
+            - ${{package.name}}-src
+      pipeline:
+        - name: Verify appsec extension is loaded
+          runs: |
+            php -m | grep -F "ddappsec"
+        - name: Verify appsec INI settings are recognized
+          runs: |
+            php -i | grep -F "datadog.appsec.enabled"
+            php -i | grep -F "datadog.appsec.rules"
+            php -i | grep -F "datadog.appsec.helper_path"
+        - name: Verify is_enabled function exists
+          runs: |
+            php -r 'var_dump(function_exists("Datadog\AppSec\is_enabled"));' | grep -F "bool(true)"
+        - name: Verify helper and rules files are installed
+          runs: |
+            stat /usr/lib/php/modules/libddappsec-helper.so
+            stat /usr/share/dd-trace-php/etc/recommended.json
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-appsec-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=ddappsec.so" > "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
+          echo "datadog.appsec.helper_path=/usr/lib/php/modules/libddappsec-helper.so" >> "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
+          echo "datadog.appsec.rules=/usr/share/dd-trace-php/etc/recommended.json" >> "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+  - name: ${{package.name}}-profiling
+    description: "Datadog PHP Profiling extension"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - ${{package.name}}-profiling-config
+        - php-${{vars.phpMM}}
+    pipeline:
+      - runs: |
+          extdir="${{targets.subpkgdir}}/usr/lib/php/modules"
+          mkdir -p "$extdir"
+          install -Dm755 tmp/build_profiler/release/libdatadog_php_profiling.so "$extdir/datadog-profiling.so"
+    test:
+      environment:
+        contents:
+          packages:
+            - php-${{vars.phpMM}}
+            - ${{package.name}}
+            - ${{package.name}}-config
+            - ${{package.name}}-profiling-config
+            - ${{package.name}}-src
+      pipeline:
+        - name: Verify profiling extension is loaded
+          runs: |
+            php -m | grep -F "datadog-profiling"
+        - name: Verify profiling appears in phpinfo
+          runs: |
+            php -i | grep -F "datadog-profiling"
+        - name: Verify profiling extension coexists with ddtrace
+          runs: |
+            php -r '
+              $mods = get_loaded_extensions();
+              if (!in_array("ddtrace", $mods)) { echo "ddtrace not loaded\n"; exit(1); }
+              if (!in_array("datadog-profiling", $mods)) { echo "datadog-profiling not loaded\n"; exit(1); }
+              echo "Both ddtrace and datadog-profiling loaded successfully\n";
+            '
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-profiling-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=datadog-profiling.so" > "${{targets.subpkgdir}}/etc/php/conf.d/datadog-profiling.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
 
 test:
   environment:

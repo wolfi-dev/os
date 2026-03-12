@@ -1,17 +1,23 @@
 package:
   name: portieris
   version: "0.13.36"
-  epoch: 0 # CVE-2025-68121
+  epoch: 6 # CVE-2026-27139
   description: A Kubernetes Admission Controller for verifying image trust.
   copyright:
     - license: Apache-2.0
   resources:
     cpu: "2"
-    memory: 7Gi
+    memory: 5Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
 
 environment:
   environment:
     CGO_ENABLED: "0"
+  contents:
+    packages:
+      - go-1.25
 
 pipeline:
   - uses: git-checkout
@@ -34,6 +40,18 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}/
           ln -s /usr/bin/portieris "${{targets.subpkgdir}}"/portieris
+    test:
+      environment:
+        contents:
+          packages:
+            # -compat packages can be satisfied by multiple source packages; install here for test only, not as a runtime dep
+            - ${{package.name}}
+      pipeline:
+        - name: Verify compat symlinks
+          runs: |
+            set -euo pipefail
+            # Verify symlink exists and points to expected target
+            readlink /portieris | grep -F "/usr/bin/portieris"
 
 update:
   enabled: true
@@ -42,7 +60,51 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - openssl
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
   pipeline:
-    - runs: |
-        which portieris
-        portieris --help
+    - uses: test/tw/help-check
+      with:
+        bins: portieris
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Verify portieris daemon startup with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl create clusterrolebinding test-admin \
+            --clusterrole=cluster-admin \
+            --serviceaccount=default:default
+        start: /usr/bin/portieris
+        timeout: "30"
+        expected_output: "."
+        error_strings: ""
+    - name: Verify portieris TLS startup with certificates
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl create clusterrolebinding test-admin-tls \
+            --clusterrole=cluster-admin \
+            --serviceaccount=default:default
+
+          # Generate TLS certificates for the webhook server
+          mkdir -p /tmp/certs
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/certs/tls.key \
+            -out /tmp/certs/tls.crt -days 365 -nodes \
+            -subj "/CN=portieris-webhook" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+          # Place certs in controller-runtime default location
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          cp /tmp/certs/tls.key /tmp/k8s-webhook-server/serving-certs/tls.key
+          cp /tmp/certs/tls.crt /tmp/k8s-webhook-server/serving-certs/tls.crt
+        start: /usr/bin/portieris
+        timeout: "30"
+        expected_output: "."
+        error_strings: ""

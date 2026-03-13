@@ -121,6 +121,10 @@ test:
     contents:
       packages:
         - multus-cni-compat
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
+      MULTUS_NODE_NAME: "node-000000"
   pipeline:
     - runs: |
         multus -version
@@ -146,6 +150,57 @@ test:
         test -x /usr/src/multus-cni/bin/cert-approver
         test -x /usr/src/multus-cni/bin/kubeconfig_generator
         /thin_entrypoint --multus-log-level info
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: "Test cert-approver with kwok cluster"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # cert-approver needs RBAC for certificatesigningrequests and events.
+          # No upstream RBAC manifest exists; permissions derived from upstream source:
+          # https://github.com/k8snetworkplumbingwg/multus-cni/blob/master/cmd/cert-approver/main.go
+          #   NewCertController()  — list/watch CSRs via SharedIndexInformer, event broadcaster/recorder
+          #   approveCSR()         — UpdateApproval on certificatesigningrequests
+          #   denyCSR()            — Update on certificatesigningrequests
+          cat <<'EORBAC' | kubectl apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: cert-approver
+          rules:
+            - apiGroups: ["certificates.k8s.io"]
+              resources: ["certificatesigningrequests", "certificatesigningrequests/approval", "certificatesigningrequests/status"]
+              verbs: ["get", "list", "watch", "update", "patch"]
+            - apiGroups: [""]
+              resources: ["events"]
+              verbs: ["create"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: cert-approver
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cert-approver
+          subjects:
+            - kind: ServiceAccount
+              name: default
+              namespace: default
+          EORBAC
+        start: cert-approver
+        timeout: 30
+        expected_output: |
+          starting cert-approver
+          cert approver synced and ready
+    # kubeconfig_generator requires a fully functional kube-controller-manager
+    # to sign CSRs, which kwok cannot provide — kwok's KCM crashes on startup
+    # with a TLS verification error against the API server.
+    - uses: test/tw/help-check
+      with:
+        bins: kubeconfig_generator
+        expect-contains: "bootstrap-config certdir"
     - name: "Run multus with dummy config"
       runs: |
         echo '{"cniVersion": "0.3.1", "name": "test", "type": "multus"}' > /tmp/netconf.json

@@ -137,8 +137,6 @@ EOF
     kubectl apply -f https://raw.githubusercontent.com/kubeflow/manifests/refs/tags/v$KUBEFLOW_TAG/apps/tensorboard/tensorboard-controller/upstream/samples/tensorboard_v1alpha1_tensorboard.yaml
     # Dump resource YAML (ignore failure, resource might be partially processed)
     kubectl get tensorboard.tensorboard.kubeflow.org tensorboard-sample1 -n kubeflow -o yaml || true
-
-    kill "$pid" || true
     ;;
 
   *)

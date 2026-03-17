@@ -48,32 +48,95 @@ vars:
   gem: http
 
 test:
+  environment:
+    contents:
+      packages:
+        - ruby-${{vars.rubyMM}}
+        - ruby${{vars.rubyMM}}-webrick
   pipeline:
-    - runs: ruby -e "require 'http'"
-    - name: Basic HTTP request parsing
+    - uses: test/tw/gem-check
+      with:
+        require: http
+    - name: Test request building and headers
       runs: |
-        cat <<EOF > /tmp/test.rb
-        require "http"
-        HTTP.get("https://github.com").to_s
+        ruby <<'EOF'
+        require 'http'
+
+        # Verify the HTTP module is loaded and key classes are accessible
+        raise 'HTTP::Client missing' unless defined?(HTTP::Client)
+        raise 'HTTP::Request missing' unless defined?(HTTP::Request)
+        raise 'HTTP::Response missing' unless defined?(HTTP::Response)
+        raise 'HTTP::Headers missing' unless defined?(HTTP::Headers)
+
+        # Test header construction via the chainable API
+        # HTTP.headers returns an HTTP::Client; verify it responds to the
+        # chainable interface rather than checking the exact class, since
+        # the returned object may be a subclass or proxy in some versions.
+        client = HTTP.headers('Accept' => 'application/json')
+                     .headers('X-Custom' => 'test-value')
+        raise 'Expected chainable client (missing :get)' unless client.respond_to?(:get)
+        raise 'Expected chainable client (missing :post)' unless client.respond_to?(:post)
+        raise 'Expected chainable client (missing :headers)' unless client.respond_to?(:headers)
+        puts 'Request building and headers test passed'
         EOF
-        ruby /tmp/test.rb
-    - name: Functional test with POST request
+    - name: Functional GET and POST against a local WEBrick server
       runs: |
-        cat <<EOF > /tmp/functional_test.rb
-        require "http"
+        ruby <<'EOF'
+        require 'http'
+        require 'webrick'
+        require 'json'
+        require 'thread'
 
-        # Perform a POST request to httpbin.org
-        response = HTTP.post("https://httpbin.org/post", json: { key: "value" })
+        # Suppress WEBrick access/error logs during the test
+        log = WEBrick::Log.new(File::NULL)
+        server = WEBrick::HTTPServer.new(
+          Port: 0,
+          Logger: log,
+          AccessLog: []
+        )
 
-        # Validate the response
-        raise "Unexpected status code" unless response.status == 200
+        # GET /hello — returns a plain-text greeting
+        server.mount_proc '/hello' do |req, res|
+          res.status = 200
+          res['Content-Type'] = 'text/plain'
+          res.body = 'Hello, http gem!'
+        end
 
-        body = response.parse(:json)
-        raise "Unexpected response body" unless body["json"]["key"] == "value"
+        # POST /echo — echoes the JSON body back as JSON
+        server.mount_proc '/echo' do |req, res|
+          body = JSON.parse(req.body)
+          res.status = 200
+          res['Content-Type'] = 'application/json'
+          res.body = JSON.generate(body)
+        end
 
-        puts "Functional test passed!"
+        thread = Thread.new { server.start }
+        # Wait for the server to bind and start accepting connections
+        sleep 1
+
+        port = server.config[:Port]
+        base = "http://127.0.0.1:#{port}"
+
+        begin
+          # Test GET request
+          get_resp = HTTP.get("#{base}/hello")
+          raise "GET: expected 200, got #{get_resp.status}" unless get_resp.status == 200
+          raise "GET: unexpected body '#{get_resp.to_s}'" unless get_resp.to_s == 'Hello, http gem!'
+          puts 'GET request test passed'
+
+          # Test POST request with JSON body
+          post_resp = HTTP.post("#{base}/echo", json: { key: 'value' })
+          raise "POST: expected 200, got #{post_resp.status}" unless post_resp.status == 200
+          parsed = post_resp.parse(:json)
+          raise "POST: unexpected body #{parsed.inspect}" unless parsed['key'] == 'value'
+          puts 'POST request test passed'
+        ensure
+          server.shutdown
+          thread.join
+        end
+
+        puts 'All functional tests passed'
         EOF
-        ruby /tmp/functional_test.rb
 
 update:
   enabled: true

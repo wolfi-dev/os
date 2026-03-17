@@ -1,7 +1,7 @@
 package:
   name: kyverno-1.17
   version: "1.17.1"
-  epoch: 2 # GHSA-9h8m-3fm2-qjrq
+  epoch: 5 # GHSA-p436-gjf2-799p
   description: Kubernetes Native Policy Management
   copyright:
     - license: Apache-2.0
@@ -17,7 +17,7 @@ package:
 var-transforms:
   - from: ${{package.name}}
     match: '.*-(\d+\.\d+).*'
-    replace: '$1'
+    replace: "$1"
     to: major-minor-version
 
 environment:
@@ -42,6 +42,7 @@ pipeline:
       deps: |-
         github.com/cloudflare/circl@v1.6.3
         go.opentelemetry.io/otel/sdk@v1.40.0
+        github.com/docker/cli@v29.2.0
 
   - uses: patch
     # This patch (ideally) can be removed when a new release is cut by the kyverno maintainers.
@@ -121,6 +122,76 @@ subpackages:
         - runs: |
             kubectl-kyverno version
             kubectl-kyverno --help
+
+  - name: kyverno-readiness-checker-${{vars.major-minor-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          install -Dm755 cmd/readiness-checker/readiness-checker ${{targets.subpkgdir}}/usr/bin/readiness-checker
+    dependencies:
+      provides:
+        - kyverno-readiness-checker=${{package.full-version}}
+    test:
+      environment:
+        environment:
+          KUBERNETES_SERVICE_HOST: "127.0.0.1"
+          KUBERNETES_SERVICE_PORT: "32764"
+        contents:
+          packages:
+            - kyverno-readiness-checker-${{vars.major-minor-version}}
+      pipeline:
+        - uses: test/kwok/cluster
+          with:
+            serviceaccount: true
+        - name: "Test check-endpoints with ready endpoint"
+          runs: |
+            set -euo pipefail
+
+            # Grant the default SA permissions to list endpointslices
+            kubectl create clusterrole endpoint-reader \
+              --verb=get,list,watch \
+              --resource=endpointslices
+            kubectl create clusterrolebinding default-endpoint-reader \
+              --clusterrole=endpoint-reader \
+              --serviceaccount=default:default
+
+            # Create a service
+            kubectl create service clusterip test-svc --tcp=80:80
+
+            # Get the service UID for the owner reference
+            SVC_UID=$(kubectl get svc test-svc -o jsonpath='{.metadata.uid}')
+
+            # Create an EndpointSlice with a ready endpoint owned by the service
+            tee /tmp/endpointslice.yaml <<EOF
+            apiVersion: discovery.k8s.io/v1
+            kind: EndpointSlice
+            metadata:
+              name: test-svc-eps
+              namespace: default
+              ownerReferences:
+              - apiVersion: v1
+                kind: Service
+                name: test-svc
+                uid: "$SVC_UID"
+              labels:
+                kubernetes.io/service-name: test-svc
+            addressType: IPv4
+            endpoints:
+            - addresses:
+              - "10.0.0.1"
+              conditions:
+                ready: true
+            ports:
+            - port: 80
+              protocol: TCP
+            EOF
+            kubectl apply -f /tmp/endpointslice.yaml
+
+            # Verify readiness-checker detects the ready endpoint
+            readiness-checker check-endpoints \
+              --service-name test-svc \
+              --namespace default \
+              --timeout 10s
 
 update:
   enabled: true

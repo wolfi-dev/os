@@ -1,23 +1,17 @@
 # Logstash is a bit of a behemoth because of the way the plugin system works.
-# Usually, patched plugins would be dropped on the filesystem as APK's and the
-# application could just pick them up. Logstash's plugin system requires the
-# plugins to be added by the logstash-plugin cli tool since it uses a generated
-# Gemfile.
+# Logstash's plugin system requires plugins to be added by the logstash-plugin
+# cli tool since it uses a generated Gemfile. Default plugins are installed by
+# gradlew installDefaultGems from RubyGems.org.
 #
-# In order to patch plugins we can do a few things
+# For non-default plugins (e.g. logstash-output-opensearch), we build the gem
+# as a separate APK and install it via logstash-plugin in a subpackage.
 #
-# 1. If the plugin is a default plugin, patch it out of the plugins-metadata.json
-#    file so the upstream plugin is not installed. Add the plugin apk to the build
-#    environment and use logstash-plugin to install the .gem file before packaging
-#    the dist into a tarball (and eventually apk). All of this should be done in
-#    the main pipeline so the changes are picked up by all subpackages.
-#
-# 2. If the plugin is not a default plugin, do the same as above, but in a
-#    subpackage to be installed separately.
+# CVE patches for default plugin dependencies are applied via Gemfile.template
+# edits before installDefaultGems runs.
 package:
   name: logstash-9.3
   version: "9.3.1"
-  epoch: 1 # go/wolfi-rsc/logstash-9.2
+  epoch: 4 # GHSA-j288-q9x7-2f5v
   description: Logstash - transport and process your logs, events, or other data
   copyright:
     - license: Apache-2.0
@@ -43,8 +37,6 @@ var-transforms:
 
 vars:
   java-version: "21"
-  separately-packaged-plugins: |
-    logstash-filter-xml logstash-input-beats logstash-input-http logstash-input-tcp logstash-integration-jdbc logstash-input-graphite logstash-input-elastic_serverless_forwarder
 
 environment:
   contents:
@@ -60,13 +52,6 @@ environment:
       - grep
       - jq
       - jruby-9.4
-      - logstash-filter-xml
-      - logstash-input-beats
-      - logstash-input-elastic_serverless_forwarder
-      - logstash-input-graphite
-      - logstash-input-http
-      - logstash-input-tcp
-      - logstash-integration-jdbc
       - logstash-output-opensearch
       - net-tools
       - openjdk-${{vars.java-version}}-default-jdk
@@ -97,23 +82,12 @@ pipeline:
     runs: |
       # Fix GHSA-xc9x-jj77-9p9j
       sed -i "s/'date', '>= 3.3.3'/'date', '>= 3.4.1'/" "Gemfile.template"
-      # Fix GHSA-c2f4-jgmc-q2r5
-      sed -i "s/rexml (>= 3\.3\.9)/rexml (>= 3.4.2)/" "Gemfile.jruby-3.1.lock.release"
-      # Fix GHSA-p543-xpfm-54cp, GHSA-w9pc-fmgc-vxvw, GHSA-wpv5-97wm-hp9c and GHSA-mxw3-3hh2-x2mh
-      sed -i "s/rack (>= 3\.1\.16)/rexml (>= 3.1.17)/" "Gemfile.jruby-3.1.lock.release"
       echo "gem 'rack', '3.1.20'" >> Gemfile.template
       echo "gem 'sinatra', '4.2.0'" >> Gemfile.template
       # Fix CVE-2025-27221, GHSA-j4pr-3wm6-xx2r
       sed -i "s/'uri', '>= 0.12.3'/'uri', '>= 0.12.5'/" "Gemfile.template"
       # Fix CVE-2025-14762
-      sed -i 's/aws-sdk-s3 (1.199.1)/aws-sdk-s3 (1.208.0)/' Gemfile.jruby-3.1.lock.release
-
-      for plugin in ${{vars.separately-packaged-plugins}}
-      do
-        # Disable the plugin download as we build and package it separately
-        jq --arg plugin $plugin 'del(.[$plugin])' rakelib/plugins-metadata.json > /tmp/plugins-metadata.json
-        mv /tmp/plugins-metadata.json rakelib/
-      done
+      echo "gem 'aws-sdk-s3', '1.208.0'" >> Gemfile.template
 
       # Disable -Werror which means that warnings are not treated as errors
       # during compilation.  Required for Java 21.
@@ -132,19 +106,9 @@ pipeline:
     runs: |
       ./gradlew installDefaultGems
 
-  - name: Re-inject default plugins that have been patched
+  - name: Upgrade logstash-integration-kafka for GHSA-j288-q9x7-2f5v
     runs: |
-      for gem in ${{vars.separately-packaged-plugins}}
-      do
-        echo "Searching for gem search=$gem-*.gem"
-        gem_path=$(find /usr/share/jruby -type f -name "$gem-*.gem")
-        if [ -z "$gem_path" ]; then
-          echo "Could not find gem gem_path=$gem_path gem=$gem"
-          exit 1
-        fi
-        echo "Installing gem gem_path=$gem_path"
-        bin/logstash-plugin install "$gem_path"
-      done
+      bin/logstash-plugin install --no-verify --version 11.8.4 logstash-integration-kafka
 
   - name: Build tarball distribution
     runs: |
@@ -510,12 +474,8 @@ test:
     - uses: test/tw/ldd-check
       with:
         extra-library-paths: /usr/share/logstash/jdk/lib/server
-    - name: Ensure default plugins were actually installed
+    - name: Ensure logstash basics work
       runs: |
-        for plugin in ${{vars.separately-packaged-plugins}}
-        do
-          logstash-plugin list | grep $plugin
-        done
         logstash --version
         logstash.lib.sh --version
         logstash.lib.sh --help

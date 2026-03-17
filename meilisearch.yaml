@@ -1,10 +1,16 @@
 package:
   name: meilisearch
-  version: "1.36.0"
-  epoch: 0
+  version: "1.39.0"
+  epoch: 0 # go/wolfi-rsc/meilisearch
   description: "A lightning-fast search engine that fits effortlessly into your apps, websites, and workflow."
   copyright:
     - license: MIT
+  resources:
+    cpu: "15"
+    memory: 26Gi
+  test-resources:
+    cpu: "1"
+    memory: 3Gi
 
 environment:
   contents:
@@ -21,7 +27,7 @@ pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/meilisearch/meilisearch.git
-      expected-commit: 2458d44f2173e26e33356482b5e26787e4e45319
+      expected-commit: 21a917800244edd08da0d61ce889360613b4b200
       tag: v${{package.version}}
       recurse-submodules: true
 
@@ -41,7 +47,75 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - jq
   pipeline:
     - runs: |
         meilisearch --version
         meilisearch --help
+    - name: Functional daemon test - index and search
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/meili-data
+        start: /usr/bin/meilisearch --http-addr 127.0.0.1:7700 --master-key testkey --db-path /tmp/meili-data --no-analytics --env development
+        expected_output: "Actix runtime found"
+        timeout: "60"
+        error_strings: ""
+        post: |
+          set -euo pipefail
+
+          # Wait for the HTTP server to be ready
+          wait-for-it 127.0.0.1:7700 -t 30
+
+          API="http://127.0.0.1:7700"
+          AUTH="Authorization: Bearer testkey"
+
+          # Verify health endpoint
+          curl -sf "$API/health" | grep -F '"status":"available"'
+
+          # Create an index and add a document
+          curl -sf -X POST "$API/indexes/movies/documents" \
+            -H "$AUTH" \
+            -H "Content-Type: application/json" \
+            -d '[{"id": 1, "title": "The Great Adventure", "genre": "action"}]' > /tmp/task.json
+
+          # Extract task UID and wait for it to complete
+          TASK_UID=$(jq -r '.taskUid' /tmp/task.json)
+          echo "Task UID: $TASK_UID"
+
+          # Poll until the task is completed
+          n=0
+          while [ $n -lt 30 ]; do
+            STATUS=$(curl -sf "$API/tasks/$TASK_UID" -H "$AUTH" | jq -r '.status')
+            echo "Task status: $STATUS"
+            if [ "$STATUS" = "succeeded" ]; then
+              break
+            fi
+            if [ "$STATUS" = "failed" ]; then
+              echo "FAIL: Document indexing task failed"
+              curl -sf "$API/tasks/$TASK_UID" -H "$AUTH"
+              exit 1
+            fi
+            n=$((n + 1))
+            sleep 1
+          done
+
+          if [ "$STATUS" != "succeeded" ]; then
+            echo "FAIL: Task did not complete within 30 seconds"
+            exit 1
+          fi
+
+          # Search for the document and verify results
+          SEARCH_RESULT=$(curl -sf -X POST "$API/indexes/movies/search" \
+            -H "$AUTH" \
+            -H "Content-Type: application/json" \
+            -d '{"q": "adventure"}')
+
+          echo "Search result: $SEARCH_RESULT"
+          echo "$SEARCH_RESULT" | grep -F "The Great Adventure"
+
+          echo "SUCCESS: Meilisearch indexing and search verified"

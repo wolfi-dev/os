@@ -1,7 +1,7 @@
 package:
   name: cluster-api-helm-controller
-  version: "0.6.0"
-  epoch: 2 # GHSA-9h8m-3fm2-qjrq
+  version: "0.6.1"
+  epoch: 1
   description: CAAPH uses Helm charts to manage the installation and lifecycle of Cluster API add-ons.
   copyright:
     - license: Apache-2.0
@@ -14,7 +14,7 @@ pipeline:
     with:
       repository: https://github.com/kubernetes-sigs/cluster-api-addon-provider-helm
       tag: v${{package.version}}
-      expected-commit: 8ed5d6a52ed7df78bbeed043e314b7e18ef1be19
+      expected-commit: 34302e5a6412972f292862be8222e9c1767fd58c
 
   - uses: go/bump
     with:
@@ -56,8 +56,10 @@ subpackages:
             - ${{package.name}}
       pipeline:
         - uses: test/tw/symlink-check
-        - runs: |
-            (/manager --help || true) 2>&1 | grep 9443
+        - name: Verify manager symlink works
+          runs: |
+            set -euo pipefail
+            /manager --help 2>&1 | grep -F 9443
 
 update:
   enabled: true
@@ -66,6 +68,51 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - openssl
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
   pipeline:
-    - runs: |
-        (cluster-api-helm-controller version --help || true) 2>&1 | grep 9443
+    - uses: test/tw/help-check
+      with:
+        bins: cluster-api-helm-controller
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Test controller startup with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # Install CAAPH CRDs
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/cluster-api-addon-provider-helm/v${{package.version}}/config/crd/bases/addons.cluster.x-k8s.io_helmchartproxies.yaml
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/cluster-api-addon-provider-helm/v${{package.version}}/config/crd/bases/addons.cluster.x-k8s.io_helmreleaseproxies.yaml
+          kubectl wait --for=condition=Established crd --all --timeout=60s
+
+          # Grant cluster-admin to the default service account
+          kubectl create clusterrolebinding test-admin \
+            --clusterrole=cluster-admin \
+            --serviceaccount=default:default
+
+          # Generate webhook certificates for port 9443
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout /tmp/k8s-webhook-server/serving-certs/tls.key \
+            -out /tmp/k8s-webhook-server/serving-certs/tls.crt \
+            -days 1 -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+        start: /usr/bin/cluster-api-helm-controller
+        timeout: "30"
+        expected_output: "Starting EventSource"
+        post: |
+          # Verify webhook server is listening on port 9443
+          wait-for-it localhost:9443 -t 15
+
+environment:
+  contents:
+    packages:
+      - go-1.25

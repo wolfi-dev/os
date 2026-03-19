@@ -1,7 +1,7 @@
 package:
   name: gitleaks
   version: "8.30.1"
-  epoch: 0 # CVE-2026-27139
+  epoch: 5 # CVE-2026-27139
   description: SAST tool for detecting and preventing hardcoded secrets like passwords, api keys, and tokens in git repos
   copyright:
     - license: MIT
@@ -17,7 +17,6 @@ environment:
       - busybox
       - ca-certificates-bundle
       - git
-      - go
 
 pipeline:
   - uses: git-checkout
@@ -34,10 +33,11 @@ pipeline:
         github.com/mholt/archives@v0.1.5-0.20251009205813-e30ac6010726
         golang.org/x/crypto@v0.45.0
 
-  - runs: |
-      make build
-      mkdir -p ${{targets.destdir}}/usr/bin
-      mv gitleaks ${{targets.destdir}}/usr/bin/gitleaks
+  - uses: go/build
+    with:
+      packages: .
+      output: gitleaks
+      ldflags: -X github.com/gitleaks/gitleaks/v8/cmd.Version=${{package.version}}
 
   - uses: strip
 
@@ -55,12 +55,13 @@ test:
       packages:
         - jq # For validating JSON report format
   pipeline:
-    - runs: |
-        gitleaks version
-        gitleaks --version
-        gitleaks --help
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: gitleaks
     - name: Test secret detection in files
       runs: |
+        set -euo pipefail
         # Create test directory with sample secrets
         mkdir -p test-secrets
         cd test-secrets
@@ -73,11 +74,17 @@ test:
         echo 'password = "supersecret123!"' > db_config.yml
 
         # Test directory scanning - gitleaks should find secrets and exit with code 1
-        gitleaks detect --source . --no-git --exit-code 1 || true
+        gitleaks detect --source . --no-git --exit-code 1 && EXIT_CODE=0 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to exit 1 when leaks found, got $EXIT_CODE"
+          exit 1
+        fi
 
-        # Verify gitleaks found secrets
-        OUTPUT=$(gitleaks detect --source . --no-git 2>&1 || true)
-        if ! echo "$OUTPUT" | grep -q "leaks found"; then
+        # Verify gitleaks found secrets by capturing output
+        set +e
+        OUTPUT=$(gitleaks detect --source . --no-git 2>&1)
+        set -e
+        if ! echo "$OUTPUT" | grep -F "leaks found"; then
           echo "ERROR: Gitleaks should have reported finding leaks"
           exit 1
         fi
@@ -86,6 +93,7 @@ test:
         rm -rf test-secrets
     - name: Test stdin detection
       runs: |
+        set -euo pipefail
         # Test secret detection via stdin
         echo 'api_key = "sk_live_abcdef123456"' | gitleaks detect --source - --no-git || EXIT_CODE=$?
         if [ "$EXIT_CODE" != "1" ]; then
@@ -156,30 +164,33 @@ test:
         rm -f test-config.toml test_secret.txt
     - name: Test report formats
       runs: |
+        set -euo pipefail
         # Create test file with known secret that will be detected
         echo 'github_token = ghp_wWPw5k4aXcaajCqbDsLRnJZZzVLgLO0M' > test_secret.txt
 
         # Test JSON report
-        gitleaks detect --source test_secret.txt --no-git --report-format json --report-path report.json --exit-code 1 || true
+        gitleaks detect --source test_secret.txt --no-git --report-format json --report-path report.json --exit-code 1 && EXIT_CODE=0 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to exit 1 when leaks found"
+          exit 1
+        fi
         if [ ! -f report.json ]; then
           echo "ERROR: JSON report was not created"
           exit 1
         fi
 
         # Validate JSON format
-        if ! jq . report.json > /dev/null 2>&1; then
-          echo "ERROR: JSON report is not valid JSON"
-          exit 1
-        fi
+        jq . report.json > /dev/null
 
         # Verify JSON contains expected fields
-        if ! jq -e '.[0] | has("Description") and has("File") and has("Secret")' report.json > /dev/null; then
-          echo "ERROR: JSON report missing expected fields"
-          exit 1
-        fi
+        jq -e '.[0] | has("Description") and has("File") and has("Secret")' report.json > /dev/null
 
         # Test CSV report
-        gitleaks detect --source test_secret.txt --no-git --report-format csv --report-path report.csv --exit-code 1 || true
+        gitleaks detect --source test_secret.txt --no-git --report-format csv --report-path report.csv --exit-code 1 && EXIT_CODE=0 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to exit 1 when leaks found"
+          exit 1
+        fi
         if [ ! -f report.csv ]; then
           echo "ERROR: CSV report was not created"
           exit 1
@@ -194,37 +205,35 @@ test:
 
         # Check CSV header contains expected columns
         HEADER=$(head -n1 report.csv)
-        if ! echo "$HEADER" | grep -q "RuleID"; then
+        if ! echo "$HEADER" | grep -F "RuleID"; then
           echo "ERROR: CSV header missing RuleID column"
           exit 1
         fi
-        if ! echo "$HEADER" | grep -q "Secret"; then
+        if ! echo "$HEADER" | grep -F "Secret"; then
           echo "ERROR: CSV header missing Secret column"
           exit 1
         fi
-        if ! echo "$HEADER" | grep -q "File"; then
+        if ! echo "$HEADER" | grep -F "File"; then
           echo "ERROR: CSV header missing File column"
           exit 1
         fi
 
         # Test SARIF report
-        gitleaks detect --source test_secret.txt --no-git --report-format sarif --report-path report.sarif --exit-code 1 || true
+        gitleaks detect --source test_secret.txt --no-git --report-format sarif --report-path report.sarif --exit-code 1 && EXIT_CODE=0 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to exit 1 when leaks found"
+          exit 1
+        fi
         if [ ! -f report.sarif ]; then
           echo "ERROR: SARIF report was not created"
           exit 1
         fi
 
         # Validate SARIF format
-        if ! jq . report.sarif > /dev/null 2>&1; then
-          echo "ERROR: SARIF report is not valid JSON"
-          exit 1
-        fi
+        jq . report.sarif > /dev/null
 
         # Verify SARIF schema version and structure
-        if ! jq -e '.version == "2.1.0" and has("runs")' report.sarif > /dev/null; then
-          echo "ERROR: SARIF report does not match expected schema"
-          exit 1
-        fi
+        jq -e '.version == "2.1.0" and has("runs")' report.sarif > /dev/null
 
         rm -f test_secret.txt report.json report.csv report.sarif
     - name: Test allowlist functionality
@@ -247,7 +256,11 @@ test:
       runs: |
         # Create initial scan with secrets
         echo 'token = "ghp_1234567890abcdef"' > baseline_test.txt
-        gitleaks detect --source baseline_test.txt --no-git --report-path baseline.json --report-format json --exit-code 1 || true
+        gitleaks detect --source baseline_test.txt --no-git --report-path baseline.json --report-format json --exit-code 1 && EXIT_CODE=0 || EXIT_CODE=$?
+        if [ "$EXIT_CODE" != "1" ]; then
+          echo "ERROR: Expected gitleaks to exit 1 when leaks found"
+          exit 1
+        fi
 
         # Using baseline should not report the same findings
         gitleaks detect --source baseline_test.txt --no-git --baseline-path baseline.json

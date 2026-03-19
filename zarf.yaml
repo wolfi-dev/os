@@ -1,7 +1,7 @@
 package:
   name: zarf
   version: "0.73.1"
-  epoch: 3 # CVE-2026-27139
+  epoch: 4 # CVE-2026-27139
   description: DevSecOps for Air Gap & Limited-Connection Systems.
   copyright:
     - license: Apache-2.0
@@ -14,9 +14,6 @@ environment:
     packages:
       - bash
       - busybox
-      - ca-certificates-bundle
-      - go-1.25
-      - nodejs
 
 pipeline:
   - uses: git-checkout
@@ -39,11 +36,52 @@ pipeline:
       go mod edit -replace=github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
       go get
 
+  # Compute k8s version from go.mod — needs arithmetic so we pre-compute to files
+  # (pattern from rancher-helm-3.yaml)
+  - name: Extract Kubernetes version
+    runs: |
+      K8S_FULL_VERSION=$(go list -f '{{.Version}}' -m k8s.io/client-go)
+      K8S_VERSION_STRIPPED="${K8S_FULL_VERSION#v}"
+      IFS='.' read -r MAJOR MINOR PATCH <<EOF
+      $K8S_VERSION_STRIPPED
+      EOF
+      MAJOR=$(expr "$MAJOR" + 1)
+      echo "$MAJOR" > k8s_major
+      echo "$MINOR" > k8s_minor
+      echo "$PATCH" > k8s_patch
+
+  # ldflags matching upstream Makefile:
+  # https://github.com/zarf-dev/zarf/blob/v${{package.version}}/Makefile#L43-L68
   - uses: go/build
     with:
-      ldflags: -X 'github.com/zarf-dev/zarf/src/config.CLIVersion=v${{package.version}}'
+      ldflags: |
+        -X github.com/zarf-dev/zarf/src/config.CLIVersion=v${{package.version}}
+        -X k8s.io/component-base/version.gitVersion=v$(cat k8s_major).$(cat k8s_minor).$(cat k8s_patch)
+        -X github.com/derailed/k9s/cmd.version=$(go list -f '{{.Version}}' -m github.com/derailed/k9s)
+        -X github.com/google/go-containerregistry/cmd/crane/cmd.Version=$(go list -f '{{.Version}}' -m github.com/google/go-containerregistry)
+        -X github.com/zarf-dev/zarf/src/cmd.syftVersion=$(go list -f '{{.Version}}' -m github.com/anchore/syft)
+        -X github.com/zarf-dev/zarf/src/cmd.archivesVersion=$(go list -f '{{.Version}}' -m github.com/mholt/archives)
+        -X github.com/zarf-dev/zarf/src/cmd.helmVersion=$(go list -f '{{.Version}}' -m helm.sh/helm/v3)
+        -X k8s.io/component-base/version.gitCommit=$(git rev-parse HEAD)
+        -X k8s.io/component-base/version.buildDate=$(date -d@${SOURCE_DATE_EPOCH} -u +'%Y-%m-%dT%H:%M:%SZ')
       output: zarf
       packages: .
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for upstream Docker image
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"
+          # https://github.com/zarf-dev/zarf/blob/main/Dockerfile#L6
+          ln -sf ./usr/bin/zarf "${{targets.contextdir}}/zarf"
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
 
 test:
   pipeline:
@@ -53,9 +91,40 @@ test:
     - uses: test/tw/ver-check
       with:
         bins: zarf
+    - name: Test shell completion generation
+      runs: |
+        set -euo pipefail
+        zarf completion bash | grep -F "bash completion"
+    - name: Test zarf tools yq functionality
+      runs: |
+        set -euo pipefail
+        echo "foo: bar" > /tmp/zarf-yq-test.yaml
+        zarf tools yq '.foo' /tmp/zarf-yq-test.yaml | grep -F "bar"
+    - name: Test zarf tools gen-pki
+      runs: |
+        mkdir -p /tmp/zarf-pki && cd /tmp/zarf-pki
+        zarf tools gen-pki test.example.com
+    - uses: test/tw/contains-files
+      with:
+        files: |
+          /tmp/zarf-pki/tls.ca
+          /tmp/zarf-pki/tls.crt
+          /tmp/zarf-pki/tls.key
+    - name: Test zarf tools archiver compress and decompress
+      runs: |
+        set -euo pipefail
+        echo "hello zarf" > /tmp/test-file.txt
+        zarf tools archiver compress /tmp/test-file.txt /tmp/zarf-test-archive.tar.zst
+        stat /tmp/zarf-test-archive.tar.zst
+        mkdir -p /tmp/zarf-archiver-output
+        zarf tools archiver decompress /tmp/zarf-test-archive.tar.zst /tmp/zarf-archiver-output
+        stat /tmp/zarf-archiver-output/test-file.txt
+        grep -F "hello zarf" /tmp/zarf-archiver-output/test-file.txt
 
 update:
   enabled: true
+  ignore-regex-patterns:
+    - "-rc"
   github:
     identifier: zarf-dev/zarf
     strip-prefix: v

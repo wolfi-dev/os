@@ -1,0 +1,150 @@
+package:
+  name: dotnet-sdk-stage0-10
+  version: "10.0.105"
+  epoch: 0
+  description: ".NET SDK ${{vars.major-version}} stage0"
+  copyright:
+    - license: MIT
+  resources:
+    cpu: 32
+    memory: 64Gi
+  dependencies:
+    runtime:
+      - icu
+
+vars:
+  clang-version: '21'
+  prefix: 'usr/share/dotnet'
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+environment:
+  environment:
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    CFLAGS: "-Wno-error=used-but-marked-unused"
+  contents:
+    packages:
+      - bash
+      - brotli-dev
+      - busybox
+      - clang-${{vars.clang-version}}
+      - cmake
+      - curl
+      - file
+      - icu-dev
+      - krb5-dev
+      - libunwind-dev
+      - lttng-ust-dev
+      - make
+      - openssl-dev
+      - python3
+      - rapidjson-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/dotnet/dotnet
+      tag: v${{package.version}}
+      expected-commit: a612c2a1056fe3265387ae3ff7c94eba1505caf9
+
+  - runs: |
+      # Setup bootstrap .NET SDK
+      ./prep-source-build.sh
+
+      if [ ${{build.arch}} = "aarch64" ]; then
+        # Dotnet does not have support for PAC/BTI which Axion uses
+        # See: https://github.com/dotnet/runtime/pull/110472
+        # EXTRA_${FLAG} is supposed to work, but it doesn't
+        # so directly override the values which is supposedly a no-no
+        # See also: https://github.com/dotnet/runtime/issues/61859
+        export CFLAGS="$CFLAGS -mbranch-protection=none"
+        export CXXFLAGS="-mbranch-protection=none"
+      fi
+
+      # The .NET runtime is built with O0 so we cannot enable FORTIFY_SOURCE
+      sed -i 's/-D_FORTIFY_SOURCE=3//g' /etc/clang-${{vars.clang-version}}/common.cfg
+
+      # Build .NET
+      ./build.sh \
+        --clean-while-building \
+        --source-only \
+        -- \
+        /v:minimal \
+        /p:LogVerbosity=minimal \
+        /p:ContinueOnPrebuiltBaselineError=true \
+        /p:MinimalConsoleLogOutput=true \
+        /p:SkipPortableRuntimeBuild=true \
+        /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind \
+        /p:OfficialBuilder=Chainguard
+
+      mkdir -p ${{targets.contextdir}}/${{vars.prefix}}/artifacts
+
+      # Install SDK
+      tar xf ./artifacts/assets/Release/dotnet-sdk-${{vars.major-version}}*.tar.gz \
+          -C ${{targets.contextdir}}/${{vars.prefix}}/
+
+      # Install SDK symbols
+      tar xf ./artifacts/assets/Release/dotnet-symbols-sdk-${{vars.major-version}}*.tar.gz \
+            -C ${{targets.contextdir}}/${{vars.prefix}}/
+
+      # Install artifacts
+      tar xf ./artifacts/assets/Release/Private.SourceBuilt.Artifacts.*.tar.gz \
+          -C ${{targets.contextdir}}/${{vars.prefix}}/artifacts \
+          --exclude '*Internal*'
+      ln -s artifacts ${{targets.contextdir}}/${{vars.prefix}}/shared-components
+
+      # Provide host in path
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      ln -s ../share/dotnet/dotnet ${{targets.contextdir}}/usr/bin/dotnet
+
+  - uses: strip
+
+test:
+  pipeline:
+    - name: Basic .NET command test
+      runs: |
+        dotnet --info
+    - name: Compile and run a simple .NET application
+      runs: |
+        cat <<'EOF' > HelloWorld.cs
+        using System;
+
+        class Program
+        {
+            static void Main()
+            {
+                Console.WriteLine("Hello, World!");
+            }
+        }
+        EOF
+        dotnet new console -o HelloWorldApp --force
+        mv HelloWorld.cs HelloWorldApp/Program.cs
+        dotnet run --project HelloWorldApp
+    - name: Compile and run a .NET application with arguments
+      runs: |
+        cat <<'EOF' > ArgumentEcho.cs
+        using System;
+
+        class Program
+        {
+            static void Main(string[] args)
+            {
+                Console.WriteLine("Arguments: " + String.Join(", ", args));
+            }
+        }
+        EOF
+        dotnet new console -o ArgumentEchoApp --force
+        mv ArgumentEcho.cs ArgumentEchoApp/Program.cs
+        dotnet run --project ArgumentEchoApp -- arg1 arg2 arg3
+    - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: "v10.0.1"

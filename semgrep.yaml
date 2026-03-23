@@ -1,13 +1,13 @@
 package:
   name: semgrep
   version: "1.156.0"
-  epoch: 1 # go/wolfi-rsc/semgrep
+  epoch: 2 # go/wolfi-rsc/semgrep
   description: "Lightweight static analysis for many languages. Find bug variants with patterns that look like source code."
   copyright:
     - license: LGPL-2.1-or-later
-  dependencies:
-    runtime:
-      - py3-semgrep=${{package.full-version}}
+  options:
+    # Don't resolve libraries installed in virtual environment as providers
+    no-provides: true
   resources:
     cpu: "12"
     memory: 24Gi
@@ -18,6 +18,8 @@ package:
 vars:
   # Current ocaml version used by upstream can be found https://github.com/semgrep/semgrep/blob/v${{package.version}}/Dockerfile#L114
   ocaml_version: 5.3.0
+  python-version: '3.13'
+  venv-home: '/opt/chainguard/semgrep'
 
 environment:
   contents:
@@ -45,13 +47,9 @@ environment:
       - pcre2-dev
       - pkgconf-dev
       - posix-libc-utils # ldd
-      - py3-gpep517 # used for py3-semgrep
-      - py3-pip # used in make install
-      - py3-setuptools # used for py3-semgrep
-      - py3-wheel # used for py3-semgrep
-      - python3 # used in make install
-      - python3-dev
+      - python-${{vars.python-version}}-dev
       - rsync
+      - uv
       - wolfi-base
       - zlib-dev
       - zstd-dev
@@ -104,92 +102,49 @@ pipeline:
 
   - uses: strip
 
-subpackages:
-  - name: py3-semgrep
-    description: "Python bindings for semgrep"
-    pipeline:
-      - runs: |
-          cd cli
-          git submodule update --init -- src/semgrep/semgrep_interfaces
-          python3=$(readlink -f `which python3`)
-          $python3 -m gpep517 build-wheel \
-            --wheel-dir dist \
-            --output-fd 3 3>&1 >&2
-          $python3 -m pip install --verbose \
-            --prefix=/usr "--root=${{targets.contextdir}}" dist/*.whl
-          $python3 -m compileall --invalidation-mode=unchecked-hash -r100 "${{targets.contextdir}}"
-      - runs: |
-          # opentelemetry uses pkg_resources but does not declare a dep.
-          python3=$(readlink -f `which python3`)
-          $python3 -m pip install --verbose \
-            --ignore-installed \
-            --prefix=/usr "--root=${{targets.contextdir}}" setuptools packaging
+  - name: "install pysemgrep"
+    working-directory: cli
+    environment:
+      UV_PYTHON: python${{vars.python-version}}
+    runs: |
+      git submodule update --init -- src/semgrep/semgrep_interfaces
 
-          # Upgrade requests to fix GHSA-9hjg-9r4m-mvj7
-          $python3 -m pip install --verbose \
-            --upgrade \
-            --prefix=/usr "--root=${{targets.contextdir}}" "requests>=2.32.4"
-      - runs: |
-          # clean out any bins other than semgrep and pysemgrep.
-          d=$(mktemp -d)
-          cd ${{targets.contextdir}}/usr/bin
-          mv semgrep pysemgrep "$d"
-          # there is a __pycache__ dir here, so -R
-          rm -Rf *
-          mv $d/* .
-      - uses: strip
-    test:
-      environment:
-        contents:
-          packages:
-            - semgrep
-      pipeline:
-        - uses: python/import
-          with:
-            imports: |
-              import semgrep
-        - uses: test/tw/help-check
-          with:
-            bins: pysemgrep
-        - name: "functional pysemgrep scan test"
-          runs: |
-            set -euo pipefail
+      # Create venv at final install path with explicit python version
+      # so shebang targets /usr/bin/python3.13 (from python-3.13-base)
+      # rather than /usr/bin/python3 (which requires full python-3.13)
+      uv venv "${{vars.venv-home}}"
+      source "${{vars.venv-home}}/bin/activate"
 
-            # Create a sample Python file with a known pattern
-            mkdir -p /tmp/semgrep-test
-            tee /tmp/semgrep-test/test_target.py <<'EOF'
-            import os
-            user_input = input("Enter command: ")
-            result = eval(user_input)
-            print(result)
-            EOF
+      # Install pysemgrep and its dependencies into the venv
+      uv pip install --no-compile .
 
-            # Create a semgrep rule to detect eval() usage
-            tee /tmp/semgrep-test/rule.yaml <<'EOF'
-            rules:
-              - id: detect-eval
-                pattern: eval(...)
-                message: "Detected use of eval()"
-                languages: [python]
-                severity: WARNING
-            EOF
+      # opentelemetry uses pkg_resources but does not declare a dep
+      uv pip install --no-compile setuptools packaging
 
-            # Run pysemgrep scan and verify it finds the match
-            output=$(pysemgrep scan --config /tmp/semgrep-test/rule.yaml /tmp/semgrep-test/test_target.py 2>&1)
-            echo "$output" | grep -F "detect-eval"
-        - uses: test/tw/help-check
-          with:
-            bins: semgrep
+      # Upgrade requests to fix GHSA-9hjg-9r4m-mvj7
+      uv pip install --no-compile --upgrade "requests>=2.32.4"
+
+      # Remove pip and virtualenv
+      uv pip uninstall pip virtualenv
+
+      # Install virtual environment to package
+      mkdir -p "${{targets.destdir}}/opt/chainguard"
+      cp -a "${{vars.venv-home}}" "${{targets.destdir}}/opt/chainguard/"
+
+      # Fix world-writable permissions on uv lock file
+      chmod 644 "${{targets.destdir}}${{vars.venv-home}}/.lock"
+
+      # Symlink semgrep and pysemgrep to /usr/bin
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/semgrep" "${{targets.destdir}}/usr/bin/semgrep"
+      ln -sf "${{vars.venv-home}}/bin/pysemgrep" "${{targets.destdir}}/usr/bin/pysemgrep"
 
 test:
-  environment:
-    contents:
-      packages:
-        - py3-semgrep=${{package.full-version}}
   pipeline:
     - uses: test/tw/help-check
       with:
-        bins: osemgrep
+        bins: osemgrep pysemgrep semgrep semgrep-core
+    - uses: test/tw/pip-check
     - name: "functional osemgrep scan test"
       runs: |
         set -euo pipefail
@@ -216,9 +171,32 @@ test:
         # Run osemgrep scan and verify it finds the match
         output=$(osemgrep scan --config /tmp/semgrep-test/rule.yaml /tmp/semgrep-test/test_target.py 2>&1)
         echo "$output" | grep -F "detect-eval"
-    - uses: test/tw/help-check
-      with:
-        bins: semgrep-core
+    - name: "functional pysemgrep scan test"
+      runs: |
+        set -euo pipefail
+
+        # Create a sample Python file with a known pattern
+        mkdir -p /tmp/semgrep-test
+        tee /tmp/semgrep-test/test_target.py <<'EOF'
+        import os
+        user_input = input("Enter command: ")
+        result = eval(user_input)
+        print(result)
+        EOF
+
+        # Create a semgrep rule to detect eval() usage
+        tee /tmp/semgrep-test/rule.yaml <<'EOF'
+        rules:
+          - id: detect-eval
+            pattern: eval(...)
+            message: "Detected use of eval()"
+            languages: [python]
+            severity: WARNING
+        EOF
+
+        # Run pysemgrep scan and verify it finds the match
+        output=$(pysemgrep scan --config /tmp/semgrep-test/rule.yaml /tmp/semgrep-test/test_target.py 2>&1)
+        echo "$output" | grep -F "detect-eval"
 
 update:
   enabled: true

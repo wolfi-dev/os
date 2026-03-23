@@ -1,0 +1,182 @@
+package:
+  name: dotnet-sdk-10.0.1
+  version: "10.0.105"
+  epoch: 1
+  description: ".NET SDK ${{package.version}}"
+  copyright:
+    - license: MIT
+  resources:
+    cpu: 32
+    memory: 64Gi
+  dependencies:
+    runtime:
+      - aspnet-${{vars.major-version}}-runtime
+      - aspnet-${{vars.major-version}}-targeting-pack
+      - dotnet-${{vars.major-version}}
+      - dotnet-${{vars.major-version}}-runtime
+      - dotnet-${{vars.major-version}}-targeting-pack
+
+vars:
+  clang-version: '21'
+  prefix: 'usr/share/dotnet'
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+environment:
+  environment:
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    CFLAGS: "-Wno-error=used-but-marked-unused"
+  contents:
+    packages:
+      - ${{package.name}}
+      - ${{package.name}}-artifacts
+      - ${{package.name}}-symbols
+      - bash
+      - brotli-dev
+      - busybox
+      - clang-${{vars.clang-version}}
+      - cmake
+      - curl
+      - file
+      - icu-dev
+      - krb5-dev
+      - libunwind-dev
+      - lttng-ust-dev
+      - make
+      - openssl-dev
+      - python3
+      - rapidjson-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/dotnet/dotnet
+      tag: v${{package.version}}
+      expected-commit: a612c2a1056fe3265387ae3ff7c94eba1505caf9
+
+  - runs: |
+      if [ ${{build.arch}} = "aarch64" ]; then
+        # Dotnet does not have support for PAC/BTI which Axion uses
+        # See: https://github.com/dotnet/runtime/pull/110472
+        # EXTRA_${FLAG} is supposed to work, but it doesn't
+        # so directly override the values which is supposedly a no-no
+        # See also: https://github.com/dotnet/runtime/issues/61859
+        export CFLAGS="$CFLAGS -mbranch-protection=none"
+        export CXXFLAGS="-mbranch-protection=none"
+      fi
+
+      # The .NET runtime is built with O0 so we cannot enable FORTIFY_SOURCE
+      sed -i 's/-D_FORTIFY_SOURCE=3//g' /etc/clang-${{vars.clang-version}}/common.cfg
+
+      # Build .NET
+      ./build.sh \
+        --with-sdk /${{vars.prefix}} \
+        --clean-while-building --source-only \
+        --with-packages /${{vars.prefix}}/artifacts \
+        -- \
+        /v:minimal \
+        /p:LogVerbosity=minimal \
+        /p:ContinueOnPrebuiltBaselineError=true \
+        /p:MinimalConsoleLogOutput=true \
+        /p:SkipPortableRuntimeBuild=true \
+        /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind
+
+      mkdir -p ${{targets.contextdir}}/${{vars.prefix}}
+
+      # Install SDK
+      tar xf ./artifacts/assets/Release/dotnet-sdk-${{vars.major-version}}*.tar.gz \
+          -C ${{targets.contextdir}}/${{vars.prefix}}/ \
+          ./sdk \
+          ./sdk-manifests \
+          ./templates
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-symbols"
+    description: ".NET SDK ${{package.version}} symbols"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/${{vars.prefix}}
+          tar xf ./artifacts/assets/Release/dotnet-symbols-sdk-${{vars.major-version}}*.tar.gz \
+                -C ${{targets.contextdir}}/${{vars.prefix}}/
+    test:
+      pipeline:
+        - runs: |
+            symbols="$(find /${{vars.prefix}} -name '*.pdb')"
+            if [ -z "${symbols}" ]; then
+              echo "No SDK debug symbols found!"
+              exit 1
+            fi
+            echo "Found SDK debug symbols"
+
+  - name: "${{package.name}}-artifacts"
+    description: ".NET SDK ${{package.version}} build artifacts"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/${{vars.prefix}}/artifacts
+          tar xf ./artifacts/assets/Release/Private.SourceBuilt.Artifacts.*.tar.gz \
+              -C ${{targets.contextdir}}/${{vars.prefix}}/artifacts \
+              --exclude '*Internal*'
+          ln -s artifacts ${{targets.contextdir}}/${{vars.prefix}}/shared-components
+    test:
+      pipeline:
+        - runs: |
+            artifacts="$(find /${{vars.prefix}} -name '*.tar.gz')"
+            if [ -z "${artifacts}" ]; then
+              echo "No SDK artifacts found!"
+              exit 1
+            fi
+            echo "Found SDK artifacts"
+
+test:
+  environment:
+    contents:
+      packages:
+        - dotnet-${{vars.major-version}}
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: dotnet tool install -g Microsoft.Web.LibraryManager.Cli
+    - name: Compile and run a simple .NET application
+      runs: |
+        cat <<'EOF' > HelloWorld.cs
+        using System;
+
+        class Program
+        {
+            static void Main()
+            {
+                Console.WriteLine("Hello, World!");
+            }
+        }
+        EOF
+        dotnet new console -o HelloWorldApp --force
+        mv HelloWorld.cs HelloWorldApp/Program.cs
+        dotnet run --project HelloWorldApp
+    - name: Compile and run a .NET application with arguments
+      runs: |
+        cat <<'EOF' > ArgumentEcho.cs
+        using System;
+
+        class Program
+        {
+            static void Main(string[] args)
+            {
+                Console.WriteLine("Arguments: " + String.Join(", ", args));
+            }
+        }
+        EOF
+        dotnet new console -o ArgumentEchoApp --force
+        mv ArgumentEcho.cs ArgumentEchoApp/Program.cs
+        dotnet run --project ArgumentEchoApp -- arg1 arg2 arg3
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: "v10.0.1"

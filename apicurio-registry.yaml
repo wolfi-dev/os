@@ -1,7 +1,7 @@
 package:
   name: apicurio-registry
-  version: "3.1.7"
-  epoch: 2 # GHSA-pq2g-wx69-c263
+  version: "3.2.0"
+  epoch: 0
   description: An API/Schema registry - stores APIs and Schemas
   copyright:
     - license: Apache-2.0
@@ -11,7 +11,7 @@ package:
     disk: 200Gi
 
 vars:
-  java-version: '17'
+  java-version: '21'
   nodejs-version: '20'
 
 environment:
@@ -36,7 +36,7 @@ pipeline:
     with:
       repository: https://github.com/Apicurio/apicurio-registry
       tag: v${{package.version}}
-      expected-commit: fb1286f068c2c7e9eea04b0e796edcc2f027a25d
+      expected-commit: 2eb4994d09d960090b85a52d7205fb7e0d680f8e
 
   - uses: patch
     with:
@@ -133,6 +133,53 @@ subpackages:
           # Move UI assets to expected directory
           mkdir -p ${{targets.contextdir}}/opt/app-root/src
           cp -r ui-app/dist/* ${{targets.contextdir}}/opt/app-root/src/
+    test:
+      environment:
+        accounts:
+          groups:
+            - groupname: nginx
+              gid: 101
+          users:
+            - username: nginx
+              uid: 101
+        contents:
+          packages:
+            - apicurio-registry-nginx-config
+            - curl
+            - wait-for-it
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /opt/app-root/src/index.html
+              /opt/app-root/src/version.js
+        - name: Serve UI via nginx and verify HTTP response
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /opt/app-root/etc/nginx.d
+              mkdir -p /opt/app-root/etc/nginx.default.d
+              mkdir -p /usr/share/nginx/modules
+            start: nginx -g "daemon off;"
+            timeout: 30
+            expected_output: "start worker processes"
+            post: |-
+              set -euo pipefail
+              if ! wait-for-it localhost:8080 -t 15; then
+                echo "FAIL: nginx did not become ready on port 8080" >&2
+                exit 1
+              fi
+              echo "PASS: nginx is ready on port 8080"
+              if ! curl -sf http://localhost:8080/ | grep -F "Apicurio Registry"; then
+                echo "FAIL: index.html did not contain expected content 'Apicurio Registry'" >&2
+                exit 1
+              fi
+              echo "PASS: index.html contains 'Apicurio Registry'"
+              if ! curl -sf http://localhost:8080/version.js; then
+                echo "FAIL: version.js not served" >&2
+                exit 1
+              fi
+              echo "PASS: version.js is served"
 
   - name: ${{package.name}}-nginx-config
     description: nginx configuration files for upstream configuration
@@ -164,6 +211,15 @@ subpackages:
           # TLS should be handled by ingress/sidecar if needed
           sed -i '/^# Settings for a TLS enabled server/,$d' "${{targets.contextdir}}/etc/nginx/nginx.conf"
           echo "}" >> "${{targets.contextdir}}/etc/nginx/nginx.conf"
+
+          # Redirect error_log to stderr at notice level for container-friendly logging
+          # and to ensure startup messages (e.g. "start worker processes") are visible
+          sed -i 's|error_log /var/log/nginx/error.log;|error_log /dev/stderr notice;|' "${{targets.contextdir}}/etc/nginx/nginx.conf"
+
+          # Redirect access_log to stdout for container-friendly logging
+          # (/var/log/nginx/ is only created by nginx-mainline-package-config, which
+          # may not be installed in all environments, causing workers to fail on startup)
+          sed -i 's|access_log  /var/log/nginx/access.log.*|access_log /dev/stdout main;|' "${{targets.contextdir}}/etc/nginx/nginx.conf"
 
           # NOTE: copy entrypoint and replace s2i/run with direct nginx exec. we don't want to maintain
           # the whole s2i related scripts so we simplify the entrypoint here

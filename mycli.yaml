@@ -1,28 +1,47 @@
 package:
   name: mycli
-  version: "1.66.0"
+  version: "1.65.1"
   epoch: 0 # go/wolfi-rsc/mycli
-  description: "A Terminal Client for MySQL with AutoCompletion and Syntax Highlighting"
+  description: "static code and composition analysis tool for IaC"
   copyright:
     - license: BSD-3-Clause
-  options:
-    # Don't resolve libraries installed in virtual environment as providers
-    no-provides: true
+  dependencies:
+    runtime:
+      - py${{vars.py-version}}-click
+      - py${{vars.py-version}}-configobj
+      - py${{vars.py-version}}-llm
+      - py${{vars.py-version}}-prompt-toolkit
+      - py${{vars.py-version}}-pyperclip
+      - py${{vars.py-version}}-sqlglot
+      - py${{vars.py-version}}-sqlparse
+      - python-${{vars.py-version}}
   resources:
     cpu: "1"
     memory: 1Gi
 
 vars:
-  python-version: '3.13'
-  venv-home: '/opt/chainguard/mycli'
+  py-version: "3.13"
 
 environment:
   contents:
     packages:
-      - build-base
-      - busybox
       - ca-certificates-bundle
-      - python-${{vars.python-version}}-dev
+      - py${{vars.py-version}}-cli-helpers
+      - py${{vars.py-version}}-click
+      - py${{vars.py-version}}-configobj
+      - py${{vars.py-version}}-cryptography
+      - py${{vars.py-version}}-gpep517
+      - py${{vars.py-version}}-installer
+      - py${{vars.py-version}}-prompt-toolkit
+      - py${{vars.py-version}}-pyaes
+      - py${{vars.py-version}}-pygments
+      - py${{vars.py-version}}-pymysql
+      - py${{vars.py-version}}-pyperclip
+      - py${{vars.py-version}}-setuptools
+      - py${{vars.py-version}}-sqlglot
+      - py${{vars.py-version}}-sqlparse
+      - py${{vars.py-version}}-wheel
+      - python-${{vars.py-version}}
       - uv
       - wolfi-base
 
@@ -31,96 +50,89 @@ pipeline:
     with:
       repository: https://github.com/dbcli/mycli.git
       tag: v${{package.version}}
-      expected-commit: c1ef3d829e0a500e0ec9e0b309e6c5b5360f8072
+      expected-commit: d6f66e9756dd277f19ef025fd068192b897ef51c
 
   - runs: |
-      # Create venv at final install path with explicit python version
-      uv venv "${{vars.venv-home}}" --python python${{vars.python-version}}
-      source "${{vars.venv-home}}/bin/activate"
+      uv build
 
-      # Install mycli and its dependencies into the venv
-      uv pip install --no-compile .
-
-      # Remove pip and virtualenv
-      uv pip uninstall pip virtualenv
-
-      # Fix uv lock file permissions (created world-writable by uv)
-      chmod 644 "${{vars.venv-home}}/.lock"
-
-      # Install virtual environment to package
-      mkdir -p "${{targets.destdir}}/opt/chainguard"
-      cp -a "${{vars.venv-home}}" "${{targets.destdir}}/opt/chainguard/"
-
-      # Symlink mycli to /usr/bin
-      mkdir -p "${{targets.destdir}}/usr/bin"
-      ln -sf "${{vars.venv-home}}/bin/mycli" "${{targets.destdir}}/usr/bin/mycli"
+  - runs: |
+      python${{vars.py-version}} -m installer -d "${{targets.destdir}}" dist/*.whl
+      rm -rf "${{targets.destdir}}"/usr/lib/python3*/site-packages/test/
 
   - uses: strip
+
+test:
+  environment:
+    contents:
+      packages:
+        - py${{vars.py-version}}-pymysql
+  pipeline:
+    - uses: python/import
+      with:
+        imports: |
+          from mycli import __version__
+    - uses: py/one-python
+      with:
+        content: |
+          cat > test.py <<-EOF
+          from mycli import __version__
+          from unittest.mock import Mock, patch, PropertyMock
+          import pymysql
+
+          expected_version = "${{package.version}}"
+          assert __version__ == expected_version, f"Expected version {expected_version}, got {__version__}"
+          print(f"Version check passed: {__version__}")
+
+          # Test core mycli functionality
+          from mycli.packages.special import iocommands
+          assert hasattr(iocommands, 'write_tee')
+          print("Core functionality test passed")
+
+          # Test connection and query functionality
+          from mycli.sqlexecute import SQLExecute
+          with patch('pymysql.connect') as mock_connect:
+              mock_conn = Mock()
+              mock_cursor = Mock()
+
+              # Setup the mock connection with proper version string
+              type(mock_conn).server_version = PropertyMock(return_value='5.7.0-MySQL')
+              mock_conn.get_server_info.return_value = '5.7.0-MySQL'
+              mock_connect.return_value = mock_conn
+              mock_conn.cursor.return_value = mock_cursor
+
+              # Setup mock responses
+              mock_cursor.fetchall.return_value = [("mycli",)]
+              mock_cursor.description = [("Database",)]
+
+              sql = SQLExecute(
+                  database='test',
+                  user='test',
+                  password='test',
+                  host='localhost',
+                  port=3306,
+                  socket=None,
+                  character_set='utf8mb4',
+                  local_infile=False,
+                  ssl=None,
+                  ssh_user=None,
+                  ssh_host=None,
+                  ssh_port=None,
+                  ssh_password=None,
+                  ssh_key_filename=None,
+              )
+              print("Connection test passed")
+
+              # Test a basic query
+              result = sql.run("SHOW DATABASES")
+              assert result is not None
+              print("Query test passed")
+
+          print("All tests passed")
+          EOF
+          python${{vars.py-version}} test.py
 
 update:
   enabled: true
   github:
     identifier: dbcli/mycli
     strip-prefix: v
-    use-tag: true
-
-test:
-  pipeline:
-    - uses: test/tw/ldd-check
-    - uses: test/tw/ver-check
-      with:
-        bins: mycli
-        version: ${{package.version}}
-    - uses: test/tw/help-check
-      with:
-        bins: mycli
-    - name: Test mycli functionality
-      runs: |
-        "${{vars.venv-home}}/bin/python" <<'EOF'
-        from mycli import __version__
-        from unittest.mock import Mock, patch, PropertyMock
-        import pymysql
-
-        # Test core mycli functionality
-        from mycli.packages.special import iocommands
-        assert hasattr(iocommands, 'write_tee')
-        print("Core functionality test passed")
-
-        # Test connection and query functionality
-        from mycli.sqlexecute import SQLExecute
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = Mock()
-            mock_cursor = Mock()
-
-            type(mock_conn).server_version = PropertyMock(return_value='5.7.0-MySQL')
-            mock_conn.get_server_info.return_value = '5.7.0-MySQL'
-            mock_connect.return_value = mock_conn
-            mock_conn.cursor.return_value = mock_cursor
-
-            mock_cursor.fetchall.return_value = [("mycli",)]
-            mock_cursor.description = [("Database",)]
-
-            sql = SQLExecute(
-                database='test',
-                user='test',
-                password='test',
-                host='localhost',
-                port=3306,
-                socket=None,
-                character_set='utf8mb4',
-                local_infile=False,
-                ssl=None,
-                ssh_user=None,
-                ssh_host=None,
-                ssh_port=None,
-                ssh_password=None,
-                ssh_key_filename=None,
-            )
-            print("Connection test passed")
-
-            result = sql.run("SHOW DATABASES")
-            assert result is not None
-            print("Query test passed")
-
-        print("All tests passed")
-        EOF

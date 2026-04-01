@@ -1,35 +1,35 @@
 package:
   name: rook
-  version: "1.19.2"
-  epoch: 0 # go/wolfi-rsc/rook
+  version: "1.19.3"
+  epoch: 1 # go/wolfi-rsc/rook
   description: Storage Orchestration for Kubernetes
   copyright:
     - license: Apache-2.0
   resources:
-    cpu: "2"
+    cpu: "3"
     memory: 9Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
 
 environment:
   contents:
     packages:
-      - build-base
       - busybox
       - ca-certificates-bundle
-      - go
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/rook/rook
-      expected-commit: bcf7b733eff8e396ed07b504f871d627fcb6515f
+      expected-commit: 4b80a90cb8a0e4d71279cc10562463dd1670a82c
       tag: v${{package.version}}
 
-  - runs: |
-      mkdir -p ${{targets.destdir}}/usr/bin/
-      go build \
-        -ldflags="-X 'github.com/rook/rook/pkg/version.Version=${{package.version}}'" \
-        -o ${{targets.destdir}}/usr/bin/rook \
-        ./cmd/rook
+  - uses: go/build
+    with:
+      packages: ./cmd/rook
+      output: rook
+      ldflags: -X 'github.com/rook/rook/pkg/version.Version=${{package.version}}'
 
   - runs: |
       mv images/ceph/toolbox.sh ${{targets.destdir}}/usr/bin/
@@ -70,7 +70,66 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - kubectl
+        - curl
+    environment:
+      ROOK_CURRENT_NAMESPACE_ONLY: "true"
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
+      POD_NAMESPACE: "rook-ceph"
+      POD_NAME: "rook-ceph-operator-test"
   pipeline:
-    - runs: |
-        rook version
-        rook --help
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: rook
+        version-flag: version
+    - uses: test/tw/help-check
+      with:
+        bins: rook
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: "true"
+    - name: Install CRDs
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/rook/rook/v${{package.version}}/deploy/examples/crds.yaml
+        kubectl wait --for condition=established --timeout=60s crd/cephclusters.ceph.rook.io
+    - name: Create namespace and RBAC
+      runs: |
+        kubectl create namespace rook-ceph
+
+        kubectl create clusterrole rook-ceph-operator \
+          --verb=get,list,watch --resource=pods,services,endpoints \
+          --verb=get,list,watch --resource=nodes \
+          --verb=get,list,watch,create,update,patch,delete --resource=deployments,daemonsets,statefulsets \
+          --verb='*' --resource=cephclusters,cephblockpools,cephfilesystems,cephnfses,cephobjectstores,cephobjectstoreusers,cephrbdmirrors
+
+        kubectl create clusterrolebinding rook-ceph-operator \
+          --clusterrole=rook-ceph-operator \
+          --serviceaccount=default:default
+
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: rook-ceph-operator-test
+          namespace: rook-ceph
+        spec:
+          nodeName: kwok-node
+          serviceAccountName: default
+          containers:
+          - name: operator
+            image: rook-operator
+        EOF
+    - name: Test operator startup
+      uses: test/daemon-check-output
+      with:
+        start: |
+          rook ceph operator
+        expected_output: |
+          starting Rook-Ceph operator
+          failed to get operator base image ceph version
+        timeout: "30"

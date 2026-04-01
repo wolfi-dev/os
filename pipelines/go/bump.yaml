@@ -1,47 +1,56 @@
 name: Bump go deps to a certain version
 
-# do not include 'go' in 'needs.packages'.
-# some packages pin to an older version; assume it gets injected elsewhere.
+# Leave go off here, some packages pin to an older version. Let's just assume this gets injected elsewhere.
 needs:
   packages:
     - git
     - gobump
 
 inputs:
-  modroot:
-    description: The root of the module
-    default: .
   deps:
-    description: "A space-separated list of packages to update (go bump --packages)"
-  replaces:
-    description: "A space-separated list of packages to replace"
-  bump-file:
-    description: "Filename containing the list of packages to update / replace"
+    description: The deps to bump, space separated
+  modroot:
+    description: The root of the module, or a newline-separated list of module roots
+    default: .
   go-version:
     description: "The go version to set the go.mod syntax to"
     default: ""
+  replaces:
+    description: "The replaces to add to the go.mod file"
+  bump-file:
+    description: "Filename containing the list of packages to update / replace"
   tidy:
     default: true
     description: Run go mod tidy command before and after the bump
-  tidy-compat:
-    description: "Set the go version for which the tidied go.mod and go.sum files should be compatible"
-    default: ""
   skip-initial-tidy:
     default: false
     description: Skip the initial go mod tidy command
   show-diff:
     default: false
     description: Show the difference between the go.mod file before and after the bump
+  tidy-compat:
+    description: "Set the go version for which the tidied go.mod and go.sum files should be compatible"
+    default: ""
   show-dependency-graph:
     default: false
     description: Display a dependency graph of the go.mod file under the modroot
   work:
     description: "Use go work vendor instead of go mod vendor for projects with go work enabled"
     default: false
+  register-workspace:
+    description: "Register modroots with go.work via go work use before bumping. Only needed when bumping modules that aren't already listed in the upstream go.work."
+    default: false
 
 pipeline:
   - runs: |
-      cd "${{inputs.modroot}}"
+      # Optionally register modroots with go.work before bumping.
+      # Off by default — upstream's go.work already declares workspace members
+      # and gobump respects it. Only opt in when bumping modules that need to be
+      # added to the workspace for tidy to resolve cross-module dependencies.
+      REGISTER_WORKSPACE=false
+      if [ "${{inputs.register-workspace}}" = "true" ] && [ -f "go.work" ]; then
+        REGISTER_WORKSPACE=true
+      fi
 
       # todo rawlingsj: Remove this once we have a new gobump version that does this for us
       # if ${{inputs.go-version}} is not set, we use the go version of the current environment
@@ -51,17 +60,42 @@ pipeline:
         GO_VERSION=${{inputs.go-version}}
       fi
 
-      if [ "${{inputs.show-dependency-graph}}" = "true" ]; then
-        go mod graph
+      # Normalize modroot input: strip blank lines and surrounding whitespace.
+      # This allows modroot to be a single path or a newline-separated list of paths.
+      MODROOTS_TMP=$(mktemp)
+      printf '%s\n' "${{inputs.modroot}}" | sed '/^[[:space:]]*$/d;s/^[[:space:]]*//;s/[[:space:]]*$//' > "${MODROOTS_TMP}"
+
+      if [ "${REGISTER_WORKSPACE}" = "true" ]; then
+        WORK_USE_ARGS=""
+        while IFS= read -r modroot; do
+          [ -z "$modroot" ] && continue
+          WORK_USE_ARGS="${WORK_USE_ARGS} ./${modroot}"
+        done < "${MODROOTS_TMP}"
+        # shellcheck disable=SC2086
+        go work use ${WORK_USE_ARGS}
       fi
 
-      gobump \
-        --packages="${{inputs.deps}}" \
-        --replaces="${{inputs.replaces}}" \
-        --bump-file="${{inputs.bump-file}}" \
-        --tidy="${{inputs.tidy}}" \
-        --compat="${{inputs.tidy-compat}}" \
-        --skip-initial-tidy="${{inputs.skip-initial-tidy}}" \
-        --show-diff="${{inputs.show-diff}}" \
-        --go-version="${GO_VERSION}" \
-        --work="${{inputs.work}}"
+      while IFS= read -r modroot; do
+        [ -z "$modroot" ] && continue
+
+        if [ "${{inputs.show-dependency-graph}}" = "true" ]; then
+          (cd "$modroot" && go mod graph)
+        fi
+
+        # We use the --tidy flag to run go mod tidy before and after in some cases (if old versions of go are used, we need to update the go.mod format)
+        (
+          cd "$modroot"
+          gobump \
+            --packages="${{inputs.deps}}" \
+            --replaces="${{inputs.replaces}}" \
+            --bump-file="${{inputs.bump-file}}" \
+            --tidy="${{inputs.tidy}}" \
+            --skip-initial-tidy="${{inputs.skip-initial-tidy}}" \
+            --show-diff="${{inputs.show-diff}}" \
+            --go-version="${GO_VERSION}" \
+            --compat="${{inputs.tidy-compat}}" \
+            --work="${{inputs.work}}"
+        )
+      done < "${MODROOTS_TMP}"
+
+      rm -f "${MODROOTS_TMP}"

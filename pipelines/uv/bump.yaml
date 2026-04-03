@@ -1,0 +1,99 @@
+name: Bump Python package versions for CVE remediation
+
+needs:
+  packages:
+    - jq
+
+# Installs/upgrades pinned Python package versions using uv.
+# Primarily used for CVE remediation in UV-managed virtual environments.
+#
+# Packages must use == pinning to ensure exact versions are installed.
+# Downgrades are rejected — this pipeline is for upgrading only.
+#
+# Example:
+#   - uses: uv/bump
+#     with:
+#       venv: ${{targets.contextdir}}${{vars.venv-home}}
+#       packages: |
+#         cryptography==46.0.6    # GHSA-r6ph-v2qm-q3c2
+#         pyjwt==2.12.0           # CVE-2026-32597
+#
+# The venv input should point to the already-staged venv in the destdir
+# (i.e. ${{targets.contextdir}}${{vars.venv-home}}). Use uv/install or
+# uv/venv to set up and stage the venv before calling this pipeline.
+
+inputs:
+  packages:
+    description: |
+      Newline-separated list of package==version specifiers to install.
+      All specifiers must use == (exact pinning). Lines beginning with #
+      are treated as comments and ignored.
+      Example:
+        cryptography==46.0.6
+        pyjwt==2.12.0
+    required: true
+  venv:
+    description: |
+      Path to the virtual environment to install packages into.
+      VIRTUAL_ENV is exported to this path before running uv pip install.
+    required: true
+
+pipeline:
+  - name: install pinned packages
+    runs: |
+      set -euo pipefail
+
+      export VIRTUAL_ENV="${{inputs.venv}}"
+
+      # Validate that all package specs use == pinning.
+      _invalid=""
+      for _spec in $(printf '%s\n' "${{inputs.packages}}" | sed 's/#.*//'); do
+        [ -z "$_spec" ] && continue
+        case "$_spec" in
+          *==*) ;;
+          *) _invalid="$_invalid $_spec" ;;
+        esac
+      done
+      if [ -n "$_invalid" ]; then
+        echo "ERROR: all package specifiers must use == pinning. Invalid:$_invalid"
+        exit 1
+      fi
+
+      # Collect package specs (comments and blank lines stripped).
+      _pkgs=$(printf '%s\n' "${{inputs.packages}}" | sed 's/#.*//' | xargs)
+      if [ -z "$_pkgs" ]; then
+        echo "ERROR: no valid package specifiers found"
+        exit 1
+      fi
+
+      # Check for downgrades. Get installed versions as JSON, then compare
+      # each requested version against what's already in the venv.
+      # uv pip list normalizes names (lowercase, hyphens), so we normalize
+      # the input name the same way for matching.
+      _installed=$(uv pip list --format json)
+      for _spec in $_pkgs; do
+        _name="${_spec%%==*}"
+        _target="${_spec#*==}"
+        _norm=$(printf '%s' "$_name" | tr '[:upper:]' '[:lower:]' | sed 's/[-_.]\{1,\}/-/g')
+        _current=$(printf '%s' "$_installed" | jq -r --arg pkg "$_norm" \
+          '.[] | select(.name == $pkg) | .version')
+        if [ -n "$_current" ]; then
+          # Compare version tuples using the venv's Python (stdlib only).
+          _is_downgrade=$("$VIRTUAL_ENV/bin/python" -c "t=tuple(int(x) for x in '$_target'.split('.'));c=tuple(int(x) for x in '$_current'.split('.'));print('yes' if t<c else 'no')")
+          if [ "$_is_downgrade" = "yes" ]; then
+            echo "ERROR: $_name would be downgraded from $_current to $_target"
+            exit 1
+          fi
+          echo "$_name: $_current -> $_target"
+        else
+          echo "$_name: (new) -> $_target"
+        fi
+      done
+
+      # --no-deps: bump only the listed packages, never pull transitive deps.
+      # If a dependency also needs bumping, list it explicitly.
+      # shellcheck disable=SC2086
+      uv pip install --upgrade --only-binary :all: --no-deps $_pkgs
+
+      # Verify the environment is consistent after bumping.
+      uv pip check

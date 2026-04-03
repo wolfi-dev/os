@@ -1,0 +1,98 @@
+name: Install Python packages into a UV venv and stage to destdir
+
+# Installs packages into an existing venv and moves it to the staging directory.
+# Assumes the venv already exists (call uv/venv first).
+#
+#   1. Installs specified packages into the venv
+#   2. Removes pip and virtualenv from the venv
+#   3. Moves the venv to the staging directory
+#   4. Fixes uv lockfile permissions
+#
+# For packages requiring custom build steps (e.g. building from source,
+# multiple install passes, or complex constraints), use uv/venv to create
+# the venv, handle installation in a runs: block, then call uv/bump
+# at the end for any CVE pin overrides.
+#
+# Example:
+#   - uses: uv/venv
+#     with:
+#       venv: ${{vars.venv-home}}
+#       python: ${{vars.python-version}}
+#
+#   - uses: uv/install
+#     with:
+#       venv: ${{vars.venv-home}}
+#       packages: mypackage==${{package.version}}
+#       constraints: constraints-${{vars.python-version}}.txt
+#
+#   - uses: uv/bump
+#     with:
+#       venv: ${{targets.contextdir}}${{vars.venv-home}}
+#       packages: |
+#         vulnerable-pkg==fixed-version  # GHSA-xxxx-yyyy-zzzz
+
+inputs:
+  venv:
+    description: |
+      Runtime path for the virtual environment (e.g. /opt/chainguard/az).
+      Must already exist — call uv/venv before this pipeline.
+    required: true
+  packages:
+    description: |
+      Space or newline-separated list of packages to install.
+      Supports any pip version specifier. Lines beginning with # are treated
+      as comments and ignored.
+    required: true
+  constraints:
+    description: Path to a constraints file to pass to uv pip install.
+    default: ""
+  no-deps:
+    description: |
+      Install without resolving or installing dependencies. Use when deps
+      are already provided by system packages or a constraints file, and
+      you want to install only the listed packages themselves.
+    default: "false"
+
+pipeline:
+  - name: install, clean up, and stage
+    runs: |
+      set -euo pipefail
+
+      export VIRTUAL_ENV="${{inputs.venv}}"
+
+      # Verify the venv exists before proceeding. If VIRTUAL_ENV points to a
+      # non-existent or invalid venv, uv silently ignores it and installs into
+      # the system Python environment instead.
+      if [ ! -f "$VIRTUAL_ENV/pyvenv.cfg" ]; then
+        echo "ERROR: $VIRTUAL_ENV is not a valid venv (missing pyvenv.cfg). Call uv/venv first."
+        exit 1
+      fi
+
+      FLAGS="--only-binary :all:"
+      if [ -n "${{inputs.constraints}}" ]; then
+        FLAGS="$FLAGS --constraint ${{inputs.constraints}}"
+      fi
+      if [ "${{inputs.no-deps}}" = "true" ]; then
+        FLAGS="$FLAGS --no-deps"
+      fi
+
+      # shellcheck disable=SC2086
+      uv pip install $FLAGS ${{inputs.packages}}
+
+      # Remove pip and virtualenv from the venv. The venv is managed by the
+      # system package manager (uv) and doesn't need pip at runtime.
+      # virtualenv vendors an outdated and unused pip wheel.
+      uv pip uninstall pip virtualenv
+
+      # Verify the environment is consistent after install and uninstall.
+      uv pip check
+
+      # Move the venv from its runtime path to the staging directory.
+      # Entry point shebangs reference the runtime path, which is correct
+      # on the final system once the package is installed there.
+      _dest="${{targets.contextdir}}${{inputs.venv}}"
+      mkdir -p "$(dirname "$_dest")"
+      mv "${{inputs.venv}}" "$_dest"
+
+      # Fix world-writable permissions on the uv lock file.
+      chmod 644 "$_dest/.lock"

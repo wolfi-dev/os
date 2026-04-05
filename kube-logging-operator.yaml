@@ -1,27 +1,22 @@
 package:
   name: kube-logging-operator
   version: "6.4.0"
-  epoch: 3
+  epoch: 10 # go/wolfi-rsc/kube-logging-operator
   description: Logging operator for Kubernetes
   copyright:
     - license: Apache-2.0
   resources:
-    cpu: "7"
-    memory: 14Gi
+    cpu: "5"
+    memory: 9Gi
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
 
 environment:
   contents:
     packages:
-      - autoconf
-      - automake
-      - build-base
-      - busybox
       - geoip-dev
       - git
-      - go-1.25
-      - libmaxminddb-dev
-      - libtool
-      - pkgconf
       - ruby-3.2
       - ruby-3.2-dev
 
@@ -36,33 +31,13 @@ pipeline:
     with:
       deps: |-
         golang.org/x/net@v0.51.0
-      modroot: pkg/sdk/logging/model/syslogng/config
-      tidy: false
-
-  - uses: go/bump
-    with:
-      deps: |-
-        golang.org/x/net@v0.51.0
-      modroot: pkg/sdk
-      tidy: false
-
-  - uses: go/bump
-    with:
-      deps: |-
-        golang.org/x/net@v0.51.0
-      work: true
-
-  - uses: go/bump
-    with:
-      deps: |-
-        golang.org/x/net@v0.51.0
-      modroot: e2e
-      tidy: false
+        google.golang.org/grpc@v1.79.3
 
   - uses: go/build
     with:
       packages: .
       output: manager
+      ldflags: -X github.com/kube-logging/logging-operator/pkg/sdk/logging/api/v1beta1.Version=${{package.version}}
 
 subpackages:
   - name: "kube-logging-operator-compat"
@@ -71,37 +46,44 @@ subpackages:
       - runs: |
           # The helm chart expects the logging-operator binaries to be in / instead of /usr/bin
           mkdir -p "${{targets.contextdir}}"
-          ln -sf /usr/bin/manager ${{targets.contextdir}}/manager
+          ln -sf ./usr/bin/manager "${{targets.contextdir}}/manager"
     test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
       pipeline:
-        - runs: test "$(readlink /manager)" = "/usr/bin/manager"
+        - uses: test/tw/symlink-check
 
   - name: ${{package.name}}-config-reloader
     description: "config-reloader is a simple binary to trigger a reload when Kubernetes ConfigMaps or Secrets are updated"
     pipeline:
-      - working-directory: ./images/config-reloader
-        uses: go/build
+      - uses: go/build
         with:
+          modroot: ./images/config-reloader
           packages: ./cmd/configreloader
           output: config-reloader
     test:
       pipeline:
-        - runs: |
-            # Ensure the binary is executable
-            test -x /usr/bin/config-reloader
-            # Check that it can be run without arguments
-            /usr/bin/config-reloader --help
+        - uses: test/tw/ldd-check
+        - uses: test/tw/help-check
+          with:
+            bins: config-reloader
 
   # create a similar compat package for config-reloader
   - name: ${{package.name}}-config-reloader-compat
     description: "Compat package for config-reloader"
     pipeline:
       - runs: |
-          mkdir -p ${{targets.contextdir}}/
-          ln -sf /usr/bin/config-reloader ${{targets.contextdir}}/config-reloader
+          mkdir -p "${{targets.contextdir}}/"
+          ln -sf ./usr/bin/config-reloader "${{targets.contextdir}}/config-reloader"
     test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-config-reloader
       pipeline:
-        - runs: test "$(readlink /config-reloader)" = "/usr/bin/config-reloader"
+        - uses: test/tw/symlink-check
 
   - name: ${{package.name}}-fluentd-outputs
     description: "Fluentd output plugins for the kube-logging operator"
@@ -192,9 +174,11 @@ subpackages:
           GEM_HOME: /usr/local/bundle
           PATH: /usr/local/bundle/bin:/usr/bin:/bin
       pipeline:
-        - name: Verify fluentd is available
-          runs: |
-            fluentd --version | grep -q "fluentd"
+        - uses: test/tw/ver-check
+          with:
+            bins: fluentd
+            version: fluentd
+            match-type: contains
         - name: Verify all output plugins can be loaded
           runs: |
             ruby -e "require 'fluent/plugin/out_oss'"
@@ -247,21 +231,22 @@ test:
       packages:
         - curl
         - git
-        - kustomize
         - kubectl
     environment:
       KUBERNETES_SERVICE_HOST: "127.0.0.1"
       KUBERNETES_SERVICE_PORT: "8080"
   pipeline:
     - uses: test/tw/ldd-check
-    - runs: |
-        ${{vars.bin-name}} --help
+    - uses: test/tw/help-check
+      with:
+        bins: ${{vars.bin-name}}
     - uses: test/kwok/cluster
-    - name: Fetch the testdata from the source repo
-      runs: git clone --depth=1 https://github.com/kube-logging/logging-operator
+    - name: Fetch CRDs from source repo
+      runs: git clone --depth=1 --branch ${{package.version}} https://github.com/kube-logging/logging-operator
     - name: Install CRDs
-      working-directory: logging-operator/charts/logging-operator/crds
-      runs: kubectl apply --server-side=true -f .
+      runs: |
+        kubectl apply --server-side=true -f logging-operator/charts/logging-operator/crds/
+        kubectl wait --for=condition=Established crd --all --timeout=60s
     - name: Launch operator with dummy kubeconfig
       uses: test/daemon-check-output
       with:
@@ -273,7 +258,11 @@ test:
           Starting EventSource
           Starting Controller
           Starting workers
-        post: |
-          echo "Verifying metrics endpoint"
-          curl -sf http://127.0.0.1:8080/metrics
-          echo "Metrics endpoint is serving as expected"
+        post: |-
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:8080/metrics > /tmp/metrics.prom
+          grep -F -e "controller_runtime_reconcile_total" /tmp/metrics.prom
+          grep -F -e "controller_runtime_active_workers" /tmp/metrics.prom
+          grep -F -e "controller_runtime_reconcile_errors_total" /tmp/metrics.prom
+          grep -F -e "workqueue_work_duration_seconds_bucket" /tmp/metrics.prom
+          grep -F -e "go_info" /tmp/metrics.prom

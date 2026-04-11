@@ -1,7 +1,7 @@
 package:
   name: trivy
   version: "0.69.3"
-  epoch: 4 # GHSA-p436-gjf2-799p
+  epoch: 7
   description: Simple and comprehensive vulnerability scanner for containers
   copyright:
     - license: Apache-2.0
@@ -22,7 +22,13 @@ pipeline:
   - uses: go/bump
     with:
       deps: |-
+        github.com/docker/cli@v29.3.1
+        github.com/go-git/go-git/v5@v5.17.1
+        github.com/moby/buildkit@v0.28.1
+        golang.org/x/net@v0.51.0
+        google.golang.org/grpc@v1.79.3
         github.com/docker/cli@v29.2.0
+        github.com/moby/buildkit@v0.28.1
 
   - uses: go/build
     with:
@@ -31,12 +37,21 @@ pipeline:
       output: trivy
       ldflags: -X github.com/aquasecurity/trivy/pkg/version/app.ver=${{package.version}}
 
+  # Install contrib output templates (html, junit, gitlab, asff, etc.)
+  # These are included in the upstream Dockerfile and required for --format template
+  - name: Install contrib templates
+    runs: |
+      mkdir -p "${{targets.destdir}}/contrib"
+      install -Dm644 contrib/*.tpl "${{targets.destdir}}/contrib/"
+
 test:
   environment:
     contents:
       packages:
         - jq
+        - trivy=${{package.full-version}}
   pipeline:
+    - uses: test/tw/ldd-check
     - name: Check trivy version
       runs: |
         trivy version
@@ -47,9 +62,50 @@ test:
       runs: |
         trivy version -f json | jq -M
         [ "$(trivy version -f json 2>/dev/null | jq -r .Version)" == "${{package.version}}" ]
+    - name: Scan Dockerfile for misconfigurations
+      runs: |
+        set -euo pipefail
+        # Create a Dockerfile with a known misconfiguration (running as root)
+        # trivy config scans for misconfigurations without needing a vuln DB
+        mkdir -p /tmp/trivy-test
+        cat > /tmp/trivy-test/Dockerfile <<'EOF'
+        FROM alpine:3.18
+        RUN apk add --no-cache curl
+        CMD ["sh"]
+        EOF
+        # Scan for misconfigurations; trivy exits non-zero when issues found,
+        # so capture output and verify trivy actually ran and produced results
+        output=$(trivy config /tmp/trivy-test --format json 2>/dev/null) || true
+        echo "$output" | jq -e '.Results' > /dev/null
+    - name: Verify contrib templates
+      uses: test/tw/contains-files
+      with:
+        files: |
+          /contrib/html.tpl
+          /contrib/junit.tpl
+          /contrib/gitlab.tpl
+          /contrib/gitlab-codequality.tpl
+          /contrib/asff.tpl
+    - name: Scan filesystem for misconfigurations
+      runs: |
+        set -euo pipefail
+        # Scan a directory using only the config scanner (no vuln DB required)
+        mkdir -p /tmp/trivy-fs-test
+        cat > /tmp/trivy-fs-test/main.tf <<'EOF'
+        resource "aws_s3_bucket" "example" {
+          bucket = "my-test-bucket"
+        }
+        EOF
+        # trivy fs with --scanners config checks IaC files without a vuln DB
+        output=$(trivy fs /tmp/trivy-fs-test --scanners config --format json 2>/dev/null) || true
+        echo "$output" | jq -e '.Results' > /dev/null
 
 update:
   enabled: true
+  # TODO: Following a discussion with Ben and Matt, we decided to disable
+  # auto-updates for a duration of time. GHSA-69fq-xp46-6x23.
+  manual: true
+  exclude-reason: "In light of the recent Trivy compromises, we're temporarily disabling auto-updates on the abundance of caution. See: GHSA-69fq-xp46-6x23."
   github:
     identifier: aquasecurity/trivy
     strip-prefix: v

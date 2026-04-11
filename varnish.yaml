@@ -1,7 +1,7 @@
 package:
   name: varnish
   version: "8.0.0"
-  epoch: 0
+  epoch: 4 # fix management interface authentication in daemon test
   description: "Varnish Cache is a web application accelerator also known as a caching HTTP reverse proxy"
   copyright:
     - license: BSD-2-Clause
@@ -9,6 +9,15 @@ package:
     runtime:
       - merged-usrsbin
       - wolfi-baselayout
+  resources:
+    cpu: "7"
+    memory: 11Gi
+  test-resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  py-version: "3.13"
 
 environment:
   contents:
@@ -18,15 +27,19 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
+      - libedit-dev
       - libtool
       - libunwind-dev
       - m4
+      - ncurses-dev
       - pcre2-dev
       - pkgconf
       - pkgconf-dev
-      - py3-docutils
-      - py3-sphinx
-      - python3
+      - py${{vars.py-version}}-docutils
+      - py${{vars.py-version}}-docutils-bin
+      - py${{vars.py-version}}-sphinx
+      - py${{vars.py-version}}-sphinx-bin
+      - python-${{vars.py-version}}
       - wolfi-baselayout
 
 pipeline:
@@ -36,6 +49,19 @@ pipeline:
       tag: varnish-${{package.version}}
       expected-commit: 71d4d75665f4d1949f7eeca28092a12df7037f3a
       recurse-submodules: true
+      cherry-picks: |
+        master/7ee64e2a51be0805b2a2ea4ff8a025fb6db5f149: flexelinting: drop spurious const from addf_hdr key parameter (varnishncsa.c)
+
+  # Cherry-pick the VTest2 submodule const fix (cffabbb: "constify" pp2 for
+  # bsearch on const array). The cherry-picks field on git-checkout only applies
+  # to the main repo, so we fetch and cherry-pick inside the submodule directly.
+  - working-directory: bin/varnishtest/vtest2
+    runs: |
+      git config user.email "melange-build@cgr.dev"
+      git config user.name "Melange Build"
+      git fetch origin cffabbb558599869fae2425bab76645d67e845cc
+      GIT_COMMITTER_DATE="@${SOURCE_DATE_EPOCH:-315532800}" \
+        git cherry-pick -x cffabbb558599869fae2425bab76645d67e845cc
 
   - runs: autoreconf -vif
 
@@ -56,6 +82,7 @@ subpackages:
       - uses: split/dev
     test:
       pipeline:
+        - uses: test/tw/devpackage
         - uses: test/pkgconf
         - uses: test/tw/ldd-check
     dependencies:
@@ -122,8 +149,27 @@ test:
             .port = "8080";
           }
           EOF
+          # Create a secret file for management interface authentication
+          dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 > /etc/varnish/secret
+          chmod 600 /etc/varnish/secret
         start: |
-          varnishd -F -f /etc/varnish/default.vcl -a :6081 -T localhost:6082 -s malloc,256m
+          varnishd -F -f /etc/varnish/default.vcl -a :6081 -T localhost:6082 -S /etc/varnish/secret -s malloc,256m
         expected_output: "Child (.*) Started"
         timeout: 30
+        post: |
+          set -euo pipefail
+          # Verify the HTTP proxy port is accepting connections
+          wait-for-it localhost:6081 -t 15
+          # Verify the management interface port is accepting connections
+          wait-for-it localhost:6082 -t 15
+          # Test HTTP proxy responds (backend is unreachable so expect 503)
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:6081/)
+          if [ "$http_code" != "503" ] && [ "$http_code" != "200" ]; then
+            echo "FAIL: Expected HTTP 503 or 200 from Varnish proxy, got $http_code"
+            exit 1
+          fi
+          echo "OK: Varnish HTTP proxy responded with $http_code"
+          # Test management interface via varnishadm (using the secret file)
+          varnishadm -T localhost:6082 -S /etc/varnish/secret ping | grep -F "PONG"
+          echo "OK: Varnish management interface is responsive"
     - uses: test/tw/ldd-check

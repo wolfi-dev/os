@@ -1,0 +1,143 @@
+package:
+  name: debezium-connector-db2-3.5
+  version: "3.5.0"
+  epoch: 1 # GHSA-vqf4-7m7x-wgfc
+  description: An incubating Debezium connector for Db2
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - debezium-connector-db2=${{package.full-version}}
+  resources:
+    cpu: "1"
+    memory: 7Gi
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - maven
+      - openjdk-21-default-jdk
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-21-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/debezium/debezium-connector-db2
+      tag: v${{package.version}}.Final
+      expected-commit: 07351cc5d8e42bfaa4fef408039eef78c9139755
+
+  - uses: auth/maven
+
+  - uses: maven/pombump
+
+  - name: Build
+    runs: |
+      ./mvnw clean install -B -ntp -f pom.xml -T$(nproc)C \
+        -Passembly \
+        -Dcheckstyle.skip=true \
+        -Dformat.skip=true \
+        -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+        -Dmaven.wagon.http.pool=false \
+        -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 \
+        -DfailFlakyTests=false \
+        -DskipITs=true -DskipTests=true -Dcheckstyle.skip=true -Dformat.skip=true -Drevapi.skip \
+        --no-transfer-progress \
+        --fail-fast
+
+  - name: Extract JARs
+    runs: |
+      mkdir -p "${{targets.contextdir}}"/usr/share/java/debezium/debezium-connector-db2
+      tar -zxf target/debezium-connector-db2-${{package.version}}.Final-plugin.tar.gz --strip-components=1 -C ${{targets.contextdir}}/usr/share/java/debezium/debezium-connector-db2
+      install -Dm644 target/debezium-connector-db2-${{package.version}}.Final.jar -t ${{targets.contextdir}}/usr/share/java/debezium/debezium-connector-db2/
+
+  - uses: strip
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - "CR"
+    - "hotfix"
+    - "Beta"
+  github:
+    identifier: debezium/debezium-connector-db2
+    use-tag: true
+    tag-filter: v3.5.
+    strip-prefix: v
+    strip-suffix: .Final
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-21-default-jdk
+  pipeline:
+    - uses: test/tw/virtualpackage
+      with:
+        virtual-pkg-name: debezium-connector-db2
+    - name: Verify JAR presence
+      runs: |
+        stat /usr/share/java/debezium/debezium-connector-db2/debezium-connector-db2-${{package.version}}.Final.jar
+    - name: Validate JAR metadata
+      runs: |
+        set -euo pipefail
+        jar tf /usr/share/java/debezium/debezium-connector-db2/debezium-connector-db2-${{package.version}}.Final.jar | grep -F "META-INF/MANIFEST.MF"
+    - name: Verify connector class exists
+      runs: |
+        set -euo pipefail
+        # Verify the main Db2Connector class is present in the JAR
+        jar tf /usr/share/java/debezium/debezium-connector-db2/debezium-connector-db2-${{package.version}}.Final.jar | grep -F "io/debezium/connector/db2/Db2Connector.class"
+        echo "SUCCESS: Db2Connector class found in JAR"
+    - name: Verify connector is loadable by Java
+      runs: |
+        set -euo pipefail
+        # Attempt to load the connector class - even if it fails due to missing
+        # Kafka runtime dependencies, the error message proves the class exists
+        # and the JVM can find it on the classpath
+        set +e
+        output=$(java -cp '/usr/share/java/debezium/debezium-connector-db2/*' -Xmx64m io.debezium.connector.db2.Db2Connector 2>&1)
+        rc=$?
+        set -e
+
+        # The class should be found. It may fail with NoClassDefFoundError for
+        # missing Kafka dependencies or main method, but NOT with
+        # ClassNotFoundException which would mean the class doesn't exist
+        if echo "$output" | grep -F "ClassNotFoundException" | grep -F "Db2Connector"; then
+          echo "FAIL: Db2Connector class not found on classpath"
+          echo "$output"
+          exit 1
+        fi
+
+        echo "SUCCESS: Db2Connector class is loadable (exit code: $rc)"
+        echo "Output: $output" | head -5
+    - name: Verify service provider configuration
+      runs: |
+        set -euo pipefail
+        # Check that at least one JAR in the plugin directory contains
+        # META-INF/services/ entries for Kafka Connect connector discovery
+        found=false
+        for jarfile in /usr/share/java/debezium/debezium-connector-db2/*.jar; do
+          if jar tf "$jarfile" | grep -F "META-INF/services/"; then
+            echo "Found service provider config in: $jarfile"
+            jar tf "$jarfile" | grep -F "META-INF/services/"
+            found=true
+          fi
+        done
+
+        if [ "$found" = "false" ]; then
+          echo "WARNING: No META-INF/services/ found in any JAR - connector may rely on external registration"
+        fi
+
+        # Verify multiple JARs exist in the plugin directory (dependencies from tar.gz)
+        jar_count=$(find /usr/share/java/debezium/debezium-connector-db2/ -name '*.jar' | wc -l)
+        echo "Found $jar_count JARs in plugin directory"
+        if [ "$jar_count" -lt 2 ]; then
+          echo "FAIL: Expected multiple JARs in plugin directory (connector + dependencies)"
+          exit 1
+        fi
+        echo "SUCCESS: Plugin directory contains $jar_count JARs"

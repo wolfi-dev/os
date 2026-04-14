@@ -1,22 +1,24 @@
 package:
   name: ggshield
   version: "1.49.0"
-  epoch: 0 # go/wolfi-rsc/ggshield
+  epoch: 1 # convert to uv venv application package
   description: Find and fix 360+ types of hardcoded secrets and 70+ types of infrastructure-as-code misconfigurations.
   copyright:
     - license: MIT
   dependencies:
     runtime:
       - git
-      - py${{vars.python-version}}-certifi
-      - py${{vars.python-version}}-packaging
-      - python-${{vars.python-version}}
+      - openssl-provider-legacy # cryptography from Libraries needs legacy provider
+      - python-${{vars.python-version}}-base
+  options:
+    no-provides: true
   resources:
     cpu: "2"
     memory: 6Gi
 
 vars:
-  python-version: 3.12
+  python-version: '3.12'
+  venv-home: '/usr/share/ggshield'
 
 environment:
   contents:
@@ -24,14 +26,8 @@ environment:
       - build-base
       - busybox
       - ca-certificates-bundle
-      - coreutils
-      - curl
-      - openssf-compiler-options
-      # pinning build and runtime deps to 3.12 because pyinstaller version project is using doesn't work with 3.13 python.
-      - py${{vars.python-version}}-pip
-      - py${{vars.python-version}}-setuptools
-      - py${{vars.python-version}}-wheel
-      - python-${{vars.python-version}}
+      - python-${{vars.python-version}}-dev
+      - uv
       - wolfi-base
 
 pipeline:
@@ -41,34 +37,35 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: 3ff83341cab96f0ac0dddc1faffcd7ba9d1886ed
 
+  - uses: auth/uv
+    with:
+      allow-fallback-indexes: true
+
   - runs: |
-      # Upstream switched to using pdm, installing using directions from https://pdm-project.org/en/latest/
-      curl -sSLO https://pdm-project.org/install-pdm.py
-      curl -sSL https://pdm-project.org/install-pdm.py.sha256 | sha256sum -c -
+      # Create venv and install ggshield from Libraries
+      uv venv "${{vars.venv-home}}" --python python${{vars.python-version}}
+      uv pip install --no-compile --python "${{vars.venv-home}}/bin/python" \
+        "ggshield==${{package.version}}"
 
-      # Run the installer
-      python3 install-pdm.py
-      # This installs pdm into $HOME/.local/bin, so put that on the PATH
-      export PATH=$HOME/.local/bin:$PATH
+      # Verify installed version
+      "${{vars.venv-home}}/bin/python" -c "
+      from importlib.metadata import version
+      v = version('ggshield')
+      assert v == '${{package.version}}', f'Expected ggshield==${{package.version}}, got {v}'
+      print(f'ggshield=={v} installed correctly')
+      "
 
-      # cryptography 44.0.2 (CVE-2024-12797 GHSA-79v4-65xg-pq4g) requires a
-      # higher minimum Python
-      sed -i 's/requires-python = ">=3.9"/requires-python = ">=3.12,<3.13"/' pyproject.toml
-      sed -i 's/cryptography~=43.0.1/cryptography~=44.0.2/' pyproject.toml
-      sed -i 's/urllib3~=2.2.2/urllib3~=2.5.0/' pyproject.toml
-      pdm update cryptography urllib3  # Regenerate lock file
+      # Remove pip/virtualenv from venv
+      uv pip uninstall pip virtualenv --python "${{vars.venv-home}}/bin/python"
 
-      # Install packages
-      # Based on directions from https://github.com/GitGuardian/ggshield/blob/v1.34.0/doc/dev/getting-started.md
-      pdm install --dev
+      # Install venv to package
+      mkdir -p "${{targets.destdir}}/usr/share"
+      cp -a "${{vars.venv-home}}" "${{targets.destdir}}/usr/share/"
+      chmod 644 "${{targets.destdir}}/${{vars.venv-home}}/.lock"
 
-      pip3 install certifi -U  # https://github.com/advisories/GHSA-xqr8-7jwr-rhp7
-
-      pdm build
-      pip3 install . --prefix=/usr --root="${{targets.destdir}}"
-
-      # Cleanup
-      find ${{targets.destdir}} -name "*.pyc" -exec rm -rf '{}' +
+      # Symlink ggshield to /usr/bin
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/ggshield" "${{targets.destdir}}/usr/bin/ggshield"
 
   - uses: strip
 
@@ -76,24 +73,41 @@ update:
   enabled: true
   github:
     identifier: GitGuardian/ggshield
-    use-tag: true
     strip-prefix: v
+    use-tag: true
 
 test:
   pipeline:
     - name: Check ggshield version
       runs: |
         ggshield --version
-        cmark --help
-        dotenv --version
-        dotenv --help
         ggshield --help
-        normalizer --version
-        normalizer --help
-        pygmentize -v
-        pygmentize --help
     - name: Check ggshield API status without API key
       runs: |
         output=$(ggshield api-status 2>&1 || true)
         echo "$output" | grep "Error: A GitGuardian API key is needed to use ggshield."
+    - name: Verify ggshield version and Libraries provenance
+      runs: |
+        set -euo pipefail
+        INSTALLED=$("${{vars.venv-home}}/bin/python" -c "from importlib.metadata import version; print(version('ggshield'))")
+        if [ "$INSTALLED" != "${{package.version}}" ]; then
+          echo "FAIL: Expected ggshield==${{package.version}}, got $INSTALLED"
+          exit 1
+        fi
+        echo "PASS: ggshield==$INSTALLED"
+        DIST_DIR="$("${{vars.venv-home}}/bin/python" -c "from importlib.metadata import distribution; print(distribution('ggshield')._path)")"
+        SBOM="${DIST_DIR}/sboms/sbom.spdx.json"
+        if [ ! -f "$SBOM" ]; then
+          echo "FAIL: No SBOM found — ggshield must come from Chainguard Libraries"
+          exit 1
+        fi
+        if grep -qF '"Organization: Chainguard, Inc"' "$SBOM"; then
+          echo "PASS: Chainguard Libraries provenance confirmed via SBOM"
+        else
+          echo "FAIL: SBOM exists but not from Chainguard Libraries"
+          exit 1
+        fi
     - uses: test/tw/ldd-check
+    - uses: test/tw/pip-check
+      with:
+        python: ${{vars.venv-home}}/bin/python

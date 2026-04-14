@@ -1,7 +1,7 @@
 package:
   name: kserve
-  version: "0.16.0"
-  epoch: 25 # GHSA-hfvc-g4fc-pqhx
+  version: "0.17.0"
+  epoch: 1 # GHSA-78h2-9frx-2jm8
   description: "Standardized Serverless ML Inference Platform on Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -13,7 +13,6 @@ package:
     memory: 3Gi
 
 vars:
-  # N.B. bump-python-version.patch will need updating when this changes
   python-version: 3.11 # Upstream https://github.com/kserve/kserve/blob/release-0.15/python/storage-initializer.Dockerfile uses python-3.11
 
 environment:
@@ -29,16 +28,15 @@ pipeline:
     with:
       repository: https://github.com/kserve/kserve
       tag: v${{package.version}}
-      expected-commit: 5b033a4024429302440b72180472ae2d26b44086
+      expected-commit: c71eba91631b976ff7b111f3061df9af86399e99
 
   - uses: go/bump
     with:
       deps: |-
-        golang.org/x/crypto@v0.45.0
         google.golang.org/grpc@v1.79.3
         github.com/expr-lang/expr@v1.17.7
-        github.com/kedacore/keda/v2@v2.17.3
         go.opentelemetry.io/otel/sdk@v1.43.0
+        github.com/go-jose/go-jose/v4@v4.1.4
 
   - uses: go/bump
     with:
@@ -53,13 +51,8 @@ pipeline:
   - uses: go/bump
     with:
       deps: |-
-        golang.org/x/net@v0.38.0
         google.golang.org/grpc@v1.79.3
       modroot: qpext
-
-  - uses: patch
-    with:
-      patches: bump-python-version.patch
 
 data:
   - name: go-components
@@ -201,6 +194,7 @@ subpackages:
         contents:
           packages:
             - curl
+            - openssl
       pipeline:
         - uses: test/tw/ldd-check
         - uses: test/kwok/cluster
@@ -210,12 +204,12 @@ subpackages:
             setup: |-
               set -euo pipefail
               BASE="https://raw.githubusercontent.com/kserve/kserve/v${{package.version}}/config/crd/full"
+              curl --max-time 60 -sfL "${BASE}/serving.kserve.io_inferenceservices.yaml" | kubectl apply --server-side=true -f -
               for crd in \
-                serving.kserve.io_inferenceservices.yaml \
                 serving.kserve.io_localmodelcaches.yaml \
                 serving.kserve.io_localmodelnodegroups.yaml \
                 serving.kserve.io_localmodelnodes.yaml; do
-                curl --max-time 60 -sfL "${BASE}/${crd}" | kubectl apply --server-side=true -f -
+                curl --max-time 60 -sfL "${BASE}/localmodel/${crd}" | kubectl apply --server-side=true -f -
               done
               kubectl wait --for=condition=established --timeout=60s \
                 crd/inferenceservices.serving.kserve.io \
@@ -226,6 +220,13 @@ subpackages:
               kubectl create namespace kserve-localmodel-jobs
               kubectl create configmap inferenceservice-config -n kserve \
                 --from-literal=localModel='{"enabled":true,"jobNamespace":"kserve-localmodel-jobs"}'
+              # v0.17.0: localmodel controller embeds the LocalModelCache validating webhook,
+              # which requires TLS certs to be present at startup.
+              mkdir -p /tmp/k8s-webhook-server/serving-certs
+              openssl req -x509 -newkey rsa:2048 \
+                -keyout /tmp/k8s-webhook-server/serving-certs/tls.key \
+                -out /tmp/k8s-webhook-server/serving-certs/tls.crt \
+                -days 1 -nodes -subj '/CN=localmodel-controller'
             start: localmodel-manager --leader-elect=false
             timeout: 60
             expected_output: |
@@ -313,7 +314,6 @@ subpackages:
       - name: uv-build-storage-controller
         working-directory: ./python/kserve
         runs: |
-          # Due to bump-python-version.patch, we need to re-lock dependencies
           uv lock
 
           # h11: CVE-2025-43859 GHSA-vqfr-h8mv-ghfj
@@ -401,7 +401,8 @@ subpackages:
       pipeline:
         - name: "test entrypoint usage"
           runs: |
-            /storage-initializer/scripts/initializer-entrypoint --help
+            out=$(/storage-initializer/scripts/initializer-entrypoint 2>&1 || true)
+            echo "$out" | grep -F "Usage: initializer-entrypoint"
         - uses: test/tw/ldd-check
 
 test:

@@ -1,0 +1,73 @@
+name: Generate Makefile.PL with Dist::Zilla
+
+# Use this pipeline for Perl packages whose upstream git repository ships
+# only a dist.ini (Dist::Zilla config) and no pre-generated Makefile.PL.
+#
+# Rewrites dist.ini to preserve the real upstream metadata (name, author,
+# copyright, license, abstract) while replacing uninstallable author plugin
+# bundles (e.g. @Author::ETHER) with the minimal set of core dzil plugins
+# needed to produce a tarball. [Encoding / ...] and [Prereqs / ...] sections
+# from the upstream dist.ini are also preserved.
+
+needs:
+  packages:
+    - perl-dist-zilla
+
+pipeline:
+  - runs: |
+      mkdir -p "$HOME/.dzil"
+      cat >"$HOME/.dzil/config.ini" <<'DZILCFG'
+      [%User]
+      name  = Wolfi User
+      email = wolfi@example.com
+      DZILCFG
+      # Rewrite dist.ini: keep real upstream metadata, replace uninstallable
+      # author plugin bundles with minimal buildable plugins.
+      # [Encoding / ...] and [Prereqs / ...] sections are passed through.
+      PKG_VERSION="${{package.version}}" perl - <<'PERLEOF'
+      use strict; use warnings;
+      my $ver = $ENV{PKG_VERSION} or die "PKG_VERSION not set\n";
+      open my $in, '<', 'dist.ini' or die "Cannot read dist.ini: $!\n";
+      my (@header, @extra_sects, @prereq_sects, $in_sect, $cur_type, @cur);
+      while (<$in>) {
+          chomp;
+          if (/^\[/) {
+              push @prereq_sects, [@cur] if $cur_type && $cur_type eq 'prereqs' && @cur;
+              push @extra_sects,  [@cur] if $cur_type && $cur_type eq 'encoding' && @cur;
+              $in_sect  = 1;
+              $cur_type = /^\[Prereqs\s*\// ? 'prereqs'
+                        : /^\[Encoding\b/   ? 'encoding'
+                        : '';
+              @cur = ($_);
+          } elsif (!$in_sect) {
+              next if /^version\s*=/i;
+              push @header, $_;
+          } elsif ($cur_type) {
+              push @cur, $_;
+          }
+      }
+      push @prereq_sects, [@cur] if $cur_type && $cur_type eq 'prereqs' && @cur;
+      push @extra_sects,  [@cur] if $cur_type && $cur_type eq 'encoding' && @cur;
+      close $in;
+      pop @header while @header && $header[-1] =~ /^\s*$/;
+      # Ensure required Dist::Zilla metadata is present
+      push @header, "author            = Wolfi Packager <packager\@wolfi.dev>"
+          unless grep { /^author\s*=/ } @header;
+      push @header, "copyright_holder  = Wolfi Packager"
+          unless grep { /^copyright_holder\s*=/ } @header;
+      push @header, "copyright_year    = 2025"
+          unless grep { /^copyright_year\s*=/ } @header;
+      push @header, "license           = Perl_5"
+          unless grep { /^license\s*=/ } @header;
+      open my $out, '>', 'dist.ini' or die "Cannot write dist.ini: $!\n";
+      print $out join("\n", @header), "\n";
+      print $out "version = $ver\n\n";
+      print $out "[GatherDir]\nexclude_filename = Makefile.PL\n[PruneCruft]\n[MetaYAML]\n[MakeMaker]\n[Manifest]\n[AutoPrereqs]\n[PkgVersion]\n";
+      for my $s (@extra_sects)  { print $out "\n", join("\n", @$s), "\n"; }
+      for my $s (@prereq_sects) { print $out "\n", join("\n", @$s), "\n"; }
+      close $out;
+      PERLEOF
+      # Extract dist name from the (possibly just-rewritten) dist.ini
+      _dist_name=$(perl -ne '/^name\s*=\s*(\S+)/ and print $1 and last' dist.ini)
+      dzil build
+      tar xzf "${_dist_name}-${{package.version}}.tar.gz" --strip-components=1

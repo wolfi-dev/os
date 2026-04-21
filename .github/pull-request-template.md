@@ -25,22 +25,6 @@ Put an `x` in all the items that apply, make notes next to any that haven't been
 addressed, and remove any items that are not relevant to this PR.
 
 -->
-
-#### For new package PRs only
-<!-- remove if unrelated -->
-- [ ] This PR is marked as fixing a pre-existing package request bug
-  - [ ] Alternatively, the PR is marked as related to a pre-existing package request bug, such as a dependency
-- [ ] REQUIRED - The package is available under an OSI-approved or FSF-approved license
-- [ ] REQUIRED - The version of the package is still receiving security updates
-- [ ] This PR links to the upstream project's support policy (e.g. `endoflife.date`)
-
-#### For new version streams
-<!-- remove if unrelated -->
-- [ ] The upstream project actually supports multiple concurrent versions.
-- [ ] Any subpackages include the version string in their package name (e.g. `name: ${{package.name}}-compat`)
-- [ ] The package (and subpackages) `provides:` logical unversioned forms of the package (e.g. `nodejs`, `nodejs-lts`)
-- [ ] If non-streamed package names no longer built, open PR to withdraw them (see [WITHDRAWING PACKAGES](https://github.com/wolfi-dev/os/blob/main/WITHDRAWING_PACKAGES.md))
-
 #### For package updates (renames) in the base images
 <!-- remove if unrelated -->
 When updating packages part of base images (i.e. cgr.dev/chainguard/wolfi-base or ghcr.io/wolfi-dev/sdk)

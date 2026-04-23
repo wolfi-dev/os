@@ -1,14 +1,14 @@
 package:
   name: py3-protobuf
   version: "7.34.1"
-  epoch: 2 # go/wolfi-rsc/py3-protobuf
+  epoch: 3 # go/wolfi-rsc/py3-protobuf
   copyright:
     - license: BSD-3-Clause
   dependencies:
     provider-priority: 0
   resources:
-    cpu: "1"
-    memory: 2Gi
+    cpu: "2"
+    memory: 4Gi
   test-resources:
     cpu: "1"
     memory: 1Gi
@@ -16,6 +16,12 @@ package:
 vars:
   pypi-package: protobuf
   import: google.protobuf
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^\d+\.(.+)$
+    replace: "$1"
+    to: protobuf-tag-version
 
 data:
   - name: py-versions
@@ -32,10 +38,44 @@ environment:
       - py3-supported-build-base-dev
 
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      uri: https://files.pythonhosted.org/packages/source/p/protobuf/protobuf-${{package.version}}.tar.gz
-      expected-sha256: 9ce42245e704cc5027be797c1db1eb93184d44d1cdd71811fb2d9b25ad541280
+      repository: https://github.com/protocolbuffers/protobuf
+      tag: v${{vars.protobuf-tag-version}}
+      expected-commit: 4b0c3aacf0657fbf38253b38918d3358dd4319ec
+
+  # The PyPI sdist bundles files from different git repo locations into a flat
+  # structure that setup.py expects. Reassemble that layout from the git tree.
+  - runs: |
+      cp python/dist/setup.py .
+      cp -r python/google .
+      mkdir -p utf8_range
+      cp -r third_party/utf8_range/* utf8_range/
+
+      # The sdist includes generated upb C sources for descriptor.proto that
+      # are produced by Bazel during official releases. Generate them with
+      # protoc + the upb plugins shipped by the protobuf package.
+      protoc --upb_out=. --upb_minitable_out=. --upbdefs_out=. \
+        -Isrc src/google/protobuf/descriptor.proto
+
+      # setup.py globs upb/**/*.c — remove git-only directories that the
+      # sdist doesn't ship (they reference generated headers that don't exist).
+      rm -rf upb/bazel upb/cmake upb/conformance upb/io upb/json \
+             upb/test upb/reflection/cmake upb/reflection/stage0 \
+             upb/wire/decode_fast upb/wire/test_util
+
+  # The upstream code enables aarch64-specific optimizations, which later will segfault in our tests
+  # because illegal CPU instructions are being used. I guess this is because different arm64 instructions extensions are
+  # embedded in the code compared to what most arm64 CPU could run.
+  # Disable the arm64-optimized ASM, and hope the non-optimized version can run just fine and not cause other problems.
+  # Before this change, functions call would be:
+  #   encode_varint() --> encode_longvarint_arm64()
+  # After this change, it would be:
+  #   encode_varint() --> encode_longvarint()
+  - if: ${{build.arch}} == "aarch64"
+    name: Disable aarch64 ASM optimizations
+    runs: |
+      find . -type f \( -name "*.c" -o -name "*.h" \) | xargs grep -l 'UPB_ARM64_ASM' | xargs sed -i 's/#define UPB_ARM64_ASM 1/#define UPB_ARM64_ASM 0/g'
 
 subpackages:
   - range: py-versions
@@ -46,18 +86,6 @@ subpackages:
       provides:
         - py3-${{vars.pypi-package}}
     pipeline:
-      # The upstream code enables aarch64-specific optimizations, which later will segfault in our tests
-      # because illegal CPU instructions are being used. I guess this is because different arm64 instructions extensions are
-      # embedded in the code compared to what most arm64 CPU could run.
-      # Disable the arm64-optimized ASM, and hope the non-optimized version can run just fine and not cause other problems.
-      # Before this change, functions call would be:
-      #   encode_varint() --> encode_longvarint_arm64()
-      # After this change, it would be:
-      #   encode_varint() --> encode_longvarint()
-      - if: ${{build.arch}} == "aarch64"
-        name: Disable aarch64 ASM optimizations
-        runs: |
-          find . -type f -name "*.c" -o -name "*.h" | xargs sed -i 's/#ifdef UPB_ARM64_ASM/#if 0/g'
       - uses: py/pip-build-install
         with:
           python: python${{range.key}}
@@ -90,5 +118,11 @@ test:
 
 update:
   enabled: true
-  release-monitor:
-    identifier: 46522
+  version-transform:
+    - match: ^(.+)$
+      replace: "7.$1"
+  github:
+    identifier: protocolbuffers/protobuf
+    strip-prefix: v
+    use-tag: true
+    tag-filter-prefix: v

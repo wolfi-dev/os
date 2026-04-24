@@ -1,0 +1,150 @@
+package:
+  name: rook-1.19
+  version: "1.19.4"
+  epoch: 2
+  description: Storage Orchestration for Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - rook=${{package.full-version}}
+    runtime:
+      - s5cmd
+  resources:
+    cpu: "3"
+    memory: 9Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go-1.25
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rook/rook
+      expected-commit: 0746ca482db2d132d607e1882c392a5b1b3e50d4
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        github.com/go-jose/go-jose/v4@v4.1.4
+        golang.org/x/crypto@v0.45.0
+        golang.org/x/net@v0.47.0
+      modroot: |-
+        .
+        pkg/apis
+      replaces: |-
+        github.com/moby/spdystream=github.com/moby/spdystream@v0.5.1
+        golang.org/x/crypto=golang.org/x/crypto@v0.45.0
+
+  - uses: go/build
+    with:
+      packages: ./cmd/rook
+      output: rook
+      go-package: go-1.25
+      ldflags: -X 'github.com/rook/rook/pkg/version.Version=${{package.version}}'
+
+  - runs: |
+      mv images/ceph/toolbox.sh ${{targets.destdir}}/usr/bin/
+
+      mkdir -p ${{targets.destdir}}/etc/rook-external
+      mv deploy/examples/create-external-cluster-resources.* ${{targets.destdir}}/etc/rook-external
+
+      mv deploy/examples/monitoring ${{targets.destdir}}/etc/ceph-monitoring
+
+subpackages:
+  - name: ${{package.name}}-oci-compat
+    dependencies:
+      provides:
+        - rook-oci-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          ln -sf ../../bin/rook ${{targets.subpkgdir}}/usr/local/bin/rook
+          ln -sf ../../bin/toolbox.sh ${{targets.subpkgdir}}/usr/local/bin/toolbox.sh
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubectl
+        - curl
+    environment:
+      ROOK_CURRENT_NAMESPACE_ONLY: "true"
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
+      POD_NAMESPACE: "rook-ceph"
+      POD_NAME: "rook-ceph-operator-test"
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: rook
+        version-flag: version
+    - uses: test/tw/help-check
+      with:
+        bins: rook
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: "true"
+    - name: Install CRDs
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/rook/rook/v${{package.version}}/deploy/examples/crds.yaml
+        kubectl wait --for condition=established --timeout=60s crd/cephclusters.ceph.rook.io
+    - name: Create namespace and RBAC
+      runs: |
+        kubectl create namespace rook-ceph
+
+        kubectl create clusterrole rook-ceph-operator \
+          --verb=get,list,watch --resource=pods,services,endpoints \
+          --verb=get,list,watch --resource=nodes \
+          --verb=get,list,watch,create,update,patch,delete --resource=deployments,daemonsets,statefulsets \
+          --verb='*' --resource=cephclusters,cephblockpools,cephfilesystems,cephnfses,cephobjectstores,cephobjectstoreusers,cephrbdmirrors
+
+        kubectl create clusterrolebinding rook-ceph-operator \
+          --clusterrole=rook-ceph-operator \
+          --serviceaccount=default:default
+
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: rook-ceph-operator-test
+          namespace: rook-ceph
+        spec:
+          nodeName: kwok-node
+          serviceAccountName: default
+          containers:
+          - name: operator
+            image: rook-operator
+        EOF
+    - name: Test operator startup
+      uses: test/daemon-check-output
+      with:
+        start: |
+          rook ceph operator
+        expected_output: |
+          starting Rook-Ceph operator
+          failed to get operator base image ceph version
+        timeout: "30"
+
+update:
+  enabled: true
+  github:
+    identifier: rook/rook
+    strip-prefix: v
+    tag-filter: v1.19.

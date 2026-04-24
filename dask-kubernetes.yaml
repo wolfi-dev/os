@@ -1,13 +1,15 @@
 package:
   name: dask-kubernetes
   version: "2026.3.0"
-  epoch: 3 # GHSA-2vrm-gr82-f7m5
+  epoch: 4 # convert to uv, add auth/uv and no-provides
   description: "Native Kubernetes integration for Dask"
   copyright:
     - license: "BSD-3-Clause"
   dependencies:
     runtime:
       - python-${{vars.python-version}}-base
+  options:
+    no-provides: true
   resources:
     cpu: "1"
     memory: 7Gi
@@ -15,6 +17,7 @@ package:
 vars:
   python-version: "3.10"
   pypi-package: dask_kubernetes
+  venv-home: '/usr/share/dask-kubernetes'
 
 environment:
   environment:
@@ -25,11 +28,7 @@ environment:
       - busybox
       - ca-certificates-bundle
       - go
-      - py${{vars.python-version}}-hatch
-      - py${{vars.python-version}}-hatch-bin
-      - py${{vars.python-version}}-hatch-vcs
-      - py${{vars.python-version}}-pip
-      - python-${{vars.python-version}}
+      - python-${{vars.python-version}}-dev
       - uv
       - wolfi-base
 
@@ -40,55 +39,37 @@ pipeline:
       tag: ${{package.version}}
       expected-commit: 02eea0fdfd1fe9abbc85874c9278d48c6189b912
 
+  - uses: auth/uv
+    with:
+      allow-fallback-indexes: true
+
   - runs: |
-      mkdir -p /usr/share/dask-kubernetes
-      python${{vars.python-version}} -m venv /usr/share/dask-kubernetes
-      source /usr/share/dask-kubernetes/bin/activate
+      # Create venv and install dask-kubernetes from Libraries
+      uv venv "${{vars.venv-home}}" --python python${{vars.python-version}}
+      uv pip install --no-compile --python "${{vars.venv-home}}/bin/python" \
+        "dask-kubernetes==${{package.version}}"
 
-      # Build and install wheel
-      hatch build
-      pip install dist/dask_kubernetes-${{package.version}}-py3-none-any.whl
+      # Verify installed version and Chainguard Libraries provenance
+      "${{vars.venv-home}}/bin/python" -c "
+      from importlib.metadata import version, distribution
+      v = version('dask-kubernetes')
+      assert v == '${{package.version}}', f'Expected dask-kubernetes==${{package.version}}, got {v}'
+      print(f'dask-kubernetes=={v} installed correctly')
+      "
 
-      # Upgrade requests to fix GHSA-9hjg-9r4m-mvj7
-      pip install --upgrade "requests>=2.32.4"
+      # Remove pip/virtualenv from venv
+      uv pip uninstall pip virtualenv --python "${{vars.venv-home}}/bin/python" || true
 
-      # Upgrade setuptools to fix authentik.yaml
-      pip install --upgrade "setuptools==80.10.2"
-
-      # Upgrade wheel separately to fix GHSA-8rrh-rw8j-w5fx (CVE-2026-24049)
-      pip install --upgrade "wheel>=0.46.2"
-
-      # Upgrade cryptography to fix GHSA-p423-j2cm-9vmq
-      pip install --upgrade "cryptography>=46.0.7"
-
-      # Upgrade aiohttp to fix GHSA-w2fm-2cpv-w7v5 and related CVEs
-      pip install --upgrade "aiohttp>=3.13.4"
-
-      # Upgrade urllib3 to fix GHSA-38jv-5279-wg99
-      pip install --upgrade "urllib3==2.6.3"
-
-      # Remove pip to avoid accumulating CVEs
-      # APK can be used instead if needed
-      pip uninstall --yes pip
-
-      # Enable system site-packages
-      sed -i "s|include-system-site-packages = false|include-system-site-packages = true|g" \
-        /usr/share/dask-kubernetes/pyvenv.cfg
-
-      # Include virtual environment's site-packages in system path
-      mkdir -p ${{targets.contextdir}}/usr/lib/python${{vars.python-version}}/site-packages
-      echo /usr/share/dask-kubernetes/lib/python${{vars.python-version}}/site-packages > \
-        ${{targets.contextdir}}/usr/lib/python${{vars.python-version}}/site-packages/${{package.name}}.pth
-
-      # Symlink scripts to path
-      mkdir -p ${{targets.contextdir}}/usr/bin
-      for script in /usr/share/dask-kubernetes/bin/*dask*; do
-        ln -s $script ${{targets.contextdir}}/usr/bin/$(basename $script)
+      # Symlink dask scripts to path
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+      for script in "${{vars.venv-home}}/bin"/*dask*; do
+        ln -sf "${{vars.venv-home}}/bin/$(basename $script)" "${{targets.contextdir}}/usr/bin/$(basename $script)"
       done
 
       # Install virtual environment
-      mkdir -p ${{targets.contextdir}}/usr/share
-      mv /usr/share/dask-kubernetes ${{targets.contextdir}}/usr/share/
+      mkdir -p "${{targets.contextdir}}/usr/share"
+      cp -a "${{vars.venv-home}}" "${{targets.contextdir}}/usr/share/"
+      chmod 644 "${{targets.contextdir}}/${{vars.venv-home}}/.lock"
 
   - name: Remove unused files causing false positives for vulnerabilities
     runs: |
@@ -101,15 +82,41 @@ test:
   pipeline:
     - uses: python/import
       with:
-        python: python${{vars.python-version}}
+        python: ${{vars.venv-home}}/bin/python
         import: ${{vars.pypi-package}}
-    - name: Verify urllib3 version and kubernetes metadata patch
+    - name: Verify operator controller can be imported
       runs: |
-        # Verify urllib3 2.6.3 is installed
-        python${{vars.python-version}} -c "import urllib3; assert urllib3.__version__ == '2.6.3', f'Expected urllib3 2.6.3, got {urllib3.__version__}'"
+        "${{vars.venv-home}}/bin/python" -c "from dask_kubernetes.operator.controller import *"
+    - name: Verify dask-kubernetes version and Libraries provenance
+      runs: |
+        set -euo pipefail
 
-        # Verify operator controller can be imported without version conflicts
-        python${{vars.python-version}} -c "from dask_kubernetes.operator.controller import *"
+        INSTALLED=$("${{vars.venv-home}}/bin/python" -c "from importlib.metadata import version; print(version('dask-kubernetes'))")
+        if [ "$INSTALLED" != "${{package.version}}" ]; then
+          echo "FAIL: Expected dask-kubernetes==${{package.version}}, got $INSTALLED"
+          exit 1
+        fi
+        echo "PASS: dask-kubernetes==$INSTALLED"
+
+        DIST_DIR="$("${{vars.venv-home}}/bin/python" -c "
+        from importlib.metadata import distribution
+        print(distribution('dask-kubernetes')._path)
+        ")"
+        SBOM="${DIST_DIR}/sboms/sbom.spdx.json"
+        if [ ! -f "$SBOM" ]; then
+          echo "FAIL: No SBOM found — dask-kubernetes must come from Chainguard Libraries"
+          exit 1
+        fi
+        if grep -q '"Organization: Chainguard, Inc"' "$SBOM"; then
+          echo "PASS: Chainguard Libraries provenance confirmed via SBOM"
+        else
+          echo "FAIL: SBOM exists but not from Chainguard Libraries"
+          exit 1
+        fi
+    - uses: test/tw/ldd-check
+    - uses: test/tw/pip-check
+      with:
+        python: ${{vars.venv-home}}/bin/python
 
 update:
   enabled: true

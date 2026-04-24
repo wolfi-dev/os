@@ -1,0 +1,144 @@
+package:
+  name: apache-tika-3.3
+  version: "3.3.0"
+  epoch: 0 # GHSA-72hv-8253-57qq
+  description: The Apache Tika toolkit detects and extracts metadata and text from over a thousand different file types (such as PPT, XLS, and PDF).
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - dash-binsh
+      - openjdk-21-default-jvm
+    provides:
+      - apache-tika=${{package.full-version}}
+  resources:
+    cpu: "2"
+    memory: 14Gi
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - coreutils
+      - fontconfig-config
+      - fontconfig-dev
+      - lcms2
+      - libfontconfig1
+      - libjpeg-turbo
+      - maven
+      - openjdk-21-default-jdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/tika
+      tag: ${{package.version}}
+      expected-commit: cd800dd8d37a85ec7e258c7ca4cc61752b3ca600
+
+  - uses: auth/maven
+
+  - uses: maven/pombump
+
+  - uses: maven/pombump
+    with:
+      pom: tika-parent/pom.xml
+
+  - runs: |
+      mvn clean install -am -DskipTests -Dossindex.skip
+      mkdir -p "${{targets.contextdir}}"/usr/share/java/
+      cp -r tika-server/tika-server-standard/target/tika-server-standard-${{package.version}}.jar "${{targets.contextdir}}"/usr/share/java/tika-server-standard-${{package.version}}.jar
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the root folder"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+          ln -sf /usr/share/java/tika-server-standard-${{package.version}}.jar ${{targets.subpkgdir}}/tika-server-standard.jar
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /tika-server-standard.jar
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - ${{package.name}}-compat
+        - openjdk-21-default-jvm
+        - zip
+  pipeline:
+    - uses: test/daemon-check-output
+      with:
+        start: java -jar /tika-server-standard.jar
+        expected_output: |
+          Started Apache Tika server
+        post: |
+          fail() { echo "FATAL: $*"; exit 1; }
+          tmpd=$(mktemp -d)
+          trap "rm -Rf $tmpd" EXIT
+
+          url=http://localhost:9998/
+          curl -s "$url" > "$tmpd/req.out" 2>"$tmpd/req.err" ||
+              fail "[$?] curl -s $url"
+          grep -q "Welcome to the Apache Tika" "$tmpd/req.out" ||
+              fail "curl $url - no Welcome message"
+
+          # Use richer English text for reliable extraction and language detection
+          printf 'Title: Apache Tika Test Document\nAuthor: Test User\nContent: This is a test document for Apache Tika.\n' \
+              > "$tmpd/sample.txt" ||
+              fail "failed writing sample.txt"
+
+          # Basic text extraction
+          curl -sf -X PUT --data-binary "@$tmpd/sample.txt" \
+              -H "Content-Type: text/plain" "http://localhost:9998/tika" \
+              > "$tmpd/tika.out" ||
+              fail "PUT /tika failed"
+          grep -q "Apache Tika Test Document" "$tmpd/tika.out" ||
+              fail "text extraction did not return expected content"
+
+          # MIME type detection
+          mime=$(curl -sf -X PUT --data-binary "@$tmpd/sample.txt" \
+              "http://localhost:9998/detect/stream") ||
+              fail "PUT /detect/stream failed"
+          [ "$mime" = "text/plain" ] ||
+              fail "MIME detection returned '$mime', expected 'text/plain'"
+
+          # Metadata extraction
+          curl -sf -X PUT --data-binary "@$tmpd/sample.txt" \
+              -H "Content-Type: text/plain" "http://localhost:9998/meta" \
+              > "$tmpd/meta.out" ||
+              fail "PUT /meta failed"
+          grep -q "Content-Type" "$tmpd/meta.out" ||
+              fail "metadata response missing Content-Type field"
+
+          # Recursive metadata extraction (rmeta) with a ZIP containing a nested HTML file
+          mkdir -p "$tmpd/nested"
+          printf '<html><body><p>Recursive metadata test content</p></body></html>' \
+              > "$tmpd/nested/test.html"
+          (cd "$tmpd" && zip -r archive.zip nested) ||
+              fail "failed to create archive.zip"
+          curl -sf -X PUT --data-binary "@$tmpd/archive.zip" \
+              -H "Content-Type: application/zip" "http://localhost:9998/rmeta" \
+              > "$tmpd/rmeta.out" ||
+              fail "PUT /rmeta failed"
+          grep -q "Recursive metadata test content" "$tmpd/rmeta.out" ||
+              fail "rmeta did not return nested file content"
+
+          # Language detection
+          lang=$(curl -sf -X PUT --data-binary "@$tmpd/sample.txt" \
+              "http://localhost:9998/language/stream") ||
+              fail "PUT /language/stream failed"
+          [ "$lang" = "en" ] ||
+              fail "language detection returned '$lang', expected 'en'"
+
+update:
+  enabled: true
+  github:
+    identifier: apache/tika
+    use-tag: true
+    tag-filter: 3.3.

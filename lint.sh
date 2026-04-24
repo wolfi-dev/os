@@ -52,15 +52,6 @@ ylint() {
     yqrun -i 'del(.test.environment.contents)' "${fn}" || return
   fi
 
-  # resources:/test-resources: must be a direct child of 'package:'.
-  out=$(yqrun '[.. | path] | .[] | select(length > 0 and (.[-1] == "resources" or .[-1] == "test-resources")) | join(".")' "${fn}") || return
-  bad=$(echo "$out" | grep -vxE 'package\.(resources|test-resources)' || true)
-  if [ -n "$bad" ]; then
-    stderr "ERROR [$fn]: 'resources:'/'test-resources:' must be a direct child of 'package:'. Found at:"
-    echo "$bad" | sed 's/^/  /' 1>&2
-    return 1
-  fi
-
   yam "${fn}" || {
       stderr "FAIL [$fn]: cmd failed $?: yam $fn"
       return 1

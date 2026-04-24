@@ -1,24 +1,21 @@
 package:
   name: py3-protobuf
   version: "7.34.1"
-  epoch: 4
+  epoch: 3 # go/wolfi-rsc/py3-protobuf
   copyright:
     - license: BSD-3-Clause
   dependencies:
     provider-priority: 0
   resources:
-    cpu: "8"
-    memory: 16Gi
+    cpu: "2"
+    memory: 4Gi
   test-resources:
     cpu: "1"
     memory: 1Gi
 
 vars:
-  bazel-version: '8'
-  clang-version: '21'
-  java-version: '25'
-  pypi-package: 'protobuf'
-  import: 'google.protobuf'
+  pypi-package: protobuf
+  import: google.protobuf
 
 var-transforms:
   - from: ${{package.version}}
@@ -37,17 +34,8 @@ data:
 environment:
   contents:
     packages:
-      - bash
-      - bazel-${{vars.bazel-version}}
-      - build-base
-      - busybox
-      - clang-${{vars.clang-version}}
-      - openjdk-${{vars.java-version}}-default-jdk
+      - protobuf-dev
       - py3-supported-build-base-dev
-  environment:
-    CC: clang-${{vars.clang-version}}
-    CXX: clang++-${{vars.clang-version}}
-    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
 
 pipeline:
   - uses: git-checkout
@@ -56,26 +44,38 @@ pipeline:
       tag: v${{vars.protobuf-tag-version}}
       expected-commit: 4b0c3aacf0657fbf38253b38918d3358dd4319ec
 
-  - name: Build sdist
+  # The PyPI sdist bundles files from different git repo locations into a flat
+  # structure that setup.py expects. Reassemble that layout from the git tree.
+  - runs: |
+      cp python/dist/setup.py .
+      cp -r python/google .
+      mkdir -p utf8_range
+      cp -r third_party/utf8_range/* utf8_range/
+
+      # The sdist includes generated upb C sources for descriptor.proto that
+      # are produced by Bazel during official releases. Generate them with
+      # protoc + the upb plugins shipped by the protobuf package.
+      protoc --upb_out=. --upb_minitable_out=. --upbdefs_out=. \
+        -Isrc src/google/protobuf/descriptor.proto
+
+      # setup.py globs upb/**/*.c — remove git-only directories that the
+      # sdist doesn't ship (they reference generated headers that don't exist).
+      rm -rf upb/bazel upb/cmake upb/conformance upb/io upb/json \
+             upb/test upb/reflection/cmake upb/reflection/stage0 \
+             upb/wire/decode_fast upb/wire/test_util
+
+  # The upstream code enables aarch64-specific optimizations, which later will segfault in our tests
+  # because illegal CPU instructions are being used. I guess this is because different arm64 instructions extensions are
+  # embedded in the code compared to what most arm64 CPU could run.
+  # Disable the arm64-optimized ASM, and hope the non-optimized version can run just fine and not cause other problems.
+  # Before this change, functions call would be:
+  #   encode_varint() --> encode_longvarint_arm64()
+  # After this change, it would be:
+  #   encode_varint() --> encode_longvarint()
+  - if: ${{build.arch}} == "aarch64"
+    name: Disable aarch64 ASM optimizations
     runs: |
-      # glob for latest installed Python
-      py=$(ls -1 /usr/bin/python3.[0-9][0-9] | sort -V | tail -1)
-
-      # Provide python3 in path
-      # The bazel system_python extension probes for python3
-      tmpd=$(mktemp -d)
-      ln -s "$py" "$tmpd/python3"
-
-      # Build sdist
-      env PATH="$tmpd:$PATH" \
-          bazel build --jobs=$(nproc) \
-            --experimental_repository_downloader_retries=3 \
-            //python/dist:source_wheel
-      bazel shutdown
-
-      # Extract sdist
-      mkdir sdist
-      tar -C sdist -xzf bazel-bin/python/dist/protobuf-*.tar.gz --strip-components=1
+      find . -type f \( -name "*.c" -o -name "*.h" \) | xargs grep -l 'UPB_ARM64_ASM' | xargs sed -i 's/#define UPB_ARM64_ASM 1/#define UPB_ARM64_ASM 0/g'
 
 subpackages:
   - range: py-versions
@@ -86,21 +86,7 @@ subpackages:
       provides:
         - py3-${{vars.pypi-package}}
     pipeline:
-      # The upstream code enables aarch64-specific optimizations, which later will segfault in our tests
-      # because illegal CPU instructions are being used. I guess this is because different arm64 instructions extensions are
-      # embedded in the code compared to what most arm64 CPU could run.
-      # Disable the arm64-optimized ASM, and hope the non-optimized version can run just fine and not cause other problems.
-      # Before this change, functions call would be:
-      #   encode_varint() --> encode_longvarint_arm64()
-      # After this change, it would be:
-      #   encode_varint() --> encode_longvarint()
-      - if: ${{build.arch}} == "aarch64"
-        name: Disable aarch64 ASM optimizations
-        working-directory: sdist
-        runs: |
-          find . -type f -name "*.c" -o -name "*.h" | xargs sed -i 's/#ifdef UPB_ARM64_ASM/#if 0/g'
       - uses: py/pip-build-install
-        working-directory: sdist
         with:
           python: python${{range.key}}
       - uses: strip
@@ -110,18 +96,16 @@ subpackages:
         - uses: python/import
           with:
             python: python${{range.key}}
-            imports: |
-              import ${{vars.import}}
-              from google.protobuf import descriptor_pool, timestamp_pb2
+            import: ${{vars.import}}
 
   - name: py3-supported-${{vars.pypi-package}}
     description: meta package providing ${{vars.pypi-package}} for supported python versions.
     dependencies:
       runtime:
-        - py3.10-${{vars.pypi-package}}=${{package.full-version}}
-        - py3.11-${{vars.pypi-package}}=${{package.full-version}}
-        - py3.12-${{vars.pypi-package}}=${{package.full-version}}
-        - py3.13-${{vars.pypi-package}}=${{package.full-version}}
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
     test:
       pipeline:
         - uses: test/metapackage
@@ -130,9 +114,7 @@ test:
   pipeline:
     - uses: python/import
       with:
-        imports: |
-          import ${{vars.import}}
-          from google.protobuf import descriptor_pool, timestamp_pb2
+        import: ${{vars.import}}
 
 update:
   enabled: true

@@ -1,7 +1,7 @@
 package:
   name: emissary
   version: "3.10.0"
-  epoch: 30 # GHSA-mh2q-q3fh-2475
+  epoch: 28 # GHSA-pc3f-x583-g7j2
   description: "open source Kubernetes-native API gateway for microservices built on the Envoy Proxy"
   copyright:
     - license: Apache-2.0
@@ -19,7 +19,15 @@ package:
 
 vars:
   py-pkg: ambassador
-  py-version: "3.14"
+  py-version: "3.13"
+
+data:
+  - name: py-versions
+    items:
+      3.10: "310"
+      3.11: "311"
+      3.12: "312"
+      3.13: "313"
 
 environment:
   contents:
@@ -29,7 +37,6 @@ environment:
       - libcap-utils
       - py3-supported-pip
       - rust
-      - uv
   accounts:
     # Need to run with privilege to be able to do setcap
     run-as: root
@@ -58,7 +65,6 @@ pipeline:
         k8s.io/kubernetes@v1.32.10
         google.golang.org/grpc@v1.79.3
         github.com/moby/spdystream@v0.5.1
-        go.opentelemetry.io/otel@v1.41.0
 
   - uses: go/build
     with:
@@ -80,16 +86,21 @@ pipeline:
       packages: ./cmd/kubestatus
       output: kubestatus
 
-  - uses: auth/uv
-    with:
-      allow-fallback-indexes: true
-
 subpackages:
-  - name: py${{vars.py-version}}-${{vars.py-pkg}}
-    description: python${{vars.py-version}} version of emissary
+  - range: py-versions
+    name: py${{range.key}}-${{vars.py-pkg}}
+    description: python${{range.key}} version of emissary
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.py-pkg}}
     pipeline:
       - name: "Install dependencies"
         runs: |
+          # Recommendation is to use the host pip instead of using venv.
+          # Pip will complain about being run as root - this disables that warning.
+          export PIP_ROOT_USER_ACTION=ignore
+
           # durationpy 0.5 fails to install with modern setuptools
           sed -i 's/durationpy==0.5/durationpy==0.6/' python/requirements.txt
           # CVE-2025-47278
@@ -103,31 +114,44 @@ subpackages:
           # requirements.txt file and it will fail if they don't match.
           sed -i 's/setuptools==75.8.2/setuptools==80.10.2/' python/requirements.txt
 
-          # Install to target dir using uv pip (sources from Chainguard Libraries via auth/uv).
-          # Note: ambassador is only consumed by the emissary image itself — no other
-          # package depends on it — so installing to site-packages without a venv is safe.
-          uv pip install --no-cache --python python${{vars.py-version}} --prefix=${{targets.contextdir}}/usr -r python/requirements.txt
-          chmod 644 ${{targets.contextdir}}/usr/.lock
+          # Install to target dir.
+          # Ignore installed packages, since this looks at the builder host packages, when we're trying to install
+          # the necessary packages into the target directory.
+          python${{range.key}} -m pip install --no-cache-dir --ignore-installed --prefix=/usr --root=${{targets.contextdir}} -r python/requirements.txt
+      - name: "Bump dependencies"
+        runs: |
+          # We're not 100% sure why this is necessary, but it seems to be needed to point pip -U at the right location for package upgrades.
+          export PYTHONPATH=${{targets.contextdir}}/usr/lib/python${{range.key}}/site-packages
+
+          # The command above won't actually install setuptools (we think because it's already installed on the host at a higher version).
+          # We need --ignore-installed in order to force the installation of setuptools. Without it, pip only installs it for 1 version of python.
+          # I don't know why this is necessary, but it is (if we figure out a better way to do this, we should).
+          #
+          # We can't use --ignore-installed for the list above, because it won't remove the old versions of the packages and the scanners will
+          # complain about the old versions being present.
+          # Running rm -rf existing setuptools first is a workaround for this.
+          rm -rf ${{targets.contextdir}}/usr/lib/python${{range.key}}/site-packages/setuptools*
+          python${{range.key}} -m pip install --no-cache-dir --prefix=/usr --root=${{targets.contextdir}} --ignore-installed --upgrade setuptools==80.10.2
       - runs: |
           # Generate version file - this static file is read by programs to provide version information in logs.
           # See https://github.com/emissary-ingress/emissary/blob/ac2dc64c6621cd8ec5617f3328544364bdd3fb01/python/ambassador/VERSION.py#L26
           make python/ambassador.version
-          cp -p python/ambassador.version ${{targets.contextdir}}/usr/lib/python${{vars.py-version}}/site-packages
+          cp -p python/ambassador.version ${{targets.contextdir}}/usr/lib/python${{range.key}}/site-packages
 
           # Install Emissary Python package
           cd python
-          python${{vars.py-version}} setup.py install --prefix=/usr --root="${{targets.contextdir}}"
+          python${{range.key}} setup.py install --prefix=/usr --root="${{targets.contextdir}}"
 
           # Install templates - this is not a python package, so it's not installed by the steps above.
           # This contains a set of HTML templates used by the Python code, but is read relative to the module.
           # See https://github.com/emissary-ingress/emissary/blob/ac2dc64c6621cd8ec5617f3328544364bdd3fb01/python/ambassador_diag/diagd.py#L603
-          cp -a templates ${{targets.contextdir}}/usr/lib/python${{vars.py-version}}/site-packages/templates
+          cp -a templates ${{targets.contextdir}}/usr/lib/python${{range.key}}/site-packages/templates
       - uses: strip
     test:
       pipeline:
         - uses: python/import
           with:
-            python: python${{vars.py-version}}
+            python: python${{range.key}}
             imports: from ambassador import Version
         - uses: test/tw/ldd-check
 

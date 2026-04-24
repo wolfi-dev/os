@@ -1,7 +1,7 @@
 package:
   name: az
   version: "2.85.0"
-  epoch: 1
+  epoch: 2
   description: Azure CLI
   copyright:
     - license: MIT
@@ -19,7 +19,7 @@ package:
 
 vars:
   python-version: "3.13"
-  venv-path: /opt/chainguard/az
+  venv-home: /opt/chainguard/az
 
 environment:
   contents:
@@ -42,37 +42,53 @@ pipeline:
     with:
       allow-fallback-indexes: true
 
-  - runs: |
-      uv venv "${{vars.venv-path}}" --python python${{vars.python-version}} --system-site-packages
+  # --system-site-packages lets the venv fall through to the system
+  # py${{vars.python-version}}-cryptography (FIPS-aware) instead of bundling
+  # its own OpenSSL-linked cryptography wheel.
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv-home}}
+      python: ${{vars.python-version}}
+      system-site-packages: "true"
 
-      # Exclude cryptography from pip install to avoid bundling OpenSSL
+  - runs: |
+      source "${{vars.venv-home}}/bin/activate"
+
+      # Exclude cryptography from pip install to avoid bundling OpenSSL;
+      # the system py${{vars.python-version}}-cryptography is used via
+      # --system-site-packages instead.
       echo "cryptography" > /tmp/exclude-pkgs.txt
 
       # Install azure-cli from the index (Chainguard Libraries) instead of
       # building from source, so the package is verified and tracked.
       # --prerelease=allow needed because azure-cli depends on pre-release
       # packages (e.g. azure-batch==15.0.0b1, azure-mgmt-containerregistry==15.1.0b1)
-      uv pip install --python "${{vars.venv-path}}/bin/python" \
+      uv pip install \
         --excludes /tmp/exclude-pkgs.txt --no-compile --prerelease=allow \
         "azure-cli==${{package.version}}"
 
       # Verify the installed version matches (both CLI output and pip metadata)
-      "${{vars.venv-path}}/bin/az" version -o tsv | grep -F "${{package.version}}"
-      "${{vars.venv-path}}/bin/python" -c "
+      "${{vars.venv-home}}/bin/az" version -o tsv | grep -F "${{package.version}}"
+      "${{vars.venv-home}}/bin/python" -c "
       from importlib.metadata import version, packages_distributions
       v = version('azure-cli')
       assert v == '${{package.version}}', f'Expected azure-cli==${{package.version}}, got {v}'
       print(f'azure-cli=={v} installed correctly')
       "
 
-      # Move venv into package output (cp -a to include hidden files like .lock)
-      mkdir -p "${{targets.destdir}}/opt/chainguard"
-      cp -a "${{vars.venv-path}}" "${{targets.destdir}}/opt/chainguard/"
-      chmod 644 "${{targets.destdir}}${{vars.venv-path}}/.lock"
+      # NOTE: do NOT add `uv pip check` here — it cannot see packages from
+      # --system-site-packages and would falsely report cryptography as missing.
+      uv pip uninstall pip virtualenv
+
+      # Move venv into package output (uv/venv created it at the runtime path
+      # so shebangs already point at the right location).
+      mkdir -p "${{targets.contextdir}}/opt/chainguard"
+      mv "${{vars.venv-home}}" "${{targets.contextdir}}${{vars.venv-home}}"
+      chmod 644 "${{targets.contextdir}}${{vars.venv-home}}/.lock"
 
       # Symlink az command to PATH
-      mkdir -p "${{targets.destdir}}/usr/bin"
-      ln -sf "${{vars.venv-path}}/bin/az" "${{targets.destdir}}/usr/bin/az"
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/az" "${{targets.contextdir}}/usr/bin/az"
 
   - uses: strip
 
@@ -86,7 +102,7 @@ test:
   pipeline:
     - uses: test/tw/pip-check
       with:
-        python: /opt/chainguard/az/bin/python
+        python: ${{vars.venv-home}}/bin/python
     - uses: test/tw/help-check
       with:
         bins: az
@@ -95,7 +111,7 @@ test:
         set -euo pipefail
 
         # Verify pip metadata version matches package version
-        INSTALLED=$("${{vars.venv-path}}/bin/python" -c "from importlib.metadata import version; print(version('azure-cli'))")
+        INSTALLED=$("${{vars.venv-home}}/bin/python" -c "from importlib.metadata import version; print(version('azure-cli'))")
         if [ "$INSTALLED" != "${{package.version}}" ]; then
           echo "FAIL: Expected azure-cli==${{package.version}}, got $INSTALLED"
           exit 1
@@ -106,7 +122,7 @@ test:
         az version -o json | grep -F "${{package.version}}"
 
         # Check if the package has a Chainguard Libraries SBOM (provenance indicator)
-        DIST_DIR="$("${{vars.venv-path}}/bin/python" -c "
+        DIST_DIR="$("${{vars.venv-home}}/bin/python" -c "
         from importlib.metadata import distribution
         print(distribution('azure-cli')._path)
         ")"

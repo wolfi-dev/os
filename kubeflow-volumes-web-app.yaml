@@ -1,23 +1,24 @@
 package:
   name: kubeflow-volumes-web-app
   version: "1.10.0"
-  epoch: 16 # GHSA-p423-j2cm-9vmq
+  epoch: 17 # application package venv conversion
   description: Kubeflow volumes web app component
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
       - bash
-      - py${{vars.py-version}}-gunicorn
-      - py${{vars.py-version}}-gunicorn-bin
-      - py${{vars.py-version}}-setuptools
-      - python-${{vars.py-version}}
+      - python-${{vars.py-version}}-base
+  options:
+    no-depends: true
+    no-provides: true
   resources:
     cpu: "3"
     memory: 10Gi
 
 vars:
   py-version: "3.13"
+  venv-home: /opt/chainguard/kubeflow-volumes-web-app
 
 environment:
   contents:
@@ -26,18 +27,20 @@ environment:
       - busybox
       - ca-certificates-bundle
       - node-gyp
-      - nodejs-16
+      - nodejs
       - npm
       - openssl
       - openssl-provider-legacy
-      - py${{vars.py-version}}-pip
-      - py${{vars.py-version}}-setuptools
-      - py${{vars.py-version}}-wheel
       - python-${{vars.py-version}}
       - python3-dev
+      - uv
       - wolfi-base
 
 pipeline:
+  - uses: auth/uv
+    with:
+      allow-fallback-indexes: true
+
   - uses: git-checkout
     with:
       repository: https://github.com/kubeflow/kubeflow
@@ -48,26 +51,33 @@ pipeline:
     with:
       patches: upgrade-urllib3.patch upgrade-jinja2.patch
 
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv-home}}
+      python: ${{vars.py-version}}
+
   - runs: |
-      # Build the backend common libs into a wheel
+      # Install the common backend library from local source
       cd components/crud-web-apps/common/backend
       # Remove the version requirement on gevent. This was introduced in this PR: https://github.com/kubeflow/kubeflow/pull/7231/files
       # The dependency was pinned due to a build issue on ppc64le: https://github.com/kubeflow/kubeflow/issues/7226
       sed -i -E 's/gevent[^"]+/gevent/g' setup.py
-      python3 setup.py bdist_wheel
-      pip3 install . --prefix=/usr --root="${{targets.destdir}}"
+      # Build the wheel first so uv can install it as a binary (--only-binary :all: blocks local path installs)
+      uv build --wheel --out-dir dist .
+      source "${{vars.venv-home}}/bin/activate"
+      uv pip install --only-binary :all: dist/*.whl
 
-      # Upgrade requests to fix GHSA-9hjg-9r4m-mvj7
-      pip3 install --upgrade "requests>=2.32.4" --prefix=/usr --root="${{targets.destdir}}"
+      # Install remaining deps with minimum versions for CVE fixes
+      uv pip install --only-binary :all: \
+        "requests>=2.32.4" \
+        "urllib3>=2.6.3" \
+        "werkzeug>=3.1.5" \
+        "pyasn1>=0.6.3" \
+        gunicorn \
+        setuptools
 
-      # Upgrade urllib3 to fix GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53, GHSA-38jv-5279-wg99
-      pip3 install --upgrade "urllib3>=2.6.3" --prefix=/usr --root="${{targets.destdir}}"
-
-      # Upgrade werkzeug to fix GHSA-87hc-h4r5-73f7
-      pip3 install --upgrade "werkzeug>=3.1.5" --prefix=/usr --root="${{targets.destdir}}"
-
-      # Remediate GHSA-jr27-m4p2-rc6r
-      pip3 install --upgrade "pyasn1>=0.6.3" --prefix=/usr --root="${{targets.destdir}}"
+      uv pip uninstall pip virtualenv
+      uv pip check
 
       # Build the frontend common packages
       cd ../frontend/kubeflow-common-lib
@@ -83,15 +93,24 @@ pipeline:
       export NODE_OPTIONS=--openssl-legacy-provider
       npm run build -- --output-path=./dist/default --configuration=production
 
-      # Now move it all into place
-      mkdir -p "${{targets.destdir}}/usr/share/kubeflow-volumes-web-app/"
+      # Place app code inside the venv directory
+      mkdir -p "${{vars.venv-home}}/app"
+      mv ../backend/apps "${{vars.venv-home}}/app/"
+      mv ../backend/entrypoint.py "${{vars.venv-home}}/app/"
+      mv ../frontend/dist/default "${{vars.venv-home}}/app/apps/default/static"
 
-      # Move the backend
-      mv ../backend/apps "${{targets.destdir}}/usr/share/kubeflow-volumes-web-app/"
-      mv ../backend/entrypoint.py "${{targets.destdir}}/usr/share/kubeflow-volumes-web-app/"
+      # Stage venv to contextdir
+      mkdir -p "${{targets.contextdir}}/opt/chainguard"
+      mv "${{vars.venv-home}}" "${{targets.contextdir}}${{vars.venv-home}}"
+      chmod 644 "${{targets.contextdir}}${{vars.venv-home}}/.lock"
 
-      # Move the frontend
-      mv ../frontend/dist/default "${{targets.destdir}}/usr/share/kubeflow-volumes-web-app/apps/default/static"
+      # Compat symlink so image entrypoints using /usr/share/kubeflow-volumes-web-app still work
+      mkdir -p "${{targets.contextdir}}/usr/share"
+      ln -sf "${{vars.venv-home}}/app" "${{targets.contextdir}}/usr/share/kubeflow-volumes-web-app"
+
+      # Symlink gunicorn to PATH
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/gunicorn" "${{targets.contextdir}}/usr/bin/gunicorn"
 
   - uses: strip
 
@@ -107,13 +126,11 @@ update:
 test:
   pipeline:
     - runs: |
-        # Verify the kubeflow-volumes-web-app package files are installed
-        test -f /usr/share/kubeflow-volumes-web-app/entrypoint.py
-        test -d /usr/share/kubeflow-volumes-web-app/apps
-        python3 -m py_compile /usr/share/kubeflow-volumes-web-app/entrypoint.py
-        flask --version
-        flask --help
-        normalizer --version
-        normalizer --help
-        wsdump --help
+        test -f ${{vars.venv-home}}/app/entrypoint.py
+        test -d ${{vars.venv-home}}/app/apps
+        ${{vars.venv-home}}/bin/python -m py_compile ${{vars.venv-home}}/app/entrypoint.py
+        gunicorn --version
+    - uses: test/tw/pip-check
+      with:
+        python: ${{vars.venv-home}}/bin/python
     - uses: test/tw/ldd-check

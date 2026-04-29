@@ -1,12 +1,12 @@
 package:
   name: cilium-1.19
   version: "1.19.3"
-  epoch: 3 # GHSA-mh2q-q3fh-2475
+  epoch: 4 # merge cilium-envoy-1.19 as a subpackage; lockstep agent + envoy
   description: Cilium is a networking, observability, and security solution with an eBPF-based dataplane
   copyright:
     - license: Apache-2.0
   resources:
-    cpu: 20
+    cpu: "63"
     memory: 64Gi
   dependencies:
     runtime:
@@ -23,29 +23,39 @@ package:
     provides:
       - cilium=${{package.full-version}}
 
+capabilities:
+  add:
+    - CAP_NET_ADMIN
+    - CAP_SYS_ADMIN
+    - CAP_BPF
+
 environment:
   contents:
     packages:
       - bash
-      - bazel-6
+      - bazel-7
       - binutils
       - build-base
       - busybox
       - ca-certificates-bundle
-      - clang-19
+      - clang-18
       - cmake
       - coreutils # for GNU install
       - git
-      - go
+      - glibc-locale-en
+      - go-1.25
       - grep
       - isl-dev
-      - libcxx1-19-dev
       - libtool
-      - lld-19
-      - lld-19-dev
-      - llvm-19-dev
+      - linux-headers
+      - llvm-18
+      - llvm-18-dev
+      - llvm-libcxx-18
+      - llvm-libcxx-18-dev
+      - llvm-libcxxabi-18
+      - llvm-lld-18~18
       - mpc-dev
-      - openjdk-11
+      - openjdk-25
       - patch
       - python3-dev
       - samurai
@@ -83,6 +93,179 @@ pipeline:
       DESTDIR=${{targets.destdir}} DISABLE_ENVOY_INSTALLATION=1 make install-container
 
 subpackages:
+  - name: ${{package.name}}-envoy
+    description: Envoy proxy with cilium plugins (lockstep with cilium-1.19)
+    dependencies:
+      provides:
+        - cilium-envoy=${{package.full-version}}
+        - cilium-envoy-1.19=${{package.full-version}}
+    pipeline:
+      - name: Build cilium-envoy at the proxy commit pinned by this cilium tag
+        runs: |
+          set -euo pipefail
+
+          # Single source of truth: the cilium tag's images/cilium/Dockerfile
+          # pins the exact cilium/proxy commit via ARG CILIUM_ENVOY_IMAGE.
+          # Reading it here guarantees the envoy we build always matches the
+          # cilium agent built in the main pipeline above.
+          ENVOY_SHA=$(grep 'ARG.*cilium-envoy' images/cilium/Dockerfile \
+            | sed 's/^ARG.*:v[0-9.]\+-[0-9]\+-//g' | cut -d@ -f1)
+          if ! echo "$ENVOY_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "ERROR: Failed to extract a valid envoy SHA, got: $ENVOY_SHA" >&2
+            exit 1
+          fi
+          echo "Building cilium-envoy at cilium/proxy@${ENVOY_SHA}"
+
+          # Fetch cilium/proxy at exactly that commit. We avoid the
+          # git-checkout pipeline step here because the SHA is computed
+          # dynamically from the cilium tag — using shell git keeps the
+          # extraction and the fetch atomic, with no second pin to maintain.
+          mkdir /home/build/proxy
+          cd /home/build/proxy
+          git init -q
+          git remote add origin https://github.com/cilium/proxy
+          git fetch --depth 1 origin "$ENVOY_SHA"
+          git checkout --detach FETCH_HEAD
+          [ "$(git rev-parse HEAD)" = "$ENVOY_SHA" ] || { echo "checkout drift"; exit 1; }
+
+          # Bazel errors out on toolchain stanza and on go point releases
+          sed -i '/$toolchain /d' go.mod
+          sed -i 's|^\(go 1\.[0-9]*\)\.[0-9]*|\1|' go.mod
+
+          # Build proxylib (libcilium.so)
+          (cd ./proxylib && make)
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          cp -v proxylib/libcilium.so ${{targets.subpkgdir}}/usr/lib/libcilium.so
+
+          # WORKSPACE patches matching the standalone cilium-envoy-1.19 build
+          sed -i 's/envoy_dependencies_extra()/envoy_dependencies_extra(ignore_root_user_error=True)/g' WORKSPACE
+          sed 's/register_toolchains/#register_toolchains/g' -i WORKSPACE
+          ln -sf /usr/bin/llvm-ar /usr/bin/llvm-ar-18
+          ln -sf /usr/bin/lld /usr/bin/ld.lld-18
+          ln -sf /usr/bin/lld /usr/lib/llvm-18/bin/ld.lld-18
+
+          export JAVA_HOME=/usr/lib/jvm/java-25-openjdk
+          export CARGO_BAZEL_REPIN=true
+          mkdir -p .cache/bazel/_bazel_root
+
+          echo "build --config=libc++"               >> user.bazelrc
+          echo "build --action_env=CC=clang"         >> user.bazelrc
+          echo "build --action_env=CXX=clang++"      >> user.bazelrc
+          # envoy's dynamic_modules/abi.h includes <cstdbool> which GCC 15 marks as deprecated
+          # in C++17 via #warning. Demote that warning-as-error for this directory only until
+          # upstream removes the redundant include (bool is a C++ builtin since C++98).
+          # Upstream issue: https://github.com/envoyproxy/envoy/blob/v1.35.9/source/extensions/dynamic_modules/abi.h
+          echo 'build --per_file_copt=dynamic_modules:@-Wno-error=#warnings' >> user.bazelrc
+
+          ./bazel/setup_clang.sh /usr
+
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+
+          bazel build --fission=no --config=clang \
+            --discard_analysis_cache \
+            --nokeep_state_after_build \
+            --notrack_incremental_state \
+            --conlyopt="-Wno-strict-prototypes" \
+            `# The thread-safety analysis flagged some issue in upstream code` \
+            --cxxopt="-Wno-thread-safety" \
+            --action_env=CC=clang \
+            --action_env=CXX=clang++ \
+            --verbose_failures -c opt //:cilium-envoy-starter
+          install -m 755 bazel-bin/cilium-envoy-starter ${{targets.subpkgdir}}/usr/bin/cilium-envoy-starter
+
+          bazel build --fission=no --config=clang \
+            --discard_analysis_cache \
+            --nokeep_state_after_build \
+            --notrack_incremental_state \
+            --conlyopt="-Wno-strict-prototypes" \
+            `# The thread-safety analysis flagged some issue in upstream code` \
+            --cxxopt="-Wno-thread-safety" \
+            --action_env=LIBURING_CFLAGS="-ftrivial-auto-var-init=uninitialized" \
+            --action_env=CC=clang \
+            --action_env=CXX=clang++ \
+            --verbose_failures -c opt //:cilium-envoy
+          install -m 755 bazel-bin/cilium-envoy ${{targets.subpkgdir}}/usr/bin/cilium-envoy
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - bash
+            - curl
+            - netcat-openbsd
+            - procps
+            - jq
+      pipeline:
+        - name: "Verify binary installation"
+          runs: |
+            cilium-envoy --version
+            cilium-envoy --help
+            cilium-envoy-starter --version
+            cilium-envoy-starter --help
+        - name: "Verify libcilium.so installation"
+          runs: |
+            test -f /usr/lib/libcilium.so
+            ldd /usr/lib/libcilium.so
+        - uses: test/tw/ldd-check
+          with:
+            files: "/usr/bin/cilium-envoy /usr/bin/cilium-envoy-starter /usr/lib/libcilium.so"
+            verbose: true
+        - name: "Test Envoy admin interface startup"
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              #!/bin/sh -e
+              cat > /tmp/minimal.yaml <<EOF
+              admin:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 9901
+              static_resources:
+                listeners: []
+                clusters: []
+              EOF
+            start: cilium-envoy --config-path /tmp/minimal.yaml --admin-address-path /tmp/admin.txt
+            timeout: 30
+            expected_output: |
+              starting main dispatch loop
+              all dependencies initialized
+            post: |
+              set -euo pipefail
+              ADMIN_ADDR=$(cat /tmp/admin.txt)
+              curl -s "http://${ADMIN_ADDR}/server_info" | jq . || exit 1
+              curl -s "http://${ADMIN_ADDR}/stats" | grep envoy || exit 1
+              curl -s "http://${ADMIN_ADDR}/clusters" | jq . || exit 1
+        - name: "Test hot restart capability"
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              #!/bin/sh -e
+              cat > /tmp/minimal.yaml <<EOF
+              admin:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 9901
+              static_resources:
+                listeners: []
+                clusters: []
+              EOF
+            start: cilium-envoy --config-path /tmp/minimal.yaml --restart-epoch 0
+            timeout: 30
+            expected_output: |
+              starting main dispatch loop
+              all dependencies initialized
+            post: |
+              #!/bin/sh -e
+              first_pid=$(pgrep -f "restart-epoch 0")
+              cilium-envoy --config-path /tmp/minimal.yaml --restart-epoch 1 > /dev/null 2>&1 &
+              sleep 2
+              if ! ps -p $first_pid > /dev/null; then
+                echo "Original Envoy process not found"
+                exit 1
+              fi
+
   - name: ${{package.name}}-container-init
     description: init scripts for cilium
     dependencies:

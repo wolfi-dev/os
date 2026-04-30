@@ -1,13 +1,20 @@
 package:
   name: vcluster
   version: "0.34.0"
-  epoch: 0 # GHSA-pc3f-x583-g7j2
+  epoch: 1
   description: Create fully functional virtual Kubernetes clusters
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
-      - helm~3 # vcluster shells out to helm for cli based installations
+      # vcluster shells out to `helm` for chart-driven installs and runtime-
+      # checks `MinHelmVersion = "v3.10.0"` (see
+      # pkg/util/clihelper/clihelper.go). Upstream sets only a minimum; the
+      # drift check below fails if upstream raises the minimum past v3, at
+      # which point this dep needs to be revisited.
+      - helm~3
+      - tzdata
+      - zstd
   resources:
     cpu: "2"
     memory: 8Gi
@@ -16,7 +23,6 @@ environment:
   contents:
     packages:
       - curl
-      - go-1.25
       - helm~3
       - jq
       - zip
@@ -27,6 +33,14 @@ pipeline:
       repository: https://github.com/loft-sh/vcluster
       tag: v${{package.version}}
       expected-commit: bb9e88b0a9e45c68d744eebe6bde5c4664cdb676
+
+  # Drift check: catch the day upstream raises MinHelmVersion past v3.
+  # Fails loudly so the dep can be re-evaluated rather than silently
+  # shipping a broken package.
+  - name: Verify upstream Helm minimum-version constraint has not drifted off v3
+    runs: |
+      set -euo pipefail
+      grep -qE '^const MinHelmVersion = "v3\.' pkg/util/clihelper/clihelper.go
 
   - runs: |
       # Remove e2e test directory that imports the private loft-sh/e2e-framework
@@ -45,7 +59,7 @@ pipeline:
 
   - runs: |
       export RELEASE_VERSION=${{package.version}}
-      go generate -tags embed_charts ./...
+      go generate -tags embed_chart ./...
 
   # Match the naming convention upstream uses, where "vcluster" is actually
   # "syncer", and "vclusterctl" is "vcluster"
@@ -53,13 +67,17 @@ pipeline:
     with:
       packages: ./cmd/vcluster
       output: syncer
-      ldflags: -X=main.version=${{package.version}}
+      ldflags: |
+        -X github.com/loft-sh/vcluster/pkg/telemetry.SyncerVersion=${{package.version}}
 
   - uses: go/build
     with:
       packages: ./cmd/vclusterctl
       output: vcluster
-      ldflags: -X=main.version=${{package.version}}
+      tags: embed_chart
+      ldflags: |
+        -X main.version=${{package.version}}
+        -X github.com/loft-sh/vcluster/pkg/telemetry.SyncerVersion=${{package.version}}
 
 subpackages:
   - name: ${{package.name}}-syncer
@@ -105,11 +123,16 @@ test:
         bins: |
           vcluster
           syncer
+    # `vcluster create` runs the helm install quickly, then blocks waiting
+    # for vcluster pods to come up — that never happens on the kwok virtual
+    # kubelet. Use test/daemon-check-output so we wait on the success log
+    # line rather than sleeping, and so the create process is cleaned up
+    # automatically once `post` finishes.
     - name: Test cluster list
-      runs: |
-        set -euo pipefail
-        # Create won't work on virtual kubelets, but we can at least register for listing
-        vcluster create foo &
-
-        sleep 5
-        vcluster list --output json | jq '. | length' | grep -F 1
+      uses: test/daemon-check-output
+      with:
+        start: vcluster create foo
+        timeout: 60
+        expected_output: Successfully created virtual cluster foo
+        post: |
+          vcluster list --output json | jq '. | length' | grep -F 1

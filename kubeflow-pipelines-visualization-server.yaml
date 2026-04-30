@@ -1,18 +1,18 @@
 package:
   name: kubeflow-pipelines-visualization-server
   version: "2.16.0"
-  epoch: 5 # application package conversion
+  epoch: 4
   description: Machine Learning Pipelines for Kubeflow
   copyright:
     - license: Apache-2.0
-  dependencies:
-    runtime:
-      - python-${{vars.python-version}}
-  options:
-    no-depends: true
-    no-provides: true
   target-architecture:
     - x86_64 # Since tensorflow-data-validation is not available for aarch64 yet
+  dependencies:
+    runtime:
+      - py${{vars.python-version}}-google-cloud-sdk
+      - py${{vars.python-version}}-packaging
+      - py${{vars.python-version}}-typing-extensions
+      - python-${{vars.python-version}}
 
 vars:
   python-version: 3.11
@@ -22,15 +22,12 @@ environment:
     packages:
       - build-base
       - ca-certificates-bundle
-      - openssl-dev
       - py${{vars.python-version}}-build-base-dev
-      - uv
+      - py${{vars.python-version}}-crcmod
+      - py${{vars.python-version}}-pip
+      - py${{vars.python-version}}-pip-tools-bin
 
 pipeline:
-  - uses: auth/uv
-    with:
-      allow-fallback-indexes: true
-
   - uses: git-checkout
     with:
       repository: https://github.com/kubeflow/pipelines
@@ -40,31 +37,31 @@ pipeline:
   - runs: |
       mkdir -p ${{targets.destdir}}/usr/share/app
       cp -r backend/src/apiserver/visualization/* ${{targets.destdir}}/usr/share/app/
+      cd ${{targets.destdir}}/usr/share/app/
 
-      # Install from upstream requirements.txt
-      uv pip install --python python${{vars.python-version}} \
-        -r backend/src/apiserver/visualization/requirements.txt \
-        --prefix=${{targets.destdir}}/usr
+      # pip-tools is not compatible with pip 25.3
+      pip install -U 'pip!=25.3'
 
-      # CVE fixes on top of upstream pins
-      uv pip install --python python${{vars.python-version}} \
-        "pyarrow-hotfix==0.*" \
-        "urllib3>=2.6.3" \
-        "aiohttp>=3.13.4" \
-        "cryptography>=46.0.7" \
-        "requests>=2.33.0" \
-        "tornado>=6.5.5" \
-        "nbconvert>=7.17.1" \
-        "pygments>=2.20.0" \
-        --prefix=${{targets.destdir}}/usr
+      # Reset and regenerate requirements.txt from our modified-requirements.in
+      # Necessary to properly (and more easily) patch CVEs and resolve build failures
+      rm requirements.txt
+      pip-compile --output-file=requirements.txt --resolver=backtracking /home/build/modified-requirements.in
 
-      # uv creates a world-writable .lock file with --prefix; fix permissions
-      chmod 644 ${{targets.destdir}}/usr/.lock
+      # To avoid file collisions during test/install time, list all Python packages that are already installed by system apks,
+      # and filter requirements.txt to remove any packages that are already present.
 
-      # Ensure we use the hotfix (see requirements)
-      sed -i '1 i\import pyarrow_hotfix' ${{targets.destdir}}/usr/share/app/server.py
+      python3.11 -c "import importlib.metadata; print('\n'.join(sorted([d.name.replace('_', '-').lower() for d in importlib.metadata.distributions()])))" > /tmp/python-installed.txt
+      grep -vFf /tmp/python-installed.txt requirements.txt > requirements.filtered.txt
+      mv requirements.filtered.txt requirements.txt
 
+      # May be helpful in debugging transitive dependency changes
+      cat requirements.txt
+
+      pip install --root=${{targets.destdir}} --prefix=/usr --root-user-action ignore -r requirements.txt
       find ${{targets.destdir}} -name "*.pyc" -exec rm -rf '{}' +
+
+      # Ensure we use the hotfix (see modified-requirements.in)
+      sed -i '1 i\import pyarrow_hotfix' server.py
 
   - uses: strip
 
@@ -81,13 +78,13 @@ test:
       packages:
         - curl
         - bash
-        - python-${{vars.python-version}}
+        - py${{vars.python-version}}-typing-extensions
   pipeline:
     - runs: |
         #!/bin/bash
         set -x
 
-        # start the server using the same entrypoint as the container image
+        # start the server
         export HOME=/usr/share/app
         cd $HOME
         /usr/bin/python server.py > /dev/null 2>&1 &
@@ -97,11 +94,13 @@ test:
 
         BASE_URL="http://localhost:8888"
 
+        # Function to print error message and exit on failure
         exit_on_failure() {
-          echo "$1"
-          exit 1
+          echo "$1" # Print error message
+          exit 1    # Exit with error status
         }
 
+        # Function to perform a curl request and check the expected status
         do_test() {
           local url=$1
           local method=$2
@@ -173,3 +172,7 @@ test:
         pyrsa-priv2pub --help
         pyrsa-sign --help
         pyrsa-verify --help
+        tf_upgrade_v2 --help
+        tflite_convert --help
+        toco --help
+        toco_from_protos --help

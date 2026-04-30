@@ -2,35 +2,34 @@
 package:
   name: confluent-docker-utils
   version: "0.0.169"
-  epoch: 3
+  epoch: 2
   description: This package provides Docker Utility Belt (dub) and Confluent Platform Utility Belt (cub).
   copyright:
     - license: Apache-2.0
   options:
-    no-provides: true
+    no-depends: true
+  dependencies:
+    runtime:
+      - py${{vars.python-version}}-jmespath-bin
+      - py${{vars.python-version}}-setuptools # To fix `No module named 'distutils'`
 
 vars:
   # This will compile with py3.13, however tests will fail with errors:
   # 'ModuleNotFoundError: No module named 'pipes'
   # - https://github.com/jupyter/nbclassic/issues/308
   # Upstream may have to make some code changes to be compatible with py3.13.
-  python-version: "3.12"
-  venv-home: /opt/chainguard/confluent-docker-utils
+  python-version: 3.12
 
 environment:
   contents:
     packages:
-      - build-base
       - busybox
       - ca-certificates-bundle
-      - python-${{vars.python-version}}-dev
-      - uv
+      - cython
+      - py${{vars.python-version}}-build-base-dev
+      - py${{vars.python-version}}-gpep517
 
 pipeline:
-  - uses: auth/uv
-    with:
-      allow-fallback-indexes: true
-
   - uses: git-checkout
     with:
       expected-commit: c3d240ef6b7daa3432ffc22ec9b72d273cbd8e49
@@ -38,37 +37,35 @@ pipeline:
       tag: v${{package.version}}
 
   - runs: |
+      # urllib3: CVE-2025-50182 GHSA-48p4-8xcf-vxj5, CVE-2025-50181 GHSA-pq67-6m6q-mj2v, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53 GHSA-38jv-5279-wg99
+      echo 'urllib3==2.6.3' >> requirements.txt
       sed -i 's/requests~=2.32.0/requests~=2.33.0/' requirements.txt
 
-  - uses: uv/venv
-    with:
-      venv: ${{vars.venv-home}}
-      python: ${{vars.python-version}}
+  - runs: |
+      python3=python${{vars.python-version}}
+      $python3 -m gpep517 build-wheel \
+        --wheel-dir dist \
+        --output-fd 3 3>&1 >&2
+      $python3 -m installer \
+        -d "${{targets.destdir}}" \
+        dist/*.whl
+      install -Dm644 LICENSE \
+        "${{targets.destdir}}"/usr/share/licenses/${{package.name}}/LICENSE
 
   - runs: |
-      source "${{vars.venv-home}}/bin/activate"
+      python3=python${{vars.python-version}}
+      # `--use-deprecated=legacy-resolver` is used force ignore the dependency check.
+      # `docker-compose` was requiring `PyYAML<6` and also `PyYAML==5.4.1` was causing
+      # `AttributeError: cython_sources` issue.
+      $python3 -m pip install --root=${{targets.destdir}} --prefix=/usr --prefer-binary --use-deprecated=legacy-resolver -r requirements.txt
+      $python3 -m pip install --root=${{targets.destdir}} --prefix=/usr setuptools
+      find ${{targets.destdir}} -name "*.pyc" -exec rm -rf '{}' +
 
-      uv pip install --no-compile -r requirements.txt .
-
-      uv pip check
-
-      chmod 644 "${{vars.venv-home}}/.lock"
-
-      # Stage venv to package
-      mkdir -p "${{targets.contextdir}}/opt/chainguard"
-      cp -a "${{vars.venv-home}}" "${{targets.contextdir}}/opt/chainguard/"
-
-      # Symlink binaries to /usr/bin
-      mkdir -p "${{targets.contextdir}}/usr/bin"
-      for bin in cub dub normalizer; do
-        ln -sf "${{vars.venv-home}}/bin/$bin" "${{targets.contextdir}}/usr/bin/$bin"
-      done
-
-  - uses: uv/bump
-    with:
-      venv: ${{targets.contextdir}}${{vars.venv-home}}
-      packages: |
-        urllib3==2.6.3  # CVE-2025-50182 GHSA-48p4-8xcf-vxj5, CVE-2025-50181 GHSA-pq67-6m6q-mj2v, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53, GHSA-38jv-5279-wg99
+  - runs: |
+      python3=python${{vars.python-version}}
+      _py3ver=$($python3 -c 'import sys; print("{}.{}".format(sys.version_info.major, sys.version_info.minor))')
+      mkdir -p ${{targets.destdir}}/usr/lib/python"$_py3ver"/site-packages/confluent/docker_utils
+      cp -r confluent/docker_utils/* ${{targets.destdir}}/usr/lib/python"$_py3ver"/site-packages/confluent/docker_utils/
 
   - uses: strip
 
@@ -82,13 +79,17 @@ update:
 
 test:
   pipeline:
+    - runs: |
+        cub -h
+        dub -h
+        cub --help
+        dub --help
+        jp.py --help
+        normalizer --version
+        normalizer --help
     - uses: test/tw/ldd-check
-    - uses: test/tw/pip-check
+    - uses: python/import
       with:
-        python: ${{vars.venv-home}}/bin/python
-    - uses: test/tw/help-check
-      with:
-        bins: |
-          cub
-          dub
-          normalizer
+        import: confluent.docker_utils
+    - uses: test/tw/ldd-check
+    - uses: test/no-docs

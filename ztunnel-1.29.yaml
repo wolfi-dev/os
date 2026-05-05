@@ -1,7 +1,7 @@
 package:
   name: ztunnel-1.29
-  version: "1.29.1"
-  epoch: 10 # GHSA-82j2-j2ch-gfr8
+  version: "1.29.2"
+  epoch: 0 # GHSA-82j2-j2ch-gfr8
   description: The `ztunnel` component of istio ambient mesh.
   copyright:
     - license: Apache-2.0
@@ -28,31 +28,14 @@ environment:
       - clang-${{vars.clang-version}}
       - cmake
       - protoc
-      - rust-1.90
+      - rust-${{vars.rust-version}}
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/istio/ztunnel
       tag: ${{package.version}}
-      expected-commit: 61888401e717c9d853eb04bfd002e2808e8af8e4
-
-  - name: Downgrade pingora-pool to 0.4.0
-    runs: |
-      # This is necessary because we need to bump lru to version 0.16,
-      # and pingora-pool comes locked at version 0.6.0, which depends
-      # on lru version 0.14.  While the ideal solution here would be to
-      # bump pingora-pool to version 0.7.0, ztunnel 1.29 doesn't build
-      # with it.  Here's a summary of the situation:
-      #
-      # - pingora-pool 0.7.0 => ztunnel fails to build.
-      # - pingora-pool 0.6.0 => locked to lru 0.14.
-      # - pingora-pool 0.5.0 => likewise.
-      # - pingora-pool 0.4.0 => accepts "lru=0"
-      #
-      # This means that we have to downgrade to pingora-pool 0.4.0 to
-      # be able to upgrade to lru 0.16.
-      cargo add pingora-pool@'=0.4.0'
+      expected-commit: 99b000df4d0f48fc75309aae894cc609ef96fa09
 
   - uses: rust/cargobump
 
@@ -94,15 +77,55 @@ update:
     use-tag: true
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
   pipeline:
+    - name: Version information tests
+      runs: |
+        VERSION_OUTPUT=$(ztunnel version)
+        echo "$VERSION_OUTPUT" | grep "Version"
+        echo "$VERSION_OUTPUT" | grep "BuildStatus"
+        echo "$VERSION_OUTPUT" | grep ${{package.version}}
+    - name: Command structure tests
+      runs: |
+        set -e
+        ztunnel help | grep "Commands:"
+        ztunnel help proxy | grep "Start the ztunnel proxy"
+        ztunnel help version | grep "Print the version"
     - uses: test/tw/ldd-check
-    - uses: test/tw/ver-check
+    - name: Daemon smoke test
+      uses: test/daemon-check-output
       with:
-        bins: ztunnel
-        version: ${{package.version}}
-    - uses: test/tw/help-check
-      with:
-        bins: ztunnel
+        setup: |
+          # Minimal local xDS config so ztunnel doesn't try to reach istiod for workloads.
+          cat > /tmp/xds.yaml <<'EOF'
+          workloads: []
+          policies: []
+          services: []
+          EOF
+        # FAKE_CA is gated behind --features testing and panics in release builds,
+        # so we let ztunnel attempt a real CA dial. It will fail to get certs, but
+        # we only assert that startup gets far enough to log the parsed config.
+        # PROXY_MODE=dedicated avoids the inpod netns operations (CAP_SYS_ADMIN)
+        # that PROXY_MODE=shared requires.
+        start: env LOCAL_XDS_PATH=/tmp/xds.yaml CLUSTER_ID=test-cluster PROXY_MODE=dedicated PROXY_WORKLOAD_INFO=istio-system/default/ztunnel-test POD_NAME=ztunnel-test POD_NAMESPACE=istio-system NODE_NAME=test-node ztunnel proxy
+        expected_output: "running with config"
+        timeout: "30"
+        # ztunnel logs transient ERROR lines while the CA is unreachable; not fatal here.
+        error_strings: ""
+        post: |
+          # Verify all HTTP listeners bind. /healthz/ready on 15021 returns 503
+          # without a CA (state manager pending), so we curl /metrics on the
+          # stats port instead -- it's unconditional and proves the HTTP stack works.
+          wait-for-it localhost:15021 -t 60   # readiness
+          wait-for-it localhost:15020 -t 60   # stats
+          wait-for-it localhost:15000 -t 60   # admin
+          wait-for-it localhost:15053 -t 60   # dns proxy
+          curl -sf -o /dev/null http://localhost:15020/metrics
 
 vars:
   clang-version: 22
+  rust-version: "1.94"

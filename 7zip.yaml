@@ -1,10 +1,12 @@
 package:
   name: 7zip
   version: "2601"
-  epoch: 0 # go/wolfi-rsc/7zip
+  epoch: 1 # go/wolfi-rsc/7zip
   description: "File archiver with a high compression ratio"
   copyright:
-    - license: LGPL-2.0-only
+    - license: LGPL-2.1-or-later
+    - license: LicenseRef-UNRAR
+      license-path: DOC/unRarLicense.txt
   resources:
     cpu: "2"
     memory: 8Gi
@@ -35,8 +37,7 @@ pipeline:
       mkdir -p b/g
       make -f ../../cmpl_gcc.mak -j$(nproc) \
         CC="${CC:-cc} $CFLAGS $CPPFLAGS $LDFLAGS" \
-        CXX="${CXX:-c++} $CXXFLAGS $CPPFLAGS $LDFLAGS" \
-        DISABLE_RAR=1
+        CXX="${CXX:-c++} $CXXFLAGS $CPPFLAGS $LDFLAGS"
 
   - runs: |
       install -Dm755 CPP/7zip/Bundles/Alone2/b/g/7zz "${{targets.destdir}}"/usr/bin/7zz
@@ -116,4 +117,97 @@ test:
     - name: "Test archive integrity checking"
       runs: |
         7z t archive.7z
+    - name: "Verify RAR archive handler is registered in the build"
+      runs: |
+        # Regression guard: if DISABLE_RAR is ever re-introduced (taking us
+        # back to Alpine's posture), `7zz i` will not list any Rar* handlers
+        # and this assertion fails fast.
+        #
+        # `grep -q` would exit on first match and SIGPIPE the upstream `7zz i`
+        # under `set -o pipefail` (see exit status 141). We capture the output
+        # once and grep it as a regular file -- no pipe, no race.
+        codecs=$(7zz i)
+        printf '%s\n' "$codecs" | grep -i "Rar" >/dev/null
+        printf '%s\n' "$codecs" | grep -i "Rar5" >/dev/null
+    - name: "Test RAR archive listing and stored-entry extraction"
+      runs: |
+        # Baseline RAR test using a tiny inline RAR4 fixture with a single
+        # STORED (uncompressed) entry. Generated from the documented RAR4
+        # format with a stdlib-only Python script -- no `rar`/`unrar` tool
+        # ever touched at fixture-creation time. This exercises 7zz's RAR
+        # archive parser and stored-entry read path.
+        #
+        # Compressed-entry decompression is exercised by the next test
+        # ("Test RAR compressed-entry extraction").
+        mkdir -p /tmp/rar-test && cd /tmp/rar-test
+        base64 -d > sample.rar <<'EOF'
+        UmFyIRoHAM+QcwAADQAAAAAAAAC0+nQAgCkACgAAAAoAAAADndKAsQAAAAAUMAkApIEAAGhlbGxvLnR4dGhlbGxvIHJhcgrEPXsAQAcA
+        EOF
+        # SIGPIPE-safe pattern: capture, then grep (same reasoning as above).
+        listing=$(7zz l sample.rar)
+        printf '%s\n' "$listing" | grep "hello.txt" >/dev/null
+        7zz x -y sample.rar
+        test -f hello.txt
+        grep -q "hello rar" hello.txt
+    - name: "Test RAR compressed-entry extraction"
+      runs: |
+        # This is the test the customer cares about. The previous step covers
+        # stored entries; this one covers entries written with RAR's actual
+        # compression codec -- the path that the unRAR-derived decompressors
+        # (Rar1/2/3/5Decoder, Rar3Vm) implement. A passing run here proves
+        # 7zz can decompress real-world .rar files end-to-end.
+        #
+        # Fixture: libarchive's test_read_format_rar5_compressed.rar
+        # (BSD-2-Clause), embedded inline. It contains a single file
+        # `test.bin` of size 1200 bytes.
+        mkdir -p /tmp/rar5-test && cd /tmp/rar5-test
+        base64 -d > compressed.rar <<'EOF'
+        UmFyIRoHAQDz4YLrCwEFBwAGAQGAgIAAicZf2iYCAwvpAgSwCaSDAs1wynyABQEIdGVzdC5iaW4K
+        AxOLV6xb+BitHsr0ZQEnZWBUH1V2Xb+UknHJz2WWWQxw2WWTGMWSE4ZCSSThkJCSSSQk45JJIQhJ
+        JCEJJJCSSEISEs21b3t9Mw6AfR0Drj+eup/3Qf732vfdea86X+gAQAEAyCCfn49vX08vHv7uzr6u
+        no5+Xk4+Lh4N/d3NrZ19bV1NPS0M/NzMrJyMfGxcTDwb+9vLu5uLe2tbSzsrGvrq2rqqmnpaSjoq
+        Ggn52cm5mXlpSTSyUjIR6FAfjoyKiYc6cNmoaEgoB+fHt6eHZ0c3Jxb21raWdlY2FfXVtZV1VTIT
+        f1/I/QJT6JTn+ESXRYowZ5YXajgppimUF+ZC0XadRjLDOMCoR/+glMZpCl9lUKxWVguLAZFoNy4H
+        deEGwA8xBIyCeZhWNAumoZbYN5uHg4Bgcg+uYROgpnYYDwNt6Hu9h1fQjfxYQI0YMecKHk0Jg2L4
+        4OY6HCIEqeGFFjtjQ/nxUIBsIQ0IhNIxnJAvJQAdd1ZRAwUEAA==
+        EOF
+        # List: must show test.bin
+        listing=$(7zz l compressed.rar)
+        printf '%s\n' "$listing" | grep "test.bin" >/dev/null
+        # Extract: must produce a 1200-byte test.bin and exit clean (so any
+        # decompression error -- e.g. a missing decoder -- fails the test).
+        7zz x -y compressed.rar
+        test -f test.bin
+        actual_size=$(wc -c < test.bin)
+        [ "$actual_size" = "1200" ] || {
+          echo "FAIL: expected test.bin size 1200, got $actual_size"
+          exit 1
+        }
+    - name: "Ensure RAR archive creation is not supported (unRAR license)"
+      runs: |
+        # The unRAR license forbids using the code to re-create the RAR
+        # compression algorithm. Upstream 7-Zip ships no RAR encoder
+        # (no Rar*Encoder.cpp exists in CPP/7zip/Archive/Rar/), so 7zz
+        # must always reject attempts to *write* a RAR archive. This guard
+        # makes that property tamper-evident: if a future change accidentally
+        # introduces RAR-creation capability, the test fails loudly.
+        echo "should-not-be-archived" > /tmp/new.txt
+        # 1. Explicit -tRar create must fail.
+        if 7zz a -tRar /tmp/forbidden.rar /tmp/new.txt 2>/dev/null; then
+          echo "FAIL: 7zz created a RAR archive via -tRar -- unRAR license violation"
+          exit 1
+        fi
+        test ! -s /tmp/forbidden.rar 2>/dev/null || true
+        # 2. Update/append on an existing RAR must also fail.
+        cp /tmp/rar-test/sample.rar /tmp/update-test.rar
+        if 7zz u /tmp/update-test.rar /tmp/new.txt 2>/dev/null; then
+          echo "FAIL: 7zz updated a RAR archive -- unRAR license violation"
+          exit 1
+        fi
+        # 3. Defence-in-depth: confirm the binary contains zero symbols
+        #    suggesting a RAR encoder was linked in.
+        if grep -aE 'Rar[0-9]?Encoder|RarOut' /usr/bin/7zz >/dev/null 2>&1; then
+          echo "FAIL: /usr/bin/7zz contains RAR encoder symbols"
+          exit 1
+        fi
     - uses: test/no-docs

@@ -1,7 +1,7 @@
 package:
   name: emissary
-  version: "3.10.0"
-  epoch: 30 # GHSA-mh2q-q3fh-2475
+  version: "4.0.1"
+  epoch: 0 # GHSA-mh2q-q3fh-2475
   description: "open source Kubernetes-native API gateway for microservices built on the Envoy Proxy"
   copyright:
     - license: Apache-2.0
@@ -19,15 +19,17 @@ package:
 
 vars:
   py-pkg: ambassador
-  py-version: "3.14"
+  # v4 hard-pins requires-python to ==3.13.5 in pyproject.toml
+  py-version: "3.13"
 
 environment:
   contents:
     packages:
-      - go-1.25
+      - go-1.26
       - iproute2
       - libcap-utils
       - py3-supported-pip
+      - python-${{vars.py-version}}
       - rust
       - uv
   accounts:
@@ -39,36 +41,68 @@ pipeline:
     with:
       repository: https://github.com/emissary-ingress/emissary
       tag: v${{package.version}}
-      expected-commit: d25610acbea3cd0e57f924f9f6bd9df99a7e33a3
+      expected-commit: 6460e5181f527317e8bba7eaf7f5e1fc6fa17f77
       depth: -1 # Full history is required for version determination
 
-  - name: Bump dependencies to resolve vulnerabilities
+  - name: Patch and bump Python dependencies
     runs: |
-      sed -i 's/^urllib3==2\.3\.0$/urllib3==2.6.3/' python/requirements.txt
-      # GHSA-87hc-h4r5-73f7
-      sed -i 's/^werkzeug==3\.1\.3$/werkzeug==3.1.6/' python/requirements.txt
-      sed -i 's/^orjson==3\.10\.15/orjson==3.11.6/' python/requirements.txt
+      # Upstream pins requires-python to ==3.13.5 exactly, but Wolfi's
+      # python-3.13 ships a different patch level. Loosen to the 3.13
+      # series so uv build can use the system interpreter.
+      sed -i 's/^requires-python = "==3\.13\.5"$/requires-python = ">=3.13,<3.14"/' pyproject.toml
+
+      # In v4.x runtime deps are pinned in the root pyproject.toml's
+      # [dependency-groups] runtime list (no more python/requirements.txt).
+      sed -i 's/orjson==3\.11\.1/orjson==3.11.6/' pyproject.toml
+      # CVE-2024-35195 / CVE-2024-47081
+      sed -i 's/requests==2\.32\.5/requests==2.33.0/' pyproject.toml
 
   # Go binaries
-  - uses: go/bump
+  #
+  # Cross-line bumps of k8s.io/kubernetes (v1.30.3 → v1.32.x) drag the
+  # transitive k8s.io/* indirect deps higher than the matching staging
+  # versions, and go mod tidy then resolves k8s.io/api past v0.33, where
+  # networking/v1alpha1 and scheduling/v1alpha1 (which emissary still
+  # imports via k8s.io/kubectl/pkg/scheme) were removed.
+  #
+  # require directives only set a minimum, so they lose to MVS pushing
+  # the version up. Use replace directives instead to force every
+  # k8s.io/* staging module to the exact v0.32.10 release that still
+  # carries those v1alpha1 packages. k8s.io/code-generator is left out
+  # because upstream go.mod already has a replace pinning it to an
+  # emissary fork.
+  - uses: bump
     with:
+      language: go
       deps: |-
-        golang.org/x/oauth2@v0.27.0
-        golang.org/x/net@v0.38.0
         k8s.io/kubernetes@v1.32.10
+        sigs.k8s.io/controller-runtime@v0.20.4
         google.golang.org/grpc@v1.79.3
         github.com/moby/spdystream@v0.5.1
-        go.opentelemetry.io/otel@v1.41.0
+      replaces: |-
+        k8s.io/api=k8s.io/api@v0.32.10
+        k8s.io/apiextensions-apiserver=k8s.io/apiextensions-apiserver@v0.32.10
+        k8s.io/apimachinery=k8s.io/apimachinery@v0.32.10
+        k8s.io/apiserver=k8s.io/apiserver@v0.32.10
+        k8s.io/cli-runtime=k8s.io/cli-runtime@v0.32.10
+        k8s.io/client-go=k8s.io/client-go@v0.32.10
+        k8s.io/component-base=k8s.io/component-base@v0.32.10
+        k8s.io/component-helpers=k8s.io/component-helpers@v0.32.10
+        k8s.io/controller-manager=k8s.io/controller-manager@v0.32.10
+        k8s.io/kubectl=k8s.io/kubectl@v0.32.10
+        k8s.io/metrics=k8s.io/metrics@v0.32.10
 
   - uses: go/build
     with:
       packages: ./cmd/busyambassador
       output: busyambassador
+      go-package: go-1.26
 
   - uses: go/build
     with:
       packages: ./cmd/capabilities_wrapper
       output: wrapper
+      go-package: go-1.26
 
   - name: wrapper-setcap
     # See https://github.com/emissary-ingress/emissary/blob/ac2dc64c6621cd8ec5617f3328544364bdd3fb01/build-aux/Dockerfile#L129-L137
@@ -79,6 +113,7 @@ pipeline:
     with:
       packages: ./cmd/kubestatus
       output: kubestatus
+      go-package: go-1.26
 
   - uses: auth/uv
     with:
@@ -88,40 +123,57 @@ subpackages:
   - name: py${{vars.py-version}}-${{vars.py-pkg}}
     description: python${{vars.py-version}} version of emissary
     pipeline:
-      - name: "Install dependencies"
+      - name: "Build wheels and install Python packages"
         runs: |
-          # durationpy 0.5 fails to install with modern setuptools
-          sed -i 's/durationpy==0.5/durationpy==0.6/' python/requirements.txt
-          # CVE-2025-47278
-          sed -i 's/flask==3.1.0/flask==3.1.3/' python/requirements.txt
+          # v4 reorganized python into a uv workspace: build the workspace
+          # member wheels, then install them along with pinned runtime deps.
+          # See docker/emissary/Dockerfile in upstream for the reference flow.
+          # Upstream pins python-preference=only-managed, but we need uv to
+          # use Wolfi's python; override to only-system for the wheel builds.
+          (cd python/ambassador && uv build --wheel --python-preference=only-system --python python${{vars.py-version}} --out-dir /tmp/wheels)
+          (cd python/ambassador-diag && uv build --wheel --python-preference=only-system --python python${{vars.py-version}} --out-dir /tmp/wheels)
 
-          # CVE-2024-35195 and CVE-2024-47081
-          sed -i 's/requests==2.32.3/requests==2.33.0/' python/requirements.txt
-
-          # We need to add this into the python/requirements.txt as the package
-          # will test if the version installed corresponds to what it is on the
-          # requirements.txt file and it will fail if they don't match.
-          sed -i 's/setuptools==75.8.2/setuptools==80.10.2/' python/requirements.txt
-
-          # Install to target dir using uv pip (sources from Chainguard Libraries via auth/uv).
-          # Note: ambassador is only consumed by the emissary image itself — no other
-          # package depends on it — so installing to site-packages without a venv is safe.
-          uv pip install --no-cache --python python${{vars.py-version}} --prefix=${{targets.contextdir}}/usr -r python/requirements.txt
+          # cd /tmp before installing for two reasons:
+          #   1. uv pip walks up from cwd looking for a pyproject.toml and
+          #      applies any [tool.uv.pip] config it finds. The repo's root
+          #      pyproject.toml sets require-hashes=true, which would reject
+          #      our hash-less install. From /tmp the walk hits / with no
+          #      pyproject.toml in between and the setting never applies.
+          #   2. Versions for these deps live in the root pyproject.toml's
+          #      [dependency-groups] runtime table, but uv pip install (vs
+          #      uv sync) does not consult dependency groups. The wheels'
+          #      own pyprojects declare deps as bare strings (no pins), so
+          #      we mirror the runtime group pins explicitly here and layer
+          #      the security overrides on top (orjson 3.11.6, requests
+          #      2.33.0, werkzeug 3.1.6).
+          cd /tmp
+          uv pip install --no-cache --python python${{vars.py-version}} --prefix=${{targets.contextdir}}/usr \
+            click==8.3.0 \
+            durationpy==0.10 \
+            expiringdict==1.2.2 \
+            flask==3.1.3 \
+            gunicorn==25.1.0 \
+            jsonpatch==1.33 \
+            orjson==3.11.6 \
+            prometheus-client==0.22.1 \
+            python-json-logger==2.0.7 \
+            pyyaml==6.0.2 \
+            requests==2.33.0 \
+            semantic-version==2.10.0 \
+            werkzeug==3.1.6 \
+            /tmp/wheels/*.whl
           chmod 644 ${{targets.contextdir}}/usr/.lock
       - runs: |
-          # Generate version file - this static file is read by programs to provide version information in logs.
-          # See https://github.com/emissary-ingress/emissary/blob/ac2dc64c6621cd8ec5617f3328544364bdd3fb01/python/ambassador/VERSION.py#L26
+          # Generate version file. v4's VERSION.py reads from a hardcoded
+          # /buildroot/ambassador/python/ambassador.version (see
+          # python/ambassador/src/ambassador/VERSION.py), so install it there
+          # rather than into site-packages.
           make python/ambassador.version
-          cp -p python/ambassador.version ${{targets.contextdir}}/usr/lib/python${{vars.py-version}}/site-packages
+          install -Dm644 python/ambassador.version \
+            ${{targets.contextdir}}/buildroot/ambassador/python/ambassador.version
 
-          # Install Emissary Python package
-          cd python
-          python${{vars.py-version}} setup.py install --prefix=/usr --root="${{targets.contextdir}}"
-
-          # Install templates - this is not a python package, so it's not installed by the steps above.
-          # This contains a set of HTML templates used by the Python code, but is read relative to the module.
-          # See https://github.com/emissary-ingress/emissary/blob/ac2dc64c6621cd8ec5617f3328544364bdd3fb01/python/ambassador_diag/diagd.py#L603
-          cp -a templates ${{targets.contextdir}}/usr/lib/python${{vars.py-version}}/site-packages/templates
+          # Templates are bundled into the ambassador-diag wheel via
+          # hatch.build.targets.sdist; no manual copy is needed.
       - uses: strip
     test:
       pipeline:
@@ -149,6 +201,7 @@ subpackages:
         with:
           packages: ./cmd/apiext
           output: apiext
+          go-package: go-1.26
     test:
       pipeline:
         - uses: test/tw/help-check

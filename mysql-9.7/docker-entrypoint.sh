@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# This script came from https://github.com/docker-library/mysql/blob/master/8.0/docker-entrypoint.sh
+# This script came from https://github.com/docker-library/mysql/blob/master/9.7/docker-entrypoint.sh
 # The only change is to tweak the logging function and remove the --rfc flag since it's not supported in our date impl
 
 set -eo pipefail
@@ -122,30 +122,9 @@ mysql_socket_fix() {
 
 # Do a temporary startup of the MySQL server, for init purposes
 docker_temp_server_start() {
-	if [ "${MYSQL_MAJOR}" = '5.7' ]; then
-		"$@" --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}" &
-		mysql_note "Waiting for server startup"
-		local i
-		for i in {30..0}; do
-			# only use the root password if the database has already been initialized
-			# so that it won't try to fill in a password file when it hasn't been set yet
-			extraArgs=()
-			if [ -z "$DATABASE_ALREADY_EXISTS" ]; then
-				extraArgs+=( '--dont-use-mysql-root-password' )
-			fi
-			if docker_process_sql "${extraArgs[@]}" --database=mysql <<<'SELECT 1' &> /dev/null; then
-				break
-			fi
-			sleep 1
-		done
-		if [ "$i" = 0 ]; then
-			mysql_error "Unable to start server."
-		fi
-	else
-		# For 5.7+ the server is ready for use as soon as startup command unblocks
-		if ! "$@" --daemonize --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}"; then
-			mysql_error "Unable to start server."
-		fi
+	# For 5.7+ the server is ready for use as soon as startup command unblocks
+	if ! "$@" --daemonize --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}"; then
+		mysql_error "Unable to start server."
 	fi
 }
 
@@ -315,6 +294,9 @@ docker_setup_db() {
 
 	# tell docker_process_sql to not use MYSQL_ROOT_PASSWORD since it is just now being set
 	docker_process_sql --dont-use-mysql-root-password --database=mysql <<-EOSQL
+		-- enable autocommit explicitly (in case it was disabled globally)
+		SET autocommit = 1;
+
 		-- What's done in this file shouldn't be replicated
 		--  or products like mysql-fabric won't work
 		SET @@SESSION.SQL_LOG_BIN=0;

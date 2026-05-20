@@ -5,7 +5,7 @@
 package:
   name: opensearch-3
   version: "3.6.0"
-  epoch: 1
+  epoch: 2
   description: Open source distributed and RESTful search engine.
   copyright:
     - license: Apache-2.0
@@ -119,10 +119,11 @@ pipeline:
   - runs: |
       # Bump log4j to 2.25.4: CVE-2026-34480
       sed -i 's/^log4j                   = "2\.25\.3"/log4j                   = "2.25.4"/' gradle/libs.versions.toml
+      sed -i 's/^\(httpclient5.*= "\)5.6"/\15.6.1"/' gradle/libs.versions.toml
 
   - runs: |
       echo "org.gradle.daemon=false" >> gradle.properties
-      ./gradlew --no-daemon localDistro --parallel -Dbuild.snapshot=false -Dbuild.version_qualifier=
+      ./gradlew --no-daemon localDistro publishToMavenLocal --parallel -Dbuild.snapshot=false -Dbuild.version_qualifier=
       mkdir -p ${{targets.destdir}}/usr/share/opensearch/logs
 
       install -dm777 ${{targets.destdir}}/usr/share/opensearch/
@@ -158,9 +159,34 @@ pipeline:
       # Manually set this to docker: https://github.com/opensearch-project/OpenSearch/blob/5f8193021215cd6979fde66474ec8d74d32ac91a/distribution/docker/src/docker/Dockerfile#LL49C90-L49C129
       sed -i -e 's/OPENSEARCH_DISTRIBUTION_TYPE=tar/OPENSEARCH_DISTRIBUTION_TYPE=docker/'  ${{targets.destdir}}/usr/share/opensearch/bin/opensearch-env
 
+  - uses: git-checkout
+    with:
+      repository: https://github.com/opensearch-project/opensearch-remote-metadata-sdk
+      tag: ${{package.version}}.${{vars.plugin_version_qualifier}}
+      expected-commit: 5223e2aeba9c741d04a7f1f189ce8b9d3c018b5d
+      destination: /tmp/opensearch-remote-metadata-sdk
+
+  - working-directory: /tmp/opensearch-remote-metadata-sdk
+    runs: |
+      # Some plugins transitively depend on opensearch-remote-metadata-sdk and
+      # so we need to build it against our local artifacts so it matches any
+      # dependencies we've bumped (e.g. log4j) and publish it into mavenLocal
+      # to avoid breaking the build.
+      echo >> gradle.properties
+      echo "org.gradle.daemon=false" >> gradle.properties
+
+      ./gradlew --no-daemon publishToMavenLocal \
+        -Dbuild.snapshot=false \
+        -Dbuild.version_qualifier="" \
+        -Dopensearch.version=3.6.0 \
+        -Drepos.mavenLocal=true \
+        -x check -x test -x javadoc \
+        -PfailOnJavadocWarning=false \
+        --stacktrace
+
   - runs: |
       cd plugins
-      ../gradlew --no-daemon assemble -Dbuild.snapshot=false -Dbuild.version_qualifier= --stacktrace
+      ../gradlew --no-daemon assemble -Dbuild.snapshot=false -Dbuild.version_qualifier= -Drepos.mavenLocal=true --stacktrace
 
       # useful for finding generated zip file we use to extract into the final apk
       find . -name "*.zip"
@@ -210,6 +236,16 @@ subpackages:
       - runs: |
           cd ./plugins/${{range.key}}
 
+          # For consistency between core and plugins, we need to prefer
+          # artifacts from MavenLocal: -Drepos.mavenLocal=true handles this in
+          # most cases, but some plugins don't honour it properly: this
+          # "hardcodes" it into their config
+          case ${{range.key}} in
+            job-scheduler)
+              sed -i '/mavenCentral()/i\    mavenLocal()' build-tools/repositories.gradle
+              ;;
+          esac
+
           # apply any CVE patches
           if [ -n "${{range.value}}" ]; then
               patch -p1 < "../../${{range.value}}"
@@ -250,6 +286,7 @@ subpackages:
               -Dbuild.snapshot=false \
               -Dbuild.version_qualifier= \
               -Dopensearch.version=${{package.version}} \
+              -Drepos.mavenLocal=true \
               -Dbuild.lib.commit_patches=false \
               -Dnmslib_simd_flags=$NMSLIB_SIMD_FLAGS \
               -x check \
@@ -292,9 +329,11 @@ subpackages:
             # variant, so force the non-FIPS dependency scope and let the jars
             # ship in the zip as they did for 3.5.0.
             ./gradlew clean assemble \
+              --refresh-dependencies \
               -Dbuild.snapshot="false" \
               -Dbuild.version_qualifier="" \
               -Dopensearch.version="${{package.version}}" \
+              -Drepos.mavenLocal=true \
               -Pcrypto.standard=any-supported \
               -x check \
               -x integTest \

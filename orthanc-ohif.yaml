@@ -1,7 +1,7 @@
 package:
   name: orthanc-ohif
-  version: "1.7"
-  epoch: 1
+  version: "1.8"
+  epoch: 0 # reset for version bump
   description: OHIF plugin for Orthanc DICOM server - modern DICOM web viewer
   copyright:
     - license: AGPL-3.0-or-later
@@ -38,7 +38,7 @@ pipeline:
   - uses: fetch
     with:
       uri: https://orthanc.uclouvain.be/downloads/sources/orthanc-ohif/OrthancOHIF-${{package.version}}.tar.gz
-      expected-sha256: 03da542f061d0e0d2c4aa033b964da35e44665c352e90655967917d685b8aea4
+      expected-sha256: a89715844eb5164aaca69d5a1e8833fa992f88184ae559523766dd121395f675
 
   - name: OHIF viewer assets
     runs: |
@@ -46,11 +46,44 @@ pipeline:
       mkdir -p OHIF/dist
       cp -r /usr/share/ohif-viewer/dist/* OHIF/dist/
 
+  - name: cmake-compat-shims
+    runs: |
+      # CMake 3.27+ removed FindPythonInterp; CMake 3.30+ removed FindBoost.
+      # Orthanc-1.12.5 (downloaded during configure) uses these legacy modules.
+      # Provide minimal compatibility shims so the configure step succeeds.
+      mkdir -p /home/build/cmake-shims
+
+      # FindPythonInterp shim: delegates to FindPython3
+      cat > /home/build/cmake-shims/FindPythonInterp.cmake << 'EOF'
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        set(PYTHONINTERP_FOUND TRUE)
+        set(PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
+        set(PYTHON_VERSION_STRING "${Python3_VERSION}")
+        set(PYTHON_VERSION_MAJOR "${Python3_VERSION_MAJOR}")
+        set(PYTHON_VERSION_MINOR "${Python3_VERSION_MINOR}")
+        set(PYTHON_VERSION_PATCH "${Python3_VERSION_PATCH}")
+      else()
+        set(PYTHONINTERP_FOUND FALSE)
+      endif()
+      EOF
+
+      # FindBoost shim: delegates to the new BoostConfig.cmake
+      cat > /home/build/cmake-shims/FindBoost.cmake << 'EOF'
+      cmake_policy(SET CMP0167 NEW)
+      find_package(Boost CONFIG QUIET COMPONENTS
+        filesystem system thread date_time regex iostreams program_options)
+      if(Boost_FOUND)
+        set(Boost_FOUND TRUE)
+      endif()
+      EOF
+
   - uses: cmake/configure
     with:
       opts: |
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_MODULE_PATH=/home/build/cmake-shims \
         -DALLOW_DOWNLOADS=ON \
         -DUSE_SYSTEM_ORTHANC_SDK=ON \
         -DUSE_SYSTEM_JSONCPP=ON \
@@ -83,6 +116,7 @@ test:
       packages:
         - curl
   pipeline:
+    - uses: test/tw/ldd-check
     - runs: |
         mkdir -p /tmp/orthanc-ohif-test
         cat > /tmp/orthanc-ohif.json << 'EOF'
@@ -119,16 +153,14 @@ test:
         post: |
           # Test OHIF viewer accessibility
           echo "Testing OHIF viewer integration..."
-          curl -s http://localhost:18052/ohif/ | head -10 | grep -q "html\|HTML" && echo "OHIF viewer endpoint accessible" || echo "OHIF viewer response received"
-
-          # Test OHIF configuration endpoint
-          curl -s http://localhost:18052/ohif/config && echo "OHIF configuration endpoint accessible" || echo "OHIF config endpoint responded"
+          if ! curl -s http://localhost:18052/ohif/ | head -10 | grep -qE "html|HTML"; then
+            echo "ERROR: OHIF viewer endpoint did not return HTML content"
+            exit 1
+          fi
+          echo "OHIF viewer endpoint accessible"
 
           # Test DICOMweb integration
-          curl -s http://localhost:18052/dicom-web/studies | grep -q "\\[\\]" && echo "DICOMweb integration working"
-
-          # Test OHIF study list endpoint
-          curl -s http://localhost:18052/ohif/studies && echo "OHIF study list endpoint accessible" || echo "OHIF study list responded"
+          curl -s http://localhost:18052/dicom-web/studies | grep -q "\[\]" && echo "DICOMweb integration working"
 
 update:
   enabled: true

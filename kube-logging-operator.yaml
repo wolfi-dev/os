@@ -1,7 +1,7 @@
 package:
   name: kube-logging-operator
-  version: "6.5.0"
-  epoch: 1 # GHSA-hfvc-g4fc-pqhx
+  version: "6.5.1"
+  epoch: 1
   description: Logging operator for Kubernetes
   copyright:
     - license: Apache-2.0
@@ -18,19 +18,38 @@ data:
       "3.2": "3.2"
       "3.4": "3.4"
 
+vars:
+  bin-name: manager
+  # Specific gem versions are pinned to match the upstream fluentd image to avoid compatibility issues
+  # Note: Drift checks included will cause build failures in case of mismatches and these version pins will need to be updated
+  # https://github.com/kube-logging/logging-operator/blob/6.5.0/images/fluentd/Dockerfile#L28-L32
+  bigdecimal-version: 3.3.1
+  ostruct-version: 0.6.3
+  oj-version: 3.16.11
+  specific_install-version: 0.3.8
+  fluent-plugin-label-router-version: 0.5.0
+  snappy-version: 0.0.15
+  # https://github.com/kube-logging/logging-operator/blob/6.5.0/images/fluentd/Dockerfile#L81-L82
+  syslog-commit: 4ab9f7df3757b0e31e4bc209acab05a518efdce3
+  elasticsearch-commit: f711c4322e37852a83caab0385ba4567031eb9ab
+
 environment:
   contents:
     packages:
       - apk-tools
+      - autoconf
+      - automake
       - geoip-dev
-      - git
+      - libtool
+      - openssl-dev
+      - snappy-dev
 
 pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/kube-logging/logging-operator
       tag: ${{package.version}}
-      expected-commit: e637b3f6d15d8858ab08d8401f5dbb1712aa4b4e
+      expected-commit: 03213c9b6530bcfea2b6dc6199befa15904aab2f
 
   - uses: go/build
     with:
@@ -95,77 +114,68 @@ subpackages:
         - geoip
         - ruby-${{range.key}}
     pipeline:
+      # Install fluentd plugins (outputs + filters) with all transitive dependencies
+      # Install to /usr/local/bundle to avoid conflicts with default gems
+      # Match upstream image structure exactly
+      # Note: fluentd itself should be provided by ruby${{range.key}}-fluentd-X.XX package
+      - runs: apk add ruby-${{range.key}}-dev
+      - name: Install fluentd plugins
+        runs: |
+          echo 'gem: --no-document' >> /etc/gemrc
+
+          export GEM_HOME="${{targets.contextdir}}/usr/local/bundle"
+          mkdir -p "$GEM_HOME"
+
+          # Install pinned plugins
+          # Verify that the correct versions are installed
+          drift_check() {
+            grep "${1}.*${2}" images/fluentd/Dockerfile || (echo "Mismatch: $1 - Expected: $2" && exit 1)
+          }
+          plugin_install() {
+            drift_check "$1" "$2"
+            gem install "$1" -v "$2"
+          }
+
+          plugin_install "bigdecimal" "${{vars.bigdecimal-version}}"
+          plugin_install "oj" "${{vars.oj-version}}"
+          plugin_install "ostruct" "${{vars.ostruct-version}}"
+          plugin_install "fluent-plugin-label-router" "${{vars.fluent-plugin-label-router-version}}"
+          plugin_install "specific_install" "${{vars.specific_install-version}}"
+          plugin_install "snappy" "${{vars.snappy-version}}"
+
+          # Install plugins from Gemfiles
+          gem install --file images/fluentd/outputs/Gemfile
+          gem install --file images/fluentd/filters/Gemfile
+
+          # required by fluent-plugin-mattermost
+          gem install fluent-logger
+
+          # Install additional plugins from git with specific commits
+          plugin_install_from_git(){
+            drift_check "$1" "$2"
+            gem specific_install -l \
+              $1 --ref $2
+          }
+          plugin_install_from_git \
+            https://github.com/kube-logging/fluent-plugin-syslog_rfc5424.git \
+            ${{vars.syslog-commit}}
+          plugin_install_from_git \
+            https://github.com/kube-logging/fluent-plugin-elasticsearch.git \
+            ${{vars.elasticsearch-commit}}
       - runs: |
-          apk add ruby-${{range.key}}-dev
-
-          # Install fluentd plugins (outputs + filters) with all transitive dependencies
-          # Install to /usr/local/bundle to avoid conflicts with default gems
-          # Match upstream image structure exactly
-          # Note: fluentd itself should be provided by ruby${{range.key}}-fluentd-X.XX package
-
-          GEM_DIR="${{targets.contextdir}}/usr/local/bundle"
-          BIN_DIR="$GEM_DIR/bin"
-
-          # Install output plugins from outputs/Gemfile
-          grep "^gem " images/fluentd/outputs/Gemfile | while read -r line; do
-            GEM_NAME=$(echo "$line" | sed -n "s/^gem '\([^']*\)'.*/\1/p")
-            GEM_VERSION=$(echo "$line" | sed -n "s/^gem '[^']*', '\([^']*\)'.*/\1/p")
-
-            if [ -n "$GEM_NAME" ] && [ -n "$GEM_VERSION" ]; then
-              echo "Installing $GEM_NAME version $GEM_VERSION"
-              gem install --install-dir="$GEM_DIR" \
-                --bindir="$BIN_DIR" \
-                --no-document \
-                "$GEM_NAME" -v "$GEM_VERSION"
-            fi
-          done
-
-          # Install filter plugins from filters/Gemfile
-          grep "^gem " images/fluentd/filters/Gemfile | while read -r line; do
-            GEM_NAME=$(echo "$line" | sed -n "s/^gem '\([^']*\)'.*/\1/p")
-            GEM_VERSION=$(echo "$line" | sed -n "s/^gem '[^']*', '\([^']*\)'.*/\1/p")
-
-            if [ -n "$GEM_NAME" ] && [ -n "$GEM_VERSION" ]; then
-              echo "Installing $GEM_NAME version $GEM_VERSION"
-              gem install --install-dir="$GEM_DIR" \
-                --bindir="$BIN_DIR" \
-                --no-document \
-                "$GEM_NAME" -v "$GEM_VERSION"
-            fi
-          done
-
-          # Install additional plugins from base Dockerfile
-          echo "Installing label-router plugin..."
-          gem install --install-dir="$GEM_DIR" \
-            --bindir="$BIN_DIR" \
-            --no-document \
-            fluent-plugin-label-router -v 0.5.0
-
-          # Install syslog_rfc5424 from git using specific_install to match upstream
-          gem install --install-dir="$GEM_DIR" \
-            --bindir="$BIN_DIR" \
-            --no-document \
-            specific_install -v 0.3.8
-
-          GEM_HOME="$GEM_DIR" gem specific_install -l https://github.com/kube-logging/fluent-plugin-syslog_rfc5424.git \
-            --ref 4ab9f7df3757b0e31e4bc209acab05a518efdce3
-
-          # Install fluent-logger
-          gem install --install-dir="$GEM_DIR" \
-            --bindir="$BIN_DIR" \
-            --no-document \
-            fluent-logger
-
-          # Set environment variables to match upstream
           mkdir -p "${{targets.contextdir}}/etc/profile.d"
           echo 'export GEM_HOME=/usr/local/bundle' > "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
           echo 'export BUNDLE_APP_CONFIG=/usr/local/bundle' >> "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
           echo 'export BUNDLE_SILENCE_ROOT_WARNING=1' >> "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
           echo 'export PATH=/usr/local/bundle/bin:$PATH' >> "${{targets.contextdir}}/etc/profile.d/fluentd-gems.sh"
-
-          # Fix world-writable files
-          find "$GEM_DIR" -type f -perm -002 -exec chmod o-w {} \;
-      - uses: ruby/clean
+      - name: Fix world-writable files
+        runs: find "${{targets.contextdir}}/usr/local/bundle" -type f -perm -002 -exec chmod o-w {} \;
+      - name: Clean up cache
+        working-directory: ${{targets.contextdir}}/usr/local/bundle
+        runs: |
+          # cannot use ruby/clean since the gems are not installed in the default dir
+          rm -rf cache
+          find . -name '*.o' -delete
       - runs: |
           apk del ruby-${{range.key}}-dev
     test:
@@ -228,9 +238,6 @@ update:
   enabled: true
   github:
     identifier: kube-logging/logging-operator
-
-vars:
-  bin-name: manager
 
 test:
   environment:

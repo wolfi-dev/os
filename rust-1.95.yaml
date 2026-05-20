@@ -1,0 +1,197 @@
+package:
+  name: rust-1.95
+  version: "1.95.0"
+  epoch: 0
+  description: "Empowering everyone to build reliable and efficient software."
+  copyright:
+    - license: Apache-2.0 AND MIT
+  resources:
+    cpu: 16
+    memory: 16Gi
+  dependencies:
+    runtime:
+      - libLLVM-${{vars.clang-version}}
+    provides:
+      - rust=${{package.full-version}}
+  annotations:
+    toolchain: true
+
+vars:
+  clang-version: 22
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-${{vars.clang-version}}
+      - cmake
+      - coreutils
+      - curl
+      - curl-dev
+      - file
+      - libLLVM-${{vars.clang-version}}
+      - libssh2-dev
+      - libxml2-dev
+      - llvm-${{vars.clang-version}}
+      - llvm-${{vars.clang-version}}-dev
+      - openssl-dev
+      - patch
+      - python3
+      - samurai
+      - wasi-libc
+      - xz-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rust-lang/rust
+      tag: ${{package.version}}
+      expected-commit: 59807616e1fa2540724bfbac14d7976d7e4a3860
+
+  - runs: |
+      # Reconstructed vendored crates and bootstrap toolchain
+      ./x vendor
+
+      # Populate cargo config
+      mkdir .cargo
+      cat > .cargo/config.toml <<EOF
+      [source.crates-io]
+      replace-with = "vendored-sources"
+      [source."git+https://github.com/rust-lang/team"]
+      git = "https://github.com/rust-lang/team"
+      replace-with = "vendored-sources"
+      [source.vendored-sources]
+      directory = "vendor"
+      EOF
+
+      export CFLAGS="$CFLAGS -O2 -I/usr/lib/llvm-${{vars.clang-version}}/include"
+      export CXXFLAGS="$CXXFLAGS -O2 -I/usr/lib/llvm-${{vars.clang-version}}/include"
+      export OPENSSL_NO_VENDOR=1
+      export ARCH=${{host.triplet.rust}}
+
+      # Using downloaded toolchain, alternative is to build-depend on
+      # our builds of rust/cargo, and then update this to /usr/bin, or
+      # drop this setting together with build.cargo and build.rustc
+      # settings in configure
+      export TOOLCHAIN_BIN_DIR=`pwd`/build/${ARCH}/stage0/bin
+
+      # Create a minimal config.toml with necessary options
+      # This is needed because of upstream changes in Rust 1.87 that removed automatic config.toml creation
+      cat > config.toml <<EOF
+      [rust]
+      deny-warnings = false
+      EOF
+
+      ./configure \
+        --host="${ARCH}" \
+        --target="${ARCH}" \
+        --prefix="/usr" \
+        --release-channel="stable" \
+        --enable-local-rust \
+        --local-rust-root="/usr" \
+        --llvm-root="/usr/lib/llvm-${{vars.clang-version}}" \
+        --llvm-config="/usr/lib/llvm-${{vars.clang-version}}/bin/llvm-config" \
+        --disable-docs \
+        --enable-extended \
+        --tools="cargo,src,clippy,rustfmt,rustdoc" \
+        --enable-llvm-link-shared \
+        --enable-option-checking \
+        --enable-locked-deps \
+        --enable-profiler \
+        --enable-vendor \
+        --dist-compression-formats=gz \
+        --python="python3" \
+        --set="rust.musl-root=/usr" \
+        --set="rust.codegen-units=1" \
+        --set="rust.codegen-units-std=1" \
+        --set="target.${ARCH}.musl-root=/usr" \
+        --set="target.${ARCH}.crt-static=false" \
+        --set="target.${ARCH}.musl-root=/usr" \
+        --set="target.${ARCH}.crt-static=false" \
+        --set="build.cargo=$TOOLCHAIN_BIN_DIR/cargo" \
+        --set="build.rustc=$TOOLCHAIN_BIN_DIR/rustc"
+
+      # Configure the bootstrap process not to use Rust's LLD (as we use our
+      # system LLVM); see
+      # https://github.com/rust-lang/rust/issues/143076#issuecomment-3018803649
+      sed -i '/^\[rust\]$/a lld=false' bootstrap.toml
+
+  - runs: |
+      sed 's|deny(warnings,|deny(|' -i src/bootstrap/src/lib.rs
+      mkdir -p "${{targets.destdir}}/usr"
+      unset CARGO_PROFILE_RELEASE_LTO
+      unset CARGO_PROFILE_RELEASE_OPT_LEVEL
+      unset CARGO_PROFILE_RELEASE_PANIC
+      unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+      export CFLAGS="$CFLAGS -O2 -I/usr/lib/llvm-${{vars.clang-version}}/include/"
+      export CXXFLAGS="$CXXFLAGS -O2 -I/usr/lib/llvm-${{vars.clang-version}}/include/"
+      export OPENSSL_NO_VENDOR=1
+      export RUSTC_BOOTSTRAP=1
+      export RUST_BACKTRACE=full
+      DESTDIR=${{targets.destdir}} python3 ./x.py install --jobs $(nproc)
+
+  - uses: strip
+
+  # delete uneeded files eg uninstalltion
+  - runs: |
+      rm ${{targets.destdir}}/usr/lib/rustlib/components
+      rm ${{targets.destdir}}/usr/lib/rustlib/install.log
+      rm ${{targets.destdir}}/usr/lib/rustlib/rust-installer-version
+      rm ${{targets.destdir}}/usr/lib/rustlib/uninstall.sh
+      rm ${{targets.destdir}}/usr/lib/rustlib/manifest-*
+
+  - name: ensure libraries are executable for melange SCA provides generation
+    runs: |
+      chmod +x ${{targets.destdir}}/usr/lib/*.so
+
+update:
+  enabled: true
+  github:
+    identifier: rust-lang/rust
+    use-tag: true
+    tag-filter: 1.95.
+
+test:
+  environment:
+    contents:
+      packages:
+        - gcc
+        - glibc-dev
+  pipeline:
+    - uses: test/tw/ver-check
+      with:
+        bins: |
+          cargo
+          rustc
+          rustdoc
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          cargo
+          cargo-clippy
+          cargo-fmt
+          clippy-driver
+          rust-gdbgui
+          rustc
+          rustdoc
+          rustfmt
+    - name: Compile and run Hello World
+      runs: |
+        set -euo pipefail
+        cat <<'EOF' > hello.rs
+        fn main() {
+          println!("Hello, World!");
+        }
+        EOF
+        rustc hello.rs
+        ./hello | grep -qF "Hello, World!"
+    - name: Cargo project creation and run
+      runs: |
+        set -euo pipefail
+        cargo new hello_cargo --bin
+        cd hello_cargo
+        cargo run | grep -qF "Hello, world!"
+    - uses: test/tw/ldd-check

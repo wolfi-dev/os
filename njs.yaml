@@ -1,10 +1,19 @@
 package:
   name: njs
-  version: "0.9.8"
+  version: "0.9.9"
   epoch: 0
-  description: njs scripting language CLI utility
+  description: njs scripting language CLI utility + dynamic nginx modules for nginx-mainline
   copyright:
     - license: BSD-2-Clause
+  dependencies:
+    # Provide `njs-mainline` so consumers can express the flavor pairing
+    # symmetrically with `njs-stable`. `nginx-mainline-config` makes the
+    # transitive nginx-mainline pull explicit, so `apk add nginx-stable njs`
+    # errors cleanly instead of silently shipping incompatible modules.
+    provides:
+      - njs-mainline=${{package.full-version}}
+    runtime:
+      - nginx-mainline-config
   resources:
     cpu: "2"
     memory: 6Gi
@@ -31,7 +40,7 @@ pipeline:
     with:
       repository: https://github.com/nginx/njs
       tag: ${{package.version}}
-      expected-commit: ab6f49e9340ef1c0e56bf4a8a79e0a31c138819d
+      expected-commit: 9ead4e71f74a27279f3212bdb6cadb0e86981a1b
       destination: njs
 
   - runs: |
@@ -99,7 +108,10 @@ test:
   environment:
     contents:
       packages:
+        - curl
+        - nginx-mainline-config
         - njs-debug
+        - wait-for-it
   pipeline:
     - name: "Verify njs can execute JavaScript"
       runs: |
@@ -148,6 +160,37 @@ test:
         EOF
         result=$(njs /tmp/test.js)
         [ "$result" = "1" ] || { echo "Expected 1, got: $result"; exit 1; }
+    - name: Module loads via nginx -t (regression guard, customer-issues#3486)
+      runs: |
+        cat > /tmp/njs.js <<'EOF'
+        function hello(r) { r.return(200, "njs ok\n"); }
+        export default { hello };
+        EOF
+        cat > /tmp/nginx-njs.conf <<'EOF'
+        user nobody;
+        worker_processes 1;
+        load_module /usr/lib/nginx/modules/ngx_http_js_module.so;
+        events { worker_connections 1024; }
+        http {
+            js_import test from /tmp/njs.js;
+            server {
+                listen 8080;
+                location / { js_content test.hello; }
+            }
+        }
+        EOF
+        nginx -t -c /tmp/nginx-njs.conf
+    - uses: test/daemon-check-output
+      with:
+        start: nginx -c /tmp/nginx-njs.conf -g 'daemon off; error_log /dev/stderr info;'
+        timeout: 10
+        post: |
+          wait-for-it localhost:8080 -t 5
+          response=$(curl -s http://localhost:8080/)
+          echo "$response" | grep -q "njs ok" \
+            || { echo "Expected js_content response, got: $response"; exit 1; }
+        expected_output: |
+          start worker process
 
 update:
   enabled: true

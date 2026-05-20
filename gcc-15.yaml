@@ -1,0 +1,386 @@
+package:
+  name: gcc-15
+  version: "15.2.0"
+  epoch: 12
+  description: "the GNU compiler collection - version ${{vars.major-version}}"
+  copyright:
+    - license: GPL-3.0-or-later WITH GCC-exception-3.1
+  resources:
+    cpu: "23"
+    memory: 16Gi
+  dependencies:
+    runtime:
+      - binutils
+      - glibc-dev # Temporary workaround to force build-ordering against new glibc's
+      - libquadmath # This is a temporary workaround for issues with single-arch packages.
+      - libstdc++-${{vars.major-version}}-dev
+      - openssf-compiler-options
+      - posix-cc-wrappers
+
+environment:
+  contents:
+    packages:
+      - bison
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - file
+      - flex-dev
+      - gawk
+      - glibc-iconv
+      - gmp-dev
+      - isl-dev
+      - make
+      - mpc-dev
+      - mpfr-dev
+      - openssf-compiler-options
+      - texinfo
+      - wolfi-baselayout
+      - zlib-dev
+      - zstd-dev
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+vars:
+  glibc-version: "2.43"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 5115c7e447fc07457443df874bf57840e8316d5f
+      repository: https://gitlab.com/gnutools/gcc.git
+      tag: releases/gcc-${{package.version}}
+
+  - runs: |
+      tmpdir="$(mktemp -d)"
+      trap 'rm -rf "${tmpdir}"' EXIT
+      grep -F -- --package-metadata= .melange.gcc.spec > "${tmpdir}/specline"
+      sed -r 's/^(.* )(--package-metadata=.*)$/\2/' < "${tmpdir}/specline" > "${tmpdir}/flag"
+      # Use JSON %[] encoding to avoid issues passing special chars through -Wl
+      sed -e 's/"/%[quot]/g' -e 's/,/%[comma]/g' -e 's/{/%[lbrace]/g' -e 's/}/%[rbrace]/g' -e 's/ /%[space]/g' < "${tmpdir}/flag" > "${tmpdir}/flag.%encoded"
+      flag="-Wl,$(cat "${tmpdir}/flag.%encoded")"
+      echo "export LDFLAGS_FOR_TARGET=\"${flag}\"" > .env
+
+  - working-directory: /home/build/build
+    pipeline:
+      - name: 'Configure GCC'
+        runs: |
+          source ../.env
+          # Check https://aws.amazon.com/ec2/instance-types/ and
+          # https://cloud.google.com/compute/docs/general-purpose-machines
+          # for most current CPU types on arm64 and x86 to set mtune to
+          # the current generation of CPUs. Other clouds are typically
+          # roughly at the same level (Azure, Oracle, IBM, Linode, etc).
+          case "${{build.arch}}" in
+            "aarch64")
+              march=armv8-a+crc+crypto
+              mtune=neoverse-v2
+              CFLAGS="-mbranch-protection=standard"
+              CXXFLAGS="-mbranch-protection=standard"
+              specs=""
+              ;;
+            "x86_64")
+              march=x86-64-v2
+              mtune=sapphirerapids
+              # Currently hangs on Apple Rosetta 2 emulator
+              specs="-mno-sahf"
+              ;;
+          esac
+          CFLAGS="$CFLAGS" \
+          CXXFLAGS="$CXXFLAGS" \
+          ../configure \
+            --prefix=/usr \
+            --program-suffix="-${{vars.major-version}}" \
+            --disable-nls \
+            --disable-werror \
+            --with-pkgversion='Wolfi ${{package.full-version}}' \
+            --with-glibc-version=${{vars.glibc-version}} \
+            --enable-initfini-array \
+            --disable-nls \
+            --disable-multilib \
+            --enable-host-shared \
+            --enable-shared \
+            --enable-threads \
+            --enable-tls \
+            --enable-default-pie \
+            --enable-default-ssp \
+            --with-system-zlib \
+            --with-arch=$march \
+            --with-tune=$mtune \
+            --with-specs=$specs \
+            --enable-languages=c,c++,fortran \
+            --enable-bootstrap \
+            --enable-gnu-indirect-function \
+            --enable-gnu-unique-object \
+            --enable-cet=auto \
+            --enable-link-mutex \
+            --enable-version-specific-runtime-libs \
+            --with-gcc-major-version-only \
+            --with-linker-hash-style=gnu \
+            --disable-libcc1
+
+          make -j$(nproc)
+          make -j$(nproc) install DESTDIR="${{targets.destdir}}"
+
+  # We don't want to keep the .la files.
+  - runs: |
+      find ${{targets.destdir}} -name '*.la' -print -exec rm \{} \;
+
+  # Remove libffi
+  - runs: |
+      rm -f "${{targets.destdir}}"/usr/lib/libffi* "${{targets.destdir}}"/usr/share/man/man3/ffi*
+      find "${{targets.destdir}}" -name 'ffi*.h' | xargs rm -f
+
+  # For some reason libgcc_s.1 is installed into /lib64/ subdir, which
+  # is not in `gcc -print-search-dirs` libraries location, and thus
+  # link tests fail to find libgcc_s.so linker script. Compiled
+  # binaries at runtime use public libgcc.
+  - name: 'Fix libgcc_s.so location'
+    runs: |
+      cd "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}
+      mv lib64/libgcc_s.* ${{vars.major-version}}/
+      rmdir lib64/
+
+  # Remove stray gcc-tmp (which used to be gcc-M.N.P)
+  - runs: |
+      rm ${{targets.destdir}}/usr/bin/${{host.triplet.gnu}}-gcc-tmp
+
+  # These are outdated and only cause issues with newer glibc.
+  - name: Remove some unneeded include-fixed
+    runs: |
+      rm -f ${{targets.destdir}}/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include-fixed/pthread.h
+
+  - name: 'Clean up documentation'
+    runs: |
+      rm -rf ${{targets.destdir}}/usr/share/info
+
+  - uses: strip
+
+subpackages:
+  - name: 'gcc-${{vars.major-version}}-doc'
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/docs
+
+  - name: 'libatomic-${{vars.major-version}}'
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/libatomic*.so.* "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+    options:
+      no-provides: true
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: 'libstdc++-${{vars.major-version}}'
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/*++.so.* "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+    options:
+      no-provides: true
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: 'libstdc++-${{vars.major-version}}-dev'
+    dependencies:
+      runtime:
+        # libstdc++-${{vars.major-version}}-dev might no longer compatible at link time
+        # with libstdc++ (${{vars.major-version}} + 1) or later, despite being runtime
+        # compatible. Ensure any users of libstdc++-${{vars.major-version}}-dev have access
+        # to link against libstsdc++-${{vars.major-version}}
+        - libstdc++-${{vars.major-version}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include/
+          mkdir -p "${{targets.subpkgdir}}"/usr/share/gcc-${{vars.major-version}}/python/libstdcxx
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/*++.a "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/libstdc++.so "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include/*++* "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/include/
+          mv "${{targets.destdir}}"/usr/share/gcc-${{vars.major-version}}/python/libstdcxx/* \
+            "${{targets.subpkgdir}}"/usr/share/gcc-${{vars.major-version}}/python/libstdcxx/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: "libgfortran-${{vars.major-version}}"
+    description: "Fortran runtime library provided by GCC"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/libgfortran.so.* "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+    options:
+      no-provides: true
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: "gfortran-${{vars.major-version}}"
+    description: "GNU Fortran Compiler"
+    pipeline:
+      - runs: |
+          _libexecdir=/usr/libexec/gcc/${{host.triplet.gnu}}/${{vars.major-version}}
+          _libdir=/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}
+
+          for i in "$_libexecdir" "$_libdir" usr/lib usr/bin; do
+            mkdir -p "${{targets.subpkgdir}}"/$i
+          done
+          mv "${{targets.destdir}}"/usr/bin/*fortran* "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/libgfortran* "${{targets.subpkgdir}}"/usr/lib/gcc/${{host.triplet.gnu}}/${{vars.major-version}}/
+          for f in "${{targets.destdir}}"/usr/lib/libquadmath*; do
+            [ -f "$f" ] && mv "$f" "${{targets.subpkgdir}}"/usr/lib
+          done
+
+          mv "${{targets.destdir}}"/$_libdir/finclude "${{targets.subpkgdir}}"/$_libdir
+          mv "${{targets.destdir}}"/$_libexecdir/f951 "${{targets.subpkgdir}}"/$_libexecdir
+    dependencies:
+      runtime:
+        - gcc-${{vars.major-version}}=${{package.full-version}}
+        - libgfortran-${{vars.major-version}}=${{package.full-version}}
+    test:
+      pipeline:
+        - runs: |
+            gfortran-${{vars.major-version}} --version
+            gfortran-${{vars.major-version}} --help
+
+  - name: 'gcc-${{vars.major-version}}-default'
+    description: 'Use GCC ${{vars.major-version}} as system gcc'
+    dependencies:
+      provides:
+        - gcc=${{package.full-version}}
+        - gfortran=${{package.full-version}}
+      runtime:
+        - gcc-${{vars.major-version}}=${{package.full-version}}
+        - gfortran-${{vars.major-version}}=${{package.full-version}}
+        - libgfortran-${{vars.major-version}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+
+          for i in c++ g++ gcc gcc-ar gcc-nm gcc-ranlib gfortran; do
+            ln -sf "${{host.triplet.gnu}}-"$i"-${{vars.major-version}}" "${{targets.subpkgdir}}"/usr/bin/"${{host.triplet.gnu}}-"$i
+          done
+
+          for i in c++ g++ cpp gcc gcc-ar gcc-nm gcc-ranlib gfortran gcov gcov-dump gcov-tool lto-dump; do
+            ln -sf $i"-${{vars.major-version}}" "${{targets.subpkgdir}}"/usr/bin/$i
+          done
+    test:
+      environment:
+        contents:
+          packages:
+            - gfortran-${{vars.major-version}}
+      pipeline:
+        - runs: |
+            c++ --version
+            c++ --help
+            cpp --version
+            cpp --help
+            g++ --version
+            g++ --help
+            gcc --version
+            gcc --help
+            gcc-ar --version
+            gcc-ar --help
+            gcc-nm --version
+            gcc-nm --help
+            gcc-ranlib --version
+            gcc-ranlib --help
+            gfortran --version
+            gfortran --help
+            gcov --version
+            gcov --help
+            gcov-dump --version
+            gcov-dump --help
+            gcov-tool --version
+            gcov-tool --help
+            lto-dump --version
+            lto-dump --help
+
+test:
+  environment:
+    contents:
+      packages:
+        - glibc-dev
+        - gcc-${{vars.major-version}}-default
+        - libstdc++-${{vars.major-version}}-dev
+  pipeline:
+    - name: Check basic usage of top level & libexec binaries
+      runs: |
+        # Check C frontend compiler
+        gcc-${{vars.major-version}} --version | grep ${{package.version}}
+        # Check C++ frontend compiler
+        g++-${{vars.major-version}} --version | grep ${{package.version}}
+        # Check C empty translation unit compilation
+        : > empty.c
+        gcc-${{vars.major-version}} -c empty.c
+
+        # Check C++ empty translation unit compilation
+        : > empty.cpp
+        g++-${{vars.major-version}} -c empty.cpp
+        c++-${{vars.major-version}} --version
+        c++-${{vars.major-version}} --help
+        cpp-${{vars.major-version}} --version
+        cpp-${{vars.major-version}} --help
+        g++-${{vars.major-version}} --help
+        gcc-${{vars.major-version}} --help
+        gcc-ar-${{vars.major-version}} --version
+        gcc-ar-${{vars.major-version}} --help
+        gcc-nm-${{vars.major-version}} --version
+        gcc-nm-${{vars.major-version}} --help
+        gcc-ranlib-${{vars.major-version}} --version
+        gcc-ranlib-${{vars.major-version}} --help
+        gcov-${{vars.major-version}} --version
+        gcov-${{vars.major-version}} --help
+        gcov-dump-${{vars.major-version}} --version
+        gcov-dump-${{vars.major-version}} --help
+        gcov-tool-${{vars.major-version}} --version
+        gcov-tool-${{vars.major-version}} --help
+        lto-dump-${{vars.major-version}} --version
+        lto-dump-${{vars.major-version}} --help
+    - name: hello world c
+      runs: |
+        cat >hello.c <<"EOF"
+        #include <stdio.h>
+        int main(int argc, char* argv[]) {
+            printf("hello-c");
+            return 0;
+        }
+        EOF
+
+        gcc-${{vars.major-version}} -o hello-c hello.c
+        out=$(./hello-c)
+        [ "$out" = "hello-c" ]
+    - name: hello world c++
+      runs: |
+        cat >hello.cpp <<"EOF"
+        #include <iostream>
+        int main() {
+            std::cout << "hello-c++";
+            return 0;
+        }
+        EOF
+
+        g++-${{vars.major-version}} -o hello-c++ hello.cpp
+        out=$(./hello-c++)
+        [ "$out" = "hello-c++" ]
+    - uses: test/compiler/hardening-check
+      with:
+        cc: gcc-${{vars.major-version}}
+    - uses: test/compiler/asan
+      with:
+        cc: gcc-${{vars.major-version}}
+    - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  git:
+    tag-filter-prefix: releases/gcc-${{vars.major-version}}.
+    strip-prefix: releases/gcc-

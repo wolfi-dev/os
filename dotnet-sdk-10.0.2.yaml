@@ -1,13 +1,13 @@
 package:
   name: dotnet-sdk-10.0.2
-  version: "10.0.201"
+  version: "10.0.204"
   epoch: 0
   description: ".NET SDK ${{package.version}}"
   copyright:
     - license: MIT
   resources:
     cpu: 32
-    memory: 64Gi
+    memory: 128Gi
   dependencies:
     runtime:
       - aspnet-${{vars.major-version}}-runtime
@@ -56,7 +56,7 @@ pipeline:
     with:
       repository: https://github.com/dotnet/dotnet
       tag: v${{package.version}}
-      expected-commit: 4d3023de605a78ba3e59e50c657eed70f125c68a
+      expected-commit: e7aa4b537d95ae955b5c98c25fa9b9220e7eb71e
 
   - runs: |
       if [ ${{build.arch}} = "aarch64" ]; then
@@ -91,7 +91,7 @@ pipeline:
         /p:MinimalConsoleLogOutput=true \
         /p:SkipPortableRuntimeBuild=true \
         /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind \
-        /m:$(( $(nproc) / 4 ))
+        /p:PublishReadyToRunCrossgen2ExtraArgs="--parallelism=1"
 
       mkdir -p ${{targets.contextdir}}/${{vars.prefix}}
 
@@ -146,6 +146,69 @@ test:
         - dotnet-${{vars.major-version}}
   pipeline:
     - uses: test/tw/ldd-check
+    - name: Bootstrap-bundled host pack alignment
+      runs: |
+        # Source-build's BundledNETCoreAppPackageVersion is set by the bootstrap
+        # input runtime, NOT by the source tree's PrivateSourceBuiltSdkVersion
+        # (we've confirmed this empirically: the same v10.0.203 source tag
+        # produced BundledVersions=10.0.5 with bootstrap dotnet-sdk-10.0.1=10.0.105
+        # and BundledVersions=10.0.7 with bootstrap dotnet-sdk-10.0.1=10.0.107).
+        #
+        # The SDK's apphost generation looks up the host pack at:
+        #   /usr/share/dotnet/packs/Microsoft.NETCore.App.Host.<rid>/<bundled>/
+        # which is provided by the dotnet-${{vars.major-version}}-targeting-pack
+        # apk installed at test time. If the targeting-pack's runtime version
+        # has drifted from this SDK's bundled runtime (which happens if a
+        # dotnet-${{vars.major-version}} security bump landed without a
+        # cascading rebuild of this package on top of the realigned bootstrap),
+        # the lookup misses, the SDK falls through to NuGet restore, and
+        # `dotnet publish` / `dotnet run` fail with NU1101.
+        #
+        # Fail this test loudly with that specific diagnosis so future
+        # maintainers don't have to reverse-engineer a cryptic NU1101.
+        case "$(uname -m)" in
+          x86_64)  rid="wolfi.20230201-x64" ;;
+          aarch64) rid="wolfi.20230201-arm64" ;;
+          *)       echo "unexpected uname -m: $(uname -m)"; exit 1 ;;
+        esac
+
+        sdk_props="/usr/share/dotnet/sdk/${{package.version}}/Microsoft.NETCoreSdk.BundledVersions.props"
+        bundled=$(sed -n 's:.*<BundledNETCoreAppPackageVersion>\([^<]*\)</BundledNETCoreAppPackageVersion>.*:\1:p' \
+          "$sdk_props" | head -1)
+        [ -n "$bundled" ] || { echo "could not parse BundledNETCoreAppPackageVersion from $sdk_props"; exit 1; }
+
+        pack_dir="/usr/share/dotnet/packs/Microsoft.NETCore.App.Host.${rid}/${bundled}"
+        if [ -d "$pack_dir" ]; then
+          echo "ok: SDK bundled runtime ${bundled} is covered by host pack at ${pack_dir}"
+          exit 0
+        fi
+
+        installed_versions=$(ls "/usr/share/dotnet/packs/Microsoft.NETCore.App.Host.${rid}/" 2>/dev/null | tr '\n' ' ')
+        cat <<EOF
+        ERROR: bootstrap-bundled host pack drift detected
+
+          ${{package.name}}=${{package.version}} was built bundled to runtime ${bundled},
+          but no host pack at /packs/Microsoft.NETCore.App.Host.${rid}/${bundled}/
+          is installed alongside it.
+
+          installed host pack version(s) for ${rid}: ${installed_versions:-(none)}
+
+          Cause: source-build's BundledNETCoreAppPackageVersion follows the bootstrap
+          (dotnet-sdk-${{vars.major-version}}.0.1) input runtime, not the
+          dotnet/dotnet@v${{package.version}} source tree's PrivateSourceBuiltSdkVersion.
+          When the dotnet-${{vars.major-version}}-targeting-pack apk's runtime version
+          moves away from what the bootstrap was built against — typically a
+          dotnet-${{vars.major-version}} security bump without a cascading rebuild of
+          this package — the resulting SDK ends up advertising a bundled runtime
+          that the targeting-pack no longer ships. dotnet publish / dotnet run will
+          fail with NU1101 looking for Microsoft.NETCore.App.Host.${rid}.${bundled}.nupkg.
+
+          Fix: rebuild dotnet-sdk-${{vars.major-version}}.0.1 against the current
+          dotnet-${{vars.major-version}} runtime, then rebuild this package on top of
+          the realigned bootstrap (epoch bump). The cascade should align bundled,
+          targeting-pack, and runtime versions again.
+        EOF
+        exit 1
     - runs: dotnet tool install -g Microsoft.Web.LibraryManager.Cli
     - name: Compile and run a simple .NET application
       runs: |

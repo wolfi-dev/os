@@ -1,7 +1,7 @@
 package:
   name: libkrunfw
   version: "5.4.0"
-  epoch: 0
+  epoch: 1
   description: Dynamic library bundling a Linux kernel for use by libkrun
   copyright:
     - license: GPL-2.0-only AND LGPL-2.1-only
@@ -122,30 +122,76 @@ pipeline:
       mkdir -p tarballs
       mv linux-${{vars.kernel-version}}.tar.xz tarballs/
 
-  - name: Enable 9p in the bundled kernel
+  - name: Write our config fragment (9p + IKCONFIG introspection)
     runs: |
-      # We need 9p networking + filesystem support so host<->guest sharing can
-      # use 9p (virtio-9p). This may be replaced by virtio-fs in the future,
-      # but for now we're carrying it. CONFIG_INET is already y in the
-      # upstream configs, so the dependency chain is satisfied.
-      # CONFIG_9P_FS_POSIX_ACL is intentionally left off (no POSIX ACL
-      # forwarding wanted right now); the libkrunfw Makefile runs
-      # `make olddefconfig` after copying these files, which will keep ACL=n.
-      for cfg in config-libkrunfw_x86_64 config-libkrunfw_aarch64; do
-        [ -f "$cfg" ] || { echo "missing $cfg" >&2; exit 1; }
-        sed -i 's|^# CONFIG_NET_9P is not set$|CONFIG_NET_9P=y|' "$cfg"
-        # Sanity-check the edit landed (so a config rename upstream is caught).
-        grep -q '^CONFIG_NET_9P=y$' "$cfg" || {
-          echo "ERROR: failed to enable CONFIG_NET_9P in $cfg" >&2
-          grep -E 'NET_9P|9P_FS' "$cfg" >&2 || true
-          exit 1
-        }
-        printf "%s\n" \
-          'CONFIG_NET_9P_FD=y' \
-          'CONFIG_9P_FS=y' \
-          '# CONFIG_9P_FS_POSIX_ACL is not set' \
-          >> "$cfg"
-      done
+      # This fragment layers on top of libkrunfw's per-arch base config via
+      # merge_config.sh in the next step. Things we add:
+      #
+      # CONFIG_NETWORK_FILESYSTEMS - parent menu under fs/Kconfig. The base
+      #   libkrunfw config has it off, which means fs/9p/Kconfig is never even
+      #   sourced and CONFIG_9P_FS isn't visible to olddefconfig. Without this
+      #   our 9p options get silently dropped during defconfig resolution.
+      # CONFIG_NET_9P*    - 9p protocol + fd transport (host<->guest sharing).
+      #   May be replaced by virtio-fs in the future; for now we need 9p.
+      # CONFIG_9P_FS      - the 9p filesystem driver itself.
+      # CONFIG_9P_FS_POSIX_ACL - intentionally left off (no POSIX ACL
+      #   forwarding wanted right now).
+      # CONFIG_IKCONFIG*  - exposes the in-kernel config at /proc/config.gz,
+      #   handy for runtime introspection ("what was this kernel built with?").
+      cat > custom.cfg <<'EOF'
+      CONFIG_NETWORK_FILESYSTEMS=y
+      CONFIG_NET_9P=y
+      CONFIG_NET_9P_FD=y
+      CONFIG_9P_FS=y
+      # CONFIG_9P_FS_POSIX_ACL is not set
+      CONFIG_IKCONFIG=y
+      CONFIG_IKCONFIG_PROC=y
+      EOF
+
+  - name: Extract and prepare kernel source tree (no kernel build yet)
+    runs: |
+      # libkrunfw's $(KERNEL_SOURCES) rule (named linux-X.Y.Z) extracts the
+      # tarball, applies patches, copies the per-arch base config to .config,
+      # and runs olddefconfig. We invoke just that target so we end up with a
+      # resolved .config we can merge our fragment over the top of, without
+      # also kicking off the full kernel compile yet.
+      make -j$(nproc) linux-${{vars.kernel-version}}
+
+  - name: Merge custom config on top of base .config (fail loudly on drift)
+    runs: |
+      KSRC=linux-${{vars.kernel-version}}
+      # merge_config.sh -m writes the merged config to $KCONFIG_CONFIG (default
+      # .config) and skips its built-in `make alldefconfig` pass. We skip that
+      # pass because libkrunfw's base config explicitly disables a lot of
+      # things alldefconfig would happily turn back on; we want olddefconfig
+      # semantics instead (preserve all existing decisions, only fill in
+      # defaults for *new* symbols that just became visible thanks to our
+      # fragment - e.g. children under NETWORK_FILESYSTEMS).
+      (cd "$KSRC" && ./scripts/kconfig/merge_config.sh -m .config ../custom.cfg)
+      (cd "$KSRC" && make olddefconfig)
+
+      # Verify every line in our fragment ended up verbatim in .config. This
+      # is what catches "your dep chain wasn't satisfied so olddefconfig
+      # dropped it" as a *build* failure, not a runtime surprise.
+      fail=0
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        if ! grep -qxF "$line" "$KSRC/.config"; then
+          echo "ERROR: requested kernel config not in final .config: $line" >&2
+          # Show what the symbol's actual state is, if any, for debugging.
+          sym=${line%%=*}; sym=${sym#\# }; sym=${sym%% *}
+          grep -E "^(${sym}=|# ${sym} )" "$KSRC/.config" >&2 || \
+            echo "  (symbol ${sym} entirely absent from .config)" >&2
+          fail=1
+        fi
+      done < custom.cfg
+      if [ "$fail" -ne 0 ]; then
+        echo "" >&2
+        echo "olddefconfig dropped one or more requested options." >&2
+        echo "Most common cause: a parent menu/dependency isn't enabled." >&2
+        echo "Inspect $KSRC/.config and the Kconfig graph for the missing symbol." >&2
+        exit 1
+      fi
 
   - runs: |
       make -j$(nproc) PREFIX=/usr LIBDIR_Linux=lib

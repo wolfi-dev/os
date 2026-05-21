@@ -7,7 +7,7 @@ package:
     - license: Apache-2.0
   resources:
     cpu: "4"
-    memory: 14Gi
+    memory: 24Gi
   options:
     no-depends: true
   dependencies:
@@ -47,7 +47,7 @@ environment:
       - libxkbfile-dev
       - node-gyp
       - nodejs-22
-      - npm<11.12.0
+      - npm<11.2.0
       - python3
       - rsync
   environment:
@@ -87,8 +87,11 @@ pipeline:
   - runs: |
       mkdir -p "${{targets.contextdir}}"/usr/lib/code-server
 
-      # Update prebuild-install
-      npm update prebuild-install
+      # All `npm pkg set` overrides and lockfile rewrites must happen BEFORE the
+      # first `npm install` (including `npm update prebuild-install`, which
+      # triggers code-server's postinstall.sh and installs lib/vscode's modules
+      # from the lockfile). Otherwise lib/vscode lands with its original pinned
+      # deps and our later overrides never take effect.
 
       # Set npm overrides for security vulnerabilities
       npm pkg set "overrides.tar-fs=3.1.1" "overrides.node-addon-api=7.1.0" "overrides.body-parser=2.2.1"
@@ -102,6 +105,7 @@ pipeline:
       npm pkg set "overrides.path-to-regexp=8.4.0"
       npm pkg set "overrides.lodash-es=4.18.0"
       npm pkg set "overrides.ip-address=10.1.1"
+      npm pkg set "dependencies.ws=^8.20.1"
 
       (cd lib/vscode
        npm pkg set "dependencies.undici=^7.24.0"
@@ -109,8 +113,19 @@ pipeline:
        npm pkg set "overrides.lodash-es=4.18.0"
        npm pkg set "overrides.basic-ftp=5.3.1"
        npm pkg set "overrides.ip-address=10.1.1"
-       # Ensure package-lock.json is regenerated for our changes
-       npm install --package-lock-only --ignore-scripts
+       # Bump direct deps to clear GHSA-9ccr-r5hg-74gf (@github/copilot) and
+       # GHSA-58qx-3vcg-4xpx (ws). Both are direct deps in lib/vscode, so an
+       # `overrides.*` entry would conflict; bump the dependency pin instead.
+       # Pass the packages explicitly to `npm install --package-lock-only` so
+       # the lock is rewritten — a bare invocation can otherwise report "up to
+       # date" against the old lock even when package.json now disagrees.
+       npm pkg set "dependencies.@github/copilot=^1.0.43"
+       npm pkg set "dependencies.ws=^8.20.1"
+       npm install --package-lock-only --ignore-scripts \
+         '@github/copilot@^1.0.43' 'ws@^8.20.1'
+      )
+      (cd lib/vscode/extensions/copilot
+       npm pkg set "dependencies.@github/copilot=^1.0.43"
       )
       (cd lib/vscode/remote
        npm pkg set "dependencies.undici=^7.24.0"
@@ -118,7 +133,21 @@ pipeline:
        npm pkg set "overrides.lodash-es=4.18.0"
        npm pkg set "overrides.basic-ftp=5.3.1"
        npm pkg set "overrides.ip-address=10.1.1"
+       # The reh-web bundle gulp task copies production deps out of
+       # lib/vscode/remote/node_modules (NOT lib/vscode/node_modules), so the
+       # @github/copilot + ws bumps must also be applied here or the final apk
+       # still ships the 1.0.39 / 8.19.0 versions.
+       npm pkg set "dependencies.@github/copilot=^1.0.43"
+       npm pkg set "dependencies.ws=^8.20.1"
+       npm install --package-lock-only --ignore-scripts \
+         '@github/copilot@^1.0.43' 'ws@^8.20.1'
       )
+
+      # Update prebuild-install. This also triggers code-server's postinstall.sh
+      # which performs the first `npm install` inside lib/vscode — at this point
+      # the lockfile and package.json overrides above are already in place, so
+      # node_modules picks up the bumped versions.
+      npm update prebuild-install
 
       # Install modules and build backend/frontend
       npm install
@@ -134,23 +163,17 @@ pipeline:
       # Builds vscode into /lib/vscode/out-vscode
       VERSION=0.0.0 npm run build:vscode
 
-      # Bundles the 'npm build ...' commands into ./release
-      npm run release
-
-      # Install the modules needed for the release
-      cd release
-      npm install --unsafe-perm --omit=dev
-
-      # Bundles the release with other needed files into ./release-standalone
-      cd ..
-      npm run release:standalone
+      # Bundles the 'npm build ...' commands into ./release with node_modules included.
+      # Upstream removed the separate `release:standalone` script in v4.121.0; passing
+      # KEEP_MODULES=1 to `npm run release` now produces the equivalent bundle in ./release.
+      KEEP_MODULES=1 npm run release
 
       # Add code-server version
-      jq --arg v ${{package.version}} '.version = $v' ./release-standalone/package.json > ./release-standalone/tmp.json \
-      && mv ./release-standalone/tmp.json ./release-standalone/package.json
+      jq --arg v ${{package.version}} '.version = $v' ./release/package.json > ./release/tmp.json \
+      && mv ./release/tmp.json ./release/package.json
 
       # Copy the release into the conext directory and setup symlink
-      cp -r ./release-standalone/* "${{targets.contextdir}}"/usr/lib/code-server
+      cp -r ./release/* "${{targets.contextdir}}"/usr/lib/code-server
       mkdir -p "${{targets.contextdir}}"/usr/bin
       ln -s /usr/lib/code-server/bin/code-server "${{targets.contextdir}}"/usr/bin/code-server
 

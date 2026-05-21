@@ -1,0 +1,228 @@
+package:
+  name: libkrunfw
+  version: "5.4.0"
+  epoch: 0
+  description: Dynamic library bundling a Linux kernel for use by libkrun
+  copyright:
+    - license: GPL-2.0-only AND LGPL-2.1-only
+  resources:
+    cpu: "6"
+    memory: 12Gi
+
+vars:
+  # IMPORTANT: kernel-version MUST match the value of KERNEL_VERSION in
+  # libkrunfw's upstream Makefile for the tag we're building. Each libkrunfw
+  # release pins exactly one kernel version (libkrunfw's job is to bake that
+  # kernel into a .so). When bumping `package.version`, you MUST also:
+  #   1. Read `KERNEL_VERSION = linux-X.Y.Z` from the upstream Makefile.
+  #   2. Set kernel-version below to "X.Y.Z".
+  #   3. Update expected-sha256 in the `fetch` step from
+  #      https://cdn.kernel.org/pub/linux/kernel/v<major>.x/sha256sums.asc
+  # A build-time assertion below catches forgotten updates.
+  kernel-version: "6.12.87"
+  python-version: "3.13"
+
+# Derive the kernel.org URL major-version segment (e.g. "6" from "6.12.87") so
+# the `fetch` URI updates automatically if kernel-version ever crosses a major.
+var-transforms:
+  - from: ${{vars.kernel-version}}
+    match: ^(\d+)\..*
+    replace: $1
+    to: kernel-major
+
+environment:
+  contents:
+    packages:
+      - bc
+      - bison
+      - build-base
+      - busybox
+      - coreutils
+      - diffutils
+      - elfutils
+      - elfutils-dev
+      - findutils
+      - flex
+      - gawk
+      # gcc-15 (instead of the default gcc, which is currently gcc-16) for the
+      # kernel compile: gcc-16's aarch64 auto-vectorizer ICEs on parts of
+      # linux-6.12 (zstd_opt.c, cfi_cmdset_0002.c) when tuning for Neoverse V2.
+      # gcc-15 builds cleanly. The shared-library link step also uses gcc-15
+      # for consistency, which is fine.
+      - gcc-15-default
+      - gmp
+      - gmp-dev
+      - gnutar
+      - mpc
+      - mpc-dev
+      - mpfr
+      - mpfr-dev
+      - openssl
+      - openssl-dev
+      - patch
+      - perl
+      - py${{vars.python-version}}-pyelftools
+      - python-${{vars.python-version}}
+      - wolfi-base
+      - xz
+      - zstd
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/containers/libkrunfw
+      tag: v${{package.version}}
+      expected-commit: e0647fa7a3932c4570fb2c0fd483b9f7a382ebdd
+
+  - uses: fetch # blocked-bootstrap-complex: libkrunfw needs a specific kernel version, expects tarball.
+    with:
+      uri: https://cdn.kernel.org/pub/linux/kernel/v${{vars.kernel-major}}.x/linux-${{vars.kernel-version}}.tar.xz
+      expected-sha256: cc12a7644b4cef9e06627b29de8753e22b3d076703a9b52be84263e05c8b9830
+      extract: false
+      delete: false
+
+  - name: Stage pre-fetched kernel tarball
+    runs: |
+      # Assert our pinned kernel-version matches what upstream's Makefile
+      # expects. If they diverge, fail loudly here instead of in the kernel
+      # build (where the error would be a sandboxed curl failure).
+      expected="linux-${{vars.kernel-version}}"
+      actual=$(awk -F'= *' '/^KERNEL_VERSION/{print $2; exit}' Makefile)
+      if [ "$expected" != "$actual" ]; then
+        new_ver=${actual#linux-}
+        new_major=${new_ver%%.*}
+        tarball_url="https://cdn.kernel.org/pub/linux/kernel/v${new_major}.x/${actual}.tar.xz"
+        shasums_url="https://cdn.kernel.org/pub/linux/kernel/v${new_major}.x/sha256sums.asc"
+        # Look up the new sha256 directly from kernel.org if we can reach it.
+        # melange's bubblewrap runs: steps DO have network, so this usually
+        # works; if it doesn't (offline build, transient failure), we fall
+        # back to printing the command for the user to run themselves.
+        new_sha=$(curl --max-time 5 -sSL "$shasums_url" 2>/dev/null \
+                  | awk -v f="${actual}.tar.xz" '$2 == f {print $1; exit}')
+        {
+          echo "ERROR: kernel version drift between libkrunfw.yaml and upstream Makefile"
+          echo "  libkrunfw.yaml vars.kernel-version => $expected"
+          echo "  upstream Makefile KERNEL_VERSION   => $actual"
+          echo ""
+          echo "To fix, set vars.kernel-version: \"${new_ver}\" in libkrunfw.yaml"
+          echo "(the kernel.org URL major segment is derived via var-transforms)."
+          echo ""
+          if [ -n "$new_sha" ]; then
+            echo "Then set the fetch step's expected-sha256 to:"
+            echo "  ${new_sha}"
+            echo "(looked up from ${shasums_url})"
+          else
+            echo "Then update the fetch step's expected-sha256, sha256 from:"
+            echo "  curl -sSL ${shasums_url} | grep -F ${actual}.tar.xz"
+            echo "(tarball: ${tarball_url})"
+          fi
+        } >&2
+        exit 1
+      fi
+      mkdir -p tarballs
+      mv linux-${{vars.kernel-version}}.tar.xz tarballs/
+
+  - name: Enable 9p in the bundled kernel
+    runs: |
+      # We need 9p networking + filesystem support so host<->guest sharing can
+      # use 9p (virtio-9p). This may be replaced by virtio-fs in the future,
+      # but for now we're carrying it. CONFIG_INET is already y in the
+      # upstream configs, so the dependency chain is satisfied.
+      # CONFIG_9P_FS_POSIX_ACL is intentionally left off (no POSIX ACL
+      # forwarding wanted right now); the libkrunfw Makefile runs
+      # `make olddefconfig` after copying these files, which will keep ACL=n.
+      for cfg in config-libkrunfw_x86_64 config-libkrunfw_aarch64; do
+        [ -f "$cfg" ] || { echo "missing $cfg" >&2; exit 1; }
+        sed -i 's|^# CONFIG_NET_9P is not set$|CONFIG_NET_9P=y|' "$cfg"
+        # Sanity-check the edit landed (so a config rename upstream is caught).
+        grep -q '^CONFIG_NET_9P=y$' "$cfg" || {
+          echo "ERROR: failed to enable CONFIG_NET_9P in $cfg" >&2
+          grep -E 'NET_9P|9P_FS' "$cfg" >&2 || true
+          exit 1
+        }
+        printf "%s\n" \
+          'CONFIG_NET_9P_FD=y' \
+          'CONFIG_9P_FS=y' \
+          '# CONFIG_9P_FS_POSIX_ACL is not set' \
+          >> "$cfg"
+      done
+
+  - runs: |
+      make -j$(nproc) PREFIX=/usr LIBDIR_Linux=lib
+
+  - runs: |
+      make PREFIX=/usr LIBDIR_Linux=lib DESTDIR="${{targets.destdir}}" install
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: Development files for ${{package.name}}
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+          with:
+            packages: ${{subpkg.name}}
+
+update:
+  enabled: true
+  github:
+    identifier: containers/libkrunfw
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Verify SONAME and symlinks
+      runs: |
+        set -euo pipefail
+        test -f /usr/lib/libkrunfw.so.${{package.version}}
+        test -L /usr/lib/libkrunfw.so.5
+        readlink /usr/lib/libkrunfw.so.5 | grep -F libkrunfw.so.${{package.version}}
+    - name: Verify exported symbols
+      runs: |
+        set -euo pipefail
+        for sym in krunfw_get_kernel krunfw_get_version; do
+          if ! nm -D --defined-only /usr/lib/libkrunfw.so.5 | grep -qw "$sym"; then
+            echo "Missing symbol: $sym"
+            nm -D --defined-only /usr/lib/libkrunfw.so.5 || true
+            exit 1
+          fi
+        done
+    - name: Functional test - load kernel data via libkrunfw
+      runs: |
+        set -euo pipefail
+        cat > /tmp/krunfw_test.c <<'EOF'
+        #include <stddef.h>
+        #include <stdio.h>
+
+        extern char *krunfw_get_kernel(size_t *load_addr, size_t *entry_addr, size_t *size);
+        extern int krunfw_get_version(void);
+
+        int main(void) {
+            size_t load_addr = 0, entry_addr = 0, size = 0;
+            char *kernel = krunfw_get_kernel(&load_addr, &entry_addr, &size);
+            if (kernel == NULL) {
+                fprintf(stderr, "krunfw_get_kernel returned NULL\n");
+                return 1;
+            }
+            if (size == 0) {
+                fprintf(stderr, "krunfw_get_kernel returned size 0\n");
+                return 1;
+            }
+            printf("krunfw kernel size=%zu load=0x%zx entry=0x%zx abi=%d\n",
+                   size, load_addr, entry_addr, krunfw_get_version());
+            return 0;
+        }
+        EOF
+        cc -o /tmp/krunfw_test /tmp/krunfw_test.c /usr/lib/libkrunfw.so.5
+        /tmp/krunfw_test

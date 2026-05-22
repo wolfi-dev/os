@@ -1,0 +1,86 @@
+package:
+  name: yaml-language-server
+  version: "1.23.0"
+  epoch: 0
+  description: Language Server for YAML files
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - nodejs
+  resources:
+    cpu: "2"
+    memory: 4Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - ca-certificates-bundle
+      - git
+      - jq
+      - nodejs-22
+      - npm
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 558f181f395c3544df513a54536acbfb28832d5d
+      repository: https://github.com/redhat-developer/yaml-language-server
+      tag: ${{package.version}}
+
+  - runs: |
+      npm ci
+      npm run compile
+      npm prune --omit=dev
+
+      install_dir="${{targets.destdir}}"/usr/lib/node_modules/yaml-language-server
+      install -d "$install_dir"
+      mv out bin l10n package.json node_modules "$install_dir"/
+
+      # CVE fix: surgically replace vulnerable bundled fast-uri with the
+      # patched tarball from npm. npm overrides on the build's package.json
+      # do not always propagate to all nested copies; the surgical
+      # find+tar-overlay pattern is the reliable fix (see gemini-cli and
+      # kibana-8.19 packages for prior art).
+      # GHSA-q3j6-qgpj-74h6 (CVE-2026-6321) fixed in 3.1.1
+      # GHSA-v39h-62p7-jpjc (CVE-2026-6322) fixed in 3.1.2
+      npm pack fast-uri@3.1.2 --pack-destination /tmp >/dev/null
+      find "$install_dir" -path "*/node_modules/fast-uri" -type d | while read dir; do
+        ver=$(jq -r .version "$dir/package.json")
+        case "$ver" in
+          3.0.*|3.1.0|3.1.1)
+            rm -rf "$dir"
+            install -d "$dir"
+            tar xzf /tmp/fast-uri-3.1.2.tgz -C "$dir" --strip-components=1
+            ;;
+        esac
+      done
+      rm -f /tmp/fast-uri-3.1.2.tgz
+
+      install -d "${{targets.destdir}}"/usr/bin
+      ln -s /usr/lib/node_modules/yaml-language-server/bin/yaml-language-server \
+        "${{targets.destdir}}"/usr/bin/yaml-language-server
+
+update:
+  enabled: true
+  github:
+    identifier: redhat-developer/yaml-language-server
+    use-tag: true
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: |
+        # LSPs don't respond to --version/--help; exercise the JSON-RPC
+        # initialize handshake over stdio. Keep stdin open with a short sleep
+        # so the server has time to respond before EOF; capture stderr too.
+        INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}'
+        LEN=${#INIT}
+        out=$( { printf "Content-Length: %d\r\n\r\n%s" "$LEN" "$INIT"; sleep 3; } \
+          | timeout 10 yaml-language-server --stdio 2>&1 | head -c 8192 || true)
+        echo "$out" | grep -q '"capabilities"' \
+          || { echo "no capabilities in LSP response:"; echo "$out"; exit 1; }

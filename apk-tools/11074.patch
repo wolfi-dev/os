@@ -1,0 +1,98 @@
+From 5b4c82fd51c722f6aad999467dcc705a0462b97c Mon Sep 17 00:00:00 2001
+From: Ismael Donmez <ismael.donmez@chainguard.dev>
+Date: Thu, 21 May 2026 09:12:16 +0000
+Subject: [PATCH] blob,tar: widen number-pulling APIs to uint64_t + fix extract
+ truncation (backport of !301 + part of #11074)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backport of upstream commits to v2.14.10:
+  - 56019c5 ({blob,tar,adb}: avoid overflow when pulling numbers, MR !301)
+    apk_adb.c hunks omitted — adb is a v3-only format.
+    tar.c hunks reapplied against v2's src/io_archive.c (same code).
+  - bdebe7b (companion: widen apk_blob_pull_uint declaration return
+    type to uint64_t; cherry-picked the relevant 2 lines only — the
+    rest of that commit is an unrelated version-lexer rewrite).
+
+Together these fix io_archive.c:get_octal silently truncating tar
+entry sizes >4 GiB via apk_blob_pull_uint's 32-bit accumulator. The
+truncated entry size desyncs apk_tar_parse, which then emits
+EAPKFORMAT ("package file format error") at the next tar header.
+
+Also widens apk_archive_entry_extract's local 'r' from int to
+ssize_t. Without this, once get_octal correctly returns >4 GiB
+sizes, apk_istream_splice's ssize_t result is truncated mod 2^32
+when stored back into the int local; the truncated value compares
+unequal to ae->size and apk falsely reports ENOSPC ("No space left
+on device") even though the data was extracted correctly. v3
+rewrote this codepath entirely (fs_fsys.c uses apk_stream_copy
+without narrowing) so there's no direct upstream cherry-pick.
+
+ref https://gitlab.alpinelinux.org/alpine/apk-tools/-/issues/11074
+ref https://gitlab.alpinelinux.org/alpine/apk-tools/-/merge_requests/301
+---
+ src/apk_blob.h   | 2 +-
+ src/blob.c       | 4 ++--
+ src/io_archive.c | 7 ++++---
+ 3 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/src/apk_blob.h b/src/apk_blob.h
+index 008666e..da4ffe3 100644
+--- a/src/apk_blob.h
++++ b/src/apk_blob.h
+@@ -123,7 +123,7 @@ void apk_blob_push_base64(apk_blob_t *to, apk_blob_t binary);
+ void apk_blob_push_hexdump(apk_blob_t *to, apk_blob_t binary);
+ 
+ void apk_blob_pull_char(apk_blob_t *b, int expected);
+-unsigned int apk_blob_pull_uint(apk_blob_t *b, int radix);
++uint64_t apk_blob_pull_uint(apk_blob_t *b, int radix);
+ void apk_blob_pull_csum(apk_blob_t *b, struct apk_checksum *csum);
+ void apk_blob_pull_base64(apk_blob_t *b, apk_blob_t to);
+ void apk_blob_pull_hexdump(apk_blob_t *b, apk_blob_t to);
+diff --git a/src/blob.c b/src/blob.c
+index 3e376ec..c012b47 100644
+--- a/src/blob.c
++++ b/src/blob.c
+@@ -439,9 +439,9 @@ void apk_blob_pull_char(apk_blob_t *b, int expected)
+ 	b->len --;
+ }
+ 
+-unsigned int apk_blob_pull_uint(apk_blob_t *b, int radix)
++uint64_t apk_blob_pull_uint(apk_blob_t *b, int radix)
+ {
+-	unsigned int val;
++	uint64_t val;
+ 	int ch;
+ 
+ 	val = 0;
+diff --git a/src/io_archive.c b/src/io_archive.c
+index 3ada751..38dd530 100644
+--- a/src/io_archive.c
++++ b/src/io_archive.c
+@@ -53,10 +53,10 @@ struct tar_header {
+ #define GET_OCTAL(s,r)		get_octal(s, sizeof(s), r)
+ #define PUT_OCTAL(s,v,hz)	put_octal(s, sizeof(s), v, hz)
+ 
+-static unsigned int get_octal(char *s, size_t l, int *r)
++static uint64_t get_octal(char *s, size_t l, int *r)
+ {
+ 	apk_blob_t b = APK_BLOB_PTR_LEN(s, l);
+-	unsigned int val = apk_blob_pull_uint(&b, 8);
++	uint64_t val = apk_blob_pull_uint(&b, 8);
+ 	while (b.len >= 1 && (b.ptr[0] == 0 || b.ptr[0] == 0x20)) b.ptr++, b.len--;
+ 	if (b.len != 0) *r = -EAPKFORMAT;
+ 	return val;
+@@ -351,7 +351,8 @@ int apk_archive_entry_extract(int atfd, const struct apk_file_info *ae,
+ {
+ 	struct apk_xattr *xattr;
+ 	const char *fn = extract_name ?: ae->name;
+-	int fd, r = -1, atflags = 0, ret = 0;
++	int fd, atflags = 0, ret = 0;
++	ssize_t r = -1;
+ 
+ 	if (unlinkat(atfd, fn, 0) != 0 && errno != ENOENT) return -errno;
+ 
+-- 
+2.54.0
+

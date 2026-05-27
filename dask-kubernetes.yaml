@@ -1,7 +1,7 @@
 package:
   name: dask-kubernetes
   version: "2026.3.0"
-  epoch: 4 # convert to uv, add auth/uv and no-provides
+  epoch: 5 # GHSA-mf9v-mfxr-j63j
   description: "Native Kubernetes integration for Dask"
   copyright:
     - license: "BSD-3-Clause"
@@ -24,13 +24,12 @@ environment:
     SOURCE_DATE_EPOCH: "315532900"
   contents:
     packages:
-      - build-base
-      - busybox
-      - ca-certificates-bundle
-      - go
+      - build-base # fixes the linker `cc` not found
+      - openssl-dev # cryptography (Rust extension) needs openssl headers when no wheel is available
+      - pkgconf # cryptography's openssl-sys crate locates openssl via pkg-config
       - python-${{vars.python-version}}-dev
+      - rust # cryptography 47+ ships a Rust extension built via maturin/cargo
       - uv
-      - wolfi-base
 
 pipeline:
   - uses: git-checkout
@@ -39,19 +38,44 @@ pipeline:
       tag: ${{package.version}}
       expected-commit: 02eea0fdfd1fe9abbc85874c9278d48c6189b912
 
+  # Guardrail: fail fast if upstream's requires-python lower bound drifts
+  # away from vars.python-version. The interpreter version is load-bearing
+  # for runtime deps (python-${{vars.python-version}}-base), so a silent
+  # drift would quietly mis-pin them. Re-pin vars.python-version on a mismatch.
+  - name: "Verify vars.python-version matches upstream requires-python"
+    runs: |
+      set -euo pipefail
+      upstream=$(grep -E '^\s*requires-python\s*=' pyproject.toml \
+        | sed -E 's/.*>=\s*([0-9]+\.[0-9]+).*/\1/')
+      ours='${{vars.python-version}}'
+      if [ -z "$upstream" ]; then
+        echo "FAIL: could not parse requires-python from upstream pyproject.toml"
+        exit 1
+      fi
+      if [ "$upstream" != "$ours" ]; then
+        echo "FAIL: upstream requires-python>=${upstream} but vars.python-version is ${ours}"
+        echo "Update vars.python-version and revisit the runtime deps."
+        exit 1
+      fi
+      echo "PASS: vars.python-version (${ours}) matches upstream requires-python>=${upstream}"
+
   - uses: auth/uv
     with:
       allow-fallback-indexes: true
 
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv-home}}
+      python: ${{vars.python-version}}
+      system-site-packages: "true"
+
   - runs: |
-      # Create venv and install dask-kubernetes from Libraries
-      uv venv "${{vars.venv-home}}" --python python${{vars.python-version}}
       uv pip install --no-compile --python "${{vars.venv-home}}/bin/python" \
         "dask-kubernetes==${{package.version}}"
 
       # Verify installed version and Chainguard Libraries provenance
       "${{vars.venv-home}}/bin/python" -c "
-      from importlib.metadata import version, distribution
+      from importlib.metadata import version
       v = version('dask-kubernetes')
       assert v == '${{package.version}}', f'Expected dask-kubernetes==${{package.version}}, got {v}'
       print(f'dask-kubernetes=={v} installed correctly')
@@ -60,6 +84,7 @@ pipeline:
       # Remove pip/virtualenv from venv
       uv pip uninstall pip virtualenv --python "${{vars.venv-home}}/bin/python" || true
 
+  - runs: |
       # Symlink dask scripts to path
       mkdir -p "${{targets.contextdir}}/usr/bin"
       for script in "${{vars.venv-home}}/bin"/*dask*; do

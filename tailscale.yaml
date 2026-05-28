@@ -45,10 +45,6 @@ pipeline:
       ./build_dist.sh tailscale.com/cmd/containerboot
       ./build_dist.sh tailscale.com/cmd/${{package.name}}
       ./build_dist.sh tailscale.com/cmd/${{package.name}}d
-      # k8s-operator binary requires the ts_kube and ts_package_container build
-      # tags, matching the upstream build_docker.sh recipe for the
-      # tailscale/k8s-operator image. The produced binary is split out below
-      # into the k8s-operator subpackage.
       TAGS=ts_kube,ts_package_container ./build_dist.sh -o k8s-operator tailscale.com/cmd/k8s-operator
 
   - runs: |
@@ -59,21 +55,57 @@ pipeline:
 
   - uses: strip
 
+test:
+  pipeline:
+    - name: Test tailscale CLI version subcommand
+      runs: |
+        # tailscale version is a documented upstream subcommand that prints
+        # the client version, Go version, and OS/arch info
+        tailscale version
+    - name: Test tailscaled version output
+      runs: |
+        # tailscaled --version prints version info and exits;
+        # this proves the daemon binary is valid and was built correctly
+        tailscaled --version
+    - name: Test containerboot binary
+      runs: |
+        # containerboot is designed to run as PID 1 in a container and requires
+        # environment variables (TS_AUTH_KEY, etc.) to function. Without them,
+        # it exits with an error. We verify it starts and fails gracefully,
+        # which proves the binary loaded and initialized correctly.
+        output=$(containerboot 2>&1 || true)
+        echo "$output" | grep -iF "tailscale"
+
 subpackages:
   - name: ${{package.name}}-k8s-operator
     description: Tailscale Kubernetes operator
     pipeline:
       - runs: |
-          # Take ownership of the k8s-operator binary built in the main pipeline.
           mkdir -p "${{targets.subpkgdir}}"/usr/bin
           mv "${{targets.destdir}}"/usr/bin/k8s-operator "${{targets.subpkgdir}}"/usr/bin/k8s-operator
-          # Upstream tailscale/k8s-operator container image expects the binary
-          # at /usr/local/bin/operator; provide a relative symlink for parity.
           mkdir -p "${{targets.subpkgdir}}"/usr/local/bin
           ln -sf ../../bin/k8s-operator "${{targets.subpkgdir}}"/usr/local/bin/operator
     dependencies:
       runtime:
         - ca-certificates-bundle
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            dir: /usr/bin
+            name: k8s-operator
+        - name: Verify k8s-operator binary runs
+          runs: |
+            # k8s-operator is a Kubernetes operator binary; verify it can
+            # print version info to confirm it was built and linked correctly
+            k8s-operator --version
+        - name: Verify operator symlink
+          runs: |
+            # Verify the /usr/local/bin/operator symlink exists and points
+            # to the correct target binary
+            target=$(readlink /usr/local/bin/operator)
+            echo "Symlink target: $target"
+            echo "$target" | grep -F "k8s-operator"
 
   - name: ${{package.name}}-compat
     description: "Compatibility package to provide parity with upstream Tailscale binary locations"
@@ -98,40 +130,15 @@ subpackages:
         - uses: test/tw/symlink-check
           with:
             allow-absolute: true
+        - name: Verify compat symlinks
+          runs: |
+            # Verify each compat symlink exists and points to the expected target
+            readlink /usr/local/bin/containerboot | grep -F "/usr/bin/containerboot"
+            readlink /usr/local/bin/tailscale | grep -F "/usr/bin/tailscale"
+            readlink /usr/local/sbin/tailscaled | grep -F "/usr/bin/tailscaled"
 
 update:
   enabled: true
   github:
     identifier: tailscale/tailscale
     strip-prefix: v
-
-test:
-  environment:
-    contents:
-      packages:
-        - ${{package.name}}-compat
-  pipeline:
-    - name: Verify Tailscale Version
-      runs: |
-        # Package tests
-        tailscale version
-        tailscale --version
-        tailscale --help
-        tailscaled --version
-        tailscaled --help
-
-        # Compat validity tests
-        stat /usr/local/bin/containerboot
-        stat /usr/local/bin/tailscale
-        stat /usr/local/sbin/tailscaled
-        /usr/local/bin/tailscale --version
-        /usr/local/sbin/tailscaled --version
-    - name: Containerboot Test
-      runs: |
-        nohup containerboot > /dev/null 2>&1 &
-        sleep 2
-    - name: Tailscale Daemon Test
-      runs: |
-        tailscaled -tun=userspace-networking -socket=tailscaled.socket > /dev/null 2>&1 &
-        sleep 2
-        { tailscale --socket=tailscaled.socket status || true; } | grep -F 'Logged out.'

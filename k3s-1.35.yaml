@@ -1,7 +1,7 @@
 package:
   name: k3s-1.35
   version: "1.35.3.1"
-  epoch: 12 # GHSA-fqw6-gf59-qr4w
+  epoch: 13 # revert containerd v2.2.4 swap to fix embedded containerd panic
   description:
   copyright:
     - license: Apache-2.0
@@ -89,14 +89,10 @@ pipeline:
         golang.org/x/crypto@v0.52.0
         golang.org/x/sys@v0.45.0
         github.com/docker/docker@v25.0.13+incompatible
-        github.com/containerd/containerd/v2@v2.2.4
-        github.com/Microsoft/hcsshim@v0.14.1
-        github.com/klauspost/compress@v1.18.5
       replaces: |-
         google.golang.org/grpc=google.golang.org/grpc@v1.79.3
         golang.org/x/net=golang.org/x/net@v0.55.0
         github.com/docker/docker=github.com/docker/docker@v25.0.13+incompatible
-        github.com/containerd/containerd/v2=github.com/containerd/containerd/v2@v2.2.4
 
   # Build things (almost) identical to upstream, with the k3s components
   # embedded in the "outer" multicall binary.
@@ -193,6 +189,55 @@ subpackages:
             containerd --version
             containerd --help
             k3s --help
+        - name: Boot the embedded containerd via k3s server
+          runs: |
+            set -ex
+            # The embedded containerd lives inside the multicall binary and is
+            # only reachable once `k3s server` extracts the bundle and launches
+            # it. `containerd --version`/`--help` hit the k3s CLI, never
+            # server.New(), so they cannot catch a containerd startup panic.
+
+            # Give k3s/containerd state its own writable mount, and disable runc
+            # pivot_root which the shared QEMU test rootfs does not support.
+            mkdir -p /var/lib/rancher
+            mount -t tmpfs tmpfs /var/lib/rancher
+            mkdir -p /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d
+            cat > /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/no-pivot-root.toml << "TOML"
+            [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
+            NoPivotRoot = true
+            TOML
+
+            k3s server --disable=traefik --disable=metrics-server \
+              --disable=servicelb --disable=local-storage --disable-network-policy \
+              > /var/log/k3s.log 2>&1 < /dev/null &
+            K3S_PID=$!
+
+            # The containerd socket only appears after server.New() succeeds.
+            sock=/run/k3s/containerd/containerd.sock
+            for i in $(seq 1 180); do
+              [ -S "$sock" ] && break
+              kill -0 "$K3S_PID" 2>/dev/null || break
+              sleep 1
+            done
+
+            if [ ! -S "$sock" ]; then
+              echo "ERROR: embedded containerd did not come up" >&2
+              cat /var/log/k3s.log >&2 || true
+              kill "$K3S_PID" 2>/dev/null || true
+              exit 1
+            fi
+
+            # containerd is serving: prove it responds and that it did not panic.
+            k3s ctr --address "$sock" version
+            if grep -Eq "already exists with the same fully-qualified name|panic:|containerd exited" /var/log/k3s.log; then
+              echo "ERROR: embedded containerd logged a startup failure" >&2
+              cat /var/log/k3s.log >&2
+              kill "$K3S_PID" 2>/dev/null || true
+              exit 1
+            fi
+
+            kill "$K3S_PID" 2>/dev/null || true
+            echo "OK: embedded containerd booted cleanly"
 
   - name: k3s-static-1.35
     description: "k3s built with statically linked components"

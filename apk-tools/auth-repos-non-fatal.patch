@@ -1,0 +1,336 @@
+Description: Optionally skip auth-required repos when HTTP_AUTH is unset.
+ When a repository returns HTTP 401 (EACCES) and no HTTP_AUTH is provided,
+ apk normally aborts. This makes that non-fatal for an allowlist of
+ repositories: the repository is dropped with a warning and apk continues.
+ Auth failures with HTTP_AUTH set, or for repositories not on the allowlist,
+ remain fatal.
+ .
+ The allowlist is a comma/space separated list of fnmatch(3) glob patterns,
+ matched case-insensitively against the "host/path" of each repository URL.
+ It is resolved from, in order: the --allow-missing-auth command line option,
+ the APK_ALLOW_MISSING_AUTH environment variable, and the
+ APK_DEFAULT_ALLOW_MISSING_AUTH compile-time default (unset upstream).
+Author: Łukasz Zemczak <lukasz.zemczak@chainguard.dev>
+Forwarded: https://gitlab.alpinelinux.org/alpine/apk-tools/-/merge_requests/410
+
+diff --git a/src/apk.c b/src/apk.c
+index 6929a80..fc884cb 100644
+--- a/src/apk.c
++++ b/src/apk.c
+@@ -67,6 +67,7 @@ static struct apk_repository_list *apk_repository_new(const char *url)
+ }
+ 
+ #define GLOBAL_OPTIONS(OPT) \
++	OPT(OPT_GLOBAL_allow_missing_auth,	APK_OPT_ARG "allow-missing-auth") \
+ 	OPT(OPT_GLOBAL_allow_untrusted,		"allow-untrusted") \
+ 	OPT(OPT_GLOBAL_arch,			APK_OPT_ARG "arch") \
+ 	OPT(OPT_GLOBAL_cache_dir,		APK_OPT_ARG "cache-dir") \
+@@ -129,6 +130,9 @@ static int option_parse_global(void *ctx, struct apk_db_options *dbopts, int opt
+ 	case OPT_GLOBAL_repositories_file:
+ 		dbopts->repositories_file = optarg;
+ 		break;
++	case OPT_GLOBAL_allow_missing_auth:
++		apk_allow_missing_auth = optarg;
++		break;
+ 	case OPT_GLOBAL_repository:
+ 		repo = apk_repository_new(optarg);
+ 		if (repo) list_add(&repo->list, &dbopts->repository_list);
+diff --git a/src/apk_defines.h b/src/apk_defines.h
+index bd1d58f..407bb5e 100644
+--- a/src/apk_defines.h
++++ b/src/apk_defines.h
+@@ -72,6 +72,7 @@ static inline int IS_ERR_OR_NULL(const void *ptr) { return IS_ERR(ptr) || !ptr;
+ extern int apk_verbosity;
+ extern unsigned int apk_flags, apk_force;
+ extern const char *apk_arch;
++extern const char *apk_allow_missing_auth;
+ extern char **apk_argv;
+ 
+ #define APK_SIMULATE		0x0002
+diff --git a/src/apk_print.h b/src/apk_print.h
+index b59f41d..583715d 100644
+--- a/src/apk_print.h
++++ b/src/apk_print.h
+@@ -22,6 +22,7 @@ struct apk_url_print {
+ };
+ 
+ void apk_url_parse(struct apk_url_print *, const char *);
++int apk_url_host_matches(const char *url, const char *list);
+ 
+ #define URL_FMT			"%.*s%s%s"
+ #define URL_PRINTF(u)		(int)u.len_before_pw, u.url, u.pwmask, u.url_or_host
+diff --git a/src/database.c b/src/database.c
+index baabb8c..8c479c1 100644
+--- a/src/database.c
++++ b/src/database.c
+@@ -48,6 +48,7 @@ enum {
+ 
+ int apk_verbosity = 1;
+ unsigned int apk_flags = 0, apk_force = 0;
++const char *apk_allow_missing_auth = NULL;
+ 
+ static apk_blob_t tmpprefix = { .len=8, .ptr = ".apknew." };
+ 
+@@ -2262,6 +2263,7 @@ int apk_db_add_repository(apk_database_t _db, apk_blob_t _repository)
+ 	struct apk_url_print urlp;
+ 	apk_blob_t brepo, btag;
+ 	int repo_num, r, tag_id = 0, atfd = AT_FDCWD, update_error = 0;
++	int auth_missing = 0;
+ 	char buf[PATH_MAX], *url;
+ 	const char *error_action = "constructing url";
+ 
+@@ -2336,22 +2338,36 @@ int apk_db_add_repository(apk_database_t _db, apk_blob_t _repository)
+ 
+ err:
+ 	if (r || update_error) {
+-		if (is_remote) {
+-			if (r) db->repositories.unavailable++;
+-			else db->repositories.stale++;
+-		}
++		const char *http_auth = getenv("HTTP_AUTH");
++		const char *allow_auth = apk_allow_missing_auth;
++		if (allow_auth == NULL) allow_auth = getenv("APK_ALLOW_MISSING_AUTH");
++#ifdef APK_DEFAULT_ALLOW_MISSING_AUTH
++		if (allow_auth == NULL) allow_auth = APK_DEFAULT_ALLOW_MISSING_AUTH;
++#endif
++		auth_missing = (r == -EACCES || update_error == -EACCES) &&
++			(http_auth == NULL || *http_auth == '\0') &&
++			apk_url_host_matches(repo->url, allow_auth);
+ 		apk_url_parse(&urlp, repo->url);
+ 		if (update_error)
+ 			error_action = r ? "updating and opening" : "updating";
+ 		else
+ 			update_error = r;
+-		apk_warning("%s " URL_FMT ": %s", error_action, URL_PRINTF(urlp),
+-			apk_error_str(update_error));
++		if (auth_missing) {
++			apk_warning("ignoring authenticated repository " URL_FMT
++				": no HTTP_AUTH provided", URL_PRINTF(urlp));
++		} else {
++			if (is_remote) {
++				if (r) db->repositories.unavailable++;
++				else db->repositories.stale++;
++			}
++			apk_warning("%s " URL_FMT ": %s", error_action, URL_PRINTF(urlp),
++				apk_error_str(update_error));
++		}
+ 	}
+ 
+ 	if (r != 0) {
+ 		db->available_repos &= ~BIT(repo_num);
+-		if (is_remote) db->repositories.unavailable++;
++		if (is_remote && !auth_missing) db->repositories.unavailable++;
+ 	} else {
+ 		db->repo_tags[tag_id].allowed_repos |= BIT(repo_num);
+ 	}
+diff --git a/src/print.c b/src/print.c
+index 7b7f37a..bfccfeb 100644
+--- a/src/print.c
++++ b/src/print.c
+@@ -7,9 +7,12 @@
+  * SPDX-License-Identifier: GPL-2.0-only
+  */
+ 
++#include <ctype.h>
++#include <fnmatch.h>
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <errno.h>
+ #include <sys/ioctl.h>
+@@ -186,6 +189,66 @@ void apk_url_parse(struct apk_url_print *urlp, const char *url)
+ 	};
+ }
+ 
++/*
++ * Match a repository URL against a comma- or space-separated list of
++ * shell-style glob patterns (fnmatch(3): '*', '?', '[...]').
++ */
++int apk_url_host_matches(const char *url, const char *list)
++{
++	const char *authority, *host, *path, *p, *q;
++	char target[PATH_MAX], pattern[PATH_MAX];
++	size_t host_len, path_len, len;
++
++	if (list == NULL || *list == '\0') return 0;
++
++	authority = strstr(url, "://");
++	if (authority == NULL) return 0;
++	authority += 3;
++
++	/* skip optional userinfo (user:password@) */
++	host = authority;
++	for (p = authority; *p && *p != '/'; p++) {
++		if (*p == '@') {
++			host = p + 1;
++			break;
++		}
++	}
++
++	/* host ends at the port or path separator */
++	for (q = host; *q && *q != ':' && *q != '/'; q++)
++		;
++	host_len = q - host;
++	if (host_len == 0) return 0;
++
++	/* skip an optional :port, keep the path from the first '/' */
++	for (path = q; *path && *path != '/'; path++)
++		;
++	path_len = strlen(path);
++
++	/* assemble "host/path" (no scheme, userinfo or port) */
++	if (host_len + path_len >= sizeof target) return 0;
++	memcpy(target, host, host_len);
++	memcpy(target + host_len, path, path_len);
++	target[host_len + path_len] = '\0';
++
++	/* match against each comma/space separated glob pattern */
++	for (p = list; *p; p = q) {
++		while (*p == ',' || isspace((unsigned char)*p))
++			p++;
++		for (q = p; *q && *q != ',' && !isspace((unsigned char)*q); q++)
++			;
++		len = q - p;
++		if (len == 0 || len >= sizeof pattern)
++			continue;
++		memcpy(pattern, p, len);
++		pattern[len] = '\0';
++		if (fnmatch(pattern, target, FNM_CASEFOLD) == 0)
++			return 1;
++	}
++
++	return 0;
++}
++
+ void apk_print_progress(size_t done, size_t total)
+ {
+ 	static size_t last_done = 0;
+diff --git a/test/command-parsing.sh b/test/command-parsing.sh
+index b68c4ad..2eb7b36 100755
+--- a/test/command-parsing.sh
++++ b/test/command-parsing.sh
+@@ -9,6 +9,21 @@ if [ "$help_output" != "$invalid_option_output" ]; then
+ 	fail=$((fail+1))
+ fi
+ 
++# --allow-missing-auth takes a required argument. When recognized, parsing
++# continues and --version runs (printing the version banner); an unrecognized
++# option would instead fall through to the help text.
++version_output="$(../src/apk --allow-missing-auth=example.com --version 2>/dev/null)"
++if ! echo "$version_output" | grep -q "^apk-tools "; then
++	echo "FAIL: --allow-missing-auth=VALUE is not recognized"
++	fail=$((fail+1))
++fi
++
++# The argument is mandatory: the bare option must be a parse error.
++if ../src/apk --allow-missing-auth >/dev/null 2>&1; then
++	echo "FAIL: --allow-missing-auth without an argument should error"
++	fail=$((fail+1))
++fi
++
+ if [ $fail -eq 0 ]; then
+ 	echo "OK: command parsing works"
+ fi
+diff --git a/test/url-host-match.c b/test/url-host-match.c
+new file mode 100644
+index 0000000..2b57e79
+--- /dev/null
++++ b/test/url-host-match.c
+@@ -0,0 +1,78 @@
++/* url-host-match.c - unit test for apk_url_host_matches()
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ */
++
++#include <stdio.h>
++
++/* Provided by libapk (src/print.c); declared here to avoid pulling in the
++ * full apk header chain for a standalone test binary. */
++extern int apk_url_host_matches(const char *url, const char *list);
++
++static int failed = 0;
++
++static void check(const char *url, const char *list, int expect)
++{
++	int got = apk_url_host_matches(url, list);
++	if (got != expect) {
++		printf("FAIL: apk_url_host_matches(\"%s\", %s%s%s) = %d, expected %d\n",
++			url,
++			list ? "\"" : "", list ? list : "NULL", list ? "\"" : "",
++			got, expect);
++		failed++;
++	}
++}
++
++int main(void)
++{
++	/* Hosts use the RFC 2606 reserved example.* domains. */
++
++	/* exact host+path matches; a bare host does not match a URL with a path */
++	check("https://pkgs.example.com/repo", "pkgs.example.com/repo", 1);
++	check("https://pkgs.example.com/repo", "pkgs.example.com", 0);
++
++	/* prefix glob: any path on the host */
++	check("https://pkgs.example.com/repo", "pkgs.example.com/*", 1);
++
++	/* leading glob matches subdomains too */
++	check("https://mirror.example.com/repo", "*.example.com/*", 1);
++	check("https://submirror.example.com/repo", "*mirror.example.com/*", 1);
++
++	/* glob in the middle: ignore a changing path segment (e.g. a token) */
++	check("https://mirror.example.com/abc123/repo",
++	      "mirror.example.com/*/repo", 1);
++
++	/* per-path scoping */
++	check("https://pkgs.example.com/myorg", "pkgs.example.com/myorg*", 1);
++	check("https://pkgs.example.com/other", "pkgs.example.com/myorg*", 0);
++
++	/* a lone "*" matches any URL */
++	check("https://anything.example.org/x", "*", 1);
++
++	/* non-matches: unrelated host, and anchored patterns are not fooled by
++	 * lookalike hosts (no accidental suffix match) */
++	check("https://example.net/x", "pkgs.example.com/*", 0);
++	check("https://evil-pkgs.example.com/x", "pkgs.example.com/*", 0);
++	check("https://evilexample.com/x", "*.example.com/*", 0);
++
++	/* empty or absent list never matches */
++	check("https://pkgs.example.com/x", "", 0);
++	check("https://pkgs.example.com/x", NULL, 0);
++
++	/* comma/space separated list */
++	check("https://pkgs.example.com/repo", "example.net/*, pkgs.example.com/*", 1);
++	check("https://pkgs.example.com/repo", "example.net/* example.org/*", 0);
++
++	/* userinfo and port are stripped before matching */
++	check("https://user:pw@pkgs.example.com:443/repo", "pkgs.example.com/repo", 1);
++
++	/* non-URL (e.g. local cache path) has no host, matches nothing */
++	check("/var/cache/apk", "*", 0);
++
++	if (failed) {
++		printf("FAIL: %d host-match case(s) failed\n", failed);
++		return 1;
++	}
++	printf("OK: all host-match cases passed\n");
++	return 0;
++}
+diff --git a/test/url-host-match.sh b/test/url-host-match.sh
+new file mode 100755
+index 0000000..1756725
+--- /dev/null
++++ b/test/url-host-match.sh
+@@ -0,0 +1,11 @@
++#!/bin/sh
++
++# Unit test for apk_url_host_matches() (no_proxy-style host allowlist matching).
++# Compiles a small harness against the freshly built libapk and runs it.
++
++set -e
++
++CC="${CC:-cc}"
++$CC ${CFLAGS:-} -o url-host-match url-host-match.c -L../src -lapk
++LD_LIBRARY_PATH=../src ./url-host-match
++rm -f url-host-match

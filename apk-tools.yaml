@@ -1,7 +1,7 @@
 package:
   name: apk-tools
   version: "2.14.10"
-  epoch: 11
+  epoch: 12
   description: "apk-tools (Wolfi package manager)"
   copyright:
     - license: GPL-2.0-only
@@ -10,6 +10,11 @@ package:
       - ca-certificates-bundle
       - merged-sbin
       - wolfi-baselayout
+
+vars:
+  # Extra CFLAGS passed to every make invocation below.
+  #   apk-build-cflags: '-DAPK_DEFAULT_ALLOW_MISSING_AUTH=\"\*.cgr.dev/\*\"'
+  apk-build-cflags: ""
 
 environment:
   contents:
@@ -40,16 +45,26 @@ pipeline:
         usrmerge-lib.patch
         387.patch
         11074.patch
+        auth-repos-non-fatal.patch
 
   - runs: |
       sed -i -e 's:-Werror::' Make.rules
       echo "FULL_VERSION=${{package.version}}-r${{package.epoch}}" > config.mk
 
   - runs: |
-      make LUA="lua5.3" V=1
+      make LUA="lua5.3" V=1 CFLAGS_EXTRA='${{vars.apk-build-cflags}}'
 
   - runs: |
-      make LUA="lua5.3" V=1 DESTDIR="${{targets.destdir}}" install SBINDIR=/usr/bin LIBDIR=/usr/lib
+      # Run the upstream unit test suite (non-root, no network). Uses the same
+      # LUA and CFLAGS_EXTRA so kbuild does not recompile shared objects and the
+      # compile-time default is preserved in the installed binary.
+      # The suite runs the test scripts as ./<name>.sh, so make sure any added
+      # by our patches are executable.
+      chmod +x test/*.sh
+      make LUA="lua5.3" V=1 CFLAGS_EXTRA='${{vars.apk-build-cflags}}' check
+
+  - runs: |
+      make LUA="lua5.3" V=1 CFLAGS_EXTRA='${{vars.apk-build-cflags}}' DESTDIR="${{targets.destdir}}" install SBINDIR=/usr/bin LIBDIR=/usr/lib
 
       install -d "${{targets.destdir}}"/var/lib/apk
       install -d "${{targets.destdir}}"/var/cache/misc
@@ -114,6 +129,39 @@ test:
         apk update
         apk --version
         apk info apk-tools
+    - name: Allowlisted auth repo with HTTP_AUTH unset is skipped with a warning
+      runs: |
+        tmpfile=$(mktemp)
+        echo "https://apk.cgr.dev/chainguard-private" > "$tmpfile"
+
+        unset HTTP_AUTH
+
+        # Explicitly allow the host.
+        out=$(apk --allow-missing-auth='apk.cgr.dev/*' --repositories-file "$tmpfile" update 2>&1)
+        echo "$out"
+        echo "$out" | grep -F "ignoring authenticated repository"
+
+        # The same allowlist can be supplied via the environment variable.
+        out=$(APK_ALLOW_MISSING_AUTH='apk.cgr.dev/*' apk --repositories-file "$tmpfile" update 2>&1)
+        echo "$out"
+        echo "$out" | grep -F "ignoring authenticated repository"
+
+        rm -f "$tmpfile"
+    - name: HTTP_AUTH set but invalid still causes apk update to fail
+      runs: |
+        tmpfile=$(mktemp)
+        echo "https://apk.cgr.dev/chainguard-private" > "$tmpfile"
+
+        # Garbage Authorization value -> 401 -> EACCES. Because HTTP_AUTH is
+        # non-empty, the patch must NOT skip; apk update should exit non-zero.
+        if HTTP_AUTH="Basic invalid" \
+           apk --repositories-file "$tmpfile" update 2>&1; then
+          rm -f "$tmpfile"
+          echo "ERROR: apk update should have failed with invalid HTTP_AUTH"
+          exit 1
+        fi
+
+        rm -f "$tmpfile"
     - uses: test/tw/ldd-check
     - uses: test/no-docs
 

@@ -1,0 +1,71 @@
+From e82f624048bff9787629adfd0ba78f18d2616b43 Mon Sep 17 00:00:00 2001
+From: Kevin Monroe <kevin.monroe@chainguard.dev>
+Date: Wed, 3 Jun 2026 18:21:31 -0500
+Subject: [PATCH] config: attach SA token to in-cluster apiserver JWKS endpoint
+
+#2354 restricted the in-cluster Kubernetes service-account bearer token to
+requests whose host exactly matches the configured issuer host, and #2356
+restored the in-cluster client for directly-configured Kubernetes issuers.
+However, the OIDC client still fetches the key set from the jwks_uri advertised
+in the issuer's discovery document, and Kubernetes advertises that as the
+apiserver's address (commonly an IP:port) rather than the issuer FQDN.
+
+As a result, on clusters whose service-account issuer is an in-cluster DNS name
+-- e.g. k3s, which uses https://kubernetes.default.svc.cluster.local -- the
+JWKS request targets a host that does not match the issuer host, the transport
+returns an error, key-set retrieval fails, and token verification (and thus
+in-cluster keyless signing) breaks.
+
+Attach the service-account token when the configured issuer is a well-known
+in-cluster Kubernetes service-account issuer, since the only additional host
+the client contacts in that case is the cluster apiserver's own jwks_uri.
+Cross-host redirect SSRF is still blocked by the client's CheckRedirect.
+
+Relates to #2355.
+
+Signed-off-by: Kevin Monroe <kevin.monroe@chainguard.dev>
+---
+ pkg/config/config.go | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 797208e..08756a8 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -57,13 +57,32 @@ type bearerTokenTransport struct {
+ 	IssuerURL string
+ }
+ 
++// isInClusterKubernetesIssuerHost reports whether host is a well-known in-cluster
++// Kubernetes service-account issuer. For these, the only other endpoint the OIDC
++// client contacts is the cluster apiserver's jwks_uri, which Kubernetes advertises
++// using the apiserver address (often an IP:port) rather than the issuer FQDN.
++func isInClusterKubernetesIssuerHost(host string) bool {
++	switch host {
++	case "kubernetes.default",
++		"kubernetes.default.svc",
++		"kubernetes.default.svc.cluster.local":
++		return true
++	}
++	return false
++}
++
+ func (t *bearerTokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+ 	req = req.Clone(req.Context())
+ 	parsedIssuer, err := url.Parse(t.IssuerURL)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if req.URL.Host == parsedIssuer.Host {
++	// Attach the in-cluster service-account token to the issuer host. For the
++	// well-known in-cluster Kubernetes issuers also attach it to the apiserver-
++	// advertised jwks_uri host, which commonly differs from the issuer FQDN
++	// (e.g. an IP:port on k3s). Cross-host redirect SSRF is still blocked by the
++	// client's CheckRedirect.
++	if req.URL.Host == parsedIssuer.Host || isInClusterKubernetesIssuerHost(parsedIssuer.Host) {
+ 		req.Header.Set("Authorization", "Bearer "+t.Token)
+ 	} else {
+ 		return nil, fmt.Errorf("issuer URL host %s does not match request URL host %s", parsedIssuer.Host, req.URL.Host)
+-- 
+2.43.0
+

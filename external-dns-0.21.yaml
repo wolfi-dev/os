@@ -1,0 +1,136 @@
+package:
+  name: external-dns-0.21
+  version: "0.21.0"
+  epoch: 9 # toolchain rebuild for  go-1.26-1.26.4
+  description: Configure external DNS servers (AWS Route53, Google CloudDNS and others) for Kubernetes Ingresses and Services.
+  copyright:
+    - paths:
+        - '*'
+      license: Apache-2.0
+  dependencies:
+    provides:
+      - external-dns=${{package.full-version}}
+  resources:
+    cpu: 4
+    memory: 11Gi
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 066a11e2158f87689a01f0ff39493037da958171
+      repository: https://github.com/kubernetes-sigs/external-dns
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.52.0
+        google.golang.org/grpc@v1.79.3
+        github.com/projectcontour/contour@v1.33.4
+        golang.org/x/net@v0.55.0
+        golang.org/x/text@v0.36.0
+
+  - runs: |
+      # Our global LDFLAGS conflict with a Makefile parameter
+      unset LDFLAGS
+      make build
+      mkdir -p ${{targets.destdir}}/usr/bin
+      mv build/external-dns ${{targets.destdir}}/usr/bin/
+
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: external-dns
+          version: ${{vars.major-version}}
+      - name: Create symlinks
+        runs: |
+          mkdir -p /opt/iamguarded/external-dns/bin
+          ln -s /usr/bin/external-dns /opt/iamguarded/external-dns/bin/external-dns
+      - uses: iamguarded/finalize-compat
+        with:
+          package: external-dns
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - runs: |
+            /opt/iamguarded/external-dns/bin/external-dns --version
+            /opt/iamguarded/external-dns/bin/external-dns --help
+        - uses: iamguarded/test-compat
+          with:
+            package: external-dns
+            version: ${{vars.major-version}}
+
+  - name: ${{package.name}}-crds
+    description: Upstream CRDs for ${{package.name}} sourced from kubernetes-sigs/external-dns v${{package.version}}
+    pipeline:
+      - runs: |
+          # Ship the upstream CRD pristine — no chart-convention
+          # wrapping happens here. Provenance is pinned by the parent
+          # package's git-checkout (tag + expected-commit).
+          #
+          # Chart-layer conditional gating (.Values.crd.create) is
+          # applied by the consuming chart manifest when it stages this
+          # file into templates/crds/.
+          install -d ${{targets.subpkgdir}}/charts/crds
+          install -m 0644 config/crd/standard/dnsendpoints.externaldns.k8s.io.yaml ${{targets.subpkgdir}}/charts/crds/crd.yaml
+    test:
+      environment:
+        contents:
+          packages:
+            - yq
+      pipeline:
+        - runs: |
+            yq /charts/crds/*.yaml
+
+update:
+  enabled: true
+  github:
+    identifier: kubernetes-sigs/external-dns
+    strip-prefix: v
+    tag-filter: v0.21.
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: external-dns
+    - uses: test/tw/help-check
+      with:
+        bins: external-dns
+        expect-contains: source provider registry
+    - uses: test/kwok/cluster
+    - name: Test basic startup initialization with dry-run
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+        start: external-dns --provider=inmemory --source=service --once --dry-run --log-level=debug --kubeconfig=/tmp/kubeconfig.yaml
+        timeout: 30
+        expected_output: Created Kubernetes client
+        # external-dns will log ERROR when it cannot reach the Kubernetes API,
+        # so disable error string checking to avoid false failures in this environment
+        error_strings: ""

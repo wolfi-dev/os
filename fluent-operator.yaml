@@ -1,0 +1,189 @@
+package:
+  name: fluent-operator
+  version: "3.8.0"
+  epoch: 1 # toolchain rebuild for  go-1.26-1.26.4
+  description: Operate Fluent Bit and Fluentd in the Kubernetes way - Previously known as FluentBit Operator
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "2"
+    memory: 6Gi
+  test-resources:
+    cpu: "1"
+    memory: 5Gi
+
+environment:
+  contents:
+    packages:
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/fluent/fluent-operator
+      expected-commit: 793e9c4d149f8e2854690e7f2c61d853356e4988
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      output: manager
+      packages: ./cmd/fluent-manager
+      go-package: go-1.26
+
+subpackages:
+  - name: fluent-watcher
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/fluent-watcher/fluentbit
+          output: fluent-watcher
+          go-package: go-1.26
+    test:
+      environment:
+        contents:
+          packages:
+            - fluent-bit
+            - fluent-bit-compat
+            - fluent-watcher-compat
+      pipeline:
+        - runs: |
+            set -euo pipefail
+            echo "Testing fluent-watcher"
+            # Run fluent-watcher in the background and redirect its output to a temporary file
+            tempfile=$(mktemp)
+            fluent-watcher > "$tempfile" 2>&1 & sleep 5
+            # Use grep to filter the output
+            cat "$tempfile" | grep -i "fluent-bit watcher started"
+        - uses: test/tw/help-check
+          with:
+            bins: fluent-watcher
+
+  - name: fluent-watcher-config
+    dependencies:
+      replaces:
+        # A "replaces" must match the package origin's full name. Since we use
+        # a version stream for fluent-bit, we must append fluent-bit-5.0
+        # exactly.
+        #
+        # Our automation has no way of linking fluent-operator to
+        # fluent-bit updates, so to ensure this doesn't silently fail when
+        # fluent-bit rolls forward, we have a test stanza below that ensures
+        # fluent-operator can always be installed alongside fluent-bit.
+        #
+        # When this test fails, that likely means fluent-bit rolled forward to
+        # a new version stream anad must be updated in the "replaces" block
+        # below
+        - fluent-bit-5.0
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/fluent-bit/etc
+          cp -af conf/* "${{targets.contextdir}}"/fluent-bit/etc
+    test:
+      environment:
+        contents:
+          packages:
+            - fluent-bit
+      pipeline:
+        - runs: |
+            cat /fluent-bit/etc/parsers.conf
+
+  - name: fluent-watcher-compat
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/fluent-bit/bin/
+          ln -s ../../usr/bin/fluent-watcher "${{targets.contextdir}}"/fluent-bit/bin/fluent-watcher
+          # Create the directory that fluent-watcher monitors for configuration changes
+          mkdir -p "${{targets.contextdir}}"/fluent-bit/config/
+    test:
+      environment:
+        contents:
+          packages:
+            - fluent-watcher
+      pipeline:
+        - uses: test/tw/symlink-check
+
+  - name: fluent-watcher-fluentd
+    dependencies:
+      runtime:
+        - libjemalloc2
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/fluent-watcher/fluentd
+          output: fluentd-watcher
+          go-package: go-1.26
+    test:
+      environment:
+        contents:
+          packages:
+            - ruby3.2-fluentd-1.19
+            - fluent-watcher-fluentd-compat
+      pipeline:
+        - uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /fluentd/etc /fluentd/plugins
+              touch /fluentd/etc/fluent.conf
+            start: /usr/bin/fluentd-watcher
+            expected_output: "Fluentd started"
+            timeout: 120
+
+  - name: fluent-watcher-fluentd-compat
+    pipeline:
+      - runs: |
+          # Symlink matching the upstream entrypoint path
+          mkdir -p "${{targets.contextdir}}"/fluentd/bin/
+          ln -s ../../usr/bin/fluentd-watcher "${{targets.contextdir}}"/fluentd/bin/fluentd-watcher
+          # The watcher's defaultBinPath is /usr/local/bundle/bin/fluentd (Debian convention);
+          # our fluentd binary is at /usr/bin/fluentd
+          mkdir -p "${{targets.contextdir}}"/usr/local/bundle/bin/
+          ln -s ../../../bin/fluentd "${{targets.contextdir}}"/usr/local/bundle/bin/fluentd
+    test:
+      environment:
+        contents:
+          packages:
+            - fluent-watcher-fluentd
+            - ruby3.2-fluentd-1.19
+      pipeline:
+        - uses: test/tw/symlink-check
+
+update:
+  enabled: true
+  github:
+    identifier: fluent/fluent-operator
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - kwok
+        - kwokctl
+        - kubernetes # has a runtime dependency on kubectl
+        - etcd
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/kwok/cluster
+    - uses: test/tw/help-check
+      with:
+        bins: manager
+    - name: "Test operator"
+      uses: test/daemon-check-output
+      with:
+        timeout: 120
+        expected_output: |
+          Starting workers
+          Starting Controller
+          Starting EventSource
+        setup: |
+          kubectl create ns fluent
+          curl -sL https://github.com/fluent/fluent-operator/archive/refs/tags/v${{package.version}}.tar.gz | tar xz
+          find fluent-operator-${{package.version}}/config/crd/bases/ -name '*.io_*.yaml' -exec kubectl apply --server-side=true -f {} \;
+        start: manager -metrics-bind-address 0.0.0.0:8082

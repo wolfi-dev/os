@@ -1,0 +1,133 @@
+package:
+  name: filebrowser
+  version: "2.63.14"
+  description: "Web File Browser"
+  epoch: 0 # go/wolfi-rsc/filebrowser
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "1"
+    memory: 8Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  contents:
+    packages:
+      - ca-certificates-bundle
+      - go-1.25
+      - jq
+      - mailcap
+      - nodejs-${{vars.node-version}}
+      - pnpm
+      - wolfi-base
+
+vars:
+  # Follow the NodeJS version used by the upstream pipeline: https://github.com/filebrowser/filebrowser/blob/master/.github/workflows/ci.yaml
+  node-version: 24
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/filebrowser/filebrowser.git
+      tag: v${{package.version}}
+      expected-commit: dfe6e5b333e3211dd6ced146672657de598299c7
+
+  - name: install-npm-dependencies
+    working-directory: frontend
+    pipeline:
+      - runs: |
+          # Follows build:frontend task in upstream Taskfile
+          # https://github.com/filebrowser/filebrowser/blob/master/Taskfile.yml
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+  - uses: bump
+    with:
+      replaces: github.com/mholt/archiver/v3=github.com/anchore/archiver/v3@v3.5.2
+      modroot: .
+
+  - uses: go/build
+    with:
+      modroot: .
+      packages: .
+      ldflags: |
+        -X github.com/filebrowser/filebrowser/v2/version.Version=v${{package.version}}
+        -X github.com/filebrowser/filebrowser/v2/version.CommitSHA=$(git rev-parse HEAD)
+      output: ${{package.name}}
+
+  - name: copy files
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.destdir}}/config
+          mkdir -p ${{targets.destdir}}/database
+          cp -ar docker/common/* ${{targets.destdir}}/
+          cp -ar docker/alpine/* ${{targets.destdir}}/
+
+          # We generally want the alpine-specific files: common/healthcheck.sh
+          # uses jq rather than alpine's json.sh, though, so we prefer that
+          cp docker/common/healthcheck.sh ${{targets.destdir}}/
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Symlink for the filebrowser binary in the root folder
+    dependencies:
+      runtime:
+        - jq
+        - tini
+        - wget
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -sf usr/bin/filebrowser ${{targets.contextdir}}/filebrowser
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - jq
+        - tini
+        - wait-for-it
+        - wget
+    environment:
+      TINI_SUBREAPER: true
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: filebrowser
+    - uses: test/tw/ver-check
+      with:
+        bins: filebrowser
+        version: ${{package.version}}
+        version-flag: version
+    - runs: |
+        stat /healthcheck.sh
+        stat /init.sh
+    - name: check health status
+      uses: test/daemon-check-output
+      with:
+        start: "tini -- /init.sh --config /config/settings.json"
+        timeout: 60
+        expected_output: |
+          Listening on
+        post: |
+          set -euo pipefail
+          wait-for-it -t 10 --strict localhost:80 -- echo "Server is up"
+          curl -sf http://localhost:80/health | grep -F "OK"
+          /healthcheck.sh
+
+update:
+  enabled: true
+  github:
+    identifier: filebrowser/filebrowser
+    strip-prefix: v

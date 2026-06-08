@@ -1,0 +1,100 @@
+package:
+  name: kafka_exporter
+  version: "1.9.0"
+  epoch: 54 # toolchain rebuild for  go-1.25-1.25.11
+  description: "Kafka exporter for Prometheus"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    # REMOVE_POST_USRMERGE - https://github.com/orgs/wolfi-dev/discussions/40270
+    provides:
+      - ${{package.name}}-compat=${{package.full-version}}
+    runtime:
+      - merged-bin
+      - wolfi-baselayout
+  resources:
+    cpu: "1"
+    memory: 4Gi
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/danielqsj/kafka_exporter
+      tag: v${{package.version}}
+      expected-commit: 8ec24078707d4d3b349e71522ebd7f179746072d
+
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+        golang.org/x/crypto@v0.52.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: kafka_exporter
+      go-package: go-1.25
+      ldflags: -X github.com/prometheus/common/version.Version=${{package.version}}
+
+update:
+  enabled: true
+  github:
+    identifier: danielqsj/kafka_exporter
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - kafka
+        - uuidgen
+    environment:
+      JAVA_HOME: "/usr/lib/jvm/default-jvm"
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: kafka_exporter
+    - uses: test/tw/help-check
+      with:
+        bins: kafka_exporter
+    - name: "Test with Kafka"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          export PATH="/usr/lib/kafka/bin:$PATH"
+
+          # Initialise Kafka storage
+          CLUSTER_ID="$(kafka-storage.sh random-uuid)"
+          echo "Using cluster ID: $CLUSTER_ID"
+
+          kafka-storage.sh format -t "$CLUSTER_ID" -c /usr/lib/kafka/config/server.properties.original --standalone
+
+          # Start Kafka server
+          kafka-server-start.sh /usr/lib/kafka/config/server.properties.original > /dev/null 2>&1 &
+          wait-for-it localhost:9092 -t 60
+
+          TOPIC_NAME="test-topic-$(uuidgen)"
+          PARTITIONS=1
+          REPLICATION_FACTOR=1
+
+          # Create a Kafka topic
+          kafka-topics.sh --create --topic "${TOPIC_NAME}" --partitions "${PARTITIONS}" --replication-factor "${REPLICATION_FACTOR}" --if-not-exists --bootstrap-server localhost:9092
+
+          # Produce a test message
+          echo "Hello Kafka" | kafka-console-producer.sh --bootstrap-server localhost:9092 --topic "${TOPIC_NAME}"
+        start: kafka_exporter --kafka.server=0.0.0.0:9092
+        timeout: 15
+        expected_output: |
+          Starting kafka_exporter
+          Listening on
+        post: |
+          set -euo pipefail
+          sleep 5 # Wait awhile until the Kafka metrics are scraped
+          curl http://localhost:9308/metrics | grep -F kafka_topic_partitions
+
+environment:
+  contents:
+    packages:
+      - go-1.25

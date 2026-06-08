@@ -1,0 +1,111 @@
+package:
+  name: trivy
+  version: "0.70.0"
+  epoch: 5 # CVE-2026-39821
+  description: Simple and comprehensive vulnerability scanner for containers
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "8"
+    memory: 15Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 8a3177aedf7ee0864920eb1852eef031cd3742b8
+      repository: https://github.com/aquasecurity/trivy
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/containerd/containerd@v1.7.32
+        github.com/containerd/containerd/v2@v2.2.4
+        github.com/go-git/go-git/v5@v5.19.1
+        golang.org/x/crypto@v0.52.0
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      experiments: jsonv2
+      packages: ./cmd/trivy
+      output: trivy
+      ldflags: -X github.com/aquasecurity/trivy/pkg/version/app.ver=${{package.version}}
+      go-package: go-1.26
+
+  # Install contrib output templates (html, junit, gitlab, asff, etc.)
+  # These are included in the upstream Dockerfile and required for --format template
+  - name: Install contrib templates
+    runs: |
+      mkdir -p "${{targets.destdir}}/contrib"
+      install -Dm644 contrib/*.tpl "${{targets.destdir}}/contrib/"
+
+test:
+  environment:
+    contents:
+      packages:
+        - jq
+        - trivy=${{package.full-version}}
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Check trivy version
+      runs: |
+        trivy version
+        trivy version | grep '^Version: ${{package.version}}$'
+        trivy --version
+        trivy --help
+    - name: Check trivy version as JSON
+      runs: |
+        trivy version -f json | jq -M
+        [ "$(trivy version -f json 2>/dev/null | jq -r .Version)" == "${{package.version}}" ]
+    - name: Scan Dockerfile for misconfigurations
+      runs: |
+        set -euo pipefail
+        # Create a Dockerfile with a known misconfiguration (running as root)
+        # trivy config scans for misconfigurations without needing a vuln DB
+        mkdir -p /tmp/trivy-test
+        cat > /tmp/trivy-test/Dockerfile <<'EOF'
+        FROM alpine:3.18
+        RUN apk add --no-cache curl
+        CMD ["sh"]
+        EOF
+        # Scan for misconfigurations; trivy exits non-zero when issues found,
+        # so capture output and verify trivy actually ran and produced results
+        output=$(trivy config /tmp/trivy-test --format json 2>/dev/null) || true
+        echo "$output" | jq -e '.Results' > /dev/null
+    - name: Verify contrib templates
+      uses: test/tw/contains-files
+      with:
+        files: |
+          /contrib/html.tpl
+          /contrib/junit.tpl
+          /contrib/gitlab.tpl
+          /contrib/gitlab-codequality.tpl
+          /contrib/asff.tpl
+    - name: Scan filesystem for misconfigurations
+      runs: |
+        set -euo pipefail
+        # Scan a directory using only the config scanner (no vuln DB required)
+        mkdir -p /tmp/trivy-fs-test
+        cat > /tmp/trivy-fs-test/main.tf <<'EOF'
+        resource "aws_s3_bucket" "example" {
+          bucket = "my-test-bucket"
+        }
+        EOF
+        # trivy fs with --scanners config checks IaC files without a vuln DB
+        output=$(trivy fs /tmp/trivy-fs-test --scanners config --format json 2>/dev/null) || true
+        echo "$output" | jq -e '.Results' > /dev/null
+
+update:
+  enabled: true
+  github:
+    identifier: aquasecurity/trivy
+    strip-prefix: v
+
+environment:
+  contents:
+    packages:
+      - go-1.26

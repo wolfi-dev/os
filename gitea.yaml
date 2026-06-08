@@ -1,0 +1,119 @@
+package:
+  name: gitea
+  version: "1.26.2"
+  epoch: 4 # toolchain rebuild for  go-1.26-1.26.4
+  description: self-hosted git service
+  copyright:
+    - license: MIT
+  resources:
+    cpu: "5"
+    memory: 13Gi
+  test-resources:
+    cpu: "1"
+    memory: 3Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go-1.26
+      - nodejs-23
+      # Upstream switched to pnpm in 1.26.0; pnpm's peerDependencyRules in
+      # package.json relax eslint-plugin-github 6's eslint ^8 || ^9 peer to
+      # accept eslint 10. npm has no equivalent, so `npm install` ERESOLVEs.
+      - pnpm
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 2c749ce548b1da0a52835861a87b888e67842d29
+      repository: https://github.com/go-gitea/gitea
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/Azure/go-ntlmssp@v0.1.1
+        golang.org/x/image@v0.41.0
+        github.com/go-git/go-git/v5@v5.19.1
+        golang.org/x/crypto@v0.52.0
+        golang.org/x/net@v0.55.0
+        golang.org/x/sys@v0.45.0
+        golang.org/x/text@v0.37.0
+
+  # Upstream swapped webpack for vite in 1.26.0 (no webpack.config.* remains)
+  # and builds the frontend via `pnpm exec vite build` from the Makefile.
+  - runs: |
+      set -x
+      pnpm install --frozen-lockfile
+      pnpm exec vite build
+
+  - runs: |
+      set -x
+      CC= GOOS= GOARCH= CGO_ENABLED=0 go generate -tags 'bindata timetzdata sqlite sqlite_unlock_notify' ./...
+
+  - uses: go/build
+    with:
+      packages: .
+      ldflags: -X "main.Version=v${{package.version}}"
+      output: gitea
+      tags: netgo,osusergo,bindata,timetzdata,sqlite,sqlite_unlock_notify
+      # go/build defaults to go-1.25; pin to go-1.26 to match the environment
+      # and avoid the go-1.25/go-1.26 file conflict on /usr/lib/go/bin/go.
+      go-package: go-1.26
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package for working with upstream docs"
+    pipeline:
+      - runs: |
+          set -x
+          mkdir -p "${{targets.subpkgdir}}"/usr/local/bin
+          cp docker/rootless/usr/local/bin/docker-entrypoint.sh "${{targets.subpkgdir}}"/usr/local/bin
+          cp docker/rootless/usr/local/bin/docker-setup.sh "${{targets.subpkgdir}}"/usr/local/bin
+          # 1.26.0 dropped contrib/environment-to-ini/environment-to-ini.go and
+          # folded the logic into `gitea config edit-ini`. Upstream now ships
+          # docker/rootless/usr/local/bin/environment-to-ini as a bash wrapper
+          # around that subcommand, so install the wrapper directly.
+          cp docker/rootless/usr/local/bin/environment-to-ini "${{targets.subpkgdir}}"/usr/local/bin
+          cp docker/rootless/usr/local/bin/gitea "${{targets.subpkgdir}}"/usr/local/bin
+          chmod 755 \
+            "${{targets.subpkgdir}}"/usr/local/bin/docker-entrypoint.sh \
+            "${{targets.subpkgdir}}"/usr/local/bin/docker-setup.sh \
+            "${{targets.subpkgdir}}"/usr/local/bin/environment-to-ini \
+            "${{targets.subpkgdir}}"/usr/local/bin/gitea
+          mkdir -p "${{targets.subpkgdir}}"/etc/profile.d
+          mkdir -p "${{targets.subpkgdir}}"/etc/templates
+          cp docker/rootless/etc/templates/app.ini "${{targets.subpkgdir}}"/etc/templates
+          mkdir -p "${{targets.subpkgdir}}"/app/gitea
+          ln -sf ../../usr/bin/gitea "${{targets.subpkgdir}}"/app/gitea/gitea
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Verify Gitea functional operation
+      runs: |
+        set -euo pipefail
+        # Gitea blocks execution as root, so we must run as unprivileged user.
+        id giteatest || adduser -D giteatest
+        # Verify the binary executes correctly as non-root user by generating a secret.
+        secret=$(su giteatest -s /bin/sh -c "gitea generate secret INTERNAL_TOKEN")
+        if [ -z "$secret" ]; then
+          echo "FAIL: Expected gitea to generate a secret"
+          exit 1
+        fi
+        echo "SUCCESS: Gitea generated secret token, binary is functional"
+
+update:
+  enabled: true
+  github:
+    identifier: go-gitea/gitea
+    strip-prefix: v

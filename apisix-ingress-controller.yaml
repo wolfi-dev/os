@@ -1,0 +1,190 @@
+package:
+  name: apisix-ingress-controller
+  version: "2.1.0"
+  epoch: 1 # CVE-2026-42504
+  description: APISIX Ingress Controller for Kubernetes.
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "4"
+    memory: 5Gi
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - go-1.26
+      - kubectl
+      - kustomize
+      - make
+  environment:
+    KUSTOMIZE: "/usr/bin/kustomize"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: f4a8dd1223573a5b72e1c7b65b37c13b49d98042
+      repository: https://github.com/apache/apisix-ingress-controller
+      tag: ${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        google.golang.org/grpc@v1.79.3
+        go.opentelemetry.io/otel/sdk@v1.43.0
+        go.opentelemetry.io/otel@v1.43.0
+        go.opentelemetry.io/otel/trace@v1.43.0
+        go.opentelemetry.io/otel/metric@v1.43.0
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: cmd/main.go
+      ldflags: |
+        -X=github.com/apache/apisix-ingress-controller/internal/version._buildVersion=${{package.version}}
+        -X=github.com/apache/apisix-ingress-controller/internal/version._buildGitRevision=$(git rev-parse --short HEAD)
+        -X=github.com/apache/apisix-ingress-controller/internal/version._buildOS=$(uname -s)/$(uname -m)
+        -X=github.com/apache/apisix-ingress-controller/internal/manager._minK8sVersion=1.26.0
+      output: apisix-ingress-controller
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compatibility package for apisix-ingress-controller to match upstream paths
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/app
+          ln -sf ../../usr/bin/apisix-ingress-controller ${{targets.subpkgdir}}/app/apisix-ingress-controller
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+  - name: ${{package.name}}-iamguarded-compat
+    description: Compat package for iamguarded apisix-ingress-controller image
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: apisix-ingress-controller
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/bin
+          ln -sf ../../../../usr/bin/apisix-ingress-controller ${{targets.contextdir}}/opt/iamguarded/apisix-ingress-controller/bin/apisix-ingress-controller
+      - uses: iamguarded/finalize-compat
+        with:
+          package: apisix-ingress-controller
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+            - curl
+            - git
+            - kustomize
+            - wait-for-it
+        environment:
+          PATH: "/opt/iamguarded/apisix-ingress-controller/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          IAMGUARDED_APP_NAME: "apisix-ingress-controller"
+      pipeline:
+        - pipeline:
+            - uses: test/tw/symlink-check
+            - uses: test/tw/ver-check
+              with:
+                bins: apisix-ingress-controller
+            - uses: test/kwok/cluster
+            - uses: test/daemon-check-output
+              with:
+                setup: |
+                  kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+
+                  # Install APISIX CRDs using local kustomization file
+                  sed -i "s/VERSION/${{package.version}}/g" kustomization.yaml
+                  kubectl apply -k .
+                start: |
+                  /opt/iamguarded/apisix-ingress-controller/bin/apisix-ingress-controller --config-path /tmp/kubeconfig.yaml
+                timeout: 30
+                expected_output: |
+                  successfully acquired lease
+                  started status update handler
+                  readiness manager started
+                  Ready detected
+                post: |
+                  wait-for-it localhost:8080
+                  curl -fsSL http://127.0.0.1:8080/metrics | grep -F go_goroutines
+
+  # sourced from https://github.com/apache/apisix-ingress-controller/tree/master/config/crd
+  # Note that APISIX also installs the gateway-api CRD from kubernetes based on a specified gateway api version,
+  # so we use the makefile to generate the crds.
+  # Ref: https://github.com/apache/apisix-ingress-controller/blob/v2.0.0/Makefile#L405
+  - name: ${{package.name}}-crds
+    description: Package containing CRDs for apisix-ingress-controller
+    pipeline:
+      - runs: |
+          install -d charts/crds
+          install -d ${{targets.contextdir}}/charts/crds
+          make helm-build-crds
+          install -m 0644 charts/crds/* ${{targets.subpkgdir}}/charts/crds/
+    # Here we simply verify the the CRD yamls are well-formed and exist.
+    test:
+      environment:
+        contents:
+          packages:
+            - yq
+      pipeline:
+        - runs: |
+            yq /charts/crds/*.yaml
+
+# This repo has switched back and forth from a v-prefix to no v-prefix, for future reference
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - -rc\d+$
+  github:
+    identifier: apache/apisix-ingress-controller
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - git
+        - kustomize
+        - wait-for-it
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: apisix-ingress-controller
+    - uses: test/tw/ver-check
+      with:
+        bins: apisix-ingress-controller
+    - uses: test/kwok/cluster
+    - uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+
+          # Install APISIX CRDs using local kustomization file
+          sed -i "s/VERSION/${{package.version}}/g" kustomization.yaml
+          kubectl apply -k .
+        start: |
+          apisix-ingress-controller --config-path /tmp/kubeconfig.yaml
+        timeout: 60
+        expected_output: |
+          successfully acquired lease
+          started status update handler
+          readiness manager started
+          Ready detected
+        post: |
+          wait-for-it localhost:8080
+          curl -fsSL http://127.0.0.1:8080/metrics | grep -F go_goroutines

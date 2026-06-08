@@ -1,0 +1,333 @@
+package:
+  name: strimzi-kafka-operator
+  version: "1.0.0"
+  epoch: 4 # go/wolfi-rsc/strimzi-kafka-operator
+  description: Apache Kafka® running on Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ${{package.name}}-cluster-operator
+      - ${{package.name}}-kafka-init
+      - ${{package.name}}-topic-operator
+      - ${{package.name}}-user-operator
+      - ${{package.name}}-v1-api-conversion
+      - bash
+      - busybox
+      - openjdk-${{vars.java-version}}-default-jdk
+      - posix-libc-utils
+      - tini
+  resources:
+    cpu: "4"
+    memory: 9Gi
+  test-resources:
+    cpu: "1"
+    memory: 3Gi
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - ca-certificates-bundle
+      - coreutils
+      - curl
+      - docker
+      - findutils
+      - helm
+      - make
+      - maven
+      - openjdk-${{vars.java-version}}-default-jdk
+      - perl-utils
+      - strimzi-kafka-oauth-m2
+      - tini
+      - tini-compat
+      - unzip
+      - wget
+      - yq
+      - zip
+  environment:
+    KAFKA_HOME: /opt/kafka
+    KAFKA_EXPORTER_HOME: /opt/kafka-exporter
+    CRUISE_CONTROL_HOME: /opt/cruise-control
+    SRC_DIR: ./docker-images/artifacts/binaries
+    DEST_DIR: opt/strimzi
+
+vars:
+  java-version: '21' # https://github.com/strimzi/strimzi-kafka-operator/blob/0.50.0/development-docs/DEV_GUIDE.md#java-versions
+  shellcheck_version: 0.10.0
+  shellcheck_aarch64_shasum512: 77abeaa8bee293264ebfd94a2021bd490695ed5518f2da7c0f9ec4b402cd1e5da6642a0e9f953961510cef7351cc9afae7c7a528a597d1befd1867b8c69e15b1
+  shellcheck_x86_64_shasum512: 31006830087c2b9ffe9fa36c1ab4a8b11c85078cac8203265d0cfd630c70a4a506e66dd9d7ccde964360ad95045894149de457db34f10cad76708c7a4aa544ca
+
+pipeline:
+  # Seed Maven local repo with OAuth JARs from strimzi-kafka-oauth-m2
+  - runs: |
+      mkdir -p /root/.m2/repository
+      cp -r /usr/share/m2/repository/* /root/.m2/repository/
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/strimzi/strimzi-kafka-operator
+      tag: ${{package.version}}
+      expected-commit: 4836c7dd74ce973f06d97936916ed7f20c1a2ff0
+
+  - uses: bump
+
+  - uses: patch
+    with:
+      patches: lz4-yawk-fork-cc.patch
+
+  - uses: bump
+    with:
+      deps: pombump-deps-cc.yaml
+      manifest: docker-images/artifacts/kafka-thirdparty-libs/cc/pom.xml
+
+  - uses: bump
+    with:
+      deps: pombump-deps-4.2.x.yaml
+      manifest: docker-images/artifacts/kafka-thirdparty-libs/4.2.x/pom.xml
+
+  - uses: bump
+    with:
+      deps: pombump-deps-4.1.x.yaml
+      manifest: docker-images/artifacts/kafka-thirdparty-libs/4.1.x/pom.xml
+
+  - runs: |
+      export JAVA_HOME="/usr/lib/jvm/default-jvm"
+      # Download the shellcheck tarball
+      wget -qO- "https://github.com/koalaman/shellcheck/releases/download/v${{vars.shellcheck_version}}/shellcheck-v${{vars.shellcheck_version}}.linux.${{build.arch}}.tar.xz" -O shellcheck.tar.xz
+
+      # Perform shasum check based on architecture
+      if [[ "${{build.arch}}" == "aarch64" ]]; then
+          echo "${{vars.shellcheck_aarch64_shasum512}}  shellcheck.tar.xz" | shasum -a 512 -c
+      elif [[ "${{build.arch}}" == "x86_64" ]]; then
+          echo "${{vars.shellcheck_x86_64_shasum512}}  shellcheck.tar.xz" | shasum -a 512 -c
+      else
+          echo "Unsupported architecture: ${{build.arch}}"
+          exit 1
+      fi
+
+      # Extract the tarball
+      tar -xJf shellcheck.tar.xz
+
+      # Copy shellcheck binary to /usr/bin/
+      cp "shellcheck-v${{vars.shellcheck_version}}/shellcheck" /usr/bin/
+
+      for i in mockkube config-model certificate-manager operator-common; do
+        make -C $i MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress" java_build
+        make -C $i MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress -e -V -B" java_install
+      done
+
+      mvn clean
+      mvn install -B -Dbuild.snapshot=false -DskipTests -Dmaven.javadoc.skip=true
+      make MVN_ARGS="-B -DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress" java_build
+      make MVN_ARGS="-DskipTests -Dmaven.javadoc.skip=true --no-transfer-progress -e -V -B" java_install
+
+      # Set the source and destination directories
+      mkdir -p "${{targets.contextdir}}"/$DEST_DIR/bin
+      mkdir -p "${{targets.contextdir}}"/$DEST_DIR/lib
+      install -Dm755 ./docker-images/operator/scripts/launch_java.sh ${{targets.contextdir}}/$DEST_DIR/bin/launch_java.sh
+
+data:
+  - name: binaries
+    items:
+      cluster-operator: cluster-operator
+      kafka-init: kafka-init
+      kafka-agent: kafka-agent
+      topic-operator: topic-operator
+      tracing-agent: tracing-agent
+      user-operator: user-operator
+
+subpackages:
+  - range: binaries
+    name: ${{package.name}}-${{range.key}}
+    description: ${{range.value}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/$DEST_DIR/bin
+          mkdir -p "${{targets.contextdir}}"/$DEST_DIR/lib
+          mkdir -p "${{targets.contextdir}}"/usr/lib/kafka/libs/
+          unzip -o "$SRC_DIR/${{range.key}}-*-dist.zip" -d tmp
+          cp -r tmp/lib/* "${{targets.contextdir}}"/$DEST_DIR/lib/
+          cp -r tmp/bin/* "${{targets.contextdir}}"/$DEST_DIR/bin/
+          ln -sf /$DEST_DIR/lib/io.strimzi.${{range.key}}-$(cat release.version).jar ${{targets.contextdir}}/usr/lib/kafka/libs/
+          # They omit `io.strimzi` on upstream Makefile
+          ln -sf /$DEST_DIR/lib/io.strimzi.${{range.key}}-$(cat release.version).jar ${{targets.contextdir}}/usr/lib/kafka/libs/${{range.key}}-$(cat release.version).jar
+    test:
+      pipeline:
+        - uses: test/jar-check
+
+  - name: "${{package.name}}-v1-api-conversion"
+    description: "V1 API conversion tool for Strimzi Kafka Operator"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/opt/v1-api-conversion
+          unzip -o "$SRC_DIR/v1-api-conversion-*-dist.zip" -d "${{targets.contextdir}}"/opt/v1-api-conversion
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /opt/v1-api-conversion/bin/v1-api-conversion.sh
+              /opt/v1-api-conversion/libs
+
+  - name: "${{package.name}}-kafka-thirdparty-libs"
+    description: "Required libraries for the Strimzi/Kafka"
+    dependencies:
+      replaces:
+        - kafka
+    pipeline:
+      - working-directory: docker-images/artifacts/kafka-thirdparty-libs
+        pipeline:
+          - runs: |
+              mkdir -p "${{targets.contextdir}}"/usr/lib/kafka/libs/
+              cp -r ./4.2.x/target/dependency/* "${{targets.contextdir}}"/usr/lib/kafka/libs/
+              cp -r ./4.1.x/target/dependency/* "${{targets.contextdir}}"/usr/lib/kafka/libs/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: "${{package.name}}-kafka-thirdparty-libs-cc"
+    description: "Required 3rd party libraries for the Cruise Control"
+    pipeline:
+      - working-directory: docker-images/artifacts/kafka-thirdparty-libs/cc/target/dependency
+        pipeline:
+          - runs: |
+              mkdir -p "${{targets.contextdir}}"/$CRUISE_CONTROL_HOME/libs
+              cp -r ./* "${{targets.contextdir}}"/$CRUISE_CONTROL_HOME/libs/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: "${{package.name}}-kafka-base"
+    description: "Required files for the Strimzi/Kafka container image"
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+        - curl
+        - gawk
+        - gettext
+        - grep
+        - kafka
+        - kafka_exporter
+        - kafka_exporter-strimzi-compat
+        - prometheus-jmx-exporter-strimzi-compat
+        - kafka-strimzi-compat
+        - net-tools
+        - nmap
+        - openssl
+        - sed
+        - strimzi-kafka-operator-topic-operator
+        - strimzi-kafka-operator-kafka-thirdparty-libs
+        - strimzi-kafka-operator-kafka-thirdparty-libs-cc
+        - tini
+      provides:
+        - strimzi-kafka=${{package.full-version}}
+    pipeline:
+      - working-directory: docker-images/kafka-based/kafka
+        pipeline:
+          - runs: |
+              mkdir -p "${{targets.contextdir}}"/$KAFKA_HOME
+              mkdir -p "${{targets.contextdir}}"/$KAFKA_EXPORTER_HOME
+              mkdir -p "${{targets.contextdir}}"/$CRUISE_CONTROL_HOME
+              cp -avR ./scripts/* "${{targets.contextdir}}/$KAFKA_HOME/"
+              cp -avR ./exporter-scripts/* "${{targets.contextdir}}/$KAFKA_EXPORTER_HOME/"
+              cp -avR ./cruise-control-scripts/* "${{targets.contextdir}}/$CRUISE_CONTROL_HOME/"
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: strimzi-kafka
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: kafka-strimzi-compat
+    description: "compat package with strimzi/kafka image"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/kafka
+          for dir in bin config libs logs; do
+            ln -s /usr/lib/kafka/$dir ${{targets.contextdir}}/opt/kafka/$dir
+          done
+    test:
+      environment:
+        contents:
+          packages:
+            - kafka
+      pipeline:
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+
+  - name: kafka_exporter-strimzi-compat
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/kafka-exporter
+          # https://github.com/strimzi/strimzi-kafka-operator/blob/23c0fb0726e1f212c6182eb251ff23697e72a353/docker-images/kafka-based/kafka/Dockerfile#L33
+          ln -sf /usr/bin/kafka_exporter ${{targets.contextdir}}/opt/kafka-exporter/kafka_exporter
+    test:
+      environment:
+        contents:
+          packages:
+            - kafka_exporter
+      pipeline:
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+
+update:
+  enabled: true
+  github:
+    identifier: strimzi/strimzi-kafka-operator
+
+test:
+  pipeline:
+    - name: check folders are not empty
+      runs: |
+        # Check if /opt/strimzi/lib is not empty
+        if [ -d "/opt/strimzi/lib" ] && [ "$(ls -A /opt/strimzi/lib)" ]; then
+          echo "/opt/strimzi/lib is not empty."
+        else
+          echo "Error: /opt/strimzi/lib is empty or does not exist."
+          exit 1
+        fi
+
+        # Check if /opt/strimzi/bin is not empty
+        if [ -d "/opt/strimzi/bin" ] && [ "$(ls -A /opt/strimzi/bin)" ]; then
+          echo "/opt/strimzi/bin is not empty."
+        else
+          echo "Error: /opt/strimzi/bin is empty or does not exist."
+          exit 1
+        fi
+
+        echo "Both directories are not empty."
+    - name: check files are there
+      runs: |
+        # Bin directory to check
+        dir="/opt/strimzi/bin"
+
+        # tls_prepare_certificates.sh removed in 1.0.0 (strimzi-kafka-operator #12627
+        # "Stop using PKCS12 files in Topic Operator")
+        for file in cluster_operator_run.sh kafka_init_run.sh launch_java.sh topic_operator_run.sh user_operator_run.sh; do
+          if [ -f "$dir/$file" ]; then
+            echo "$file exists in $dir."
+          else
+            echo "Error: $file does not exist in $dir."
+            exit 1
+          fi
+        done
+
+        # Lib directory to check
+        dir="/opt/strimzi/lib"
+
+        # agent-3 jars removed in 0.48.0, only check for agent jar
+        if [ -f "$dir/io.strimzi.kafka-agent-${{package.version}}.jar" ]; then
+          echo "$file exists in $dir."
+        else
+          echo "Error: $file does not exist in $dir."
+          exit 1
+        fi
+
+
+        echo "All required files exist in $dir."

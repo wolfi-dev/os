@@ -1,0 +1,152 @@
+package:
+  name: newrelic-fluent-bit-output
+  version: "3.6.0"
+  epoch: 0 # toolchain rebuild for  go-1.25-1.25.11
+  description: A Fluent Bit output plugin that sends logs to New Relic
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - libpq # New Relic Fluent Bit plugin depends on libpq at runtime otherwise it will fail with "libpq.so.5: cannot open shared object file: No such file or directory"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/newrelic/newrelic-fluent-bit-output
+      tag: v${{package.version}}
+      expected-commit: 800f0b5a1eb1db36ba5f8a51d58561560f8cdfba
+
+  - uses: go/build
+    with:
+      output: out_newrelic.so
+      buildmode: c-shared
+      packages: .
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/fluent-bit/bin/
+          # The upstream chart expects the fluent-bit binary to be in /fluent-bit/bin/fluent-bit
+          ln -sf /usr/bin/out_newrelic.so ${{targets.contextdir}}/fluent-bit/bin/out_newrelic.so
+          ln -sf /usr/bin/fluent-bit ${{targets.contextdir}}/fluent-bit/bin/fluent-bit
+    test:
+      environment:
+        contents:
+          packages:
+            - fluent-bit
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - "-beta"
+  github:
+    identifier: newrelic/newrelic-fluent-bit-output
+    strip-prefix: v
+    use-tag: true
+    tag-filter: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - fluent-bit
+        - fluent-bit-compat
+        - procps
+        - ${{package.name}}-compat
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: "Verify plugin binary exists"
+      runs: |
+        PLUGIN_PATH="/fluent-bit/bin/out_newrelic.so"
+        test -f "$PLUGIN_PATH"
+    - name: "Verify plugin loads in fluent-bit"
+      runs: |
+        # Create a basic config that loads the plugin
+        tee /tmp/test-load.conf <<EOF
+        [SERVICE]
+            Flush        1
+            Daemon       Off
+            Log_Level    info
+
+        [INPUT]
+            Name   dummy
+            Dummy  {"message": "test"}
+            Rate   1
+
+        [OUTPUT]
+            Name   stdout
+            Match  *
+        EOF
+
+        # Start fluent-bit in background and capture output
+        fluent-bit -e /fluent-bit/bin/out_newrelic.so -c /tmp/test-load.conf > /tmp/fb-output.txt 2>&1 &
+        FB_PID=$!
+
+        # Wait for fluent-bit to start and produce some output
+        sleep 3
+
+        # Kill fluent-bit
+        kill $FB_PID || true
+        wait $FB_PID || true
+
+        # Check the output
+        cat /tmp/fb-output.txt
+
+        # Verify no plugin load errors
+        if grep -Eq "(failed.*loading|cannot.*load.*out_newrelic|dlopen.*failed)" /tmp/fb-output.txt; then
+          echo "ERROR: Plugin failed to load"
+          exit 1
+        fi
+
+        # Verify fluent-bit started successfully
+        if grep -q "Fluent Bit" /tmp/fb-output.txt; then
+          echo "SUCCESS: New Relic plugin loaded successfully"
+        else
+          echo "ERROR: Fluent Bit did not start properly"
+          exit 1
+        fi
+    - name: "Test plugin with mock New Relic endpoint"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          #!/bin/sh
+          # Create config with New Relic output
+          cat > /tmp/newrelic-test.conf <<EOF
+          [SERVICE]
+              Flush        1
+              Daemon       Off
+              Log_Level    debug
+
+          [INPUT]
+              Name   dummy
+              Dummy  {"test": "message", "hostname": "test-host", "service": "test-service"}
+              Rate   1
+              Tag    test.logs
+
+          [OUTPUT]
+              Name   newrelic
+              Match  *
+              licenseKey  test_license_key_12345678901234567890123456789012
+              endpoint    https://log-api.newrelic.com/log/v1
+          EOF
+        start: fluent-bit -e /fluent-bit/bin/out_newrelic.so -c /tmp/newrelic-test.conf
+        timeout: 10
+        expected_output: |
+          Fluent Bit
+        post: |
+          #!/bin/sh
+          set -o pipefail
+          # Verify fluent-bit is running with the plugin
+          pgrep -f "fluent-bit"
+
+environment:
+  contents:
+    packages:
+      - go-1.25

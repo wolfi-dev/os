@@ -1,7 +1,7 @@
 package:
   name: postgresql-18
   version: "18.4"
-  epoch: 3 # go/wolfi-rsc/postgresql-18
+  epoch: 4 # add plperl subpackage
   description: A sophisticated object-relational DBMS
   copyright:
     - license: BSD-3-Clause
@@ -31,9 +31,28 @@ environment:
   environment:
     # Used to fetch docker scripts
     ALPINE_VERSION: "3.23"
-    # Common configure flags for both main package and plpython builds
-    CONFIGURE_FLAGS: >-
-      --bindir=/usr/libexec/${{vars.mangled-package-name}} --datadir=/usr/share/${{vars.mangled-package-name}} --docdir=/usr/share/doc/${{vars.mangled-package-name}} --mandir=/usr/share/${{vars.mangled-package-name}}/man --with-openssl --with-libedit-preferred --with-uuid=e2fs --with-libxml --with-libxslt --with-icu --with-lz4 --with-zstd --with-gssapi --with-ldap --with-llvm --with-pam  --enable-thread-safety
+    # Common configure flags shared between the main package build and the
+    # plpython subpackage rebuilds (which add their own --with-python on top).
+    # PL/Perl is built only in the main package, which appends --with-perl to
+    # these flags; its artifacts are carved into the -plperl subpackage.
+    CONFIGURE_FLAGS: |
+      --bindir=/usr/libexec/${{vars.mangled-package-name}} \
+      --datadir=/usr/share/${{vars.mangled-package-name}} \
+      --docdir=/usr/share/doc/${{vars.mangled-package-name}} \
+      --mandir=/usr/share/${{vars.mangled-package-name}}/man \
+      --with-openssl \
+      --with-libedit-preferred \
+      --with-uuid=e2fs \
+      --with-libxml \
+      --with-libxslt \
+      --with-icu \
+      --with-lz4 \
+      --with-zstd \
+      --with-gssapi \
+      --with-ldap \
+      --with-llvm \
+      --with-pam \
+      --enable-thread-safety
   contents:
     packages:
       - autoconf
@@ -61,6 +80,7 @@ environment:
       - net-tools
       - openldap-dev
       - openssl-hardened-dev
+      - perl-dev
       - py3-supported-build-base-dev
       - tzdata
       - util-linux-dev
@@ -102,7 +122,7 @@ pipeline:
 
   - uses: autoconf/configure
     with:
-      opts: $CONFIGURE_FLAGS
+      opts: $CONFIGURE_FLAGS --with-perl
 
   - uses: autoconf/make
 
@@ -116,6 +136,17 @@ pipeline:
       # the official postgres image listens on all interfaces by default, let's do the same for consistency
       sed -ri "s!^#?(listen_addresses)\s*=\s*\S+.*!\1 = '*'!" ${{targets.destdir}}/usr/share/${{vars.mangled-package-name}}/postgresql.conf.sample
       grep -F "listen_addresses = '*'" ${{targets.destdir}}/usr/share/${{vars.mangled-package-name}}/postgresql.conf.sample
+
+  - name: Build PL/Perl transform modules
+    runs: |
+      # The top-level "make install" already installed the core PL/Perl handler
+      # (plperl.so + plperl[u] extension). The bool/hstore/jsonb_plperl transform
+      # modules live under contrib/ and are not built by the top-level target, so
+      # build and install them into the main destdir here. The -plperl subpackage
+      # carves the complete PL/Perl set back out before the -base sweep.
+      for ext in bool_plperl hstore_plperl jsonb_plperl; do
+        make -C contrib/$ext DESTDIR="${{targets.destdir}}" install
+      done
 
   - uses: strip
 
@@ -210,6 +241,10 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.subpkgdir}}
           make DESTDIR=${{targets.subpkgdir}} -C contrib install
+          # The PL/Perl transform modules (bool/hstore/jsonb_plperl) ship in the
+          # -plperl subpackage, matching Debian's postgresql-plperl layout. Drop
+          # them here so -contrib carries no libperl runtime dependency.
+          find "${{targets.subpkgdir}}" -name '*plperl*' -delete
     description: Extension modules distributed with PostgreSQL
     test:
       pipeline:
@@ -467,6 +502,124 @@ subpackages:
         - runs: |
             test -x /usr/local/bin/docker-entrypoint.sh
 
+  # PL/Perl: carve the artifacts produced by the main --with-perl build into
+  # their own subpackage, matching Debian's postgresql-plperl layout. This must
+  # run before the -base sweep below so the perl-linked files leave the main
+  # (libperl-free) package. NOTE: hstore_plperl additionally requires the
+  # `hstore` extension from postgresql-18-contrib at CREATE EXTENSION time.
+  - name: ${{package.name}}-plperl
+    description: PL/Perl procedural language for PostgreSQL ${{vars.major-version}}
+    dependencies:
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - perl
+      provides:
+        - postgresql-plperl=${{package.full-version}}
+    pipeline:
+      - runs: |
+          libdir="usr/lib/postgresql${{vars.major-version}}"
+          extdir="usr/share/postgresql${{vars.major-version}}/extension"
+          mkdir -p "${{targets.subpkgdir}}/${libdir}" "${{targets.subpkgdir}}/${extdir}"
+
+          # Shared objects: core PL/Perl handler plus bool/hstore/jsonb transforms.
+          mv "${{targets.destdir}}/${libdir}"/*plperl*.so "${{targets.subpkgdir}}/${libdir}/"
+
+          # Extension control/SQL for plperl[u] and the three transforms.
+          mv "${{targets.destdir}}/${extdir}"/*plperl* "${{targets.subpkgdir}}/${extdir}/"
+
+          # JIT bitcode for the transform modules (only present with --with-llvm).
+          if ls "${{targets.destdir}}/${libdir}/bitcode/"*plperl* >/dev/null 2>&1; then
+            mkdir -p "${{targets.subpkgdir}}/${libdir}/bitcode"
+            mv "${{targets.destdir}}/${libdir}/bitcode/"*plperl* "${{targets.subpkgdir}}/${libdir}/bitcode/"
+          fi
+
+          # PL/Perl message catalogs.
+          for mo in "${{targets.destdir}}"/usr/share/locale/*/LC_MESSAGES/plperl*; do
+            [ -e "$mo" ] || continue
+            rel="${mo#${{targets.destdir}}/}"
+            mkdir -p "${{targets.subpkgdir}}/$(dirname "$rel")"
+            mv "$mo" "${{targets.subpkgdir}}/${rel}"
+          done
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+            - ${{package.name}}-client
+            - ${{package.name}}-contrib
+            - shadow
+            - sudo-rs
+            - wait-for-it
+            - perl
+        environment:
+          PGDATA: /tmp/plperl_test_db
+          PGUSER: testuser
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "Verify plperl artifacts are installed at expected paths"
+          runs: |
+            libdir=/usr/lib/postgresql${{vars.major-version}}
+            extdir=/usr/share/postgresql${{vars.major-version}}/extension
+            for so in plperl bool_plperl hstore_plperl jsonb_plperl; do
+              test -f "$libdir/${so}.so"
+            done
+            for ext in plperl plperlu bool_plperl bool_plperlu hstore_plperl hstore_plperlu jsonb_plperl jsonb_plperlu; do
+              test -f "$extdir/${ext}.control"
+              test -f "$extdir/${ext}--1.0.sql"
+            done
+        - name: "Verify plperl.so links against libperl"
+          runs: |
+            ldd /usr/lib/postgresql${{vars.major-version}}/plperl.so | grep -E 'libperl\.so'
+        - name: "Test plperl database functionality"
+          runs: |
+            echo "=== Setting up test database for plperl ==="
+            useradd $PGUSER
+            sudo -u $PGUSER initdb -D $PGDATA 2>&1
+            sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/plperl_logfile start 2>&1
+            wait-for-it localhost:5432 -t 5 2>&1
+            createdb plperl_testdb 2>&1
+
+            # Trusted plperl: load extension and run a Perl function
+            psql -d plperl_testdb -c "CREATE EXTENSION plperl;"
+            psql -d plperl_testdb -c "SELECT extname FROM pg_extension WHERE extname='plperl';" | grep -w plperl
+
+            psql -d plperl_testdb -c "
+            CREATE OR REPLACE FUNCTION perl_hello(name text) RETURNS text AS \$\$
+              my (\$n) = @_;
+              return \"Hello from PL/Perl, \$n!\";
+            \$\$ LANGUAGE plperl;"
+            PLPERL_RESULT=$(psql -t -A -d plperl_testdb -c "SELECT perl_hello('chainguard');")
+            [ "$PLPERL_RESULT" = "Hello from PL/Perl, chainguard!" ]
+
+            # Untrusted plperlu: load extension and confirm it executes
+            psql -d plperl_testdb -c "CREATE EXTENSION plperlu;"
+            psql -d plperl_testdb -c "
+            CREATE OR REPLACE FUNCTION perl_version() RETURNS text AS \$\$
+              return sprintf('%vd', \$^V);
+            \$\$ LANGUAGE plperlu;"
+            PERL_VERSION=$(psql -t -A -d plperl_testdb -c "SELECT perl_version();")
+            echo "Perl version reported by plperlu: $PERL_VERSION"
+            echo "$PERL_VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$'
+
+            # jsonb_plperl transform: jsonb <-> Perl, needs only core types.
+            # jsonb_plperl registers the transform for the trusted plperl
+            # language (jsonb_plperlu would cover untrusted plperlu).
+            psql -d plperl_testdb -c "CREATE EXTENSION jsonb_plperl CASCADE;"
+            psql -d plperl_testdb -c "
+            CREATE OR REPLACE FUNCTION jsonb_roundtrip(val jsonb) RETURNS jsonb
+              TRANSFORM FOR TYPE jsonb AS \$\$
+              return \$_[0];
+            \$\$ LANGUAGE plperl;"
+            JSONB_RESULT=$(psql -t -A -d plperl_testdb -c "SELECT jsonb_roundtrip('[1,2,3]'::jsonb);")
+            [ "$JSONB_RESULT" = "[1, 2, 3]" ]
+
+            # hstore_plperl transform: requires the hstore extension from -contrib.
+            psql -d plperl_testdb -c "CREATE EXTENSION hstore_plperl CASCADE;"
+            psql -d plperl_testdb -c "SELECT extname FROM pg_extension WHERE extname='hstore_plperl';" | grep -w hstore_plperl
+
+            sudo -u $PGUSER pg_ctl -D $PGDATA stop 2>&1
+
   # This subpackage should always come last to avoid shipping resources included in other subpackages
   - name: "${{package.name}}-base"
     description: "Base for PostgreSQL 18"
@@ -518,7 +671,20 @@ subpackages:
           mv ${{targets.contextdir}}/usr/share/postgresql${{vars.major-version}}/extension/plpython* $savedir/usr/share/postgresql${{vars.major-version}}/extension/
           mv ${{targets.contextdir}}/usr/lib/postgresql${{vars.major-version}}/plpython* $savedir/usr/lib/postgresql${{vars.major-version}}/
           mv ${{targets.contextdir}}/usr/include/postgresql/${{vars.major-version}}/server/plpython* $savedir/usr/include/postgresql/${{vars.major-version}}/server/
-          rm -rf "${{targets.contextdir}}"
+          # Recursively removing the staged full install tree can intermittently
+          # fail with "Directory not empty" on some mounted build filesystems
+          # (e.g. the docker runner's overlay on macOS). The step runs under
+          # `set -e`, so swallow each rm's exit status (|| true) and retry until
+          # the tree is actually gone rather than aborting on a transient failure.
+          for _ in $(seq 1 30); do
+            rm -rf "${{targets.contextdir}}" 2>/dev/null || true
+            [ -d "${{targets.contextdir}}" ] || break
+            sleep 1
+          done
+          if [ -d "${{targets.contextdir}}" ]; then
+            echo "could not remove ${{targets.contextdir}}" >&2
+            exit 1
+          fi
           mv "$savedir" "${{targets.contextdir}}"
       - uses: strip
     test:

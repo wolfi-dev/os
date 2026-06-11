@@ -1,0 +1,127 @@
+package:
+  name: pluto
+  version: "5.24.0"
+  epoch: 5 # go/wolfi-rsc/pluto
+  description: A cli tool to help discover deprecated apiVersions in Kubernetes
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "2"
+    memory: 5Gi
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
+
+environment:
+  contents:
+    packages:
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/FairwindsOps/pluto
+      tag: v${{package.version}}
+      expected-commit: dd5ec8cccce5e42dfe8054b8250baa35546056a0
+
+  - uses: bump
+    with:
+      deps: golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      packages: ./cmd/pluto/main.go
+      output: pluto
+      ldflags: |
+        -X main.version=${{package.version}} -X main.commit=$(git rev-parse HEAD)}
+      go-package: go-1.26
+
+update:
+  enabled: true
+  github:
+    identifier: FairwindsOps/pluto
+    strip-prefix: v
+    use-tag: true
+    tag-filter: v
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to place binaries in the location expected by upstream Dockerfile"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf ./usr/bin/pluto ${{targets.contextdir}}/pluto
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+test:
+  environment:
+    contents:
+      packages:
+        - jq
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: pluto
+        version: ${{package.version}}
+    - uses: test/tw/help-check
+      with:
+        bins: pluto
+    - uses: test/kwok/cluster
+    - name: "Bash Completion test"
+      runs: |
+        set -euo pipefail
+        # Generate and verify bash completion script
+        pluto completion bash > /tmp/completion.bash
+        # Verify file was created with content
+        test -s /tmp/completion.bash
+        grep -F "bash completion" /tmp/completion.bash
+    - name: "Detection test"
+      runs: |
+        set -euo pipefail
+        # Create a sample manifest
+        tee deprecated.yaml <<EOF
+        apiVersion: apps/v1beta1
+        kind: Deployment
+        metadata:
+          name: deprecated-deployment
+        spec:
+          template:
+            spec:
+              containers:
+              - name: nginx
+                image: nginx
+        EOF
+        # Detect issues - pluto exits 3 when deprecated APIs are found, which is expected
+        pluto detect deprecated.yaml --output json > /tmp/pluto-output.json || [ $? -eq 3 ]
+        # Verify deprecated API is detected
+        jq -e '.items[] | select(.deprecated == true)' /tmp/pluto-output.json
+    - name: "detect-all-in-cluster"
+      runs: |
+        set -euo pipefail
+        # Create and apply a custom Endpoints object
+        cat > deprecated-endpoints.yaml <<EOF
+        apiVersion: v1
+        kind: Endpoints
+        metadata:
+          name: deprecated-endpoints
+        subsets:
+        - addresses:
+          - ip: 10.0.0.10
+          ports:
+          - port: 80
+            protocol: TCP
+        EOF
+        kubectl apply -f deprecated-endpoints.yaml
+        pluto detect-all-in-cluster --output json --ignore-deprecations --ignore-removals | grep -F "target-versions"
+    - name: "List Versions"
+      runs: |
+        set -euo pipefail
+        pluto list-versions | grep -F "Deployment"
+        pluto list-versions | grep -F "PodSecurityPolicy"

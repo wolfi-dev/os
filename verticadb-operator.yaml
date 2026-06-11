@@ -1,0 +1,94 @@
+package:
+  name: verticadb-operator
+  version: "25.4.0.0"
+  epoch: 17 # toolchain rebuild for  go-1.26-1.26.4
+  description: Simple, fast container image builder for Go applications.
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "3"
+    memory: 9Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - go-1.26
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+\.\d+)\.(\d+)$
+    replace: "$1-$2"
+    to: mangled-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 6f9d6dd950dd044089cdb535befb1f6ca429cd78
+      repository: https://github.com/vertica/vertica-kubernetes
+      tag: v${{vars.mangled-package-version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        google.golang.org/grpc@v1.79.3
+        github.com/expr-lang/expr@v1.17.7
+        github.com/moby/spdystream@v0.5.1
+        go.opentelemetry.io/otel/sdk@v1.43.0
+        golang.org/x/net@v0.55.0
+        golang.org/x/text@v0.36.0
+      modroot: |-
+        local-libs/vcluster
+        .
+
+  - name: Setup go modroot
+    runs: |
+      # bump controller-tools to a version that compiles with go-1.25;
+      # upstream v0.15.0 pulls golang.org/x/tools@v0.20.0 which fails to build
+      make CONTROLLER_TOOLS_VERSION=v0.20.1 manifests generate fmt vet
+      mkdir -p workspace-verticadb-operator
+      cp go.mod go.sum workspace-verticadb-operator/
+      mv cmd/operator/*.go-generate.txt workspace-verticadb-operator/
+      cp cmd/operator/main.go workspace-verticadb-operator/
+      cp -r api workspace-verticadb-operator/
+      cp -r pkg workspace-verticadb-operator/
+      cp -r local-libs workspace-verticadb-operator/
+
+  - uses: go/build
+    with:
+      modroot: workspace-verticadb-operator/
+      output: manager
+      packages: .
+      go-package: go-1.26
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: compat package to place binaries in location expected by upstream helm chart
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/
+          ln -sf /usr/bin/manager ${{targets.contextdir}}/manager
+    test:
+      pipeline:
+        - runs: test "$(readlink /manager)" = "/usr/bin/manager"
+
+update:
+  enabled: true
+  github:
+    identifier: vertica/vertica-kubernetes
+    strip-prefix: v
+    use-tag: true
+  version-transform:
+    - match: '-(\d+)$'
+      replace: '.$1'
+
+test:
+  pipeline:
+    - runs: |
+        # Tried to use kwok but it doesn't work with this project since there is a bug in the source-code similar to this: https://github.com/kedacore/keda/issues/5404
+        # it gives the error: "unable to find leader election namespace: not running in-cluster, please specify LeaderElectionNamespace"
+        # I verified that by patching the source code with the code suggested in the PR above and it worked fine.
+        stat /usr/bin/manager

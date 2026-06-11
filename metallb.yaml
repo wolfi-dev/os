@@ -1,0 +1,242 @@
+package:
+  name: metallb
+  version: "0.16.1"
+  epoch: 1 # CVE-2026-39821
+  description: "A network load-balancer implementation for Kubernetes using standard routing protocols"
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/metallb/metallb
+      tag: v${{package.version}}
+      expected-commit: 791dfcc63ced7a6b3e869131eae75e645150fff0
+
+  - uses: bump
+    with:
+      deps: |-
+        google.golang.org/grpc@v1.79.3
+        go.opentelemetry.io/otel/sdk@v1.43.0
+        go.opentelemetry.io/otel/metric@v1.43.0
+        go.opentelemetry.io/otel/trace@v1.43.0
+        go.opentelemetry.io/otel@v1.43.0
+        go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.43.0
+        go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.43.0
+        golang.org/x/net@v0.55.0
+        golang.org/x/sys@v0.45.0
+      modroot: |-
+        .
+        e2etest
+
+  - uses: go/build
+    with:
+      packages: ./controller
+      output: metallb-controller
+      ldflags: |
+        -X go.universe.tf/metallb/internal/version.gitCommit=$(git rev-parse HEAD)
+        -X go.universe.tf/metallb/internal/version.gitBranch=$(git rev-parse --abbrev-ref HEAD)
+      go-package: go-1.26
+
+  - uses: go/build
+    with:
+      packages: ./frr-tools/metrics
+      output: metallb-frr-metrics
+      ldflags: |
+        -X go.universe.tf/metallb/internal/version.gitCommit=$(git rev-parse HEAD)
+        -X go.universe.tf/metallb/internal/version.gitBranch=$(git rev-parse --abbrev-ref HEAD)
+      go-package: go-1.26
+
+  - uses: go/build
+    with:
+      packages: ./speaker
+      output: metallb-speaker
+      ldflags: |
+        -X go.universe.tf/metallb/internal/version.gitCommit=$(git rev-parse HEAD)
+        -X go.universe.tf/metallb/internal/version.gitBranch=$(git rev-parse --abbrev-ref HEAD)
+      go-package: go-1.26
+
+  - uses: go/build
+    with:
+      packages: ./frr-tools/cp-tool
+      output: cp-tool
+      ldflags: |
+        -X go.universe.tf/metallb/internal/version.gitCommit=$(git rev-parse HEAD)
+        -X go.universe.tf/metallb/internal/version.gitBranch=$(git rev-parse --abbrev-ref HEAD)
+      go-package: go-1.26
+
+subpackages:
+  - name: metallb-controller
+    pipeline:
+      - runs: |
+          install -Dm755 "${{targets.destdir}}"/usr/bin/metallb-controller "${{targets.subpkgdir}}"/usr/bin/metallb-controller
+    test:
+      environment:
+        contents:
+          packages:
+            - metallb-controller
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: metallb-controller
+        - name: Check controller runs
+          runs: |
+            set -euo pipefail
+            error_message="open /var/run/secrets/kubernetes.io/serviceaccount/namespace: no such file or directory"
+            # metallb-controller exits non-zero outside Kubernetes; capture output and verify expected error
+            rc=0
+            metallb-controller > /tmp/metallb-controller-out.txt 2>&1 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+                echo "expected non-zero exit code outside Kubernetes, got 0"
+                exit 1
+            fi
+            if ! grep -qF "${error_message}" /tmp/metallb-controller-out.txt; then
+                echo "unexpected error output:"
+                cat /tmp/metallb-controller-out.txt
+                exit 1
+            fi
+            echo "verified error message when not running in kubernetes"
+
+  - name: metallb-controller-compat
+    description: "compat package for metallb-controller"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -s ./usr/bin/metallb-controller ${{targets.contextdir}}/controller
+    test:
+      environment:
+        contents:
+          packages:
+            - metallb-controller
+      pipeline:
+        - uses: test/tw/symlink-check
+
+  - name: metallb-frr
+    pipeline:
+      - runs: |
+          install -Dm755 "${{targets.destdir}}"/usr/bin/metallb-frr-metrics "${{targets.subpkgdir}}"/usr/bin/metallb-frr-metrics
+          install frr-tools/reloader/frr-reloader.sh "${{targets.subpkgdir}}"/usr/bin/frr-reloader.sh
+    test:
+      environment:
+        contents:
+          packages:
+            - metallb-frr
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: metallb-frr-metrics
+
+  - name: metallb-frr-compat
+    pipeline:
+      - runs: |
+          # symlinks are required for compatibility with the metallb helm chart - does some cp stuff in init containers
+          install -Dm755 "${{targets.destdir}}"/usr/bin/metallb-frr-metrics "${{targets.subpkgdir}}"/frr-metrics
+          install frr-tools/reloader/frr-reloader.sh "${{targets.subpkgdir}}"/frr-reloader.sh
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /frr-metrics
+              /frr-reloader.sh
+
+  - name: metallb-speaker
+    pipeline:
+      - runs: |
+          # Ref: https://github.com/metallb/metallb/blob/main/speaker/Dockerfile
+          install -Dm755 "${{targets.destdir}}"/usr/bin/metallb-speaker "${{targets.subpkgdir}}"/usr/bin/metallb-speaker
+    dependencies:
+      runtime:
+        - bash # required by frr-reloader.sh
+        - metallb-frr
+    test:
+      environment:
+        contents:
+          packages:
+            - metallb-speaker
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: metallb-speaker
+        - name: Check speaker runs
+          runs: |
+            set -euo pipefail
+            error_message="open /var/run/secrets/kubernetes.io/serviceaccount/namespace: no such file or directory"
+            # metallb-speaker exits non-zero outside Kubernetes; capture output and verify expected error
+            rc=0
+            metallb-speaker > /tmp/metallb-speaker-out.txt 2>&1 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+                echo "expected non-zero exit code outside Kubernetes, got 0"
+                exit 1
+            fi
+            if ! grep -qF "${error_message}" /tmp/metallb-speaker-out.txt; then
+                echo "unexpected error output:"
+                cat /tmp/metallb-speaker-out.txt
+                exit 1
+            fi
+            echo "verified error message when not running in kubernetes"
+
+  - name: metallb-speaker-compat
+    description: "compat package for metallb-speaker"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -s ./usr/bin/metallb-speaker ${{targets.contextdir}}/speaker
+    test:
+      environment:
+        contents:
+          packages:
+            - metallb-speaker
+      pipeline:
+        - uses: test/tw/symlink-check
+
+  - name: metallb-cp-tool
+    pipeline:
+      - runs: |
+          install -Dm755 "${{targets.destdir}}"/usr/bin/cp-tool "${{targets.subpkgdir}}"/usr/bin/cp-tool
+    test:
+      environment:
+        contents:
+          packages:
+            - metallb-cp-tool
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: cp-tool
+
+  - name: metallb-cp-tool-compat
+    description: "compat package for metallb-cp-tool"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -s ./usr/bin/cp-tool ${{targets.contextdir}}/cp-tool
+    test:
+      environment:
+        contents:
+          packages:
+            - metallb-cp-tool
+      pipeline:
+        - uses: test/tw/symlink-check
+
+update:
+  enabled: true
+  github:
+    identifier: metallb/metallb
+    strip-prefix: v
+    tag-filter: v
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: |
+        stat /usr/bin/cp-tool
+        stat /usr/bin/metallb-controller
+        stat /usr/bin/metallb-frr-metrics
+        stat /usr/bin/metallb-speaker

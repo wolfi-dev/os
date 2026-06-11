@@ -1,0 +1,105 @@
+package:
+  name: kubernetes-csi-external-snapshotter-8.6
+  version: "8.6.0"
+  epoch: 1 # toolchain rebuild for  go-1.26-1.26.4
+  description: Sidecar container that watches Kubernetes Snapshot CRD objects and triggers CreateSnapshot/DeleteSnapshot against a CSI endpoint
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - kubernetes-csi-external-snapshotter=${{package.full-version}}
+      - kubernetes-csi-external-csi-snapshotter=${{package.full-version}}
+      - kubernetes-csi-external-csi-snapshotter-${{vars.major-minor-version}}=${{package.full-version}}
+  resources:
+    cpu: "2"
+    memory: 6Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kubernetes-csi/external-snapshotter
+      tag: v${{package.version}}
+      expected-commit: 78e32cd84e0abec2621924a30e38c755f93e180a
+
+  - uses: bump
+    with:
+      deps: |-
+        google.golang.org/grpc@v1.79.3
+        go.opentelemetry.io/otel/sdk@v1.43.0
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      packages: ./cmd/csi-snapshotter
+      output: csi-snapshotter
+      go-package: go-1.26
+      ldflags: -X main.version=$(git describe --long --tags --match="v*" --dirty 2>/dev/null || git rev-list -n1 HEAD)
+
+subpackages:
+  - name: kubernetes-csi-external-snapshot-controller-${{vars.major-minor-version}}
+    dependencies:
+      provides:
+        - kubernetes-csi-external-snapshot-controller=${{package.full-version}}
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/snapshot-controller
+          output: snapshot-controller
+          go-package: go-1.26
+          ldflags: -X main.version=$(git describe --long --tags --match="v*" --dirty 2>/dev/null || git rev-list -n1 HEAD)
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: kubernetes-csi-external-snapshot-controller
+            real-pkg-name: ${{subpkg.name}}
+
+update:
+  enabled: true
+  github:
+    identifier: kubernetes-csi/external-snapshotter
+    strip-prefix: v
+    tag-filter: v8.6
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubernetes-csi-external-snapshot-controller-${{vars.major-minor-version}}
+        - curl
+        - kubernetes-csi-driver-hostpath
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          csi-snapshotter
+          snapshot-controller
+    - uses: test/tw/ver-check
+      with:
+        bins: csi-snapshotter
+        version: ${{package.version}}
+    - uses: test/kwok/cluster
+    - name: Test csi-snapshotter with hostpath driver
+      runs: |-
+        set -euo pipefail
+        mkdir -p /csi
+        hostpathplugin --v=5 --endpoint="unix:///csi/csi.sock" --nodeid="node-000000" > hostpathplugin.log 2>&1 & sleep 5
+        csi-snapshotter --v=5 --csi-address "/csi/csi.sock" --kubeconfig ~/.kube/config --http-endpoint ":8080" > csi-snapshotter.log 2>&1 & sleep 10
+        sleep 10
+        # Verify metrics endpoint is accessible and returns expected CSI metrics
+        curl -sf localhost:8080/metrics | grep -F "process_"
+
+environment:
+  contents:
+    packages:
+      - go-1.26

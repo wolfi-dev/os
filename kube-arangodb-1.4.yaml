@@ -1,0 +1,149 @@
+package:
+  name: kube-arangodb-1.4
+  version: "1.4.3"
+  epoch: 8 # CVE-2026-39821
+  description: ArangoDB Kubernetes Operator - manages deployments of the ArangoDB database in Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - kube-arangodb=${{package.full-version}}
+  resources:
+    cpu: "8"
+    memory: 12Gi
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/arangodb/kube-arangodb/
+      tag: ${{package.version}}
+      expected-commit: 1a7b0c8218295115113960a9ea735b5fc38827a3
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/containerd/containerd@v1.7.32
+        github.com/go-jose/go-jose/v4@v4.1.4
+        github.com/moby/spdystream@v0.5.1
+        go.opentelemetry.io/otel/sdk@v1.43.0
+        helm.sh/helm/v3@v3.20.2
+        golang.org/x/net@v0.55.0
+        golang.org/x/sys@v0.45.0
+        golang.org/x/text@v0.37.0
+      replaces: |-
+        k8s.io/api=k8s.io/api@v0.35.1
+        k8s.io/apiextensions-apiserver=k8s.io/apiextensions-apiserver@v0.35.1
+        k8s.io/apimachinery=k8s.io/apimachinery@v0.35.1
+        k8s.io/apiserver=k8s.io/apiserver@v0.35.1
+        k8s.io/cli-runtime=k8s.io/cli-runtime@v0.35.1
+        k8s.io/client-go=k8s.io/client-go@v0.35.1
+        k8s.io/cloud-provider=k8s.io/cloud-provider@v0.35.1
+        k8s.io/cluster-bootstrap=k8s.io/cluster-bootstrap@v0.35.1
+        k8s.io/component-base=k8s.io/component-base@v0.35.1
+        k8s.io/kubectl=k8s.io/kubectl@v0.35.1
+        k8s.io/kubernetes=k8s.io/kubernetes@v0.35.1
+        k8s.io/metrics=k8s.io/metrics@v0.35.1
+
+  - uses: go/build
+    with:
+      packages: ./cmd/main
+      output: arangodb_operator
+      tags: community
+      ldflags: |
+        -X github.com/arangodb/kube-arangodb/pkg/version.version=${{package.version}}
+        -X github.com/arangodb/kube-arangodb/pkg/version.buildDate=$(date -d@${SOURCE_DATE_EPOCH} -u +'%Y-%m-%dT%H:%M:%SZ')
+        -X github.com/arangodb/kube-arangodb/pkg/version.build=$(git rev-parse --short HEAD)
+      go-package: go-1.26
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/licenses
+      cp LICENSE ${{targets.destdir}}/licenses/LICENSE
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to provide envoy for ArangoDB gateway feature"
+    dependencies:
+      runtime:
+        - envoy
+      provides:
+        - kube-arangodb-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          ln -sf ../../bin/envoy ${{targets.subpkgdir}}/usr/local/bin/envoy
+    test:
+      pipeline:
+        - uses: test/tw/symlink-check
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+    environment:
+      MY_POD_NAMESPACE: default
+      MY_POD_NAME: arangodb-operator-test
+      MY_POD_IP: 0.0.0.0
+      WATCH_NAMESPACE: default
+      HTTP_API_PORT: "8628"
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: arangodb_operator
+        version: ${{package.version}}
+    - uses: test/tw/help-check
+      with:
+        bins: arangodb_operator
+    - name: "Setup KWOK cluster"
+      uses: test/kwok/cluster
+    - name: "Verify operator startup"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          set -euo pipefail
+          kubectl apply -f https://raw.githubusercontent.com/arangodb/kube-arangodb/${{package.version}}/manifests/arango-crd.yaml
+          kubectl wait --for=condition=Established crd --all --timeout=60s
+          kubectl create serviceaccount default -n default --dry-run=client -o yaml | kubectl apply -f -
+          # Operator requires its own pod to exist for self-lookup
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: arangodb-operator-test
+            namespace: default
+          spec:
+            nodeName: kwok-node
+            containers:
+            - name: operator
+              image: image
+          EOF
+          kubectl wait --for=jsonpath='{.metadata.name}'=arangodb-operator-test pod/arangodb-operator-test --timeout=30s
+        start: |
+          arangodb_operator --operator.deployment --log.level=debug --chaos.allowed=false --api.http-port=$HTTP_API_PORT
+        timeout: "150"
+        expected_output: |
+          Starting arangodb-operator (Community), version ${{package.version}}
+          Successfully acquired lease
+        post: |
+          set -euo pipefail
+          wait-for-it localhost:$HTTP_API_PORT -t 60
+          curl -k -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o /dev/null -w "%{http_code}" https://localhost:$HTTP_API_PORT/health | grep -F "200"
+
+update:
+  enabled: true
+  github:
+    identifier: arangodb/kube-arangodb
+    strip-prefix: v
+    tag-filter-prefix: 1.4.
+  ignore-regex-patterns:
+    - "-preview"
+
+environment:
+  contents:
+    packages:
+      - go-1.26

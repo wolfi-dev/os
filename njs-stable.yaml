@@ -1,0 +1,144 @@
+package:
+  name: njs-stable
+  version: "0.9.9"
+  epoch: 1
+  description: njs scripting language CLI utility + dynamic nginx modules for nginx-stable
+  copyright:
+    - license: BSD-2-Clause
+  dependencies:
+    # Tie modules to the matching nginx-stable. Without this, `apk add njs-stable`
+    # alongside nginx-mainline would silently install incompatible modules.
+    runtime:
+      - nginx-stable-config
+  resources:
+    cpu: "1"
+    memory: 6Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - libedit-dev
+      - libxml2-dev
+      - libxslt-dev
+      - nginx-src
+      - openssl-dev
+      - pcre2-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/nginx/njs
+      tag: ${{package.version}}
+      expected-commit: 9ead4e71f74a27279f3212bdb6cadb0e86981a1b
+      destination: njs
+
+  - runs: |
+      builddir=$(pwd)
+      mkdir -p build
+      cd build
+      ln -sf /usr/src/nginx/auto
+      ln -sf /usr/src/nginx/src
+
+      cd $builddir/njs
+
+      CFLAGS="$CFLAGS -Wno-dangling-pointer -Wno-maybe-uninitialized" ./configure --debug=YES
+
+      make njs
+
+      mv build/njs ../build/
+
+      cd $builddir/build
+
+      /usr/src/nginx/auto/configure \
+        --with-compat \
+        --with-stream \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --add-dynamic-module=../njs/nginx
+
+      make modules
+
+      cd ..
+
+      mkdir -p "${{targets.contextdir}}"/usr/bin
+      install -m 755 -D build/njs "${{targets.contextdir}}"/usr/bin/njs
+
+      cd build/objs
+      mkdir -p "${{targets.contextdir}}"/usr/lib/nginx/modules
+      for mod in *.so; do
+          install -Dm755 $mod "${{targets.contextdir}}"/usr/lib/nginx/modules/$mod
+      done
+
+  - uses: strip
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - nginx-stable-config
+        - wait-for-it
+  pipeline:
+    - name: "Verify njs can execute JavaScript"
+      runs: |
+        set -euo pipefail
+        output=$(echo 'var x = 2 + 3; console.log(x)' | njs)
+        echo "$output" | grep -F "5"
+        output=$(echo 'var obj = {key: "value"}; console.log(JSON.stringify(obj))' | njs)
+        echo "$output" | grep -F '{"key":"value"}'
+    - name: "Verify nginx dynamic modules exist"
+      uses: test/tw/contains-files
+      with:
+        dir: /usr/lib/nginx/modules
+        name: "*.so"
+    - uses: test/tw/ver-check
+      with:
+        bins: njs
+        version-flag: -v
+    - uses: test/tw/ldd-check
+    - name: Module loads via nginx -t (regression guard, customer-issues#3486)
+      runs: |
+        cat > /tmp/njs.js <<'EOF'
+        function hello(r) { r.return(200, "njs ok\n"); }
+        export default { hello };
+        EOF
+        cat > /tmp/nginx-njs.conf <<'EOF'
+        user nobody;
+        worker_processes 1;
+        load_module /usr/lib/nginx/modules/ngx_http_js_module.so;
+        events { worker_connections 1024; }
+        http {
+            js_import test from /tmp/njs.js;
+            server {
+                listen 8080;
+                location / { js_content test.hello; }
+            }
+        }
+        EOF
+        nginx -t -c /tmp/nginx-njs.conf
+    - uses: test/daemon-check-output
+      with:
+        start: nginx -c /tmp/nginx-njs.conf -g 'daemon off; error_log /dev/stderr info;'
+        timeout: 10
+        post: |
+          wait-for-it localhost:8080 -t 5
+          response=$(curl -s http://localhost:8080/)
+          echo "$response" | grep -q "njs ok" \
+            || { echo "Expected js_content response, got: $response"; exit 1; }
+        expected_output: |
+          start worker process
+
+update:
+  enabled: true
+  github:
+    identifier: nginx/njs
+    use-tag: true

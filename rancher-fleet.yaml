@@ -1,0 +1,165 @@
+package:
+  name: rancher-fleet
+  version: "0.15.2"
+  epoch: 2 # toolchain rebuild for  go-1.26-1.26.4
+  description: Deploy workloads from Git to large fleets of Kubernetes clusters
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "3"
+    memory: 6Gi
+  test-resources:
+    cpu: "1"
+    memory: 3Gi
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: c8932b5fc204c3f36026d0fabdf41f740873526c
+      repository: https://github.com/rancher/fleet
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        helm.sh/helm/v4@v4.1.4
+        github.com/moby/spdystream@v0.5.1
+        github.com/go-git/go-git/v5@v5.19.0
+        golang.org/x/net@v0.55.0
+        golang.org/x/crypto@v0.52.0
+        github.com/go-git/go-billy/v5@v5.9.0
+      modroot: |-
+        .
+        integrationtests
+
+subpackages:
+  - name: ${{package.name}}-agent
+    dependencies:
+      runtime:
+        - busybox
+        - gzip
+        - posix-libc-utils
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-1.26
+          ldflags: |
+            -X github.com/rancher/fleet/pkg/version.GitCommit=$(git rev-parse HEAD)
+            -X github.com/rancher/fleet/pkg/version.Version=${{package.version}}
+          output: fleetagent
+          packages: ./cmd/fleetagent/main.go
+    test:
+      pipeline:
+        - runs: |
+            set -euo pipefail
+            fleetagent --version | grep ${{package.version}}
+
+  - name: ${{package.name}}-cli
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-1.26
+          ldflags: |
+            -X github.com/rancher/fleet/pkg/version.GitCommit=$(git rev-parse HEAD)
+            -X github.com/rancher/fleet/pkg/version.Version=${{package.version}}
+          output: fleet
+          packages: ./cmd/fleetcli/main.go
+    test:
+      pipeline:
+        - runs: |
+            set -euo pipefail
+            fleet --version | grep ${{package.version}}
+            fleet completion bash | grep -qE "__fleet_debug.*starting completion logic.*"
+        - name: "Setup KWOK cluster"
+          uses: test/kwok/cluster
+        - name: "Install CRDs"
+          runs: |
+            kubectl apply -f https://raw.githubusercontent.com/rancher/fleet/refs/tags/v${{package.version}}/charts/fleet-crd/templates/crds.yaml
+            kubectl wait --for=condition=Established crd --all --timeout=60s
+        - name: "Cleanup cluster registrations"
+          runs: |
+            set -euo pipefail
+            fleet cleanup clusterregistration | grep "Cleaning up outdated cluster registrations"
+
+  - name: ${{package.name}}-controller
+    dependencies:
+      runtime:
+        - openssh-client
+        - git
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-1.26
+          ldflags: |
+            -X github.com/rancher/fleet/pkg/version.GitCommit=$(git rev-parse HEAD)
+            -X github.com/rancher/fleet/pkg/version.Version=${{package.version}}
+          output: fleetcontroller
+          packages: ./cmd/fleetcontroller
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+        environment:
+          CATTLE_ELECTION_LEASE_DURATION: 20s
+          CATTLE_ELECTION_RENEW_DEADLINE: 10s
+          CATTLE_ELECTION_RETRY_PERIOD: 1s
+      pipeline:
+        - runs: |
+            fleetcontroller --version
+            fleetcontroller --help
+        - name: "Setup KWOK cluster"
+          uses: test/kwok/cluster
+        - name: "Install CRDs"
+          runs: |
+            kubectl apply -f https://raw.githubusercontent.com/rancher/fleet/refs/tags/v${{package.version}}/charts/fleet-crd/templates/crds.yaml
+            kubectl wait --for=condition=Established crd --all --timeout=60s
+            kubectl create ns cattle-fleet-system
+        - name: "Start fleet controller daemon"
+          uses: test/daemon-check-output
+          with:
+            start: |
+              fleetcontroller \
+                --namespace cattle-fleet-system  \
+                --kubeconfig ~/.kube/config
+            timeout: 30
+            expected_output: |
+              listening for changes on local cluster
+              starting job scheduler
+              starting manager
+              Successfully acquired lease
+            post: |
+              set -euo pipefail
+              # Check metrics endpoint
+              curl -fsSL http://localhost:8080/metrics | grep "leader_election_master_status"
+
+  - name: ${{package.name}}-termination-log
+    description: fleet-termination-log outputs fleet's termination log to /dev/termination-log
+    dependencies:
+      runtime:
+        - busybox
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          cp package/log.sh ${{targets.subpkgdir}}/usr/bin/log.sh
+          chmod +x ${{targets.subpkgdir}}/usr/bin/log.sh
+    test:
+      pipeline:
+        - runs: |
+            stat /usr/bin/log.sh
+
+update:
+  enabled: true
+  github:
+    identifier: rancher/fleet
+    strip-prefix: v
+
+# Based on package contents inspection, it was found that this origin package is empty apart from its own SBOM and this test was added to confirm it is empty and will fail if the package is no longer empty (contains more than an SBOM)
+test:
+  pipeline:
+    - uses: test/emptypackage
+
+environment:
+  contents:
+    packages:
+      - go-1.26

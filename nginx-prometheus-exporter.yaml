@@ -1,0 +1,132 @@
+package:
+  name: nginx-prometheus-exporter
+  version: "1.5.1"
+  epoch: 15 # toolchain rebuild for  go-1.25-1.25.11
+  description: NGINX Prometheus Exporter for NGINX and NGINX Plus
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - merged-usrsbin
+      - wolfi-baselayout
+  resources:
+    cpu: "1"
+    memory: 5Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+# Create a new major-version variable that contains only the major version
+# to use in the iamguarded/compat pipeline to find out the correct folder for the image.
+# e.g. 1.4.1 will create a new var major-version=1
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 3c38a4c27ce2c2784739064da5c9acf5b2021680
+      repository: https://github.com/nginxinc/nginx-prometheus-exporter
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.52.0
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -w
+        -X=github.com/prometheus/common/version.Version=${{package.version}}
+        -X=main.version=${{package.version}}
+      output: nginx-prometheus-exporter
+      packages: .
+
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    description: Compat package for iamguarded nginx-exporter image
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: nginx-exporter
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/nginx-exporter/bin
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          ln -sf /usr/bin/nginx-prometheus-exporter /opt/iamguarded/nginx-exporter/bin/nginx-prometheus-exporter
+          ln -sf /usr/bin/nginx-prometheus-exporter ${{targets.contextdir}}/usr/bin/exporter
+      - uses: iamguarded/finalize-compat
+        with:
+          package: nginx-exporter
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+        environment:
+          PATH: "/opt/iamguarded/nginx-exporter/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          IAMGUARDED_APP_NAME: "nginx-exporter"
+        accounts:
+          groups:
+            - groupname: nginx-iamguarded
+              gid: 1001
+          users:
+            - username: nginx-iamguarded
+              gid: 1001
+              uid: 1001
+          run-as: 1001
+      pipeline:
+        - working-directory: /tmp # Workaround for "can't cd to /home/build: Permission denied" error
+          pipeline:
+            # We don't need to have `test/daemon-check-output` pipeline here as upstream entrypoint doesn't
+            # wrap with the `entrypoint.sh`, so we're covered by in the main pipeline test.
+            - name: Verify the symlinks were created
+              runs: |
+                test "$(readlink /opt/iamguarded/nginx-exporter/bin/nginx-prometheus-exporter)" = "/usr/bin/nginx-prometheus-exporter"
+                test "$(readlink /usr/bin/exporter)" = "/usr/bin/nginx-prometheus-exporter"
+            - runs: /opt/iamguarded/nginx-exporter/bin/nginx-prometheus-exporter --version
+
+update:
+  enabled: true
+  github:
+    identifier: nginxinc/nginx-prometheus-exporter
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - shadow
+        - nginx
+  pipeline:
+    - name: "Verify Installation"
+      runs: nginx-prometheus-exporter --version 2>&1 | grep -q "${{package.version}}"
+    - name: "start daemon"
+      uses: test/daemon-check-output
+      with:
+        start: nginx-prometheus-exporter
+        timeout: 60
+        setup: |
+          useradd nginx
+          nginx -g "daemon off;" > /dev/null 2>&1 &
+        expected_output: |
+          Listening on
+        post: |
+          #!/bin/sh -e
+          response=$(curl -s localhost:9113/metrics)
+          if ! echo "$response" | grep -q 'nginx_up'; then
+            echo "expected metric not found"
+            echo "$response"
+            exit 1
+          fi
+
+environment:
+  contents:
+    packages:
+      - go-1.25

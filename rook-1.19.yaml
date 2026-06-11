@@ -1,0 +1,160 @@
+package:
+  name: rook-1.19
+  version: "1.19.6"
+  epoch: 1 # toolchain rebuild for  go-1.26-1.26.4
+  description: Storage Orchestration for Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - rook=${{package.full-version}}
+    runtime:
+      - s5cmd
+  resources:
+    cpu: "2"
+    memory: 9Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rook/rook
+      expected-commit: 7a84015d5d81890f82a4f9d01a30fb2c59e05ef2
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/go-jose/go-jose/v4@v4.1.4
+        golang.org/x/crypto@v0.52.0
+        golang.org/x/net@v0.55.0
+      replaces: |-
+        github.com/moby/spdystream=github.com/moby/spdystream@v0.5.1
+        golang.org/x/crypto=golang.org/x/crypto@v0.52.0
+      modroot: |-
+        .
+        pkg/apis
+
+  - uses: go/build
+    with:
+      packages: ./cmd/rook
+      output: rook
+      go-package: go-1.26
+      ldflags: -X 'github.com/rook/rook/pkg/version.Version=${{package.version}}'
+
+  - runs: |
+      mv images/ceph/toolbox.sh ${{targets.destdir}}/usr/bin/
+
+      mkdir -p ${{targets.destdir}}/etc/rook-external
+      mv deploy/examples/create-external-cluster-resources.* ${{targets.destdir}}/etc/rook-external
+
+      mv deploy/examples/monitoring ${{targets.destdir}}/etc/ceph-monitoring
+
+subpackages:
+  - name: ${{package.name}}-oci-compat
+    dependencies:
+      provides:
+        - rook-oci-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin
+          # hardlink, not symlink: rook operator's cp -a would preserve a symlink and dangle.
+          ln -f ${{targets.destdir}}/usr/bin/rook ${{targets.subpkgdir}}/usr/local/bin/rook
+          ln -sf ../../bin/toolbox.sh ${{targets.subpkgdir}}/usr/local/bin/toolbox.sh
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+        - name: Verify /usr/local/bin/rook is not a symlink
+          runs: |
+            # rook operator's init-copy-binaries does `cp -a` of this path and
+            # mounts the result into a separate container. cp -a preserves
+            # symlinks, so this must be a real file for the operator to work.
+            set -euo pipefail
+            test -f /usr/local/bin/rook
+            test -x /usr/local/bin/rook
+            test ! -L /usr/local/bin/rook
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubectl
+        - curl
+    environment:
+      ROOK_CURRENT_NAMESPACE_ONLY: "true"
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
+      POD_NAMESPACE: "rook-ceph"
+      POD_NAME: "rook-ceph-operator-test"
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: rook
+        version-flag: version
+    - uses: test/tw/help-check
+      with:
+        bins: rook
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: "true"
+    - name: Install CRDs
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/rook/rook/v${{package.version}}/deploy/examples/crds.yaml
+        kubectl wait --for condition=established --timeout=60s crd/cephclusters.ceph.rook.io
+    - name: Create namespace and RBAC
+      runs: |
+        kubectl create namespace rook-ceph
+
+        kubectl create clusterrole rook-ceph-operator \
+          --verb=get,list,watch --resource=pods,services,endpoints \
+          --verb=get,list,watch --resource=nodes \
+          --verb=get,list,watch,create,update,patch,delete --resource=deployments,daemonsets,statefulsets \
+          --verb='*' --resource=cephclusters,cephblockpools,cephfilesystems,cephnfses,cephobjectstores,cephobjectstoreusers,cephrbdmirrors
+
+        kubectl create clusterrolebinding rook-ceph-operator \
+          --clusterrole=rook-ceph-operator \
+          --serviceaccount=default:default
+
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: rook-ceph-operator-test
+          namespace: rook-ceph
+        spec:
+          nodeName: kwok-node
+          serviceAccountName: default
+          containers:
+          - name: operator
+            image: rook-operator
+        EOF
+    - name: Test operator startup
+      uses: test/daemon-check-output
+      with:
+        start: |
+          rook ceph operator
+        expected_output: |
+          starting Rook-Ceph operator
+          failed to get operator base image ceph version
+        timeout: "30"
+
+update:
+  enabled: true
+  github:
+    identifier: rook/rook
+    strip-prefix: v
+    tag-filter: v1.19.

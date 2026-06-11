@@ -1,0 +1,125 @@
+package:
+  name: tempo-3.0
+  version: "3.0.0"
+  epoch: 1 # toolchain rebuild for  go-1.26-1.26.4
+  description: Grafana Tempo is a high volume, minimal dependency distributed tracing backend.
+  copyright:
+    - license: AGPL-3.0-or-later
+  resources:
+    cpu: "6"
+    memory: 12Gi
+  dependencies:
+    provides:
+      - ${{vars.package-basename}}=${{package.full-version}}
+
+vars:
+  package-basename: tempo
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: d399842f5d699627e49cdb7034b70e29e0e29567
+      repository: https://github.com/grafana/tempo
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |
+        github.com/apache/thrift@v0.23.0
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: ./cmd/tempo
+      output: ${{vars.package-basename}}
+      ldflags: -X github.com/prometheus/common/version.Version=${{package.version}}
+
+  - uses: strip
+
+data:
+  - name: components
+    items:
+      query: query
+      vulture: vulture
+      cli: cli
+
+subpackages:
+  - range: components
+    name: "${{package.name}}-${{range.key}}"
+    dependencies:
+      provides:
+        - "${{vars.package-basename}}-${{range.key}}=${{package.full-version}}"
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-1.26
+          packages: ./cmd/${{vars.package-basename}}-${{range.key}}
+          output: ${{vars.package-basename}}-${{range.key}}
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: "/usr/bin/${{vars.package-basename}}-${{range.key}}"
+        - uses: test/tw/virtualpackage
+          with:
+            virtual-pkg-name: "${{vars.package-basename}}-${{range.key}}"
+
+update:
+  enabled: true
+  github:
+    identifier: grafana/tempo
+    strip-prefix: v
+    tag-filter-prefix: v3.0.
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/virtualpackage
+      with:
+        virtual-pkg-name: "${{vars.package-basename}}"
+    - uses: test/tw/help-check
+      with:
+        bins: tempo
+    - name: Test Tempo server start
+      runs: |
+        set -euo pipefail
+        # Create a simple tempo.yaml config file
+        cat <<EOF > tempo.yaml
+        auth_enabled: false
+        server:
+          http_listen_port: 3200
+        distributor:
+          receivers:
+            jaeger:
+              protocols:
+                thrift_compact:
+        storage:
+          trace:
+            backend: local
+            local:
+              path: /tmp/tempo/traces
+        EOF
+
+        tempo start -config.file=tempo.yaml &
+        TEMPO_PID=$!
+
+        attempts=0
+        until curl -f http://localhost:3200/ready || [ $attempts -eq 5 ]; do
+          sleep 10
+          attempts=$((attempts+1))
+        done
+        kill "$TEMPO_PID" || true
+        if [ $attempts -eq 5 ]; then exit 1; fi

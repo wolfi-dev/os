@@ -1,0 +1,129 @@
+package:
+  name: policy-controller
+  version: "0.15.1"
+  epoch: 10 # CVE-2026-39821
+  description: "The policy admission controller used to enforce policy on a cluster on verifiable supply-chain metadata from cosign."
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go-1.26
+      - make
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: cc75baab1d34d3bae47bde7bd934bf79e5ca3afc
+      repository: https://github.com/sigstore/policy-controller
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/sigstore/rekor@v1.5.0
+        github.com/sigstore/sigstore@v1.10.4
+        github.com/theupdateframework/go-tuf/v2@v2.4.1
+        google.golang.org/grpc@v1.79.3
+        github.com/go-jose/go-jose/v4@v4.1.4
+        go.opentelemetry.io/otel/sdk@v1.43.0
+        github.com/sigstore/timestamp-authority/v2@v2.0.6
+        github.com/in-toto/in-toto-golang@v0.11.0
+        golang.org/x/crypto@v0.52.0
+        golang.org/x/net@v0.55.0
+
+  - runs: |
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      make policy-controller && mv policy-controller "${{targets.destdir}}/usr/bin/policy-controller"
+      make policy-tester && mv policy-tester "${{targets.destdir}}/usr/bin/policy-tester"
+
+subpackages:
+  - name: policy-controller-tester
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/bin"
+          mv "${{targets.destdir}}/usr/bin/policy-tester" "${{targets.subpkgdir}}/usr/bin/policy-tester"
+    dependencies:
+      runtime:
+        - ca-certificates-bundle
+    description: CLI for testing ClusterImagePolicy resources
+    test:
+      pipeline:
+        - runs: |
+            policy-tester --version
+            policy-tester --help
+
+update:
+  enabled: true
+  manual: false
+  github:
+    identifier: sigstore/policy-controller
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - git
+        - openssl
+    environment:
+      SYSTEM_NAMESPACE: default
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: |
+        policy-controller --help
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Launch controller with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl create configmap config-image-policies \
+            --namespace default \
+            --from-literal=policies='{}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create configmap config-sigstore-keys \
+            --namespace default \
+            --from-literal=sigstoreKeys='{}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create configmap config-policy-controller \
+            --namespace default \
+            --from-literal=config='{}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout server.key \
+            -out server.crt \
+            -days 365 \
+            -subj "/CN=policy-webhook.default.svc"
+          cp server.crt ca-cert.pem
+          kubectl create secret generic webhook-certs \
+            -n default \
+            --type=Opaque \
+            --from-file=ca-cert.pem=ca-cert.pem \
+            --from-file=server-key.pem=server.key \
+            --from-file=server-cert.pem=server.crt \
+            --from-file=tls.crt=server.crt \
+            --from-file=tls.key=server.key
+
+          git clone --branch v${{package.version}} --depth 1 https://github.com/sigstore/policy-controller
+          kubectl apply -k policy-controller/config
+          sleep 1
+        start: /usr/bin/policy-controller
+        timeout: 30
+        expected_output: |
+          Initializing TUF root
+          Successfully acquired lease
+          Reconcile succeeded
+        post: |
+          curl --silent --fail localhost:9090/metrics

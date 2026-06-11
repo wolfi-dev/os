@@ -1,0 +1,107 @@
+package:
+  name: management-api-for-apache-cassandra-5.0
+  version: "0.1.117"
+  epoch: 1 # GHSA-v8h7-rr48-vmmv
+  description: RESTful / Secure Management Sidecar for Apache Cassandra
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - merged-bin
+      - procps
+      - wolfi-baselayout
+    provides:
+      - management-api-for-apache-cassandra=${{package.full-version}}
+  resources:
+    cpu: "1"
+    memory: 3Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - maven
+      - openjdk-11-default-jdk
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-11-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/k8ssandra/management-api-for-apache-cassandra
+      expected-commit: 3a72f2eeb0f04a0dbcc4279eac1cedfb82c97452
+      tag: v${{package.version}}
+
+  # We can't (currently), use pombump, as this repo places license info as
+  # code comments, embedded in the pom.xml files. pombump currently isn't able
+  # to handle this. Internal issue create to track.
+  - uses: patch
+    with:
+      patches: |
+        2025-08-15-consolidated-cve-patches.patch
+
+  # Bump netty in all modules (GHSA-v8h7-rr48-vmmv); the patch above covers
+  # the agent module's netty.http.codec.version, but the server module
+  # (management-api-server/pom.xml) uses netty.version to control all netty
+  # artifacts and needs the same bump to 4.1.133.Final.
+  - runs: |
+      find . -name "pom.xml" -exec sed -i \
+        -e 's|<netty\.http\.codec\.version>[^<]*</netty\.http\.codec\.version>|<netty.http.codec.version>4.1.133.Final</netty.http.codec.version>|g' \
+        -e 's|<netty\.version>[^<]*</netty\.version>|<netty.version>4.1.133.Final</netty.version>|g' \
+        {} +
+
+  - runs: |
+      echo "Running build..."
+      MAAC_PATH="${{targets.contextdir}}"/opt/management-api
+      mkdir -p "${{targets.contextdir}}"/usr/local/bin
+      mkdir -p "${{targets.contextdir}}"/opt/management-api
+      mvn -q -ff package -Dskip.surefire.tests -DskipTests -DskipOpenApi
+
+      cp ./cassandra/scripts/docker-entrypoint.sh "${{targets.contextdir}}"/usr/local/bin/
+      find . -type f -name "datastax-*.jar" -exec mv -t $MAAC_PATH -i '{}' +
+      chmod +x "${{targets.contextdir}}"/usr/local/bin/docker-entrypoint.sh
+
+subpackages:
+  - name: ${{package.name}}-compat
+    dependencies:
+      # Backwards compatibility with previous package name.
+      provides:
+        - management-api-for-apache-cassandra-compat=${{package.full-version}}
+      runtime:
+        - merged-bin
+        - wolfi-baselayout
+    options:
+      # This package only contains symlinks, we don't want it to introduce any
+      # new depends as a result of chasing those symlinks.
+      no-depends: true
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/opt/management-api
+          ln -s /opt/management-api/datastax-mgmtapi-agent-5.0.x-0.1.0-SNAPSHOT.jar ${{targets.contextdir}}/opt/management-api/datastax-mgmtapi-agent.jar
+          ln -s /opt/management-api/datastax-mgmtapi-server-0.1.0-SNAPSHOT.jar ${{targets.contextdir}}/opt/management-api/datastax-mgmtapi-server.jar
+          ln -sf /usr/local/bin/docker-entrypoint.sh ${{targets.contextdir}}/docker-entrypoint.sh
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: management-api-for-apache-cassandra-compat
+            real-pkg-name: ${{subpkg.name}}
+
+update:
+  enabled: true
+  github:
+    identifier: k8ssandra/management-api-for-apache-cassandra
+    # Upstream doesn't use tags to differentiate between supported cassandra
+    # releases. Each new tag cut supports multiple Cassandra versions.
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - management-api-for-apache-cassandra-compat
+        - openjdk-11-default-jvm
+  pipeline:
+    - runs: |
+        java -jar /opt/management-api/datastax-mgmtapi-server.jar --help

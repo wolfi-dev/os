@@ -1,0 +1,147 @@
+package:
+  name: rabbitmq-cluster-operator
+  version: "2.21.0"
+  epoch: 4 # CVE-2026-39821
+  description: Open source RabbitMQ cluster operator. Kubernetes operator to deploy and manage RabbitMQ clusters.
+  copyright:
+    - license: MPL-2.0
+
+# Create a new major-version variable that contains only the major version
+# to use in the iamguarded/compat pipeline to find out the correct folder for the image.
+# e.g. 2.12.1 will create a new var major-version=2
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rabbitmq/cluster-operator
+      tag: v${{package.version}}
+      expected-commit: e07b69cff26aecb3521d68bf406ee1a3a5915c5c
+
+  - uses: bump
+    with:
+      modroot: |-
+        kubectl-rabbitmq
+        .
+      deps: golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      packages: ./cmd
+      output: manager
+      go-package: go-1.26
+      tags: timetzdata
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          # link /usr/bin/manager to /manager due to hardcoded command
+          # See https://github.com/rabbitmq/cluster-operator/blob/main/config/manager/manager.yaml#L34-L35
+          mkdir -p "${{targets.subpkgdir}}"
+          ln -sf ./usr/bin/manager "${{targets.subpkgdir}}/manager"
+    test:
+      environment:
+        contents:
+          packages:
+            # -compat packages can be satisfied by multiple source packages; install here for test only, not as a runtime dep
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package for iamguarded"
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: ${{package.name}}
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/rabbitmq-cluster-operator/bin
+          ln -sf /usr/bin/manager /opt/iamguarded/rabbitmq-cluster-operator/bin/manager
+          ln -sf /opt/iamguarded/rabbitmq-cluster-operator/bin/manager ${{targets.contextdir}}/manager
+      - uses: iamguarded/finalize-compat
+        with:
+          package: ${{package.name}}
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: ${{package.name}}
+            version: ${{vars.major-version}}
+        - runs: |
+            run-script --version
+            run-script --help
+        - name: Verify the symlinks were created
+          runs: |
+            test "$(readlink /manager)" = "/opt/iamguarded/rabbitmq-cluster-operator/bin/manager"
+            test "$(readlink /opt/iamguarded/rabbitmq-cluster-operator/bin/manager)" = "/usr/bin/manager"
+        - runs: /manager --help
+    dependencies:
+      runtime:
+        - wolfi-baselayout
+
+  - name: ${{package.name}}-crds
+    description: Upstream CRD for rabbitmq/cluster-operator v${{package.version}}, shipped at charts/crds/rabbitmq-cluster/ to mirror the Bitnami chart subdir layout
+    pipeline:
+      - runs: |
+          install -d ${{targets.subpkgdir}}/charts/crds/rabbitmq-cluster
+          install -m 0644 config/crd/bases/rabbitmq.com_rabbitmqclusters.yaml \
+            ${{targets.subpkgdir}}/charts/crds/rabbitmq-cluster/
+    test:
+      environment:
+        contents:
+          packages:
+            - yq
+      pipeline:
+        - runs: |
+            yq /charts/crds/rabbitmq-cluster/*.yaml
+
+update:
+  enabled: true
+  github:
+    identifier: rabbitmq/cluster-operator
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+    environment:
+      OPERATOR_NAMESPACE: default
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: |
+        manager --help
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Launch operator with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl apply -f https://raw.githubusercontent.com/rabbitmq/cluster-operator/refs/tags/v${{package.version}}/config/crd/bases/rabbitmq.com_rabbitmqclusters.yaml
+          kubectl create clusterrolebinding test-admin --clusterrole=cluster-admin --serviceaccount=default:default
+          sleep 1
+        start: /usr/bin/manager --metrics-bind-address ":8080"
+        timeout: 30
+        expected_output: |
+          Starting Controller
+          Starting workers
+        post: |
+          curl --silent --fail localhost:8080/metrics
+
+environment:
+  contents:
+    packages:
+      - go-1.26

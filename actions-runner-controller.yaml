@@ -1,0 +1,129 @@
+package:
+  name: actions-runner-controller
+  version: "0.14.2"
+  epoch: 3 # CVE-2026-39821
+  description: Kubernetes controller for GitHub Actions self-hosted runners
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/actions/actions-runner-controller
+      tag: gha-runner-scale-set-${{package.version}}
+      expected-commit: 9bb16ae49d0ce585d8e682aa7e2668a6e832d5d8
+
+  - uses: bump
+    with:
+      deps: golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: .
+      output: manager
+      ldflags: -X 'github.com/actions/actions-runner-controller/build.Version=${{package.version}}' -X 'github.com/actions/actions-runner-controller/build.CommitSHA=$(git rev-parse HEAD)'
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: ./cmd/ghalistener
+      output: ghalistener
+      ldflags: -X 'github.com/actions/actions-runner-controller/build.Version=${{package.version}}' -X 'github.com/actions/actions-runner-controller/build.CommitSHA=$(git rev-parse HEAD)'
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: ./cmd/githubwebhookserver
+      output: github-webhook-server
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: ./cmd/actionsmetricsserver
+      output: actions-metrics-server
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+          ln -sf ./usr/bin/manager ${{targets.subpkgdir}}/manager
+          ln -sf ./usr/bin/ghalistener ${{targets.subpkgdir}}/ghalistener
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /ghalistener
+            readlink -v /manager
+
+update:
+  enabled: true
+  github:
+    identifier: actions/actions-runner-controller
+    strip-prefix: gha-runner-scale-set-
+    tag-filter: gha-runner-scale-set-
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - ${{package.name}}-compat
+        - openssl
+  pipeline:
+    - runs: |
+        set +e
+        /manager -h
+        /ghalistener -h
+        github-runnerscaleset-listener -h
+        ghalistener -h
+        github-webhook-server -h
+        actions-metrics-server -h
+        actions-metrics-server --help
+        github-webhook-server --help
+        manager --help
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          ghalistener
+          github-webhook-server
+          actions-metrics-server
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Launch manager with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -keyout /tmp/k8s-webhook-server/serving-certs/tls.key \
+            -out /tmp/k8s-webhook-server/serving-certs/tls.crt \
+            -subj "/CN=actions-runner-controller-webhook-service.default.svc" \
+            -addext "subjectAltName=DNS:actions-runner-controller-webhook-service.default.svc"
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_horizontalrunnerautoscalers.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runnerdeployments.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runnerreplicasets.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runners.yaml
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/actions/actions-runner-controller/refs/tags/gha-runner-scale-set-${{package.version}}/charts/actions-runner-controller/crds/actions.summerwind.dev_runnersets.yaml
+          # Wait for CRDs to be registered
+          sleep 3
+          openssl genrsa -out /tmp/fake-gh-app.key 2048
+        start: manager --github-app-private-key /tmp/fake-gh-app.key --metrics-addr ":8080"
+        timeout: 30
+        expected_output: |
+          Starting Controller
+          Starting workers
+        post: |
+          curl --silent --fail http://127.0.0.1:8080/metrics

@@ -1,0 +1,135 @@
+package:
+  name: cedar
+  version: "4.11.0"
+  epoch: 0 # go/wolfi-rsc/cedar
+  description: "Core implementation of the Cedar language"
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "5"
+    memory: 10Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+vars:
+  rust-version: "1.94"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cargo-auditable
+      - rust-${{vars.rust-version}}
+      - wolfi-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/cedar-policy/cedar
+      expected-commit: d86ed2ee47cbe5a30e6b70a3d8414bc66ce88ae3
+      tag: v${{package.version}}
+
+  - uses: rust/cargobump
+
+  - name: Configure and build
+    runs: |
+      # Fix auditable builds: we're tripping over
+      # https://github.com/rust-secure-code/cargo-auditable/issues/124 so need
+      # to fix up the `dep:` features causing it
+      find . -name Cargo.toml | xargs sed -i 's/dep:\(serde-wasm-bindgen\)/\1/'
+      find . -name Cargo.toml | xargs sed -i 's/dep:\(tsify\)/\1/'
+      find . -name Cargo.toml | xargs sed -i 's/dep:\(wasm-bindgen\)/\1/'
+
+      cargo auditable build --release -vv
+      mkdir -p ${{targets.destdir}}/usr/bin/
+      mv target/release/cedar ${{targets.destdir}}/usr/bin/
+
+  - name: Simple test
+    runs: |
+      cat <<EOF > sample.cedar
+      permit (
+        principal == User::"alice",
+        action == Action::"view",
+        resource in Album::"jane_vacation"
+      );
+      EOF
+      RUST_BACKTRACE=full ${{targets.destdir}}/usr/bin/cedar check-parse --policies sample.cedar
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: cedar-policy/cedar
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - coreutils
+  pipeline:
+    - name: "Verify cedar installation"
+      runs: |
+        which cedar
+        cedar --version
+    - name: "Test basic policy parsing"
+      runs: |
+        cat <<EOF > basic.cedar
+        permit (
+          principal == User::"alice",
+          action == Action::"read",
+          resource == Document::"doc1"
+        );
+        EOF
+        cedar check-parse --policies basic.cedar
+    - name: "Test complex policy with conditions"
+      runs: |
+        cat <<EOF > complex.cedar
+        permit (
+          principal == User::"bob",
+          action == Action::"edit",
+          resource == Document::"doc2"
+        ) when {
+          resource.owner == principal
+        };
+        EOF
+        cedar check-parse --policies complex.cedar
+    - name: "Test policy with variables"
+      runs: |
+        cat <<EOF > vars.cedar
+        permit (
+          principal == ?principal,
+          action == Action::"view",
+          resource == Document::"public"
+        );
+        EOF
+        cedar check-parse --policies vars.cedar
+    - name: "Test policy with context"
+      runs: |
+        cat <<EOF > context.cedar
+        permit (
+          principal == User::"alice",
+          action == Action::"access",
+          resource == Resource::"data"
+        ) when { context.time_of_day == "day" };
+        EOF
+        cedar check-parse --policies context.cedar
+    - name: "Test help command functionality"
+      runs: |
+        cedar --help
+        cedar check-parse --help
+    - name: "Test policy with groups and hierarchies"
+      runs: |
+        cat <<EOF > hierarchy.cedar
+        permit (
+          principal in Group::"admins",
+          action in Action::"write",
+          resource in Folder::"documents"
+        );
+        EOF
+        cedar check-parse --policies hierarchy.cedar

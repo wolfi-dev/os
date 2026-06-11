@@ -1,0 +1,214 @@
+package:
+  name: druid
+  version: "37.0.0"
+  epoch: 10 # CVE-2026-45300 CVE-2024-25638 CVE-2026-42577 CVE-2026-42578 CVE-2026-45205 GHSA-72hv-8253-57qq
+  description: Apache Druid is a high performance real-time analytics database.
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: 8
+    memory: 16Gi
+  dependencies:
+    runtime:
+      - bash
+      - busybox
+      - openjdk-17-default-jvm
+
+vars:
+  py-version: "3.13"
+
+environment:
+  contents:
+    packages:
+      - bash
+      - busybox
+      - maven
+      - openjdk-17-default-jdk
+      - py${{vars.py-version}}-pyyaml
+      - python-${{vars.py-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/druid.git
+      tag: druid-${{package.version}}
+      expected-commit: b206640c830bc2c3bdc2867cfb317c902a0e1acb
+
+  # Backport apache/druid#19528: jackson 2.21 made @JacksonInject prefer injected values over JSON
+  # input, breaking DruidNode discovery deserialization so the router can't resolve brokers. The
+  # upstream cherry-pick conflicts on licenses.yaml, so apply the two source files as a patch.
+  - uses: patch
+    with:
+      patches: druid-19528.patch
+
+  - uses: bump
+    with:
+      deps: |-
+        org.apache.kafka@kafka-clients@3.9.2
+        org.apache.derby.osgi.EmbeddedActivator@derby@10.14.3
+        io.airlift@aircompressor@2.0.3
+        org.apache.solr@solr-solrj@8.11.3
+        org.apache.thrift@libthrift@0.9.3-1
+        com.microsoft.azure@msal4j@1.15.1
+        com.azure@azure-identity@1.12.2
+        com.nimbusds@nimbus-jose-jwt@10.0.2
+        io.projectreactor.netty@reactor-netty-http@1.2.8
+        io.netty@netty-codec-http2@4.1.133.Final
+        org.apache.logging.log4j@log4j@2.0
+        io.netty@netty-codec@4.1.133.Final
+        io.netty@netty-codec-http@4.1.133.Final
+        org.bouncycastle@bcpkix-jdk18on@1.84
+        org.bouncycastle@bcprov-jdk18on@1.84
+        org.codehaus.jettison@jettison@1.5.4
+        org.apache.avro@avro@1.11.4
+        org.eclipse.jetty@jetty-server@12.0.33
+        org.asynchttpclient@async-http-client@3.0.10
+        org.apache.zookeeper@zookeeper@3.8.6
+        org.apache.commons@commons-lang3@3.18.0
+        org.apache.logging.log4j@log4j-core@2.25.4
+        org.postgresql@postgresql@42.7.11
+        io.netty@netty-codec-dns@4.2.13.Final
+        dnsjava@dnsjava@3.6.0
+        io.netty@netty-transport-native-epoll@4.2.13.Final
+        io.netty@netty-handler-proxy@4.2.13.Final
+        org.apache.commons@commons-configuration2@2.15.0
+        io.netty@netty-codec-http3@4.2.13.Final
+
+  - uses: bump
+    with:
+      deps: |-
+        com.nimbusds@nimbus-jose-jwt@10.0.2
+        org.pac4j@pac4j-core@5.7.10
+        io.netty@netty-codec-http3@4.2.13.Final
+      manifest: extensions-core/druid-pac4j/pom.xml
+
+  - uses: bump
+    with:
+      deps: |-
+        io.vertx@vertx-core@4.5.24
+        io.netty@netty-codec-http3@4.2.13.Final
+      manifest: extensions-core/kubernetes-overlord-extensions/pom.xml
+
+  - runs: |
+      # CVE-2026-42577: bump netty base so the classified native-epoll jar moves to 4.2.13.Final
+      sed -i "s|<netty4.version>[^<]*</netty4.version>|<netty4.version>4.2.13.Final</netty4.version>|" pom.xml
+      # GHSA-72hv-8253-57qq: full-stack jackson bump (aligned, avoids pull-deps NoClassDefFoundError)
+      sed -i "s|<jackson.version>[^<]*</jackson.version>|<jackson.version>2.21.1</jackson.version>|" pom.xml
+
+  - runs: |
+      mvn -B -ff -q \
+      install \
+      -Pdist,bundle-contrib-exts \
+      -Pskip-static-checks,skip-tests \
+      -Dmaven.javadoc.skip=true -T1C
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/usr/share/java/druid
+      tar -zxf distribution/target/apache-druid-${{package.version}}-bin.tar.gz --strip-components=1 -C ${{targets.destdir}}/usr/share/java/druid
+
+  - runs: |
+      # deduplicate jars
+      distribution/docker/deduplicate_jars.sh ${{targets.destdir}}/usr/share/java/druid
+
+      # deduplicate_jars makes symlinks, which would be fine, but they're absolute.
+      # it is meant to be run from /, so adjust things for it.
+      ddir=${{targets.destdir}}
+      cd "$ddir"
+      tmpf=$(mktemp)
+      trap "rm -f $tmpf" EXIT
+      find usr/share/java/druid -name "*.jar" -type l > "$tmpf"
+      while read src ; do
+         dest=$(readlink "$src") || {
+           echo "failed to readlink on '$src'"
+           exit 1
+         }
+         case "$dest" in
+             $ddir/*) ndest="/${dest#$ddir/}";;
+             *) continue;;
+         esac
+         [ -f "./${ndest}" -o -L "./${ndest}" ] || {
+           echo "$src was dangling symlink to $dest"
+           exit 1
+         }
+         echo "adjusting $src from $dest to $ndest"
+         ln -sf "${ndest}" "$src" || {
+           echo "failed [$?] ln -sf $ndest $src"
+           exit 1
+         }
+      done <"$tmpf"
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to copy the entrypoint scripts"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}
+          cp distribution/docker/druid.sh ${{targets.subpkgdir}}/druid.sh
+          cp distribution/docker/peon.sh ${{targets.subpkgdir}}/peon.sh
+
+          mkdir -p ${{targets.subpkgdir}}/opt
+          ln -s /usr/share/java/druid ${{targets.subpkgdir}}/opt/druid
+    dependencies:
+      runtime:
+        - iproute2
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /opt/druid
+
+test:
+  environment:
+    contents:
+      packages:
+        - python-${{vars.py-version}}
+        - perl
+        - curl
+  pipeline:
+    - uses: test/daemon-check-output
+      with:
+        start: env DRUID_LOG_DIR=/tmp/druid-logs /usr/share/java/druid/bin/start-nano-quickstart
+        expected_output: |
+          Starting Apache Druid
+        post: |
+          # NOTE: previously, this was a fatal error, but turns out, the reason this error occurs
+          # seems to be because druid uses jetty 12 and zookeper expects jetty 9. This discrepancy
+          # results in the zookeper admin server showing errors
+          # WARN [main] org.apache.zookeeper.server.admin.AdminServerFactory - Unable to load jetty, not starting JettyAdminServer
+          # java.lang.NoClassDefFoundError: org/eclipse/jetty/security/ConstraintSecurityHandler
+          # The version discrepancy can be seen here:
+          #   https://github.com/apache/druid/blob/druid-35.0.0/pom.xml#L102 <jetty.version>12.0.25</jetty.version>
+          #   https://github.com/apache/zookeeper/blob/release-3.8.4/pom.xml#L471 <jetty.version>9.4.57.v20241219</jetty.version>
+          # per https://jetty.org/download.html jetty 9.x is EOL.
+          # Another approach to eliminate this error could be to downgrade jetty in druid to be the same version expected by zookeper
+          if grep -r java.lang.NoClassDefFoundError /tmp/druid-logs; then
+            echo "WARNING: found java.lang.NoClassDefFoundError in logs"
+            cat /tmp/druid-logs/*
+          fi
+          set -- curl -L --fail http://localhost:8888/
+          n=0
+          rc=1
+          max=60
+          while [ $n -lt $max ] && n=$((n+1)); do
+            sleep 1
+            "$@" > stdout.log 2>stderr.log && rc=0 && break
+            echo "[$n/$max] curl http://localhost:8888/ returned $?"
+          done
+          [ $n -eq $max ] && {
+            echo "FATAL: gave up on http://localhost:8888/ after $max tries"
+            exit 1
+          }
+          echo "$* returned success after $n/$max tries"
+          grep -qF "Apache Druid" stdout.log &&
+            echo "PASS: found Apache Druid in curl output" || {
+            echo "FATAL: output of '\$*' did not contain \"Apache Druid\"";
+            exit 1;
+          }
+
+update:
+  enabled: true
+  github:
+    identifier: apache/druid
+    use-tag: true
+    tag-filter: druid-
+    strip-prefix: druid-

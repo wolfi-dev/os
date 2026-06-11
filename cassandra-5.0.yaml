@@ -1,0 +1,320 @@
+package:
+  name: cassandra-5.0
+  version: "5.0.8"
+  epoch: 1 # GHSA-qqpg-mvqg-649v
+  description: Open Source NoSQL Database
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - curl
+      - jemalloc
+      - python-${{vars.python-version}} # needed for cqlsh
+    provides:
+      - cassandra=${{package.full-version}}
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+vars:
+  python-version: 3.11
+  java-version: 17
+
+environment:
+  contents:
+    packages:
+      - ant
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl # for entrypoint verification
+      - go # for documentation generation
+      - openjdk-${{vars.java-version}}-default-jdk
+      - patch
+      - py${{vars.python-version}}-build
+      - py${{vars.python-version}}-cython-bin
+      - py${{vars.python-version}}-pip
+      - py${{vars.python-version}}-setuptools
+      - python-${{vars.python-version}}-dev
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/apache/cassandra
+      expected-commit: 172227094626d50d4bc9a3d9de2e3659a7844386
+      tag: cassandra-${{package.version}}
+
+  - uses: bump
+    with:
+      deps: pombump-deps.yaml
+      manifest: .build/parent-pom-template.xml
+
+  - runs: |
+      ant -Drat.skip=true artifacts -Dversion=${{package.version}}
+
+      # Install cassandra from the tarball in build/dist into the destdir in /usr/share/java/cassandra
+      mkdir -p "${{targets.destdir}}"/usr/share/java/cassandra
+      tar --strip-components 1 -C "${{targets.destdir}}"/usr/share/java/cassandra -xzf build/apache-cassandra-${{package.version}}-bin.tar.gz
+
+      # Symlink everything in the cassandra bin directory into /usr/bin
+      mkdir -p "${{targets.destdir}}"/usr/bin/
+
+      for f in /home/build/build/dist/bin/*; do
+        filename=$(basename "$f")
+        ln -sf  /usr/share/java/cassandra/bin/"$filename" "${{targets.destdir}}"/usr/bin/"$filename"
+      done
+
+      mkdir -p ${{targets.destdir}}/var/lib/cassandra
+      mkdir -p ${{targets.destdir}}/var/log/cassandra
+
+      ln -sT /var/lib/cassandra/ "${{targets.destdir}}"/usr/share/java/cassandra/data
+      ln -sT /var/log/cassandra/ "${{targets.destdir}}"/usr/share/java/cassandra/logs
+
+      # The build process downloads `.so` files from an old commit in
+      # Cassandra's GitHub repo: remove all but the amd64 `.so` (there isn't
+      # one for ARM) to avoid generating impossible to satisfy `so:`
+      # dependencies
+      for so in ${{targets.destdir}}/usr/share/java/cassandra/lib/sigar-bin/*; do
+        if ! [[ $so = "*-amd64-linux.so" ]]; then
+          rm $so
+        fi
+      done
+
+subpackages:
+  - name: ${{package.name}}-compat
+    dependencies:
+      provides:
+        - cassandra-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc
+          ln -sf /opt/cassandra/conf ${{targets.subpkgdir}}/etc/cassandra
+          mkdir -p ${{targets.subpkgdir}}/opt
+          ln -sf /usr/share/java/cassandra ${{targets.subpkgdir}}/opt/cassandra
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: cassandra-compat
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: ${{package.name}}-iamguarded-compat
+    dependencies:
+      provides:
+        - cassandra-iamguarded-compat=${{package.full-version}}
+      runtime:
+        - cassandra-${{vars.major-minor-version}}
+        - python-${{vars.python-version}}
+        - dash-binsh
+        - posix-libc-utils
+        - coreutils
+        - bash
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: cassandra
+          version: ${{vars.major-minor-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/cassandra/bin /iamguarded/cassandra /opt/iamguarded/java
+          chmod g+rwX /opt/iamguarded
+
+          ln -s /usr/bin/cassandra /opt/iamguarded/cassandra/bin/cassandra
+          ln -s /usr/bin/cassandra.in.sh /opt/iamguarded/cassandra/bin/cassandra.in.sh
+          ln -s /usr/bin/cqlsh /opt/iamguarded/cassandra/bin/cqlsh
+          ln -s /usr/bin/cqlsh.py /opt/iamguarded/cassandra/bin/cqlsh.py
+          ln -s /usr/bin/debug-cql /opt/iamguarded/cassandra/bin/debug-cql
+          ln -s /usr/bin/nodetool /opt/iamguarded/cassandra/bin/nodetool
+          ln -s /usr/bin/sstableloader /opt/iamguarded/cassandra/bin/sstableloader
+          ln -s /usr/bin/sstablescrub /opt/iamguarded/cassandra/bin/sstablescrub
+          ln -s /usr/bin/sstableupgrade /opt/iamguarded/cassandra/bin/sstableupgrade
+          ln -s /usr/bin/sstableutil /opt/iamguarded/cassandra/bin/sstableutil
+          ln -s /usr/bin/sstableverify /opt/iamguarded/cassandra/bin/sstableverify
+          ln -s /usr/bin/stop-server /opt/iamguarded/cassandra/bin/stop-server
+
+          ln -s /usr/share/java/cassandra/lib /opt/iamguarded/cassandra/lib
+      - name: copy-files-to-dest
+        runs: |
+          # Create symlinks for all files and directories in /usr/lib/jvm/java-${{vars.java-version}}-openjdk/
+          for item in /usr/lib/jvm/java-${{vars.java-version}}-openjdk/*; do
+            # Get the base name of the item (file or directory)
+            base_item=$(basename "$item")
+            ln -s "$item" /opt/iamguarded/java/$base_item
+          done
+      - name: copy-conf-files
+        runs: |
+          # Copy conf files for iamguarded compatibility
+          mkdir -p /opt/iamguarded/cassandra/
+          cp -r ${{targets.destdir}}/usr/share/java/cassandra/conf /opt/iamguarded/cassandra/conf
+          cp -r ${{targets.destdir}}/usr/share/java/cassandra/conf /opt/iamguarded/cassandra/conf.default
+
+          # Convert flat-format authenticator/authorizer/role_manager entries to
+          # nested class_name format expected by iamguarded libcassandra.sh.
+          # Apache Cassandra 5.0 ships flat (e.g. "authenticator: AllowAllAuthenticator")
+          # but the init scripts regex expects nested format:
+          #   authenticator:
+          #     class_name: AllowAllAuthenticator
+          for conf_dir in /opt/iamguarded/cassandra/conf /opt/iamguarded/cassandra/conf.default; do
+            sed -i \
+              -e 's/^authenticator: \(.*\)/authenticator:\n    class_name: \1/' \
+              -e 's/^authorizer: \(.*\)/authorizer:\n    class_name: \1/' \
+              -e 's/^role_manager: \(.*\)/role_manager:\n    class_name: \1/' \
+              -e 's/^network_authorizer: \(.*\)/network_authorizer:\n    class_name: \1/' \
+              "$conf_dir/cassandra.yaml"
+          done
+      - uses: iamguarded/finalize-compat
+        with:
+          package: cassandra
+          version: ${{vars.major-minor-version}}
+    test:
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: cassandra
+            version: ${{vars.major-minor-version}}
+        - name: "Verify cassandra.yaml uses nested class_name format for auth keys"
+          runs: |
+            set -euo pipefail
+            CONF="/opt/iamguarded/cassandra/conf/cassandra.yaml"
+            stat "$CONF"
+            for key in authenticator authorizer role_manager network_authorizer; do
+              # FAIL if flat format: "authenticator: AllowAllAuthenticator" (value on same line)
+              if grep -E "^${key}:\s+\S" "$CONF"; then
+                echo "FAIL: '${key}' is in flat format - must use nested class_name format"
+                exit 1
+              fi
+              grep -A1 "^${key}:" "$CONF" | grep -F "class_name:"
+            done
+
+  # This subpackage provides compatibility with upstream docker-library/cassandra entrypoint behavior.
+  # It fetches the official entrypoint script from GitHub and verifies its integrity using SHA256.
+  # The entrypoint script processes environment variables (CASSANDRA_SEEDS, CASSANDRA_CLUSTER_NAME,
+  # CASSANDRA_DC, CASSANDRA_RACK, etc.) and writes them to configuration files.
+  #
+  # This is necessary for sustaining because upstream may update the entrypoint script independently
+  # of Cassandra releases. By tracking the SHA256 hash, we can detect when the script changes and
+  # decide whether to update our vendored copy or investigate breaking changes.
+  #
+  # If the hash verification fails, the pipeline will exit 1 to alert that the upstream
+  # entrypoint has changed and requires review before accepting the update.
+  - name: ${{package.name}}-entrypoint-compat
+    description: Entrypoint script for Cassandra environment variable configuration
+    dependencies:
+      runtime:
+        - bash
+        - coreutils
+        - findutils
+        - gawk
+        - gosu
+        - iproute2
+        - sed
+      provides:
+        - cassandra-entrypoint-compat=${{package.full-version}}
+    pipeline:
+      - runs: |
+          ENTRYPOINT_URL="https://raw.githubusercontent.com/docker-library/cassandra/master/5.0/docker-entrypoint.sh"
+          curl -o /tmp/docker-entrypoint.sh "$ENTRYPOINT_URL"
+
+          EXPECTED_SHA256="9a5b895a511bd19512eb19e001196bc458d80201b98e3acca85e8792e99f4aed"
+          ACTUAL_SHA256=$(sha256sum /tmp/docker-entrypoint.sh | cut -d' ' -f1)
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            exit 1
+          fi
+
+          mkdir -p ${{targets.contextdir}}/usr/local/bin/
+          cp docker-entrypoint.sh ${{targets.contextdir}}/usr/local/bin/
+          chmod +x ${{targets.contextdir}}/usr/local/bin/docker-entrypoint.sh
+    test:
+      pipeline:
+        - runs: |
+            # Verify the entrypoint script is executable
+            test -x /usr/local/bin/docker-entrypoint.sh
+
+  - name: cqlsh-${{vars.major-minor-version}}
+    dependencies:
+      runtime:
+        - py${{vars.python-version}}-cassandra-driver
+        - py${{vars.python-version}}-wcwidth
+      provides:
+        - cqlsh=${{package.full-version}}
+    pipeline:
+      - name: "Install python module"
+        working-directory: pylib
+        uses: py/pip-build-install
+        with:
+          python: python${{vars.python-version}}
+      - name: "Install cqlsh executable"
+        runs: |
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          cp ./bin/cqlsh.py ${{targets.contextdir}}/usr/bin/cqlsh
+          python=python${{vars.python-version}}
+          sed -i "1s,.*,#!/usr/bin/$python,g" ${{targets.contextdir}}/usr/bin/cqlsh
+          head -n 1 ${{targets.contextdir}}/usr/bin/cqlsh
+    test:
+      pipeline:
+        - runs: |
+            cqlsh --version
+
+update:
+  enabled: true
+  github:
+    identifier: apache/cassandra
+    use-tag: true
+    tag-filter-prefix: cassandra-5.0
+    strip-prefix: cassandra-
+
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - coreutils
+        - procps
+        - shadow
+        - ${{package.name}}-compat
+        - openjdk-${{vars.java-version}}-default-jvm
+    environment:
+      LANG: en_US.UTF-8
+      CASSANDRA_HOME: /opt/cassandra
+      CASSANDRA_CONF: /opt/cassandra/conf
+      CASSANDRA_LOGS_DIR: /opt/cassandra/logs
+      PATH: /usr/sbin:/sbin:/usr/bin:/bin:/opt/cassandra/bin/
+  pipeline:
+    - runs: |
+        cqlsh --help
+        cqlsh.py --version
+        cqlsh.py --help
+        stop-server -h
+    - name: "Test Cassandra server startup"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          cassandra -R -f
+        timeout: 120
+        expected_output: |
+          Startup complete
+        post: |
+          set -o pipefail
+          # Basic connectivity test
+          nodetool status | grep -F "UN"
+
+          # Run CQL operations
+          cqlsh -e "CREATE KEYSPACE IF NOT EXISTS test_ks
+            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};"
+
+          cqlsh -e "CREATE TABLE IF NOT EXISTS test_ks.test_table
+            (id uuid PRIMARY KEY, value text);"
+
+          cqlsh -e "INSERT INTO test_ks.test_table (id, value)
+            VALUES (uuid(), 'test_value');"
+
+          # Verify data
+          cqlsh -e "SELECT value FROM test_ks.test_table;" | grep -F "test_value"
+
+          # Check node tools
+          nodetool info | grep -F "Native Transport active"

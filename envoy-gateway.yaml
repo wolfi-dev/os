@@ -1,0 +1,115 @@
+package:
+  name: envoy-gateway
+  version: "1.8.1"
+  epoch: 0 # toolchain rebuild for  go-1.26-1.26.4
+  description: Manages Envoy Proxy as a Standalone or Kubernetes-based Application Gateway
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "19"
+    memory: 11Gi
+  test-resources:
+    cpu: "30"
+    memory: 9Gi
+
+environment:
+  contents:
+    packages:
+      - btrfs-progs-dev
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 097ab899b9d041452d02f15d738514eda10ea21b
+      repository: https://github.com/envoyproxy/gateway
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        google.golang.org/grpc@v1.79.3
+        helm.sh/helm/v3@v3.20.2
+        github.com/go-jose/go-jose/v4@v4.1.4
+        go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp@v1.43.0
+        github.com/distribution/distribution/v3@v3.1.1
+        golang.org/x/sync@v0.20.0
+        go.opentelemetry.io/otel@v1.43.0
+        go.opentelemetry.io/otel/sdk@v1.43.0
+        go.opentelemetry.io/otel/trace@v1.43.0
+        golang.org/x/net@v0.55.0
+        github.com/jackc/pgx/v5@v5.9.2
+        github.com/containerd/containerd@v1.7.32
+      replaces: github.com/moby/spdystream=github.com/moby/spdystream@v0.5.1
+      modroot: |-
+        tools
+        .
+        test
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: ./cmd/envoy-gateway
+      ldflags: |
+        -X github.com/envoyproxy/gateway/internal/cmd/version.envoyGatewayVersion=${{package.version}}
+        -X github.com/envoyproxy/gateway/internal/cmd/version.gitCommitID=$(git rev-parse HEAD)
+      output: envoy-gateway
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for envoy-gateway
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/local/bin
+          ln -sf /usr/bin/envoy-gateway "${{targets.contextdir}}"/usr/local/bin/envoy-gateway
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /usr/local/bin/envoy-gateway
+
+  - name: ${{package.name}}-egctl
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-1.26
+          packages: ./cmd/egctl
+          output: egctl
+          ldflags: |
+            -X github.com/envoyproxy/gateway/internal/cmd/version.envoyGatewayVersion=${{package.version}}
+            -X github.com/envoyproxy/gateway/internal/cmd/version.gitCommitID=$(git rev-parse HEAD)
+    test:
+      pipeline:
+        - runs: egctl version --remote=false | grep ${{package.version}}
+
+test:
+  environment:
+    contents:
+      packages:
+        - kubectl
+        - git
+        - curl
+        - mkcert
+  pipeline:
+    - uses: test/kwok/cluster
+    - runs: |
+        git clone --depth=1 -b v${{package.version}} https://github.com/envoyproxy/gateway
+        kubectl apply --server-side -f gateway/charts/gateway-helm/charts/crds/crds/gatewayapi-crds.yaml
+        kubectl apply --server-side=true -f gateway/charts/gateway-helm/charts/crds/crds/generated
+    - runs: |
+        mkdir -p /certs
+        mkcert -key-file /certs/tls.key -cert-file /certs/tls.crt localhost
+        # Copy the CA cert and key to /certs
+        cp $(mkcert -CAROOT)/rootCA.pem /certs/ca.crt
+        cp $(mkcert -CAROOT)/rootCA-key.pem /certs/ca.key
+        envoy-gateway serve > out.log 2>&1 &
+        sleep 3
+        curl -s localhost:8081/healthz | grep "ok"
+        curl -s localhost:19001/metrics | grep certwatcher_read_certificate_total
+
+update:
+  enabled: true
+  github:
+    identifier: envoyproxy/gateway
+    strip-prefix: v
+    tag-filter: v

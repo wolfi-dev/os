@@ -1,0 +1,104 @@
+package:
+  name: step-issuer
+  version: "0.10.2"
+  epoch: 16 # toolchain rebuild for  go-1.26-1.26.4
+  description: A certificate issuer for cert-manager using step certificates CA
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "2"
+    memory: 8Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  environment:
+    CGO_ENABLED: "0"
+  contents:
+    packages:
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/smallstep/step-issuer
+      tag: v${{package.version}}
+      expected-commit: 83de36c8b89a4c676d9d4e59ba01074de240339e
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/go-jose/go-jose/v3@v3.0.5
+        github.com/go-jose/go-jose/v4@v4.1.4
+        github.com/jackc/pgx/v5@v5.9.2
+        go.opentelemetry.io/otel@v1.41.0
+        golang.org/x/crypto@v0.52.0
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      packages: ./
+      output: step-issuer
+      go-package: go-1.26
+      ldflags: -X "main.Version=${{package.version}}"
+
+subpackages:
+  - name: ${{package.name}}-compat
+    dependencies:
+      runtime:
+        - step-issuer
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}
+          ln -sf ./usr/bin/step-issuer ${{targets.contextdir}}/manager
+    description: Helm chart compatibility
+    test:
+      pipeline:
+        - uses: test/tw/symlink-check
+
+update:
+  enabled: true
+  github:
+    identifier: smallstep/step-issuer
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - ca-certificates-bundle
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Run Help Command
+      runs: |
+        /usr/bin/step-issuer -h
+        step-issuer --help
+    - name: "Setup KWOK cluster"
+      uses: test/kwok/cluster
+    - name: "Install CRDs"
+      runs: |
+        kubectl apply -f https://raw.githubusercontent.com/smallstep/step-issuer/refs/heads/master/config/crd/bases/certmanager.step.sm_stepclusterissuers.yaml
+        kubectl apply -f https://raw.githubusercontent.com/smallstep/step-issuer/refs/heads/master/config/crd/bases/certmanager.step.sm_stepissuers.yaml
+    - name: "Functional Test"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+        start: |
+          /usr/bin/step-issuer --logtostderr=true --zap-log-level=debug --disable-approval-check --metrics-bind-address=":8080" --kubeconfig=/tmp/kubeconfig.yaml
+        timeout: 180
+        expected_output: |
+          starting manager
+          Starting metrics server
+          Starting Controller
+          Starting workers
+          Starting EventSource
+        post: |
+          if curl -sf http://localhost:8080/metrics | grep -q "controller_runtime_active_workers"; then
+            echo "Metrics endpoint is up and exporting metrics"
+          else
+            echo " Metrics endpoint check failed"
+            exit 1
+          fi

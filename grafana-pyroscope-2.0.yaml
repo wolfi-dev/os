@@ -1,0 +1,127 @@
+package:
+  name: grafana-pyroscope-2.0
+  version: "2.0.3"
+  epoch: 0 # go/wolfi-rsc/grafana-pyroscope-1.19
+  description: Continuous Profiling Platform. Debug performance issues down to a single line of code
+  copyright:
+    - license: AGPL-3.0-only
+  resources:
+    cpu: "3"
+    memory: 14Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - cairo-dev
+      - go-1.25
+      - node-gyp
+      - nodejs-24
+      - npm
+      - pango-dev
+      - python3
+      - yarn-berry
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: a62c208abb299ee91d5d16f99c0b7cc7e59c6cf1
+      repository: https://github.com/grafana/pyroscope
+      tag: v${{package.version}}
+
+  - working-directory: ui
+    runs: |
+      yarn install
+      yarn build
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.Branch=main
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.Version=${{package.version}}
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.Revision=$(git rev-parse HEAD)
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.BuildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+      output: pyroscope
+      go-package: go-1.25
+      tags: embedassets
+      packages: ./cmd/pyroscope
+
+  - uses: go/build
+    with:
+      ldflags: |
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.Branch=main
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.Version=${{package.version}}
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.Revision=$(git rev-parse HEAD)
+        -X github.com/grafana/pyroscope/v2/pkg/util/build.BuildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+      output: profilecli
+      go-package: go-1.25
+      packages: ./cmd/profilecli
+
+  - runs: |
+      mkdir -p "${{targets.contextdir}}"/etc/pyroscope
+      install -Dm755 ./cmd/pyroscope/pyroscope.yaml "${{targets.contextdir}}"/etc/pyroscope/config.yaml
+
+update:
+  enabled: true
+  github:
+    identifier: grafana/pyroscope
+    strip-prefix: v
+    tag-filter: v2.0.
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          profilecli
+          pyroscope
+    - uses: test/tw/ver-check
+      with:
+        bins: |
+          profilecli
+          pyroscope
+        version: ${{package.version}}
+        version-flag: "--version"
+    - name: "Start and verify Grafana pyroscope"
+      uses: test/daemon-check-output
+      with:
+        start: |
+          pyroscope -config.file=/etc/pyroscope/config.yaml
+        timeout: 30
+        expected_output: |
+          Pyroscope started
+          server listening on addresses
+        post: |
+          set -euo pipefail
+          # check for the ready endpoint - pyroscope needs ~15s after startup to become ready
+          wait-for-it -t 15 --strict localhost:4040 -- echo "Server is up"
+
+          # wait for the service to become fully ready (various internal
+          # services warmup in serial, taking ~a minute)
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:4040/ready; then
+              echo "Service is ready"
+              break
+            fi
+            echo "Waiting for ready... attempt $i"
+            sleep 2
+          done
+
+          # check for the metrics endpoint
+          curl -s http://localhost:4040/metrics | grep -i "pyroscope_compactor_block_cleanup_started_total"
+
+          sleep 20
+
+          PROFILECLI_URL=http://localhost:4040 profilecli query series --query='{service_name="pyroscope"}' | grep -i "pyroscope"
+
+          # check for the UI endpoint
+          curl -L http://localhost:4040/ | grep -i "<title>Pyroscope</title>"

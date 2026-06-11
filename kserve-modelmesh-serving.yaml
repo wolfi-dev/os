@@ -1,0 +1,131 @@
+package:
+  name: kserve-modelmesh-serving
+  version: 0.12.0
+  epoch: 32 # toolchain rebuild for  go-1.26-1.26.4
+  description: ModelMesh Serving is the Controller for managing ModelMesh, a general-purpose model serving management/routing layer.
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "2"
+    memory: 10Gi
+  test-resources:
+    cpu: "1"
+    memory: 6Gi
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kserve/modelmesh-serving.git
+      tag: v${{package.version}}
+      expected-commit: d0e56fa4ac7547e644c87d63dc97a14f612c0391
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/go-logr/logr@v1.4.3
+        github.com/google/go-cmp@v0.7.0
+        github.com/stretchr/testify@v1.11.1
+        go.opentelemetry.io/otel@v1.41.0
+        golang.org/x/crypto@v0.52.0
+        golang.org/x/oauth2@v0.27.0
+        google.golang.org/api@v0.155.0
+        google.golang.org/grpc@v1.72.0
+      replaces: golang.org/x/net=golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: manager
+      go-package: go-1.26
+
+  - name: Copy configs
+    # Binary assumes path is populated relative to the workdir. In the upstream image this is /.
+    # See https://github.com/kserve/modelmesh-serving/blob/f8cc7aa73f6a9360d7635ca5e5c3461d0c60b392/controllers/modelmesh/modelmesh.go#L95
+    #     https://github.com/kserve/modelmesh-serving/blob/f8cc7aa73f6a9360d7635ca5e5c3461d0c60b392/Dockerfile#L71
+    runs: |
+      mkdir -p ${{targets.destdir}}/config
+      cp -a ./config/internal ${{targets.destdir}}/config/internal
+
+subpackages:
+  - name: kserve-modelmesh-serving-compat
+    description: compatibility symlinks package for modelmesh-controller Deployment
+    pipeline:
+      - runs: |
+          # Symlink the binary from /usr/bin to /
+          # See https://github.com/kserve/modelmesh-serving/blob/f8cc7aa73f6a9360d7635ca5e5c3461d0c60b392/config/manager/manager.yaml#L44
+          mkdir -p ${{targets.subpkgdir}}
+          ln -sf ./usr/bin/manager ${{targets.subpkgdir}}/manager
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /manager
+
+test:
+  environment:
+    contents:
+      packages:
+        - kustomize
+        - make
+        - go
+        - curl
+        - openssl
+        - jq
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/kwok/cluster
+    - name: Wait for nodes
+      runs: kubectl wait --for=condition=Ready nodes --all
+    - uses: git-checkout
+      with:
+        repository: https://github.com/kserve/modelmesh-serving.git
+        tag: v${{package.version}}
+        expected-commit: d0e56fa4ac7547e644c87d63dc97a14f612c0391
+    - name: Install CRDs
+      runs: |
+        kubectl create ns modelmesh-serving
+        # We exit 0 here, because this fails trying to wait for the Pods to come up (I don't think they ever will because kwok is not a full k8s cluster).
+        # However, this does a bunch of very useful things for us like installing the CRDs and generating mTLS certs that the manager expects to exist.
+        ./scripts/install.sh --namespace modelmesh-serving --fvt || exit 0
+    # Binary assumes that a configmap named `model-serving-config` exists.
+    - name: Set default configmap
+      runs: |
+        kubectl apply -f - <<EOF
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: model-serving-config
+          namespace: modelmesh-serving
+        EOF
+    # Binary assumes default config is mounted locally at runtime.
+    # See https://github.com/kserve/modelmesh-serving/blob/f8cc7aa73f6a9360d7635ca5e5c3461d0c60b392/config/manager/manager.yaml#L76
+    - name: Populate default config
+      runs: |
+        mkdir -p /etc/model-serving/config/default
+        cp ./config/default/config-defaults.yaml /etc/model-serving/config/default/config-defaults.yaml
+    # Binary assumes mTLS certs are mounted locally.
+    - name: Download mTLS certs
+      runs: |
+        set -euo pipefail
+        certdir="/tmp/k8s-webhook-server/serving-certs"
+        mkdir -p "${certdir}"
+        kubectl get secrets modelmesh-webhook-server-cert -o jsonpath='{.data.tls\.crt}' | base64 -d > ${certdir}/tls.crt
+        kubectl get secrets modelmesh-webhook-server-cert -o jsonpath='{.data.tls\.key}' | base64 -d > ${certdir}/tls.key
+    - name: Verify installation
+      runs: |
+        manager > /dev/null 2>&1 &
+        sleep 5
+        # We're using this as a proxy for "is the controller up and serving"
+        curl -s localhost:8080/metrics
+
+update:
+  enabled: true
+  github:
+    identifier: kserve/modelmesh-serving
+    strip-prefix: v
+
+environment:
+  contents:
+    packages:
+      - go-1.26

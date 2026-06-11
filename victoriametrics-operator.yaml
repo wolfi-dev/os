@@ -1,0 +1,149 @@
+package:
+  name: victoriametrics-operator
+  version: "0.70.1"
+  epoch: 3 # CVE-2026-39821
+  description: Kubernetes operator for Victoria Metrics
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "3"
+    memory: 7Gi
+  test-resources:
+    cpu: "1"
+    memory: 5Gi
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 56d283f3426cf96ad21c5fdbeaced982204620db
+      repository: https://github.com/VictoriaMetrics/operator
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      modroot: |-
+        api
+        .
+      deps: golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      modroot: .
+      output: app
+      packages: ./cmd
+      ldflags: |
+        -X 'github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo.Version=v${{package.version}}'
+
+subpackages:
+  - name: ${{package.name}}-config-reloader
+    description: Config-reloader sidecar for VictoriaMetrics operator
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-1.26
+          modroot: .
+          output: app
+          packages: ./cmd/config-reloader
+          ldflags: |
+            -X 'github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo.Version=config-reloader-${{package.version}}'
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/help-check
+          with:
+            bins: app
+        - uses: test/tw/ver-check
+          with:
+            bins: app
+
+  - name: ${{package.name}}-config-reloader-compat
+    description: compatibility symlinks package for victoriametrics-operator config-reloader Dockerfile
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"
+          ln -sf ./usr/bin/app "${{targets.contextdir}}/app"
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-config-reloader
+      pipeline:
+        - uses: test/tw/symlink-check
+
+  - name: ${{package.name}}-compat
+    description: compatibility symlinks package for victoriametrics-operator Dockerfile
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"
+          ln -sf ./usr/bin/app "${{targets.contextdir}}/app"
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+update:
+  enabled: true
+  github:
+    identifier: VictoriaMetrics/operator
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - git
+        - curl
+        - kustomize
+        - kubectl
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: app
+        version: ${{package.version}}
+    - uses: test/tw/help-check
+      with:
+        bins: app
+    - uses: test/kwok/cluster
+    - name: Fetch the testdata from the source repo
+      runs: |
+        set -euo pipefail
+        git clone --depth=1 https://github.com/VictoriaMetrics/operator
+        cd operator
+        kustomize build config/crd/overlay | kubectl apply -f -
+        # Start the operator
+        app > /dev/null 2>&1 &
+        sleep 15
+        cat << EOF | kubectl apply -f -
+        apiVersion: operator.victoriametrics.com/v1beta1
+        kind: VMAgent
+        metadata:
+          name: example-vmagent
+        spec:
+          selectAllByDefault: true
+          replicaCount: 1
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "350Mi"
+            limits:
+              cpu: "500m"
+              memory: "850Mi"
+          extraArgs:
+            memory.allowedPercent: "40"
+          remoteWrite:
+          - url: "http://vmsingle-example-vmsingle-pvc.default.svc:8429/api/v1/write"
+        EOF
+
+        sleep 5
+        # wait for the pod to be created
+        kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=example-vmagent --timeout=300s
+
+environment:
+  contents:
+    packages:
+      - go-1.26

@@ -1,0 +1,95 @@
+package:
+  name: postgres-operator
+  version: "1.15.1"
+  epoch: 13 # toolchain rebuild for  go-1.26-1.26.4
+  description: Postgres operator creates and manages PostgreSQL clusters running in Kubernetes
+  copyright:
+    - license: MIT
+  resources:
+    cpu: "2"
+    memory: 5Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 1f4ee605ae35b25f45108cab29ae58d080697908
+      repository: https://github.com/zalando/postgres-operator.git
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/moby/spdystream@v0.5.1
+        golang.org/x/net@v0.55.0
+        golang.org/x/crypto@v0.52.0
+      modroot: |-
+        .
+        kubectl-pg
+
+  - uses: go/build
+    with:
+      modroot: .
+      packages: ./cmd
+      output: postgres-operator
+      ldflags: -X=main.version=${{package.version}}
+      go-package: go-1.26
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - runs: |
+          # The helm chart/dockerfile expects the postgres-operator binaries to be in / instead of /usr/bin
+          mkdir -p "${{targets.subpkgdir}}"
+          ln -sf /usr/bin/postgres-operator ${{targets.subpkgdir}}/postgres-operator
+    test:
+      environment:
+        contents:
+          packages:
+            # -compat packages can be satisfied by multiple source packages; install here for test only, not as a runtime dep
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+
+update:
+  enabled: true
+  github:
+    identifier: zalando/postgres-operator
+    strip-prefix: v
+
+test:
+  pipeline:
+    - runs: |
+        postgres-operator --help
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Launch operator with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl config view --minify --raw > /tmp/kubeconfig.yaml
+          echo -n "default" >/var/run/secrets/kubernetes.io/serviceaccount/namespace
+          kubectl apply -f https://raw.githubusercontent.com/zalando/postgres-operator/refs/tags/v${{package.version}}/charts/postgres-operator/crds/operatorconfigurations.yaml
+          kubectl apply -f https://raw.githubusercontent.com/zalando/postgres-operator/refs/tags/v${{package.version}}/charts/postgres-operator/crds/postgresteams.yaml
+          kubectl apply -f https://raw.githubusercontent.com/zalando/postgres-operator/refs/tags/v${{package.version}}/charts/postgres-operator/crds/postgresqls.yaml
+        start: postgres-operator --outofcluster --kubeconfig=/tmp/kubeconfig.yaml
+        timeout: 30
+        expected_output: |
+          started working in background
+          listening on

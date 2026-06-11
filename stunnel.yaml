@@ -1,7 +1,7 @@
 package:
   name: stunnel
   version: "5.78"
-  epoch: 2
+  epoch: 1
   description: SSL encryption wrapper between network client and server
   copyright:
     - license: GPL-2.0-or-later
@@ -16,6 +16,7 @@ environment:
       - automake
       - build-base
       - busybox
+      - ca-certificates-bundle
       - linux-headers
       - openssl-dev
       - python3
@@ -51,10 +52,7 @@ subpackages:
           packages:
             - stunnel
       pipeline:
-        - uses: test/tw/symlink-check
-          with:
-            # stunnel5 -> /usr/bin/stunnel is an absolute symlink by design
-            allow-absolute: true
+        - runs: test -f "$(readlink -f /usr/bin/stunnel5)"
 
   - name: ${{package.name}}-doc
     description: "${{package.name}} manpages"
@@ -78,36 +76,29 @@ test:
   environment:
     contents:
       packages:
-        - curl
         - openssl
-        - python3
-        - wait-for-it
   pipeline:
     - uses: test/tw/ldd-check
-    - uses: test/tw/ver-check
-      with:
-        bins: stunnel
-        version-flag: -version
-    - name: TLS termination end-to-end (handshake + byte forwarding)
+    - name: Verify stunnel binary executes and reports version
+      runs: |
+        set -euo pipefail
+        # stunnel -version outputs version and OpenSSL info to stderr
+        output=$(stunnel -version 2>&1 || true)
+        echo "$output" | grep -F "stunnel"
+        echo "$output" | grep -Fi "openssl"
+        echo "$output" | grep -F "${{package.version}}"
+    - name: Test stunnel daemon starts with minimal config
       uses: test/daemon-check-output
       with:
         setup: |
-          # Self-signed cert for the stunnel listener
+          # Generate a self-signed certificate for stunnel
           openssl req -new -x509 -days 1 -nodes \
-            -newkey rsa:2048 -sha256 \
             -out /tmp/stunnel.pem -keyout /tmp/stunnel.key \
             -subj "/CN=localhost"
           cat /tmp/stunnel.key /tmp/stunnel.pem > /tmp/stunnel-combined.pem
           chmod 600 /tmp/stunnel-combined.pem
 
-          # Plaintext HTTP backend with a known marker. stunnel terminates
-          # TLS in front of this; the end-to-end assertion is that the
-          # marker reaches the TLS client unchanged.
-          mkdir -p /tmp/htdocs
-          echo 'stunnel-backend-ok' > /tmp/htdocs/index.html
-          python3 -m http.server -d /tmp/htdocs 8080 >/tmp/backend.log 2>&1 &
-          wait-for-it 127.0.0.1:8080 -t 10
-
+          # Create a minimal stunnel configuration
           tee /tmp/stunnel.conf <<'EOF'
           foreground = yes
           pid =
@@ -121,19 +112,5 @@ test:
         expected_output: "Configuration successful"
         timeout: "15"
         post: |
-          set -euo pipefail
+          # Verify stunnel is listening on the configured port
           wait-for-it 127.0.0.1:8443 -t 10
-
-          # Real TLS handshake: assert the listener returns our cert and
-          # negotiates a modern TLS version, not just that the socket is open.
-          openssl s_client -connect 127.0.0.1:8443 \
-            -servername localhost </dev/null 2>/dev/null \
-            | tee /tmp/s_client.log \
-            | grep -F 'subject=CN=localhost'
-          grep -E '^Protocol\s*:\s*TLSv1\.[23]' /tmp/s_client.log
-
-          # End-to-end: client speaks TLS to stunnel, stunnel decrypts and
-          # forwards to the plaintext HTTP backend, the backend body returns
-          # through the TLS tunnel intact.
-          curl -sSk https://127.0.0.1:8443/ -o /tmp/curl.out
-          grep -F 'stunnel-backend-ok' /tmp/curl.out

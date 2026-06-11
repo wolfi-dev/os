@@ -1,0 +1,109 @@
+package:
+  name: amazon-cloudwatch-agent-operator
+  version: "3.4.2"
+  epoch: 3 # CVE-2026-33814
+  description: Software developed to manage the CloudWatch Agent on kubernetes.
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 4ee8ca4981ecba616f4f59e75e762508c7e093e6
+      repository: https://github.com/aws/amazon-cloudwatch-agent-operator
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        go.opentelemetry.io/otel@v1.41.0
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      output: manager
+      packages: .
+      ldflags: |
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.version=${{package.version}}
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.buildDate=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" "+%Y-%m-%dT%H:%M:%SZ")
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.agent=$(grep -v '\#' versions.txt | grep cloudwatch-agent | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationJava=$(grep -v '\#' versions.txt | grep aws-otel-java-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationPython=$(grep -v '\#' versions.txt | grep aws-otel-python-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationDotNet=$(grep -v '\#' versions.txt | grep aws-otel-dotnet-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.autoInstrumentationNodeJS=$(grep -v '\#' versions.txt | grep aws-otel-nodejs-instrumentation | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.dcgmExporter=$(grep -v '\#' versions.txt | grep dcgm-exporter | awk -F= '{print $$2}')
+        -X github.com/aws/amazon-cloudwatch-agent-operator/internal/version.neuronMonitor=$(grep -v '\#' versions.txt | grep neuron-monitor | awk -F= '{print $$2}')
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-compat
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/
+          ln -sf /usr/bin/manager ${{targets.contextdir}}/manager
+    description: Compatibility symlink for ${{package.name}}
+    # test added by a robot (compat)
+    test:
+      pipeline:
+        - runs: |
+            readlink -v /manager
+
+update:
+  enabled: true
+  github:
+    identifier: aws/amazon-cloudwatch-agent-operator
+    strip-prefix: v
+    tag-filter: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - kustomize
+        - kubectl
+        - git
+        - mkcert
+        - nss
+        - curl
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: 32764
+  pipeline:
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Fetch the testdata from the source repo
+      runs: git clone --depth=1 https://github.com/aws/amazon-cloudwatch-agent-operator
+    - name: Install CRDs
+      working-directory: amazon-cloudwatch-agent-operator/config/crd/
+      runs: |
+        kustomize build | kubectl apply --server-side=true -f -
+        # wait for all CRDs to be created
+        sleep 3
+    - name: "Test manager run"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/k8s-webhook-server/serving-certs/
+          mkcert -install
+          mkcert -key-file /tmp/k8s-webhook-server/serving-certs/tls.key -cert-file /tmp/k8s-webhook-server/serving-certs/tls.crt localhost
+        start: /usr/bin/manager --kubeconfig $HOME/.kwok/clusters/kwok/kubeconfig.yaml
+        timeout: 30
+        expected_output: |
+          starting manager
+          Starting webhook server
+          starting server
+          Starting workers
+        post: |
+          sleep 3
+          STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" http://localhost:8081/healthz)
+          # Check if the status code is 200, if so exit 0, otherwise exit 1
+          if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed with status code 200"
+              exit 0
+          else
+              echo "Health check failed with status code $STATUS"
+              exit 1
+          fi

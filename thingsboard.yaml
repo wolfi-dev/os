@@ -1,0 +1,240 @@
+package:
+  name: thingsboard
+  version: "4.3.1.2"
+  epoch: 1 # GHSA-q8mj-m7cp-5q26
+  description: "Open-source IoT Platform - Device management, data collection, processing and visualization."
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - merged-lib
+      - wolfi-baselayout
+  resources:
+    cpu: "4"
+    memory: 28Gi
+    disk: 50Gi
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - dpkg
+      - fontconfig
+      - gnutar
+      - jq
+      - lcms2
+      - maven
+      - nodejs-20
+      - openjdk-17-default-jdk
+      - ttf-dejavu
+      - xz
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: c37fb50952db983aed707c5d48efed72ba749c89
+      repository: https://github.com/thingsboard/thingsboard.git
+      tag: v${{package.version}}
+
+  - uses: patch
+    with:
+      patches: wire-schema.patch
+
+  - uses: maven/configure-mirror
+
+  - name: Narrow Maven mirror to `central` only
+    runs: |
+      # maven/configure-mirror writes <mirrorOf>*</mirrorOf>, which would reroute
+      # ThingsBoard's `thingsboard-repo` (and spring-snapshots / spring-milestones /
+      # typesafe) through the GCS Central mirror and 404 on TB-forked artifacts
+      # like org.thingsboard.langchain4j:langchain4j-bom:1.8.0-TB. Restrict the
+      # mirror to `central` so non-central repos resolve against their declared URLs.
+      sed -i 's|<mirrorOf>\*</mirrorOf>|<mirrorOf>central</mirrorOf>|' /root/.m2/settings.xml
+
+  - name: Bump tinymce to remediate GHSA-5359-pvf2-pw78
+    runs: |
+      jq '.dependencies."tinymce" = "^7.0.0"' ui-ngx/package.json > temp.json && mv temp.json ui-ngx/package.json
+
+  - runs: |
+      mvn clean install -DskipTests -Dlicense.skip=true
+
+subpackages:
+  - name: "${{package.name}}-tb-js-executor"
+    description: "Executes user-defined JavaScript functions in isolation for the ThingsBoard rule engine."
+    dependencies:
+      runtime:
+        - merged-lib
+        - nodejs-20
+        - wolfi-baselayout
+    pipeline:
+      - name: Move tb-js-executor to target directories
+        runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/share/tb-js-executor"
+          mkdir -p "${{targets.subpkgdir}}/usr/bin"
+          cd msa/js-executor/target
+          cp -r src/* "${{targets.subpkgdir}}/usr/share/tb-js-executor"
+          cp -r package/linux/conf "${{targets.subpkgdir}}/usr/share/tb-js-executor"
+          cp -r package/linux/conf/* "${{targets.subpkgdir}}/usr/share/tb-js-executor/config"
+          cp -r start-js-executor.sh "${{targets.subpkgdir}}/usr/bin"
+      - name: Patch CVEs
+        runs: |
+          cd "${{targets.subpkgdir}}/usr/share/tb-js-executor"
+          resolutions='{
+            "body-parser": "^2.2.1",
+            "moment": "^2.29.4",
+            "qs": "^6.15.2"
+          }'
+          jq --argjson resolutions "$resolutions" '.resolutions += $resolutions' package.json > temp.json && mv temp.json package.json
+      - name: Install nodejs dependencies
+        runs: |
+          cd "${{targets.subpkgdir}}/usr/share/tb-js-executor"
+          yarn install --production --non-interactive --network-concurrency 4 --network-timeout 100000 --mutex network && yarn cache clean --all
+    test:
+      pipeline:
+        - name: Test tb-js-executor server logs
+          uses: test/daemon-check-output
+          with:
+            setup: "ln -s default.yml /usr/share/tb-js-executor/conf/production.yml"
+            start: "start-js-executor.sh"
+            timeout: 30
+            expected_output: |
+              Starting 'ThingsBoard JavaScript Executor Microservice'
+
+  - name: "${{package.name}}-tb-mqtt-transport"
+    description: Handles MQTT-based device communication and API requests for ThingsBoard.
+    dependencies:
+      runtime:
+        - merged-lib
+        - openjdk-17-default-jvm
+        - wolfi-baselayout
+    pipeline:
+      - name: Extract tb-mqtt-transport to target directories
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          cd msa/transport/mqtt/target
+          dpkg-deb -x tb-mqtt-transport.deb ${{targets.subpkgdir}}
+          cp start-tb-mqtt-transport.sh ${{targets.subpkgdir}}/usr/bin
+          mkdir -p ${{targets.subpkgdir}}/config
+          cp ${{targets.subpkgdir}}/usr/share/tb-mqtt-transport/conf/* ${{targets.subpkgdir}}/config
+          mv ${{targets.subpkgdir}}/lib/* ${{targets.subpkgdir}}/usr/lib
+          rmdir ${{targets.subpkgdir}}/lib
+    test:
+      pipeline:
+        - name: Test mqtt-transport server logs
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /var/log/tb-mqtt-transport/
+              touch /var/log/tb-mqtt-transport/gc.log
+            start: "start-tb-mqtt-transport.sh"
+            timeout: 30
+            expected_output: |
+              Starting 'ThingsBoard MQTT Transport Microservice'
+
+  - name: "${{package.name}}-tb-node"
+    description: "Core service responsible for handling REST API, WebSocket subscriptions, and processing messages via the rule engine."
+    dependencies:
+      runtime:
+        - udev
+        - fontconfig
+        - lcms2
+        - merged-lib
+        - openjdk-17-default-jvm
+        - ttf-dejavu
+        - wolfi-baselayout
+    pipeline:
+      - name: Extract tb-node to target directories
+        runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          cd msa/tb-node/target
+          dpkg-deb -x thingsboard.deb ${{targets.subpkgdir}}
+          cp start-tb-node.sh ${{targets.subpkgdir}}/usr/bin
+          mkdir -p ${{targets.subpkgdir}}/config
+          cp -r ${{targets.subpkgdir}}/usr/share/thingsboard/conf/* ${{targets.subpkgdir}}/config
+          mv ${{targets.subpkgdir}}/lib/* ${{targets.subpkgdir}}/usr/lib
+          rmdir ${{targets.subpkgdir}}/lib
+    test:
+      pipeline:
+        # This test needs to be run in order to ensure that tomcat-embed-core exists to provide jakarta/servlet/Filter.class (issue with pombump before)
+        - name: Test for tomcat-embed-core
+          runs: |
+            set -euo pipefail
+            cd /usr/share/thingsboard/bin/
+            unzip thingsboard.jar
+            ls BOOT-INF/lib/ | grep -F "tomcat-embed-core" || { echo "tomcat-embed-core not found"; exit 1; }
+        - name: Test server logs
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /var/log/thingsboard/
+            start: "start-tb-node.sh"
+            timeout: 30
+            expected_output: |
+              Starting 'ThingsBoard Node Microservice'
+
+  - name: "${{package.name}}-tb-web-ui"
+    description: "Hosts static web UI content using a lightweight Express.js component"
+    dependencies:
+      runtime:
+        - merged-lib
+        - nodejs-20
+        - wolfi-baselayout
+    pipeline:
+      - name: Move tb-web-ui to target directories
+        runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/share/tb-web-ui/web"
+          mkdir -p "${{targets.subpkgdir}}/usr/bin"
+          cd msa/web-ui/target
+          cp -r src/* "${{targets.subpkgdir}}/usr/share/tb-web-ui"
+          cp -r web/* "${{targets.subpkgdir}}/usr/share/tb-web-ui/web"
+          cp -r package/linux/conf "${{targets.subpkgdir}}/usr/share/tb-web-ui"
+          cp -r package/linux/conf/* "${{targets.subpkgdir}}/usr/share/tb-web-ui/config"
+          cp -r start-web-ui.sh "${{targets.subpkgdir}}/usr/bin"
+      - name: Patch CVEs
+        runs: |
+          cd "${{targets.subpkgdir}}/usr/share/tb-web-ui"
+          resolutions='{
+            "body-parser": "^2.2.1",
+            "follow-redirects": "^1.16.0",
+            "moment": "^2.29.4",
+            "qs": "^6.15.2"
+          }'
+          jq --argjson resolutions "$resolutions" '.resolutions += $resolutions' package.json > temp.json && mv temp.json package.json
+      - name: Install nodejs dependencies
+        runs: |
+          cd "${{targets.subpkgdir}}/usr/share/tb-web-ui"
+          yarn install --production --non-interactive --network-concurrency 4 --network-timeout 100000 --mutex network && yarn cache clean --all
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+      pipeline:
+        - name: Test tb-web-ui logs
+          uses: test/daemon-check-output
+          with:
+            start: "start-web-ui.sh"
+            timeout: 30
+            expected_output: |
+              Starting 'ThingsBoard Web UI Microservice'
+            post: |
+              wait-for-it localhost:8090 -t 30
+              # Verify endpoint responds with HTTP 200
+              curl -sf -o /dev/null -w "%{http_code}" http://localhost:8090 | grep -F "200"
+
+update:
+  enabled: true
+  github:
+    identifier: thingsboard/thingsboard
+    tag-filter: v
+    strip-prefix: v
+
+# Based on package contents inspection, it was found that this origin package is empty apart from its own SBOM and this test was added to confirm it is empty and will fail if the package is no longer empty (contains more than an SBOM)
+test:
+  pipeline:
+    - uses: test/emptypackage

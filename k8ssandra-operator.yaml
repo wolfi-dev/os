@@ -1,0 +1,109 @@
+package:
+  name: k8ssandra-operator
+  version: "1.32.2"
+  epoch: 0 # toolchain rebuild for go-1.26 1.26.3-r4
+  description: The Kubernetes operator for K8ssandra
+  copyright:
+    - license: Apache-2.0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/k8ssandra/k8ssandra-operator
+      tag: v${{package.version}}
+      expected-commit: 1ab0f776258e13236a9851d3f6b9f8fbdd6ef51c
+
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: manager
+      go-package: go-1.26
+      ldflags: |
+        -X "main.version=${{package.version}}"
+        -X "main.commit=$(git rev-parse HEAD)"
+        -X "main.date=$(date -d@${SOURCE_DATE_EPOCH} +%FT%T)"
+
+subpackages:
+  - name: "${{package.name}}-compat"
+    description: "Compatibility package to place binaries in the location expected by upstream helm charts"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"
+          ln -sf usr/bin/manager ${{targets.subpkgdir}}/manager
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+update:
+  enabled: true
+  github:
+    identifier: k8ssandra/k8ssandra-operator
+    strip-prefix: v
+
+vars:
+  bin-name: manager
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - k8ssandra-operator-compat
+        - openssl
+    environment:
+      WATCH_NAMESPACE: default
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: ${{vars.bin-name}}
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Launch operator with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          kubectl create clusterrolebinding test-admin \
+            --clusterrole=cluster-admin \
+            --serviceaccount=default:default
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -keyout /tmp/k8s-webhook-server/serving-certs/tls.key \
+            -out /tmp/k8s-webhook-server/serving-certs/tls.crt \
+            -subj "/CN=k8ssandra-operator-webhook-service.default.svc" \
+            -addext "subjectAltName=DNS:k8ssandra-operator-webhook-service.default.svc"
+          kubectl apply --server-side=true -f https://raw.githubusercontent.com/k8ssandra/k8ssandra-operator/v${{package.version}}/charts/k8ssandra-operator/crds/k8ssandra-operator-crds.yaml
+          kubectl create configmap image-config \
+            --from-literal=image_config.yaml="$(cat <<'IMGCFG'
+          apiVersion: config.k8ssandra.io/v1beta2
+          kind: ImageConfig
+          metadata:
+            name: image-config
+          defaults: {}
+          IMGCFG
+          )"
+          kubectl label configmap image-config k8ssandra.io/config=image
+          sleep 1
+        start: ${{vars.bin-name}} --metrics-bind-address ":8080" --health-probe-bind-address ":8081"
+        timeout: 30
+        expected_output: |
+          Starting Controller
+          Starting workers
+        post: |
+          curl --silent --fail http://127.0.0.1:8080/metrics
+          curl --silent --fail http://127.0.0.1:8081/healthz
+
+environment:
+  contents:
+    packages:
+      - go-1.26

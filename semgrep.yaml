@@ -1,0 +1,209 @@
+package:
+  name: semgrep
+  version: "1.165.0"
+  epoch: 0
+  description: "Lightweight static analysis for many languages. Find bug variants with patterns that look like source code."
+  copyright:
+    - license: LGPL-2.1-or-later
+  options:
+    # Don't resolve libraries installed in virtual environment as providers
+    no-provides: true
+  resources:
+    cpu: "12"
+    memory: 24Gi
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
+
+vars:
+  # Current ocaml version used by upstream can be found https://github.com/semgrep/semgrep/blob/v${{package.version}}/Dockerfile#L114
+  ocaml_version: 5.3.0
+  python-version: '3.13'
+  venv-home: '/opt/chainguard/semgrep'
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - bubblewrap # build errors without it but bubblewrap throws a warning that it's not working anyway
+      - build-base
+      - busybox
+      - bzip2-dev
+      - ca-certificates-bundle
+      - curl # needed for opam, it tries to use wget with missing flags instead.
+      - curl-dev
+      - elfutils-dev
+      - git
+      - gmp-dev # linked against
+      - libcurl-openssl4
+      - libev-dev
+      - libffi-dev
+      - libunwind-dev
+      - ocaml=${{vars.ocaml_version}}
+      - opam
+      - openssl-hardened-dev
+      - patch # needed for 'opam init'
+      - pcre-dev # linked against
+      - pcre2-dev
+      - pkgconf-dev
+      - posix-libc-utils # ldd
+      - python-${{vars.python-version}}-dev
+      - rsync
+      - uv
+      - wolfi-base
+      - zlib-dev
+      - zstd-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/returntocorp/semgrep
+      tag: v${{package.version}}
+      expected-commit: 4cc850aff696dce0f6beddd4bb72db7f4c9abbc0
+      recurse-submodules: true
+
+  - name: Change tree sitter version to 0.26
+    runs: |
+      # The tree-sitter version in the repo is 0.20.6, but we need to use 0.26.3
+      sed -i 's/0\.22\.6/0.26.3/g' libs/ocaml-tree-sitter-core/tree-sitter-version.default
+
+  - name: "initialize the environment"
+    runs: |
+      # Setup OCaml and opam.
+      rm -rf ~/.opam || true
+      # Initialize OPAM with specific compiler version `vars.ocaml_version`
+      opam init --bare --disable-sandboxing -y
+
+      OPAMJOBS=1 opam switch create ${{vars.ocaml_version}} ocaml-base-compiler.${{vars.ocaml_version}} || {
+        echo "Failed to create OCaml switch, retrying with debug info..."
+        OPAMVERBOSE=1 OPAMJOBS=1 opam switch create ${{vars.ocaml_version}} ocaml-base-compiler.${{vars.ocaml_version}}
+      }
+
+  - name: "setup and build"
+    runs: |
+      eval $(opam env --switch=${{vars.ocaml_version}})
+
+      # Setup the opam environment. Install the dependencies etc.
+      make setup
+
+      # Build the core library.
+      make core
+
+      # Make binaries available to pysemgrep
+      make copy-core-for-cli
+
+  - name: install
+    runs: |
+      install -Dm755 _build/default/src/main/Main.exe \
+        "${{targets.destdir}}"/usr/bin/osemgrep
+      ln -sf osemgrep "${{targets.destdir}}"/usr/bin/semgrep-core
+      install -Dm644 LICENSE \
+        "${{targets.destdir}}"/usr/share/licenses/${{package.name}}/LICENSE
+
+  - uses: strip
+
+  - name: "install pysemgrep"
+    working-directory: cli
+    environment:
+      UV_PYTHON: python${{vars.python-version}}
+    runs: |
+      git submodule update --init -- src/semgrep/semgrep_interfaces
+
+      # Create venv at final install path with explicit python version
+      # so shebang targets /usr/bin/python3.13 (from python-3.13-base)
+      # rather than /usr/bin/python3 (which requires full python-3.13)
+      uv venv "${{vars.venv-home}}"
+      source "${{vars.venv-home}}/bin/activate"
+
+      # Install pysemgrep and its dependencies into the venv
+      uv pip install --no-compile .
+
+      # opentelemetry uses pkg_resources but does not declare a dep
+      uv pip install --no-compile setuptools packaging
+
+      # Upstream ignore dependencies uploaded in the last week by default:
+      # override that for cryptography and pygments
+      echo 'exclude-newer-package = { cryptography = "1 day", pygments = "1 day" }' >> pyproject.toml
+      uv pip install --no-compile cryptography~=46.0.6
+      uv pip install --no-compile pygments~=2.20.0
+
+      # Remove pip and virtualenv
+      uv pip uninstall pip virtualenv
+
+      # Install virtual environment to package
+      mkdir -p "${{targets.destdir}}/opt/chainguard"
+      cp -a "${{vars.venv-home}}" "${{targets.destdir}}/opt/chainguard/"
+
+      # Fix world-writable permissions on uv lock file
+      chmod 644 "${{targets.destdir}}${{vars.venv-home}}/.lock"
+
+      # Symlink semgrep and pysemgrep to /usr/bin
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/semgrep" "${{targets.destdir}}/usr/bin/semgrep"
+      ln -sf "${{vars.venv-home}}/bin/pysemgrep" "${{targets.destdir}}/usr/bin/pysemgrep"
+
+test:
+  pipeline:
+    - uses: test/tw/help-check
+      with:
+        bins: osemgrep pysemgrep semgrep semgrep-core
+    - uses: test/tw/pip-check
+    - name: "functional osemgrep scan test"
+      runs: |
+        set -euo pipefail
+
+        # Create a sample Python file with a known pattern
+        mkdir -p /tmp/semgrep-test
+        tee /tmp/semgrep-test/test_target.py <<'EOF'
+        import os
+        user_input = input("Enter command: ")
+        result = eval(user_input)
+        print(result)
+        EOF
+
+        # Create a semgrep rule to detect eval() usage
+        tee /tmp/semgrep-test/rule.yaml <<'EOF'
+        rules:
+          - id: detect-eval
+            pattern: eval(...)
+            message: "Detected use of eval()"
+            languages: [python]
+            severity: WARNING
+        EOF
+
+        # Run osemgrep scan and verify it finds the match
+        output=$(osemgrep scan --config /tmp/semgrep-test/rule.yaml /tmp/semgrep-test/test_target.py 2>&1)
+        echo "$output" | grep -F "detect-eval"
+    - name: "functional pysemgrep scan test"
+      runs: |
+        set -euo pipefail
+
+        # Create a sample Python file with a known pattern
+        mkdir -p /tmp/semgrep-test
+        tee /tmp/semgrep-test/test_target.py <<'EOF'
+        import os
+        user_input = input("Enter command: ")
+        result = eval(user_input)
+        print(result)
+        EOF
+
+        # Create a semgrep rule to detect eval() usage
+        tee /tmp/semgrep-test/rule.yaml <<'EOF'
+        rules:
+          - id: detect-eval
+            pattern: eval(...)
+            message: "Detected use of eval()"
+            languages: [python]
+            severity: WARNING
+        EOF
+
+        # Run pysemgrep scan and verify it finds the match
+        output=$(pysemgrep scan --config /tmp/semgrep-test/rule.yaml /tmp/semgrep-test/test_target.py 2>&1)
+        echo "$output" | grep -F "detect-eval"
+
+update:
+  enabled: true
+  manual: false
+  github:
+    identifier: returntocorp/semgrep
+    strip-prefix: v

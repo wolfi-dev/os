@@ -1,0 +1,112 @@
+package:
+  name: dependency-track
+  version: "4.14.2"
+  epoch: 1 # GHSA-98qh-xjc8-98pq
+  description:
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - openjdk-21-default-jvm
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - maven
+      - openjdk-21-default-jdk
+      - wolfi-base
+      - wolfi-baselayout
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/DependencyTrack/dependency-track
+      tag: ${{package.version}}
+      expected-commit: c4a156726472cd529cc9fa8ed12e825cc000327d
+
+  - uses: patch
+    with:
+      patches: compressutil.patch
+
+  - uses: auth/maven
+
+  - uses: bump
+
+  - runs: |
+      export LANG=en_US.UTF-8
+      # Build the API Server and the bundled UI jars
+      mvn clean package -P clean-exclude-wars -P enhance -P embedded-jetty \
+        -DskipTests -Dlogback.configuration.file=src/main/docker/logback.xml
+
+      mvn clean package -P clean-exclude-wars -P enhance -P embedded-jetty \
+        -P bundle-ui -DskipTests -Dlogback.configuration.file=src/main/docker/logback.xml
+
+      mkdir -p ${{targets.destdir}}/usr/share/java/dependency-track
+
+      mv target/*jar ${{targets.destdir}}/usr/share/java/dependency-track
+      mv src/main/docker/*.xml ${{targets.destdir}}/usr/share/java/dependency-track
+
+subpackages:
+  - name: dependency-track-bundled
+    description: Dependency track with bundled UI
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/share/java/dependency-track
+          mv ${{targets.destdir}}/usr/share/java/dependency-track/dependency-track-bundled.jar ${{targets.subpkgdir}}/usr/share/java/dependency-track/
+
+          # Grab the same logging files
+          cp ${{targets.destdir}}/usr/share/java/dependency-track/*.xml ${{targets.subpkgdir}}/usr/share/java/dependency-track/
+    test:
+      environment:
+        contents:
+          packages:
+            - openjdk-21-default-jdk
+      pipeline:
+        - name: Verify bundled JAR is present
+          runs: |
+            stat /usr/share/java/dependency-track/dependency-track-bundled.jar
+        - name: Verify logging config is present
+          runs: |
+            stat /usr/share/java/dependency-track/logback.xml
+        - name: Validate JAR is a valid Java archive
+          runs: |
+            set -euo pipefail
+            jar tf /usr/share/java/dependency-track/dependency-track-bundled.jar | grep -F "META-INF/MANIFEST.MF"
+
+update:
+  enabled: true
+  github:
+    identifier: DependencyTrack/dependency-track
+
+test:
+  environment:
+    contents:
+      packages:
+        - dependency-track-bundled
+        - coreutils
+        - curl
+  pipeline:
+    - name: "Server logs"
+      working-directory: /usr/share/java/dependency-track
+      runs: |
+        set -euo pipefail
+        export HOME=/tmp
+        export DEFAULT_TEMPLATES_OVERRIDE_BASE_DIRECTORY=/data
+        export DEFAULT_TEMPLATES_OVERRIDE_ENABLED=false
+        # Write a simple config file
+        cat >> /tmp/application.properties <<'EOF'
+        alpine.database.url=jdbc:h2:/tmp/db
+        EOF
+
+        java -Dlogback.configurationFile=logback.xml -Dalpine.application.properties=/tmp/application.properties -jar dependency-track-bundled.jar -context / > /tmp/logs.txt 2>&1 &
+        PID=$!
+
+        sleep 60 # Hope that enough time is given for the logs to get written
+        if ! grep -F 'Dependency-Track is ready' /tmp/logs.txt; then
+          cat /tmp/logs.txt
+          exit 1
+        fi
+        kill $PID

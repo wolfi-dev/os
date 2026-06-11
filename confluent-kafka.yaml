@@ -1,0 +1,211 @@
+package:
+  name: confluent-kafka
+  # Upstream versioning is too weird that we need to work-around it.
+  # Release Monitor returns the latest version as `7.7.0-314-ccs` format:
+  # https://release-monitoring.org/api/v2/versions/?project_id=371656
+  # In order to make the `update:` section happy:
+  # 1. We need to transform it by replacing the last `-` with `.` to match
+  # with the `version:` field.
+  # 2. Created a new variable `mangled-package-version` to append `-ccs` to the
+  # version.
+  version: "8.4.0.213"
+  epoch: 0 # go/wolfi-rsc/confluent-kafka
+  description: Community edition of Confluent Kafka.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bash # Required by kafka - uses shebangs to launch the image.
+      - busybox
+      - confluent-common-docker
+      - confluent-common-docker-base
+      - confluent-cp-docker-utils
+      - confluent-docker-utils
+      - confluent-kafka-images-kafka
+      - openjdk-17-default-jvm
+      - openjdk-17-jre
+  resources:
+    cpu: "5"
+    memory: 11Gi
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      # Pin below 9.5: gradle 9.5.x breaks the Kafka build script with
+      # "Could not get unknown property 'sourceSets' for project ':core'".
+      # Same constraint as kafka-4.3.
+      - gradle-9<9.5
+      - openjdk-17
+      - sbt
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(.+)\.(\d+)$
+    replace: $1-$2-ccs
+    to: mangled-package-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: e88f7bd146abd775cb3612fceef347cc92c25877
+      repository: https://github.com/confluentinc/kafka
+      tag: v${{vars.mangled-package-version}}
+
+  - runs: |
+      export JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF8
+
+      # Remediate https://github.com/advisories/GHSA-vc5p-v9hr-52mj
+      sed -i 's/log4j2: "2.25.1"/log4j2: "2.25.3"/' gradle/dependencies.gradle
+
+      # Remediate https://github.com/advisories/GHSA-wjpw-4j6x-6rwh and https://github.com/advisories/GHSA-xxh7-fcf3-rj7f
+      # Note: 12.0.32 fixes both (jetty-http fixed in 12.0.31, jetty-server fixed in 12.0.32)
+      sed -i 's/jetty: "12.0.25"/jetty: "12.0.32"/' gradle/dependencies.gradle
+
+      gradle clean releaseTarGz
+
+      nohup /usr/lib/kafka/bin/zookeeper-server-start.sh /usr/lib/kafka/config/zookeeper.properties > ${{targets.destdir}}/usr/lib/kafka/logs/zookeeper.out 2> zookeeper.err < /dev/null &
+      tar -xzvf core/build/distributions/kafka_*-${{vars.mangled-package-version}}.tgz
+
+      mkdir -p ${{targets.destdir}}/usr/lib/kafka/logs
+      mkdir -p ${{targets.destdir}}/etc/kafka
+      mkdir -p ${{targets.destdir}}/var/lib/kafka/data
+
+      mv kafka_*-${{vars.mangled-package-version}}/bin ${{targets.destdir}}/usr/lib/kafka
+      mv kafka_*-${{vars.mangled-package-version}}/libs ${{targets.destdir}}/usr/lib/kafka
+      mv kafka_*-${{vars.mangled-package-version}}/config ${{targets.destdir}}/usr/lib/kafka
+
+      # Install required runtime scripts
+      mkdir -p ${{targets.destdir}}/usr/bin
+      for file in $(find ./bin -type f -exec grep -lE '^#!(/usr/bin/env |/bin/)' {} \;); do
+        filename=$(basename "$f")
+        install -D -m755 "$file" ${{targets.destdir}}/usr/bin/"$filename"
+      done
+
+      # Create a symlink for the kafka libs since upstream images expect it to be in /usr/share/java/kafka:
+      # https://github.com/confluentinc/kafka/blob/b66558da5d6b33c2fba9f424131575b948e6f611/bin/kafka-run-class.sh#L197
+      mkdir -p ${{targets.destdir}}/usr/share/java/kafka
+      # ln -sf /usr/lib/kafka/libs/* ${{targets.destdir}}/usr/share/java/kafka/
+
+      # symlink every file in /usr/lib/kafka/libs to /usr/share/java/kafka
+      for file in "${{targets.destdir}}"/usr/lib/kafka/libs/*; do
+        ln -sf /usr/lib/kafka/libs/$(basename $file) ${{targets.destdir}}/usr/share/java/kafka/$(basename $file)
+      done
+
+      # /etc/confluent/docker/ensure runs kafka-storage whereas upstream only provides kafka-storage.sh for some reason.
+      echo "#!/usr/bin/env bash" > ${{targets.destdir}}/usr/bin/kafka-storage
+      echo "exec \"\$0.sh\" \"\$@\"" >> ${{targets.destdir}}/usr/bin/kafka-storage
+      chmod +x ${{targets.destdir}}/usr/bin/kafka-storage
+
+      # Clean up windows
+      rm -rf ${{targets.destdir}}/usr/lib/kafka/bin/*.bat
+
+# Need to use Git poller as confluent blocks GitHub API requests from GH runners
+update:
+  enabled: true
+  schedule:
+    period: daily
+    reason: Confluent Kafka cut a high number of tags every day.
+  git:
+    strip-prefix: v
+    strip-suffix: -ccs
+  ignore-regex-patterns:
+    - -rc.*
+    - kafka-.*
+    - show
+    - fetch
+  version-transform:
+    - match: ^(\d+\.\d+\.\d+)\-(\d+)$
+      replace: $1.$2
+
+test:
+  environment:
+    contents:
+      packages:
+        - bash
+        - openjdk-17-default-jvm
+        - procps
+        - curl
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
+      KAFKA_LOG_DIRS: "/tmp/kafka-logs"
+      KAFKA_LOG4J_OPTS: "-Dlog4j2.configurationFile=file:/usr/lib/kafka/config/tools-log4j2.yaml"
+  pipeline:
+    # AUTOGENERATED
+    - runs: |
+        kafka-acls --version
+        kafka-acls.sh --version
+        kafka-broker-api-versions --version
+        kafka-broker-api-versions.sh --version
+        kafka-client-metrics.sh --version
+        kafka-configs --version
+        kafka-configs.sh --version
+        kafka-console-consumer --version
+        kafka-console-consumer.sh --version
+        kafka-console-producer --version
+        kafka-console-producer.sh --version
+        kafka-console-share-consumer.sh --version
+        kafka-consumer-groups --version
+        kafka-consumer-groups.sh --version
+        kafka-consumer-perf-test --version
+        kafka-consumer-perf-test.sh --version
+        kafka-delegation-tokens --version
+        kafka-delegation-tokens.sh --version
+        kafka-delete-records --version
+        kafka-delete-records.sh --version
+        kafka-dump-log.sh --version
+        kafka-get-offsets.sh --version
+        kafka-jmx.sh --version
+        kafka-leader-election.sh --version
+        kafka-log-dirs --version
+        kafka-log-dirs.sh --version
+        kafka-metadata-quorum.sh --help
+        kafka-reassign-partitions --version
+        kafka-reassign-partitions.sh --version
+        kafka-replica-verification --version
+        kafka-replica-verification.sh --version
+        kafka-run-class --version
+        kafka-run-class.sh --version
+        kafka-server-start --version
+        kafka-server-start.sh --version
+        kafka-share-groups.sh --version
+        kafka-storage --help
+        kafka-storage.sh --help
+        kafka-streams-application-reset --version
+        kafka-streams-application-reset.sh --version
+        kafka-topics --version
+    - name: "Initialize Kafka storage"
+      runs: |
+        mkdir -p /tmp/kafka-logs
+        CLUSTER_ID="$(kafka-storage.sh random-uuid)"
+        echo "Using cluster ID: $CLUSTER_ID"
+
+        kafka-storage.sh format -t "$CLUSTER_ID" -c /usr/lib/kafka/config/server.properties --standalone
+    - name: "Run integration test against Kafka server (KRaft mode)"
+      runs: |
+        set -euo pipefail
+        nohup kafka-server-start.sh /usr/lib/kafka/config/server.properties > /tmp/kafka.log 2>&1 &
+        sleep 10
+        pgrep -f "kafka\.Kafka"
+
+        # Create and verify test topic
+        kafka-topics.sh --create --topic test-topic --partitions 1 --replication-factor 1 --bootstrap-server localhost:9092
+        kafka-topics.sh --describe --topic test-topic --bootstrap-server localhost:9092 | grep -F "test-topic"
+
+        # Test message production and consumption
+        echo "test message" | kafka-console-producer.sh --topic test-topic --bootstrap-server localhost:9092
+        kafka-console-consumer.sh --topic test-topic --from-beginning --bootstrap-server localhost:9092 --max-messages 1 --timeout-ms 5000 | grep -F "test message"
+
+        # Test Kafka configuration tools
+        # Test broker configs
+        kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type brokers --entity-default
+
+        # Test topic configs
+        kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type topics --entity-name test-topic

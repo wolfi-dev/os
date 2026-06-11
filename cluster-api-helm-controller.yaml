@@ -1,0 +1,115 @@
+package:
+  name: cluster-api-helm-controller
+  version: "0.6.4"
+  epoch: 5 # toolchain rebuild for  go-1.26-1.26.4
+  description: CAAPH uses Helm charts to manage the installation and lifecycle of Cluster API add-ons.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kubernetes-sigs/cluster-api-addon-provider-helm
+      tag: v${{package.version}}
+      expected-commit: 825662962a26dc339f3871184c91ed4bd2f83a4f
+
+  - uses: bump
+    with:
+      deps: |-
+        github.com/containerd/containerd@v1.7.32
+        golang.org/x/crypto@v0.52.0
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      packages: .
+      output: cluster-api-helm-controller
+      go-package: go-1.26
+      ldflags: |
+        -buildid= ""
+        -X sigs.k8s.io/cluster-api-addon-provider-helm/version.buildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')
+        -X sigs.k8s.io/cluster-api-addon-provider-helm/version.gitCommit=$(git rev-parse HEAD)
+        -X sigs.k8s.io/cluster-api-addon-provider-helm/version.gitVersion=$(git describe --dirty --tags --always)
+        -X sigs.k8s.io/cluster-api-addon-provider-helm/version.gitTreeState=$(shell git diff --quiet >/dev/null 2>&1 || echo "dirty" || echo "clean")
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: "Compatibility package for cluster-api-helm-controller"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/
+          ln -s ./usr/bin/cluster-api-helm-controller ${{targets.subpkgdir}}/manager
+    dependencies:
+      provides:
+        - ${{package.name}}-entrypoint=${{package.full-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+        - name: Verify manager symlink works
+          runs: |
+            set -euo pipefail
+            /manager --help 2>&1 | grep -F 9443
+
+update:
+  enabled: true
+  github:
+    identifier: kubernetes-sigs/cluster-api-addon-provider-helm
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - openssl
+    environment:
+      KUBERNETES_SERVICE_HOST: "127.0.0.1"
+      KUBERNETES_SERVICE_PORT: "32764"
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: cluster-api-helm-controller
+    - uses: test/kwok/cluster
+      with:
+        serviceaccount: true
+    - name: Test controller startup with kwok cluster
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          # Install CAAPH CRDs
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/cluster-api-addon-provider-helm/v${{package.version}}/config/crd/bases/addons.cluster.x-k8s.io_helmchartproxies.yaml
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/cluster-api-addon-provider-helm/v${{package.version}}/config/crd/bases/addons.cluster.x-k8s.io_helmreleaseproxies.yaml
+          kubectl wait --for=condition=Established crd --all --timeout=60s
+
+          # Grant cluster-admin to the default service account
+          kubectl create clusterrolebinding test-admin \
+            --clusterrole=cluster-admin \
+            --serviceaccount=default:default
+
+          # Generate webhook certificates for port 9443
+          mkdir -p /tmp/k8s-webhook-server/serving-certs
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout /tmp/k8s-webhook-server/serving-certs/tls.key \
+            -out /tmp/k8s-webhook-server/serving-certs/tls.crt \
+            -days 1 -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+        start: /usr/bin/cluster-api-helm-controller
+        timeout: "30"
+        expected_output: "Starting EventSource"
+        post: |
+          # Verify webhook server is listening on port 9443
+          wait-for-it localhost:9443 -t 15
+
+environment:
+  contents:
+    packages:
+      - go-1.26

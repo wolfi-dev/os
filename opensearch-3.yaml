@@ -1,0 +1,564 @@
+# This melange yaml is complex.  The context is opensearch releases the main package and many plugins, some in the same repo
+# and some in different repos.  They all share the same version number so rather than having a separate melange yaml for each
+# package, we package them all in one build so they can be released together.  For plugins to run they need to be built with the
+# same version they are installed into.
+package:
+  name: opensearch-3
+  version: "3.6.0"
+  epoch: 5 # GHSA-2c5c-chwr-9hqw GHSA-45q3-82m4-75jr GHSA-cm33-6792-r9fm
+  description: Open source distributed and RESTful search engine.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - bash # some helper scripts use bash
+      - busybox # some helper scripts use busybox
+      - openjdk-25-jre
+  resources:
+    cpu: "24"
+    memory: 96Gi
+
+vars:
+  java-version: "25"
+  plugin_version_qualifier: "0"
+
+var-transforms:
+  # External plugins typically only release for major.minor versions (x.y.0)
+  # Extract major.minor from package version (e.g., "3.3.1" -> "3.3.*") using * as a wildcard
+  # This is used to find the latest matching tag if upstream releases multiple patch versions
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: $1.[0-9]*
+    to: plugin_version
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cmake-3
+      - curl
+      - gcc-14
+      - gcc-14-default
+      - gfortran
+      - git
+      - gradle
+      - libgomp
+      - liblapack
+      - liblapacke
+      - openblas
+      - openblas-dev
+      - openjdk-25-default-jdk
+      - patch
+      - unzip
+      - zlib-dev
+  environment:
+    JAVA_HOME: /usr/lib/jvm/java-25-openjdk
+    LANG: "en_US.UTF-8"
+
+data:
+  - name: internal-plugins
+    items:
+      # plugin_name: cve patch list
+      analysis-icu: ""
+      analysis-kuromoji: ""
+      analysis-nori: ""
+      analysis-phonetic: ""
+      analysis-smartcn: ""
+      analysis-stempel: ""
+      analysis-ukrainian: ""
+      crypto-kms: ""
+      discovery-azure-classic: ""
+      discovery-ec2: ""
+      discovery-gce: ""
+      ingest-attachment: ""
+      mapper-annotated-text: ""
+      mapper-murmur3: ""
+      mapper-size: ""
+      repository-azure: ""
+      repository-gcs: ""
+      repository-s3: ""
+      store-smb: ""
+      telemetry-otel: ""
+
+  - name: external-plugins
+    items:
+      # plugin_name: cve patch list
+      alerting: ""
+      anomaly-detection: ""
+      asynchronous-search: ""
+      cross-cluster-replication: ""
+      custom-codecs: ""
+      geospatial: ""
+      index-management: ""
+      job-scheduler: ""
+      k-nn: ""
+      ml-commons: ""
+      neural-search: ""
+      notifications: ""
+      observability: ""
+      performance-analyzer: ""
+      reporting: ""
+      security: ""
+      security-analytics: ""
+      sql: ""
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/opensearch-project/OpenSearch
+      tag: ${{package.version}}
+      expected-commit: 4ca747d8d47f80162db323019357447126732e35
+
+  - runs: |
+      # Bump log4j to 2.25.4: CVE-2026-34480
+      sed -i 's/^log4j                   = "2\.25\.3"/log4j                   = "2.25.4"/' gradle/libs.versions.toml
+      sed -i 's/^\(httpclient5.*= "\)5.6"/\15.6.1"/' gradle/libs.versions.toml
+      # Bump netty to 4.2.13.Final: GHSA-2c5c-chwr-9hqw, GHSA-45q3-82m4-75jr, GHSA-cm33-6792-r9fm
+      sed -i 's/^netty             = "4\.2\.12\.Final"/netty             = "4.2.13.Final"/' gradle/libs.versions.toml
+      # Fail the build if the netty bump did not apply (upstream version line drift)
+      grep -qE '^netty +=.*"4\.2\.13\.Final"' gradle/libs.versions.toml
+
+  - runs: |
+      echo "org.gradle.daemon=false" >> gradle.properties
+      ./gradlew --no-daemon localDistro publishToMavenLocal --parallel -Dbuild.snapshot=false -Dbuild.version_qualifier=
+      mkdir -p ${{targets.destdir}}/usr/share/opensearch/logs
+
+      install -dm777 ${{targets.destdir}}/usr/share/opensearch/
+      mv build/distribution/local/opensearch-${{package.version}}/agent/ ${{targets.destdir}}/usr/share/opensearch
+      mv build/distribution/local/opensearch-${{package.version}}/bin/ ${{targets.destdir}}/usr/share/opensearch
+      mv build/distribution/local/opensearch-${{package.version}}/lib/ ${{targets.destdir}}/usr/share/opensearch
+      mv build/distribution/local/opensearch-${{package.version}}/config/ ${{targets.destdir}}/usr/share/opensearch
+      mv build/distribution/local/opensearch-${{package.version}}/modules/ ${{targets.destdir}}/usr/share/opensearch
+      mv build/distribution/local/opensearch-${{package.version}}/plugins/ ${{targets.destdir}}/usr/share/opensearch
+
+      mv ./distribution/docker/src/docker/config/opensearch.yml ./distribution/docker/src/docker/config/log4j2.properties ${{targets.destdir}}/usr/share/opensearch/config
+
+  - runs: |
+      # Use a modified entrypoint script as the official one duplicates env vars and system properties used by the JVM on startup
+      # This means we avoid errors like: ERROR: setting [discovery.seed_hosts] already set, saw [opensearch-cluster-master-headless] and [opensearch-cluster-master-headless]
+      #
+      # Opensearch operator requires opensearch-docker-entrypoint.sh in /usr/share/opensearch but historically we had it in bin, so also make a symlink to avoid breaking things.
+      mv opensearch-docker-entrypoint.sh  ${{targets.destdir}}/usr/share/opensearch/
+      ln -s /usr/share/opensearch/opensearch-docker-entrypoint.sh ${{targets.destdir}}/usr/share/opensearch/bin/opensearch-docker-entrypoint.sh
+
+  - runs: |
+      # Set permissions to read/write the config dir
+      chmod -R 755 ${{targets.destdir}}/usr/share/opensearch/
+
+      mkdir -p ${{targets.destdir}}/usr/bin
+      for i in ${{targets.destdir}}/usr/share/opensearch/bin/*; do
+        name=$(basename $i)
+        ln -sf /usr/share/opensearch/bin/$name ${{targets.destdir}}/usr/bin/$name
+      done
+
+      chmod -R 644 ${{targets.destdir}}/usr/share/opensearch/config/opensearch.yml
+
+      # Manually set this to docker: https://github.com/opensearch-project/OpenSearch/blob/5f8193021215cd6979fde66474ec8d74d32ac91a/distribution/docker/src/docker/Dockerfile#LL49C90-L49C129
+      sed -i -e 's/OPENSEARCH_DISTRIBUTION_TYPE=tar/OPENSEARCH_DISTRIBUTION_TYPE=docker/'  ${{targets.destdir}}/usr/share/opensearch/bin/opensearch-env
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/opensearch-project/opensearch-remote-metadata-sdk
+      tag: ${{package.version}}.${{vars.plugin_version_qualifier}}
+      expected-commit: 5223e2aeba9c741d04a7f1f189ce8b9d3c018b5d
+      destination: /tmp/opensearch-remote-metadata-sdk
+
+  - working-directory: /tmp/opensearch-remote-metadata-sdk
+    runs: |
+      # Some plugins transitively depend on opensearch-remote-metadata-sdk and
+      # so we need to build it against our local artifacts so it matches any
+      # dependencies we've bumped (e.g. log4j) and publish it into mavenLocal
+      # to avoid breaking the build.
+      echo >> gradle.properties
+      echo "org.gradle.daemon=false" >> gradle.properties
+
+      ./gradlew --no-daemon publishToMavenLocal \
+        -Dbuild.snapshot=false \
+        -Dbuild.version_qualifier="" \
+        -Dopensearch.version=3.6.0 \
+        -Drepos.mavenLocal=true \
+        -x check -x test -x javadoc \
+        -PfailOnJavadocWarning=false \
+        --stacktrace
+
+  - runs: |
+      cd plugins
+      ../gradlew --no-daemon assemble -Dbuild.snapshot=false -Dbuild.version_qualifier= -Drepos.mavenLocal=true --stacktrace
+
+      # useful for finding generated zip file we use to extract into the final apk
+      find . -name "*.zip"
+
+  - runs: |
+      # Remove files so they don't conflict with subpackages
+      echo "Removing files that conflict with subpackages"
+      rm -rf /home/build/settings.gradle
+
+  - uses: strip
+
+subpackages:
+  - range: internal-plugins
+    name: ${{package.name}}-${{range.key}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/share/opensearch/plugins/opensearch-${{range.key}}
+          unzip "./plugins/${{range.key}}/build/distributions/${{range.key}}-${{package.version}}.zip" -d "${{targets.contextdir}}/usr/share/opensearch/plugins/opensearch-${{range.key}}"
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/share/opensearch/plugins/opensearch-${{range.key}}
+
+  - range: external-plugins
+    name: ${{package.name}}-${{range.key}}
+    pipeline:
+      # Delete other plugins. Opensearch can only build one at a time, otherwise we run into conflicting dependencies version issues with yarn.
+      - runs: |
+          rm -r plugins/* || true
+
+          # Clone the repository and find the latest matching tag
+          git clone --quiet --origin=origin https://github.com/opensearch-project/${{range.key}}.git ./plugins/${{range.key}}
+          cd ./plugins/${{range.key}}
+
+          # Get the latest tag matching the pattern (e.g., major.minor.*.0)
+          LATEST_TAG=$(git tag -l "${{vars.plugin_version}}.${{vars.plugin_version_qualifier}}" | sort -V | tail -n1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "ERROR: No matching tag found for pattern ${{vars.plugin_version}}.${{vars.plugin_version_qualifier}}"
+            exit 1
+          fi
+
+          echo "Using plugin tag: $LATEST_TAG"
+          git checkout --quiet "$LATEST_TAG"
+      - runs: |
+          cd ./plugins/${{range.key}}
+
+          # For consistency between core and plugins, we need to prefer
+          # artifacts from MavenLocal: -Drepos.mavenLocal=true handles this in
+          # most cases, but some plugins don't honour it properly: this
+          # "hardcodes" it into their config
+          case ${{range.key}} in
+            job-scheduler)
+              sed -i '/mavenCentral()/i\    mavenLocal()' build-tools/repositories.gradle
+              ;;
+          esac
+
+          # apply any CVE patches
+          if [ -n "${{range.value}}" ]; then
+              patch -p1 < "../../${{range.value}}"
+          fi
+
+          # notifications source live in a subfolder
+          if [ "${{range.key}}" = "notifications" ]; then
+            cd ./notifications
+          fi
+
+          # skip check task, using -x doesn't append to an existing list
+          # job scheduler requires a test cluster to connect to so skip verification checks
+          if [ "${{range.key}}" = "job-scheduler" ]; then
+            sed -i '/startParameter.excludedTaskNames=\[/ s/]/, "check"]/g' settings.gradle
+          fi
+
+          # Ensure there's a newline at the end of the file, so we don't append
+          # to the last line
+          echo >> gradle.properties
+          echo "org.gradle.daemon=false" >> gradle.properties
+
+          # k-nn plugin requires special handling for building JNI native libraries
+          if [ "${{range.key}}" = "k-nn" ]; then
+            # Disable static BLAS linking and use OpenBLAS
+            sed -i 's/set(BLA_STATIC ON)/set(BLA_VENDOR OpenBLAS)\nset(BLA_STATIC OFF)/' ./jni/cmake/init-faiss.cmake
+
+            # Set NMSLIB_SIMD_FLAGS based on architecture
+            if [ "${{build.arch}}" = "x86_64" ]; then
+              NMSLIB_SIMD_FLAGS="x86-64"
+            else
+              NMSLIB_SIMD_FLAGS="armv8-a"
+            fi
+
+            # Build the Java plugin first
+            ./gradlew build \
+              --no-daemon \
+              --refresh-dependencies \
+              -Dbuild.snapshot=false \
+              -Dbuild.version_qualifier= \
+              -Dopensearch.version=${{package.version}} \
+              -Drepos.mavenLocal=true \
+              -Dbuild.lib.commit_patches=false \
+              -Dnmslib_simd_flags=$NMSLIB_SIMD_FLAGS \
+              -x check \
+              -x integTest \
+              -x test \
+              -x javadoc \
+              -PfailOnJavadocWarning=false \
+              --stacktrace
+
+            # Build Faiss base library (without AVX)
+            ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dbuild.lib.commit_patches=false -Dnproc.count=4 --stacktrace
+
+            # Clear CMake cache before building nmslib
+            rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+
+            # Build Nmslib library
+            ./gradlew :buildJniLib -Pknn_libs=opensearchknn_nmslib -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+
+            # AVX variants only for x86_64
+            if [ "${{build.arch}}" = "x86_64" ]; then
+              rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+              ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx2.enabled=true -Davx512.enabled=false -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+
+              rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+              ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=true -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+
+              rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
+              ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512_spr.enabled=true -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false -Dnproc.count=4 --stacktrace
+            fi
+          else
+            # For other plugins, single gradle run.
+            # -Pcrypto.standard=any-supported overrides the security plugin's
+            # gradle.properties (added in security 3.6.0.0) which hardcodes
+            # crypto.standard=FIPS-140-3. Without the override, the plugin's
+            # build.gradle scopes bc-fips/bcpkix-fips/bcutil-fips as compileOnly,
+            # which excludes them from the plugin zip produced by bundlePlugin
+            # (runtimeClasspath - compileOnly). The compiled plugin classes still
+            # reference BouncyCastleFipsProvider, so the non-FIPS image crashes at
+            # load time with NoClassDefFoundError. This image is the non-FIPS
+            # variant, so force the non-FIPS dependency scope and let the jars
+            # ship in the zip as they did for 3.5.0.
+            ./gradlew clean assemble \
+              --refresh-dependencies \
+              -Dbuild.snapshot="false" \
+              -Dbuild.version_qualifier="" \
+              -Dopensearch.version="${{package.version}}" \
+              -Drepos.mavenLocal=true \
+              -Pcrypto.standard=any-supported \
+              -x check \
+              -x integTest \
+              -x javadoc \
+              -PfailOnJavadocWarning=false \
+              --stacktrace
+          fi
+
+          # useful for finding generated zip file we use to extract into the final apk
+          find . -name "*.zip"
+
+          # Extract the value of rootProject.name, this is because the key is not always the same as the plugin name
+          # note: not all plugins have a settings.gradle file
+          plugin_name=""
+          if [ -f settings.gradle ]; then
+            # rootProject.name = 'foo' -> foo. remove any quotes around the name by splicing ['"] into this single quoted awk command
+            plugin_name=$(awk -F' = ' '/^rootProject.name/{ gsub(/['"'"'"]/, "", $2); print $2 }' settings.gradle)
+          fi
+
+          # Check if plugin_name is empty and assign default if it is
+          if [ -z "$plugin_name" ]; then
+              plugin_name=${{range.key}}
+          fi
+
+          echo "Plugin name: $plugin_name"
+
+          # Remove any existing "opensearch-" prefix before adding it to ensure it's not duplicated
+          plugin_name=$(echo $plugin_name | sed 's/^opensearch-//')
+
+          # Ensure the plugin_name has the "opensearch-" prefix
+          plugin_name="opensearch-$plugin_name"
+
+          echo "Final plugin name: $plugin_name"
+
+          mkdir -p "${{targets.contextdir}}/usr/share/opensearch/plugins"
+
+          # Define the base path for the unzip destination
+          destination_base="${{targets.contextdir}}/usr/share/opensearch"
+
+          # Determine the source directory based on the plugin key
+          case "${{range.key}}" in
+              "alerting")
+                  zip_dir="./alerting"
+                  ;;
+              "k-nn")
+                  zip_dir="."
+                  ;;
+              "ml-commons"|"sql")
+                  zip_dir="./plugin"
+                  ;;
+              "notifications")
+                  zip_dir="./notifications"
+                  install -Dm644 notifications/src/main/config/notifications.yml "${destination_base}/config/${plugin_name}/notifications.yml"
+
+                  # Special handling for notifications core
+                  unzip "./core/build/distributions/${plugin_name}-core-${{vars.plugin_version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/plugins/${plugin_name}-core"
+                  install -Dm644 core/src/main/config/notifications-core.yml "${destination_base}/config/${plugin_name}-core/notifications-core.yml"
+                  ;;
+              "observability")
+                  zip_dir="."
+                  install -Dm644 src/main/config/observability.yml "${destination_base}/config/${plugin_name}/observability.yml"
+                  ;;
+              "performance-analyzer")
+                  zip_dir="."
+                  mkdir -p "${destination_base}/config/${plugin_name}/"
+                  install -Dm644 config/* "${destination_base}/config/${plugin_name}/"
+                  ;;
+              "reporting")
+                  zip_dir="."
+                  install -Dm644 src/main/config/reports-scheduler.yml "${destination_base}/config/${plugin_name}/reports-scheduler.yml"
+                  ;;
+              "security")
+                  zip_dir="."
+                  mkdir -p "${destination_base}/config/${plugin_name}/"
+                  install -Dm644 config/* "${destination_base}/config/${plugin_name}/"
+                  ;;
+              *)
+                  zip_dir="."
+                  ;;
+          esac
+
+          # Unzip the main plugin distribution
+          unzip "${zip_dir}/build/distributions/${plugin_name}-${{vars.plugin_version}}.${{vars.plugin_version_qualifier}}.zip" -d "${destination_base}/plugins/${plugin_name}"
+
+          # Copy JNI native libraries for k-nn plugin
+          if [ "${{range.key}}" = "k-nn" ]; then
+            mkdir -p "${destination_base}/plugins/${plugin_name}/lib"
+            cp ./jni/build/release/libopensearchknn*.so "${destination_base}/plugins/${plugin_name}/lib/"
+            cp /usr/lib/libgomp.so* "${destination_base}/plugins/${plugin_name}/lib/"
+          fi
+      - uses: strip
+    test:
+      pipeline:
+        - runs: |
+            # Verify k-nn JNI native libraries are present
+            if [ "${{range.key}}" = "k-nn" ]; then
+              # Common libraries (all architectures)
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_common.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_nmslib.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_util.so
+              stat /usr/share/opensearch/plugins/opensearch-knn/lib/libgomp.so.1
+
+              # x86_64-specific AVX variant libraries
+              if [ "${{build.arch}}" = "x86_64" ]; then
+                stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss_avx2.so
+                stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss_avx512.so
+                stat /usr/share/opensearch/plugins/opensearch-knn/lib/libopensearchknn_faiss_avx512_spr.so
+              fi
+
+              echo "All k-nn JNI native libraries verified"
+            fi
+
+  - name: ${{package.name}}-iamguarded-compat
+    description: "Compatibility package for iamguarded variant of OpenSearch"
+    dependencies:
+      provides:
+        - opensearch-iamguarded-compat=${{package.full-version}}
+      runtime:
+        - bash
+        - curl
+        - gzip
+        - coreutils
+        - glibc-locale-en
+        - posix-libc-utils
+        - yq
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: opensearch
+          version: ${{vars.major-version}}
+      - runs: |
+          mkdir -p /opt/iamguarded/opensearch
+          chmod -R g+rwX /opt/iamguarded
+          mkdir -p /opt/iamguarded/opensearch/config
+          mkdir -p /opt/iamguarded/opensearch/config.default
+          mkdir -p /opt/iamguarded/opensearch/logs
+          mkdir -p /opt/iamguarded/opensearch/data
+          mkdir -p /opt/iamguarded/scripts/opensearch
+          # Create symlink for Java (required by iamguarded scripts)
+          ln -sf /usr/lib/jvm/java-${{vars.java-version}}-openjdk /opt/iamguarded/java
+          # Create symlinks to the main opensearch installation
+          ln -sf /usr/share/opensearch/bin /opt/iamguarded/opensearch/bin
+          ln -sf /usr/share/opensearch/lib /opt/iamguarded/opensearch/lib
+          ln -sf /usr/share/opensearch/modules /opt/iamguarded/opensearch/modules
+          ln -sf /usr/share/opensearch/plugins /opt/iamguarded/opensearch/plugins
+          ln -sf /usr/share/opensearch/agent /opt/iamguarded/opensearch/agent
+          # plugins.default/: required by the iamguarded entrypoint and by the
+          # chart's copy-default-plugins init container, both of which copy from
+          # plugins.default into the writable plugins/ volume at runtime. Plugins
+          # are installed via separate subpackages at image build time, so the
+          # set of installed plugins is known only at image time. Symlink to the
+          # actual plugins dir so all installed plugins are seen at runtime.
+          # Same pattern as os/opensearch-dashboards-3.yaml.
+          rm -rf /opt/iamguarded/opensearch/plugins.default
+          ln -sf /usr/share/opensearch/plugins /opt/iamguarded/opensearch/plugins.default
+          # Copy config to both config and config.default (entrypoint copies config.default to config at startup)
+          cp -r "${{targets.destdir}}/usr/share/opensearch/config/"* /opt/iamguarded/opensearch/config/
+          cp -r "${{targets.destdir}}/usr/share/opensearch/config/"* /opt/iamguarded/opensearch/config.default/
+          # Remove the shipped opensearch.yml from both config/ and config.default/
+          # so the iamguarded entrypoint generates a complete config from env vars
+          # at startup. elasticsearch_initialize() in libopensearch.sh skips all
+          # env-driven setup (path.data, discovery, cluster, network, node) when
+          # opensearch.yml already exists, which left the chart unable to populate
+          # the PVC data path or cluster discovery from its provided env. With the
+          # file removed:
+          #   - chart use: emptyDir mount over config/ + entrypoint generates
+          #     full config from chart env (path.data, discovery.seed_hosts,
+          #     cluster.initial_master_nodes, etc.)
+          #   - direct image use: entrypoint generates path.data plus the
+          #     discovery.type: single-node fallback (no chart env present)
+          rm -f /opt/iamguarded/opensearch/config/opensearch.yml \
+                /opt/iamguarded/opensearch/config.default/opensearch.yml
+          ln -sf /opt/iamguarded/scripts/opensearch/entrypoint.sh "${{targets.contextdir}}/entrypoint.sh"
+          ln -sf /opt/iamguarded/scripts/opensearch/run.sh "${{targets.contextdir}}/run.sh"
+      - uses: iamguarded/finalize-compat
+        with:
+          package: opensearch
+          version: ${{vars.major-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: opensearch
+            version: ${{vars.major-version}}
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
+        - name: "Test iamguarded directory structure"
+          runs: |
+            stat /opt/iamguarded/opensearch/bin
+            stat /opt/iamguarded/opensearch/lib
+            stat /opt/iamguarded/opensearch/modules
+            stat /opt/iamguarded/opensearch/plugins
+            stat /opt/iamguarded/opensearch/plugins.default
+            stat /opt/iamguarded/opensearch/agent
+            test "$(readlink /entrypoint.sh)" = "/opt/iamguarded/scripts/opensearch/entrypoint.sh"
+            test "$(readlink /run.sh)" = "/opt/iamguarded/scripts/opensearch/run.sh"
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - -beta
+    - -alpha
+  github:
+    identifier: opensearch-project/OpenSearch
+    tag-filter-prefix: "3."
+
+test:
+  environment:
+    contents:
+      packages:
+        - openjdk-25-default-jvm
+        - bash
+  pipeline:
+    - runs: |
+        export JAVA_HOME=/usr/lib/jvm/default-jvm
+        opensearch --version
+        opensearch-env-from-file --version
+        opensearch-env-from-file --help

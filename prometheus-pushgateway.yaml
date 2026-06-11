@@ -1,0 +1,150 @@
+package:
+  name: prometheus-pushgateway
+  version: "1.11.3"
+  epoch: 1 # toolchain rebuild for  go-1.25-1.25.11
+  description: Push acceptor for ephemeral and batch jobs.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - merged-usrsbin
+      - wolfi-baselayout
+  resources:
+    cpu: "4"
+    memory: 7Gi
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+).*
+    replace: $1
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/prometheus/pushgateway
+      tag: v${{package.version}}
+      expected-commit: e803ebd81be5867ff17a21205030611fa033af13
+
+  - uses: go/build
+    with:
+      packages: .
+      output: prometheus-pushgateway
+      ldflags: |
+        -X github.com/prometheus/common/version.Version=${{package.version}}
+        -X github.com/prometheus/common/version.Revision=$(git rev-parse --short HEAD)
+        -X github.com/prometheus/common/version.Branch=HEAD
+        -X github.com/prometheus/common/version.BuildUser=reproducible@reproducible
+        -X github.com/prometheus/common/version.BuildDate=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d-%H:%M)
+
+  # for backward compatibility with older installations expecting pushgateway in /usr/bin
+  - runs: |
+      ln -sf /usr/bin/prometheus-pushgateway ${{targets.destdir}}/usr/bin/pushgateway
+
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package for iamguarded"
+    dependencies:
+      runtime:
+        - tzdata
+    pipeline:
+      - runs: |
+          mkdir -p /opt/iamguarded/pushgateway/bin/
+          ln -sf /usr/bin/pushgateway /opt/iamguarded/pushgateway/bin/pushgateway
+      - uses: iamguarded/build-compat
+        with:
+          package: prometheus-pushgateway
+          version: ${{vars.major-version}}
+      - uses: iamguarded/finalize-compat
+        with:
+          package: prometheus-pushgateway
+          version: ${{vars.major-version}}
+    test:
+      pipeline:
+        - runs: |
+            stat /opt/iamguarded/pushgateway/bin/pushgateway
+        - uses: iamguarded/test-compat
+          with:
+            package: prometheus-pushgateway
+            version: ${{vars.major-version}}
+
+update:
+  enabled: true
+  github:
+    identifier: prometheus/pushgateway
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+        - prometheus
+  pipeline:
+    - name: "Basic binary verification"
+      runs: |
+        pushgateway --version | grep -i ${{package.version}}
+        pushgateway --help
+    - runs: test "$(readlink /usr/bin/pushgateway)" = "/usr/bin/prometheus-pushgateway"
+    - name: "Test Pushgateway functionality"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/pushgateway
+        start: prometheus-pushgateway --web.listen-address=:9091 --persistence.file=/tmp/pushgateway/metrics --persistence.interval=5s --web.enable-admin-api
+        timeout: 30
+        expected_output: |
+          msg="starting pushgateway"
+          msg="Listening on"
+        post: |
+          wait-for-it localhost:9091 -t 30 -- curl -fsSL http://localhost:9091/-/ready | grep -q "OK"
+          curl -fsSL http://localhost:9091/-/healthy | grep -q "OK"
+
+          # basic metrics push and verify (with proper HELP and TYPE for promtool)
+          cat <<EOF | curl -fsSL --data-binary @- http://localhost:9091/metrics/job/test_job
+          # HELP test_metric A test metric for pushgateway
+          # TYPE test_metric gauge
+          test_metric 42
+          EOF
+          curl -fsSL http://localhost:9091/metrics | promtool check metrics
+
+          # pushing with labels and verify
+          cat <<EOF | curl -fsSL --data-binary @- http://localhost:9091/metrics/job/test_job/instance/test_instance
+          # HELP test_metric A test metric for pushgateway
+          # TYPE test_metric gauge
+          test_metric{label="value"} 43
+          EOF
+          curl -fsSL http://localhost:9091/metrics | promtool check metrics
+
+          # DELETE functionality
+          curl -fsSL -X DELETE http://localhost:9091/metrics/job/test_job/instance/test_instance
+          curl -fsSL http://localhost:9091/metrics | grep -qv "test_metric{instance=\"test_instance\",job=\"test_job\",label=\"value\"}"
+
+          # Test persistence
+          cat <<EOF | curl -fsSL --data-binary @- http://localhost:9091/metrics/job/persistent_job
+          # HELP persistent_metric A persistent test metric
+          # TYPE persistent_metric gauge
+          persistent_metric 123
+          EOF
+          curl -fsSL http://localhost:9091/metrics | promtool check metrics
+
+          # Wait for persistence file to be created
+          for i in $(seq 1 10); do
+            if [ -f /tmp/pushgateway/metrics ]; then
+              break
+            fi
+            if [ $i -eq 10 ]; then
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # admin API wipe functionality
+          curl -fsSL -X PUT http://localhost:9091/api/v1/admin/wipe
+          curl -fsSL http://localhost:9091/metrics | grep -qv "test_metric"
+
+environment:
+  contents:
+    packages:
+      - go-1.25

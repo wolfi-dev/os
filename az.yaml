@@ -1,0 +1,228 @@
+package:
+  name: az
+  version: "2.87.0"
+  epoch: 0 # go/wolfi-rsc/az
+  description: Azure CLI
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - py${{vars.python-version}}-cryptography
+      # sca does not find symlink farm ultimately back to python3.13
+      - python-${{vars.python-version}}-base
+  resources:
+    cpu: "2"
+    memory: 10Gi
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
+
+vars:
+  python-version: "3.13"
+  venv-home: /opt/chainguard/az
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - py${{vars.python-version}}-cryptography
+      - python-${{vars.python-version}}-dev
+      - uv
+
+pipeline:
+  # git-checkout retained for SBOM source provenance metadata until
+  # Libraries SBOM integration lands in melange (internal-dev#20709, #21315)
+  - uses: git-checkout
+    with:
+      repository: https://github.com/Azure/azure-cli/
+      tag: azure-cli-${{package.version}}
+      expected-commit: f7f6f67676cb4f417b350b4f52596760dc99e8fe
+
+  # --system-site-packages lets the venv fall through to the system
+  # py${{vars.python-version}}-cryptography (FIPS-aware) instead of bundling
+  # its own OpenSSL-linked cryptography wheel.
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv-home}}
+      python: ${{vars.python-version}}
+      system-site-packages: "true"
+
+  - runs: |
+      source "${{vars.venv-home}}/bin/activate"
+
+      # Exclude cryptography from pip install to avoid bundling OpenSSL;
+      # the system py${{vars.python-version}}-cryptography is used via
+      # --system-site-packages instead.
+      echo "cryptography" > /tmp/exclude-pkgs.txt
+
+      # Install azure-cli from PyPI (Chainguard Libraries integration is
+      # currently disabled — restore the auth/uv pipeline step once the
+      # libraries.cgr.dev STS binding for elastic-build is re-provisioned).
+      # --prerelease=allow needed because azure-cli depends on pre-release
+      # packages (e.g. azure-batch==15.0.0b1, azure-mgmt-containerregistry==15.1.0b1)
+      uv pip install \
+        --excludes /tmp/exclude-pkgs.txt --no-compile --prerelease=allow \
+        "azure-cli==${{package.version}}"
+
+      # Verify the installed version matches (both CLI output and pip metadata)
+      "${{vars.venv-home}}/bin/az" version -o tsv | grep -F "${{package.version}}"
+      "${{vars.venv-home}}/bin/python" -c "
+      from importlib.metadata import version, packages_distributions
+      v = version('azure-cli')
+      assert v == '${{package.version}}', f'Expected azure-cli==${{package.version}}, got {v}'
+      print(f'azure-cli=={v} installed correctly')
+      "
+
+      # NOTE: do NOT add `uv pip check` here — it cannot see packages from
+      # --system-site-packages and would falsely report cryptography as missing.
+      uv pip uninstall pip virtualenv
+
+      # Move venv into package output (uv/venv created it at the runtime path
+      # so shebangs already point at the right location).
+      mkdir -p "${{targets.contextdir}}/opt/chainguard"
+      mv "${{vars.venv-home}}" "${{targets.contextdir}}${{vars.venv-home}}"
+      chmod 644 "${{targets.contextdir}}${{vars.venv-home}}/.lock"
+
+      # Symlink az command to PATH
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/az" "${{targets.contextdir}}/usr/bin/az"
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: Azure/azure-cli
+    strip-prefix: azure-cli-
+
+test:
+  pipeline:
+    - uses: test/tw/pip-check
+      with:
+        python: ${{vars.venv-home}}/bin/python
+    - uses: test/tw/help-check
+      with:
+        bins: az
+    - name: Verify azure-cli version and provenance
+      runs: |
+        set -euo pipefail
+
+        # Verify pip metadata version matches package version
+        INSTALLED=$("${{vars.venv-home}}/bin/python" -c "from importlib.metadata import version; print(version('azure-cli'))")
+        if [ "$INSTALLED" != "${{package.version}}" ]; then
+          echo "FAIL: Expected azure-cli==${{package.version}}, got $INSTALLED"
+          exit 1
+        fi
+        echo "PASS: azure-cli==$INSTALLED"
+
+        # Verify az CLI reports same version
+        az version -o json | grep -F "${{package.version}}"
+    - name: Validate Core CLI Commands
+      runs: |
+        # Check az version in multiple formats
+        az version -o json
+        az version -o table
+        az version -o yaml
+
+        # Verify that core command groups exist
+        for cmd in account group network storage; do
+          if ! az "$cmd" -h > /dev/null; then
+            echo "Core command group '$cmd' not found"
+            exit 1
+          fi
+        done
+
+        echo "Basic command tests passed!"
+    - name: Extended CLI Functionality Checks
+      runs: |
+        # Test cloud-related commands without authentication
+        az cloud list -o table
+        az cloud show -n AzureCloud -o json
+
+        # Test configure commands
+        az configure -h
+        az configure --list-defaults
+
+        # Verify presence of additional command groups
+        for cmd in cloud extension configure; do
+          if ! az "$cmd" -h > /dev/null; then
+            echo "Command group '$cmd' not found"
+            exit 1
+          fi
+        done
+
+        # List available extensions (no need to install them)
+        az extension list-available --output table
+
+        # Check if 'az find' help works
+        az find --help
+
+        # Validate debug output
+        az version --debug
+
+        # Verify additional commands are available
+        for cmd in feedback rest upgrade interactive; do
+          if ! az "$cmd" -h > /dev/null; then
+            echo "Command group or command '$cmd' not found"
+            exit 1
+          fi
+        done
+
+        # Check help for these commands explicitly
+        az feedback -h
+        az rest -h
+        az upgrade -h
+        az interactive -h
+
+        echo "Expanded command tests passed!"
+    - uses: test/tw/ldd-check
+
+subpackages:
+  - name: ${{package.name}}-iamguarded-compat
+    description: "compat package with iamguarded/azure-cli image"
+    dependencies:
+      runtime:
+        - az=${{package.full-version}}
+        - bash
+        - busybox
+        - merged-usrsbin
+        - python-${{vars.python-version}}
+        - wolfi-baselayout
+    pipeline:
+      - uses: iamguarded/build-compat
+        with:
+          package: azure-cli
+          version: "2"
+      - runs: |
+          mkdir -p /opt/iamguarded/azure-cli/bin
+          chmod g+rwX /opt/iamguarded
+
+          # Create symlink for az binary
+          ln -sf /usr/bin/az /opt/iamguarded/azure-cli/bin/az
+
+          # Create expected directories
+          mkdir -p /opt/iamguarded/azure-cli/tmp
+          mkdir -p /opt/iamguarded/azure-cli/logs
+          mkdir -p /iamguarded/azure-cli
+      - uses: iamguarded/finalize-compat
+        with:
+          package: azure-cli
+          version: "2"
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: iamguarded/test-compat
+          with:
+            package: azure-cli
+            version: "2"
+        - name: Verify iamguarded symlinks work
+          runs: |
+            # Test az command through symlink
+            /opt/iamguarded/azure-cli/bin/az --version
+
+            # Test basic command functionality
+            /opt/iamguarded/azure-cli/bin/az -h
+            /opt/iamguarded/azure-cli/bin/az version -o json

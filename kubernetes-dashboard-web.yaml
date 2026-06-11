@@ -1,0 +1,107 @@
+package:
+  name: kubernetes-dashboard-web
+  version: "1.7.0"
+  epoch: 24 # toolchain rebuild for  go-1.25-1.25.11
+  description: General-purpose web UI for Kubernetes clusters with enhanced authentication features
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "5"
+    memory: 13Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  contents:
+    packages:
+      - go-1.25
+      - make
+      # I wanted to use the latest but got this build time warning so we're using nodejs-20.
+      # Odd numbered Node.js versions will not enter LTS status and should not be used for production.
+      - nodejs-20
+      - npm
+      - perl
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kubernetes/dashboard
+      tag: web/v${{package.version}}
+      expected-commit: 7198d4a2a6170111a05a6daadaf8b18473f2ce67
+
+  - working-directory: modules/web
+    runs: |
+      yarn set version 3.3.0
+      yarn plugin import workspace-tools
+      SKIP_POSTINSTALL=true yarn workspaces focus
+      make build-frontend
+      # copy static assets
+      mkdir -p ${{targets.contextdir}}
+      cp -av .dist/public/locale_conf.json ${{targets.contextdir}}/locale_conf.json
+      cp -av .dist/public ${{targets.contextdir}}/
+
+  - working-directory: modules/web
+    runs: |
+      GO_VER=$(go version | awk '{print $3}' | sed 's/go//')
+      go work edit -go=${GO_VER}
+
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+        golang.org/x/oauth2@v0.27.0
+        golang.org/x/text@v0.36.0
+      modroot: ./modules/web
+
+  - uses: go/build
+    with:
+      packages: .
+      modroot: ./modules/web
+      output: dashboard-web
+      go-package: go-1.25
+      ldflags: -X k8s.io/dashboard/web/pkg/environment.Version=${{package.version}}
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin/
+          # /dashboard-web -> usr/bin/dashboard-web (relative, resolves to /usr/bin/dashboard-web)
+          ln -sf usr/bin/dashboard-web "${{targets.contextdir}}"/dashboard-web
+          # by default binary will look at this location and this is required for application to function correctly and important for backward compatibility.
+          # symlink path is getting resolved and ultimately it's looking for assets under `/usr/bin/public`
+          # /usr/bin/locale_conf.json -> ../../locale_conf.json (relative, resolves to /locale_conf.json)
+          ln -sf ../../locale_conf.json "${{targets.contextdir}}"/usr/bin/locale_conf.json
+          # /usr/bin/public -> ../../public (relative, resolves to /public)
+          ln -sf ../../public "${{targets.contextdir}}"/usr/bin/public
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/symlink-check
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/kwok/cluster
+    - name: Verify kubernetes-dashboard-web installation
+      runs: |
+        dashboard-web --bind-address=0.0.0.0 --kubeconfig=/root/.kube/config > dashboard-web.log 2>&1 &
+        sleep 5
+        grep -F "Starting Kubernetes Dashboard Web" dashboard-web.log || exit 1
+    - name: Check version in logs
+      runs: |
+        grep -F "${{package.version}}" dashboard-web.log || exit 1
+
+update:
+  enabled: true
+  github:
+    identifier: kubernetes/dashboard
+    strip-prefix: web/v
+    use-tag: true
+    tag-filter: web/v

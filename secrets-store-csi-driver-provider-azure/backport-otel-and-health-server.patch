@@ -1,0 +1,152 @@
+Patch-Source: https://github.com/Azure/secrets-store-csi-driver-provider-azure/commit/70c5e747e418304295a9d40acc7eb6ec35f686af
+From 70c5e747e418304295a9d40acc7eb6ec35f686af Mon Sep 17 00:00:00 2001
+From: Standa Láznička <stlaz@users.noreply.github.com>
+Date: Fri, 9 Jan 2026 19:44:45 +0100
+Subject: [PATCH] refactor: update outdated k8s deps and linter (#1962)
+Signed-off-by: Stanislav Láznička <slznika@microsoft.com>
+Co-authored-by: Anish Ramasekar <anish.ramasekar@gmail.com>
+---
+ pkg/metrics/prometheus_exporter.go | 18 ++++++++++++++----
+ pkg/metrics/stats_reporter.go      | 26 ++++++++++++++------------
+ pkg/server/server.go               |  6 ++++++
+ 3 files changed, 34 insertions(+), 16 deletions(-)
+
+diff --git a/pkg/metrics/prometheus_exporter.go b/pkg/metrics/prometheus_exporter.go
+index 1c62e6f..6f0af3e 100644
+--- a/pkg/metrics/prometheus_exporter.go
++++ b/pkg/metrics/prometheus_exporter.go
+@@ -5,7 +5,11 @@ import (
+ 	"net/http"
+ 	"time"
+
+-	"go.opentelemetry.io/otel/exporters/metric/prometheus"
++	promclient "github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/promhttp"
++	"go.opentelemetry.io/otel"
++	"go.opentelemetry.io/otel/exporters/prometheus"
++	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+ 	"k8s.io/klog/v2"
+ )
+
+@@ -14,14 +18,28 @@ const (
+ )
+
+ func initPrometheusExporter(port int) error {
+-	pusher, err := prometheus.InstallNewPipeline(prometheus.Config{
+-		DefaultHistogramBoundaries: []float64{
+-			0.1, 0.2, 0.3, 0.4, 0.5, 1, 1.5, 2, 2.5, 3.0, 5.0, 10.0, 15.0, 30.0,
+-		}})
++	registry := promclient.NewRegistry()
++
++	exporter, err := prometheus.New(
++		prometheus.WithRegisterer(registry))
+ 	if err != nil {
+ 		return err
+ 	}
+-	http.HandleFunc("/metrics", pusher.ServeHTTP)
++
++	mp := sdkmetric.NewMeterProvider(
++		sdkmetric.WithReader(exporter),
++		sdkmetric.WithView(sdkmetric.NewView(
++			sdkmetric.Instrument{Kind: sdkmetric.InstrumentKindHistogram},
++			sdkmetric.Stream{
++				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
++					Boundaries: []float64{0.1, 0.2, 0.3, 0.4, 0.5, 1, 1.5, 2, 2.5, 3.0, 5.0, 10.0, 15.0, 30.0},
++				},
++			},
++		)),
++	)
++	otel.SetMeterProvider(mp)
++
++	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+ 	go func() {
+ 		server := &http.Server{
+ 			Addr:              fmt.Sprintf(":%v", port),
+diff --git a/pkg/metrics/stats_reporter.go b/pkg/metrics/stats_reporter.go
+index f04e887..a969b9d 100644
+--- a/pkg/metrics/stats_reporter.go
++++ b/pkg/metrics/stats_reporter.go
+@@ -4,9 +4,9 @@ import (
+ 	"context"
+ 	"runtime"
+
++	"go.opentelemetry.io/otel"
+ 	"go.opentelemetry.io/otel/attribute"
+ 	"go.opentelemetry.io/otel/metric"
+-	"go.opentelemetry.io/otel/metric/global"
+ )
+
+ var (
+@@ -20,8 +20,8 @@ var (
+ 	grpcMethodKey   = "grpc_method"
+ 	grpcCodeKey     = "grpc_code"
+ 	grpcMessageKey  = "grpc_message"
+-	keyvaultRequest metric.Float64ValueRecorder
+-	grpcRequest     metric.Float64ValueRecorder
++	keyvaultRequest metric.Float64Histogram
++	grpcRequest     metric.Float64Histogram
+ )
+
+ type reporter struct {
+@@ -36,10 +36,17 @@ type StatsReporter interface {
+
+ // NewStatsReporter creates a new StatsReporter
+ func NewStatsReporter() StatsReporter {
+-	meter := global.Meter("csi-secrets-store-provider-azure")
++	meter := otel.GetMeterProvider().Meter("csi-secrets-store-provider-azure")
+
+-	keyvaultRequest = metric.Must(meter).NewFloat64ValueRecorder("keyvault_request", metric.WithDescription("Distribution of how long it took to get from keyvault"))
+-	grpcRequest = metric.Must(meter).NewFloat64ValueRecorder("grpc_request", metric.WithDescription("Distribution of how long it took for the gRPC requests"))
++	var err error
++	keyvaultRequest, err = meter.Float64Histogram("keyvault_request", metric.WithDescription("Distribution of how long it took to get from keyvault"))
++	if err != nil {
++		panic(err)
++	}
++	grpcRequest, err = meter.Float64Histogram("grpc_request", metric.WithDescription("Distribution of how long it took for the gRPC requests"))
++	if err != nil {
++		panic(err)
++	}
+ 	return &reporter{meter: meter}
+ }
+
+@@ -55,9 +62,8 @@ func (r *reporter) ReportKeyvaultRequest(ctx context.Context, duration float64,
+ 		attribute.String(objectNameKey, objectName),
+ 		attribute.String(errorKey, err),
+ 	}
+-	r.meter.RecordBatch(ctx,
+-		attributes,
+-		keyvaultRequest.Measurement(duration),
++	keyvaultRequest.Record(ctx, duration,
++		metric.WithAttributes(attributes...),
+ 	)
+ }
+
+@@ -72,8 +78,8 @@ func (r *reporter) ReportGRPCRequest(ctx context.Context, duration float64, meth
+ 		attribute.String(grpcCodeKey, code),
+ 		attribute.String(grpcMessageKey, message),
+ 	}
+-	r.meter.RecordBatch(ctx,
+-		attributes,
+-		grpcRequest.Measurement(duration),
++	grpcRequest.Record(ctx,
++		duration,
++		metric.WithAttributes(attributes...),
+ 	)
+ }
+diff --git a/pkg/server/server.go b/pkg/server/server.go
+index c7433e0..d113700 100644
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -97,6 +97,12 @@ func (s *CSIDriverProviderServer) Check(_ context.Context, _ *grpc_health_v1.Hea
+ 	}, nil
+ }
+
++// List provides a non-atomic snapshot of the health of all the available
++// services.
++func (s *CSIDriverProviderServer) List(_ context.Context, _ *grpc_health_v1.HealthListRequest) (*grpc_health_v1.HealthListResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "List is not supported")
++}
++
+ // Watch for the serving status of the requested service.
+ func (s *CSIDriverProviderServer) Watch(_ *grpc_health_v1.HealthCheckRequest, _ grpc_health_v1.Health_WatchServer) error {
+ 	return status.Error(codes.Unimplemented, "Watch is not supported")

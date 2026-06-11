@@ -1,0 +1,152 @@
+package:
+  name: knative-operator-1.22
+  version: "1.22.2"
+  epoch: 2 # CVE-2026-39821
+  description: Automatically provision and manage TLS certificates in Kubernetes
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - knative-operator=${{package.full-version}}
+    runtime:
+      - kodata-compat
+      - tzdata
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/knative/operator
+      tag: knative-v${{package.version}}
+      expected-commit: 48fc4b569a24b40db210a62a5fb7448359d55e0e
+
+  - uses: bump
+    with:
+      deps: golang.org/x/net@v0.55.0
+
+  - name: build the operator
+    uses: go/build
+    with:
+      packages: ./cmd/operator/main.go
+      output: operator
+      go-package: go-1.26
+
+  - name: populate kodata
+    runs: ./hack/update-codegen.sh
+
+  - name: package operator kodata
+    runs: |
+      # Consumers expect /var/run/ko; the kodata-compat package provides a symlink.
+      mkdir -p ${{targets.contextdir}}/usr/share/ko
+      # it's strange that upstream project have suid bit set :(
+      # unset them first before moving
+      find -perm /u=s,g=s -exec chmod u-s,g-s {} \;
+      cp -r ./cmd/operator/kodata/* ${{targets.contextdir}}/usr/share/ko/
+
+subpackages:
+  - name: ${{package.name}}-compat
+    description: Compat package for ${{package.name}}
+    dependencies:
+      provides:
+        - knative-operator-compat=${{package.full-version}}
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/ko-app
+          ln -sf ../usr/bin/operator "${{targets.contextdir}}"/ko-app/operator
+    test:
+      pipeline:
+        - name: Verify compat symlinks
+          runs: |
+            set -euo pipefail
+            readlink /ko-app/operator | grep -F "../usr/bin/operator"
+
+  - name: ${{package.name}}-webhook-compat
+    description: Compat package for ${{package.name}}-webhook
+    dependencies:
+      provides:
+        - knative-operator-webhook-compat=${{package.full-version}}
+      runtime:
+        - ${{package.name}}-webhook
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/ko-app
+          ln -sf ../usr/bin/webhook "${{targets.contextdir}}"/ko-app/webhook
+    test:
+      pipeline:
+        - name: Verify compat symlinks
+          runs: |
+            set -euo pipefail
+            readlink /ko-app/webhook | grep -F "../usr/bin/webhook"
+
+  - name: ${{package.name}}-webhook
+    dependencies:
+      provides:
+        - knative-operator-webhook=${{package.full-version}}
+    pipeline:
+      - name: build the webhook binary
+        uses: go/build
+        with:
+          packages: ./cmd/webhook/main.go
+          output: webhook
+          go-package: go-1.26
+    test:
+      environment:
+        environment:
+          SYSTEM_NAMESPACE: default
+          WEBHOOK_NAME: pikachu
+      pipeline:
+        - uses: test/kwok/cluster
+        - uses: test/daemon-check-output
+          with:
+            start: /usr/bin/webhook
+            timeout: 30
+            # the binary logs ERROR which makes test/daemon-check-output unhappy, setting this so "" so that we don't error on ERROR log messages.
+            error_strings: |
+              FATAL
+            expected_output: |
+              Registering
+              informers
+              factories
+              controllers
+
+test:
+  environment:
+    contents:
+      packages:
+        - fd
+    environment:
+      SYSTEM_NAMESPACE: default
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/systemd-tmpfiles
+    - name: check KODATA
+      runs: |
+        fd eventing /var/run/ko
+        fd serving /var/run/ko
+    - uses: test/kwok/cluster
+    - uses: test/daemon-check-output
+      with:
+        start: /usr/bin/operator
+        timeout: 30
+        error_strings: |
+          FATAL
+          panic
+          failed to create
+        expected_output: |
+          Registering
+          informers
+          factories
+          controllers
+
+update:
+  enabled: true
+  github:
+    identifier: knative/operator
+    strip-prefix: knative-v
+    tag-filter-prefix: knative-v1.22.
+
+environment:
+  contents:
+    packages:
+      - go-1.26

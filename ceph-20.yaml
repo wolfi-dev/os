@@ -2,7 +2,7 @@ package:
   name: ceph-20
   version: "20.2.2"
   description: Distributed object, block, and file storage
-  epoch: 0
+  epoch: 1
   copyright:
     - license: LGPL-2.1
   resources:
@@ -33,8 +33,15 @@ package:
       - ${{package.name}}-mon=${{package.full-version}}
       - ${{package.name}}-osd=${{package.full-version}}
       - ${{package.name}}-radosgw=${{package.full-version}}
+      # rook's RGW startup/readiness probes exec `bash -c '... curl ...'` in
+      # the radosgw container (rook: pkg/operator/ceph/object/rgw-probe.sh).
+      - bash
+      - curl
       # data-only dep used by the dashboard mgr module at runtime.
       - grafana-grafonnet
+      # full python (owns /usr/bin/python3) for the all-in-one deploy; rook's
+      # OSD activate init container and ceph tooling invoke generic `python3`.
+      - python-${{vars.python-version}}
     provides:
       - ceph=${{package.full-version}}
 
@@ -276,6 +283,23 @@ pipeline:
              "$sitepkg"/rbd-*.egg-info \
              "$sitepkg"/cephfs-*.egg-info \
              "$sitepkg"/rgw-*.egg-info
+
+  - name: Pin generic python3 shebangs to the versioned interpreter
+    runs: |
+      # crushdiff and mount.fuse.ceph ship a generic '#!/usr/bin/python3' shebang,
+      # which would force a full-python dependency; rewrite each to the versioned
+      # interpreter so subpackages can depend on python-${{vars.python-version}}-base.
+      # Both files must exist: sed fails the build on a missing file, and the
+      # grep assertion fails it if the rewrite did not land.
+      for name in crushdiff mount.fuse.ceph; do
+        f="${{targets.destdir}}/usr/bin/$name"
+        sed -i '1s|^#!/usr/bin/python3$|#!/usr/bin/python${{vars.python-version}}|' "$f"
+        head -n1 "$f" | grep -qxF '#!/usr/bin/python${{vars.python-version}}'
+        echo "pinned shebang: /usr/bin/$name"
+      done
+      # Backstop: assert no other generic python3 shebang remains anywhere in the
+      # install tree ('|| true' only neutralizes grep's no-match exit code).
+      test -z "$(grep -rlIE '^#!/usr/bin/(env +)?python3([[:space:]]|$)' "${{targets.destdir}}" || true)"
 
   - uses: strip
 
@@ -695,7 +719,7 @@ subpackages:
         - py${{vars.python-version}}-${{package.name}}-rbd=${{package.full-version}}
         - py${{vars.python-version}}-${{package.name}}-rgw=${{package.full-version}}
         - py${{vars.python-version}}-prettytable
-        - python-${{vars.python-version}}
+        - python-${{vars.python-version}}-base
         - umount
       provides:
         - ceph-common=${{package.full-version}}
@@ -783,7 +807,7 @@ subpackages:
             bins: ceph rados rbd radosgw-admin ceph-authtool ceph-conf ceph-dencoder
         - uses: test/tw/help-check
           with:
-            bins: ceph rados rbd radosgw-admin ceph-authtool ceph-conf
+            bins: ceph rados rbd radosgw-admin ceph-authtool ceph-conf crushdiff mount.fuse.ceph
         - uses: python/import
           with:
             python: python${{vars.python-version}}
@@ -1135,7 +1159,7 @@ subpackages:
         - ${{package.name}}-libcephfs=${{package.full-version}}
         - ${{package.name}}-librbd=${{package.full-version}}
         - fuse3
-        - python-${{vars.python-version}}
+        - python-${{vars.python-version}}-base
       provides:
         - ceph-fuse=${{package.full-version}}
     pipeline:
@@ -1472,7 +1496,7 @@ subpackages:
       environment:
         contents:
           packages:
-            - python-${{vars.python-version}}
+            - python-${{vars.python-version}}-base
       pipeline:
         - name: diskprediction_local module + models installed
           runs: |
@@ -1620,7 +1644,9 @@ test:
         done
 
         # Check status
-        ceph health | grep -q HEALTH_OK || {
+        # mgr may respawn mid-bootstrap, leaving .mgr without its `mgr` application
+        # (POOL_APP_NOT_ENABLED); enable it ourselves and poll until HEALTH_OK.
+        timeout 180 bash -c 'until ceph health 2>/dev/null | grep -qF "HEALTH_OK"; do ceph osd pool application enable .mgr mgr 2>/dev/null || true; sleep 2; done' || {
           tail -n100 /var/log/ceph/*.log
           ceph -s
           ceph osd tree

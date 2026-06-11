@@ -1,0 +1,76 @@
+name: Configure npm to fetch Chainguard Libraries dependencies.
+
+needs:
+  packages:
+    - busybox
+    - cosign
+    - curl
+    - jq
+    - pnpm
+
+inputs:
+  identity:
+    description: the identity to use for Chainguard Libraries
+    default: "720909c9f5279097d847ad02a2f24ba8f59de36a/a49c7fedc33adf69"
+  group:
+    description: the group to use for Chainguard Libraries
+    default: "720909c9f5279097d847ad02a2f24ba8f59de36a"
+  allow-fallback-registry:
+    description: |
+      allow falling back to another registry when a package is not
+      available via Chainguard Libraries
+    default: "false"
+  fallback-registry-url:
+    description: the registry URL to fall back to when allow-fallback-registry is true
+    default: "https://registry.npmjs.org"
+
+pipeline:
+  - name: Install chainctl
+    runs: |
+      set -eu
+
+      ARCH=${{build.arch}}
+      PLATFORM="linux_${ARCH/aarch64/arm64}"
+      curl --fail-with-body -sSL -o /usr/local/bin/chainctl \
+        "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}"
+      chmod 755 /usr/local/bin/chainctl
+
+      VERSION=$(curl -sS "https://dl.enforce.dev/chainctl/latest/metadata.json" | jq -r .version)
+      cosign verify-blob \
+        --signature "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}.sig" \
+        --certificate "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}.cert.pem" \
+        --certificate-identity "https://github.com/chainguard-dev/mono/.github/workflows/.release-drop.yaml@refs/tags/v${VERSION}" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        /usr/local/bin/chainctl
+
+  - name: Setup npm credentials
+    runs: |
+      set -eu
+
+      if [ -f ${{package.srcdir}}/.libraries.token ]; then
+        cgtoken=$(cat ${{package.srcdir}}/.libraries.token)
+      else
+        idtoken=$(curl --fail-with-body -sSL -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=issuer.enforce.dev)
+        cgtoken=$(curl --fail-with-body -sSL -H "Authorization: Bearer ${idtoken}" 'https://issuer.enforce.dev/sts/exchange?aud=libraries.cgr.dev&scope=${{inputs.group}}&identity=${{inputs.identity}}' | jq -r '.token')
+      fi
+
+      cat > /etc/npmrc <<EOF
+      registry=https://libraries.cgr.dev/javascript/
+      //libraries.cgr.dev/javascript/:_authToken=$cgtoken
+      EOF
+
+      # Override registry in project-level .npmrc files to use Chainguard Libraries
+      for npmrc in $(find ${{package.srcdir}} -name .npmrc -not -path '*/node_modules/*' -type f); do
+        (cd "$(dirname "$npmrc")" && pnpm config set registry=https://libraries.cgr.dev/javascript/ --location=project)
+      done
+
+      fallback_flag=""
+      if [ "${{inputs.allow-fallback-registry}}" = "true" ]; then
+        fallback_flag="--fallback-registry-url ${{inputs.fallback-registry-url}}"
+      fi
+
+      for lockfile_name in package-lock.json yarn.lock pnpm-lock.yaml bun.lock; do
+        find . -name "$lockfile_name" -not -path '*/node_modules/*' -type f \
+          -exec echo "Updating {} hashes for Chainguard Libraries..." \; \
+          -exec env CHAINCTL_AUTH_TOKEN="$cgtoken" chainctl libraries update-hashes --replace --parent ${{inputs.group}} $fallback_flag {} \;
+      done

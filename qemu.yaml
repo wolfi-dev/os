@@ -1,7 +1,7 @@
 package:
   name: qemu
   version: "11.0.1"
-  epoch: 0
+  epoch: 1
   description: "fast processor emulator"
   copyright:
     - license: GPL-2.0
@@ -23,6 +23,7 @@ environment:
       - bash
       - bison
       - build-base
+      - ceph-20-dev
       - curl-dev
       - flex
       - git
@@ -30,9 +31,11 @@ environment:
       - glib-dev
       - glib-static
       - libaio-dev
+      - libiscsi-dev
       - libjpeg-turbo-dev
       - libseccomp-dev
       - liburing-dev
+      - libusb-dev
       - libxkbcommon-dev
       - ncurses
       - ncurses-dev
@@ -41,6 +44,9 @@ environment:
       - pixman-dev
       - python3-as-${{vars.python-version}}
       - samurai
+      - spice-dev
+      - spice-protocol
+      - usbredir-dev
       - wolfi-base
       - xkeyboard-config
       - zlib-dev
@@ -63,9 +69,16 @@ pipeline:
       # -Wno-discarded-qualifiers: dtc subproject has const-qualifier issues in fdt_overlay.c
       CFLAGS="$CFLAGS -Wno-maybe-uninitialized -Wno-discarded-qualifiers" \
           ../../configure \
+              --enable-libiscsi \
+              --enable-libusb \
+              --enable-modules \
+              --enable-rbd \
               --enable-seccomp \
+              --enable-spice \
+              --enable-spice-protocol \
               --enable-system \
               --enable-slirp \
+              --enable-usb-redir \
               --enable-vnc \
               --target-list=x86_64-softmmu,aarch64-softmmu \
               --prefix=/usr
@@ -109,6 +122,11 @@ subpackages:
 
   - name: ${{package.name}}-utils # in Alpine this is qemu-img
     description: "QEMU utils"
+    dependencies:
+      runtime:
+        # qemu-img and friends load block driver modules (curl, dmg);
+        # modules must match the exact build they were compiled with
+        - ${{package.name}}-modules=${{package.full-version}}
     pipeline:
       - runs: |
           set -x
@@ -151,6 +169,17 @@ subpackages:
                 }
                 echo "PASS: $t"
             done
+        - name: "modular curl block driver is loadable"
+          runs: |
+            set -euo pipefail
+            # connection refused is fine; "Unknown protocol" means the
+            # block-curl module failed to load
+            out=$(qemu-img info "https://127.0.0.1:1/nonexistent" 2>&1 || true)
+            echo "$out" | grep -qi "unknown protocol" && {
+              echo "FAIL: https protocol driver not available: $out"
+              exit 1
+            }
+            echo "PASS: block-curl module loads: $out"
 
   - name: ${{package.name}}-system-x86_64
     description: "QEMU x86 system"
@@ -158,6 +187,8 @@ subpackages:
       runtime:
         - ${{package.name}}-ipxe
         - ${{package.name}}-edk2-x86_64
+        # modules must match the exact build they were compiled with
+        - ${{package.name}}-modules=${{package.full-version}}
     pipeline:
       - runs: |
           set -x
@@ -194,6 +225,9 @@ subpackages:
               -sandbox on \
               -kernel /tmp/boot/vmlinuz-virt -m 1G -nographic -append "console=ttyS0 panic=1" \
               -no-reboot | grep -F "Unable to mount root fs"
+        - name: "modular virtio-gpu device is loadable"
+          runs: |
+            qemu-system-x86_64 -device virtio-gpu-pci,help > /dev/null
 
   - name: ${{package.name}}-edk2-x86_64
     description: "QEMU built edk2 files for x86_64"
@@ -221,6 +255,8 @@ subpackages:
       runtime:
         - ${{package.name}}-ipxe
         - ${{package.name}}-edk2-aarch64
+        # modules must match the exact build they were compiled with
+        - ${{package.name}}-modules=${{package.full-version}}
     pipeline:
       - runs: |
           set -x
@@ -254,6 +290,9 @@ subpackages:
             # immediately with "-sandbox support is not enabled in this QEMU binary".
             qemu-system-aarch64 -sandbox on -kernel /tmp/boot/vmlinuz-virt -m 1G -cpu max -machine virt \
               -nographic -no-reboot -append "panic=1" | grep -F "Unable to mount root fs"
+        - name: "modular virtio-gpu device is loadable"
+          runs: |
+            qemu-system-aarch64 -machine virt -device virtio-gpu-pci,help > /dev/null
 
   - name: ${{package.name}}-edk2-aarch64
     description: "QEMU built edk2 files for aarch64"
@@ -272,6 +311,169 @@ subpackages:
             files: |
               /usr/share/qemu/edk2-aarch64-code.fd
               /usr/share/qemu/edk2-aarch64-vars.fd
+
+  - name: ${{package.name}}-modules-spice
+    description: "QEMU SPICE display and USB redirection modules"
+    dependencies:
+      runtime:
+        # keep the module set aligned with the binaries that load it
+        - ${{package.name}}-modules=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/qemu
+          for i in audio-spice chardev-spice hw-display-qxl hw-usb-redirect ui-spice-app ui-spice-core; do
+            mv "${{targets.destdir}}"/usr/lib/qemu/$i.so "${{targets.subpkgdir}}"/usr/lib/qemu/
+          done
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-system-x86_64
+            - python3
+            - wait-for-it
+      pipeline:
+        - uses: test/tw/ldd-check
+        # not test/daemon-check-output: it keys readiness on log output
+        # and qemu prints nothing on success; the open port is the signal
+        - name: "spice server accepts a SPICE protocol link"
+          runs: |
+            set -euo pipefail
+            qemu-system-x86_64 \
+              -S -daemonize -display none -m 256M \
+              -vga qxl \
+              -chardev spicevmc,id=vdagent,name=vdagent \
+              -audiodev spice,id=snd0 \
+              -spice port=5931,addr=127.0.0.1,disable-ticketing=on \
+              -pidfile /tmp/qemu-spice.pid
+            wait-for-it -t 30 127.0.0.1:5931
+
+            # SPICE link handshake for the main channel: the server must
+            # answer with the REDQ magic, protocol 2.x and error == OK
+            python3 <<'PYEOF'
+            import socket, struct
+
+            def recv_exact(sock, n):
+                buf = b""
+                while len(buf) < n:
+                    chunk = sock.recv(n - len(buf))
+                    if not chunk:
+                        raise SystemExit(f"FAIL: connection closed after {len(buf)} bytes")
+                    buf += chunk
+                return buf
+
+            s = socket.create_connection(("127.0.0.1", 5931), timeout=10)
+            # SpiceLinkMess: connection_id, channel_type=1 (MAIN), channel_id,
+            # num_common_caps, num_channel_caps, caps_offset
+            mess = struct.pack("<IBBIII", 0, 1, 0, 0, 0, 18)
+            # SpiceLinkHeader: magic, major, minor, payload size
+            s.sendall(struct.pack("<4sIII", b"REDQ", 2, 2, len(mess)) + mess)
+
+            magic, major, minor, size = struct.unpack("<4sIII", recv_exact(s, 16))
+            if magic != b"REDQ" or major != 2:
+                raise SystemExit(f"FAIL: bad link reply: magic={magic!r} version={major}.{minor}")
+            (error,) = struct.unpack_from("<I", recv_exact(s, size), 0)
+            if error != 0:
+                raise SystemExit(f"FAIL: spice link error {error}")
+            print(f"PASS: spice link reply: protocol {major}.{minor}, error=OK")
+            PYEOF
+
+            kill "$(cat /tmp/qemu-spice.pid)"
+
+  # separate from qemu-modules: pulls libiscsi, which the default
+  # qemu closure should not gain
+  - name: ${{package.name}}-block-iscsi
+    description: "QEMU iSCSI block driver module"
+    dependencies:
+      runtime:
+        # keep the module set aligned with the binaries that load it
+        - ${{package.name}}-modules=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/qemu
+          mv "${{targets.destdir}}"/usr/lib/qemu/block-iscsi.so "${{targets.subpkgdir}}"/usr/lib/qemu/
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-utils
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "iscsi protocol driver is loadable"
+          runs: |
+            set -euo pipefail
+            # a connection error is fine; "Unknown protocol" means the
+            # block-iscsi module failed to load
+            out=$(timeout 30 qemu-img info "iscsi://127.0.0.1:1/iqn.2026-06.test:nonexistent/0" 2>&1 || true)
+            echo "$out" | grep -qi "unknown protocol" && {
+              echo "FAIL: iscsi protocol driver not available: $out"
+              exit 1
+            }
+            echo "PASS: block-iscsi module loads: $out"
+
+  # separate from qemu-modules: pulls the ceph librbd/librados stack,
+  # far too heavy for the default qemu closure
+  - name: ${{package.name}}-block-rbd
+    description: "QEMU Ceph RBD block driver module"
+    dependencies:
+      runtime:
+        # keep the module set aligned with the binaries that load it
+        - ${{package.name}}-modules=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/qemu
+          mv "${{targets.destdir}}"/usr/lib/qemu/block-rbd.so "${{targets.subpkgdir}}"/usr/lib/qemu/
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-utils
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "rbd protocol driver is loadable"
+          runs: |
+            set -euo pipefail
+            # a ceph connection error is fine; "Unknown protocol" means
+            # the block-rbd module failed to load
+            out=$(timeout 30 qemu-img info "rbd:pool/nonexistent:mon_host=127.0.0.1:6789" 2>&1 || true)
+            echo "$out" | grep -qi "unknown protocol" && {
+              echo "FAIL: rbd protocol driver not available: $out"
+              exit 1
+            }
+            echo "PASS: block-rbd module loads: $out"
+
+  - name: ${{package.name}}-modules-usb-host
+    description: "QEMU USB host passthrough module"
+    dependencies:
+      runtime:
+        # keep the module set aligned with the binaries that load it
+        - ${{package.name}}-modules=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/qemu
+          mv "${{targets.destdir}}"/usr/lib/qemu/hw-usb-host.so "${{targets.subpkgdir}}"/usr/lib/qemu/
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-system-x86_64
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: "usb-host device module is loadable"
+          runs: |
+            qemu-system-x86_64 -device usb-host,help > /dev/null
+
+  # catch-all for the remaining loadable modules; a hard dependency of the
+  # qemu-system packages so previously built-in features stay available
+  - name: ${{package.name}}-modules
+    description: "QEMU loadable modules"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/qemu
+          mv "${{targets.destdir}}"/usr/lib/qemu/*.so "${{targets.subpkgdir}}"/usr/lib/qemu/
+          rmdir "${{targets.destdir}}"/usr/lib/qemu
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
 
   - name: ${{package.name}}-user
     description: "QEMU user binaries"

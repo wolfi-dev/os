@@ -1,0 +1,62 @@
+name: lib-coverage
+
+needs:
+  packages:
+    - busybox
+    - cosign
+    - curl
+    - jq
+
+inputs:
+  identity:
+    description: the identity to use for Chainguard Libraries
+    default: "720909c9f5279097d847ad02a2f24ba8f59de36a/a49c7fedc33adf69"
+  group:
+    description: the group to use for Chainguard Libraries
+    default: "720909c9f5279097d847ad02a2f24ba8f59de36a"
+  path:
+    description: the path to verify for library coverage
+    default: ${{targets.contextdir}}
+
+pipeline:
+  - name: Install chainctl
+    runs: |
+      set -eu
+
+      # The test runs inside a melange qemu VM whose package rootfs (e.g.
+      # /usr/local/bin) is not writable; only the workspace is. Install chainctl
+      # under the workspace dir and add it to PATH in the verify step below.
+      bindir="${PWD}/.test-tools"
+      mkdir -p "${bindir}"
+
+      ARCH=${{build.arch}}
+      PLATFORM="linux_${ARCH/aarch64/arm64}"
+      curl --fail-with-body -sSL -o "${bindir}/chainctl" \
+        "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}"
+      chmod 755 "${bindir}/chainctl"
+
+      VERSION=$(curl -sS "https://dl.enforce.dev/chainctl/latest/metadata.json" | jq -r .version)
+      cosign verify-blob \
+        --signature "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}.sig" \
+        --certificate "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}.cert.pem" \
+        --certificate-identity "https://github.com/chainguard-dev/mono/.github/workflows/.release-drop.yaml@refs/tags/v${VERSION}" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        "${bindir}/chainctl"
+
+  - name: Verify Chainguard Libraries coverage
+    runs: |
+      set -euo pipefail
+
+      # chainctl was installed under the workspace dir by the previous step.
+      export PATH="${PWD}/.test-tools:${PATH}"
+
+      # If libraries token exists in source dir, use that.
+      if [ -f ${{package.srcdir}}/.libraries.token ]; then
+        cgtoken=$(cat ${{package.srcdir}}/.libraries.token)
+      else
+        idtoken=$(curl --fail-with-body -sSL -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=issuer.enforce.dev)
+        cgtoken=$(curl --fail-with-body -sSL -H "Authorization: Bearer ${idtoken}" 'https://issuer.enforce.dev/sts/exchange?aud=libraries.cgr.dev&scope=${{inputs.group}}&identity=${{inputs.identity}}' | jq -r '.token')
+      fi
+
+      # Verify library coverage for the specified path
+      CHAINCTL_AUTH_TOKEN="$cgtoken" chainctl libs verify "${{inputs.path}}" --verbose

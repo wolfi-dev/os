@@ -3,7 +3,7 @@ package:
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
   version: "7.79.2"
-  epoch: 3 # GHSA-r374-rxx8-8654
+  epoch: 4 # ZD9970: build components un-bundled + stripped
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -319,17 +319,22 @@ pipeline:
 
   - name: Build the agent
     runs: |
-      # Default includes [process-agent, security-agent, trace-agent]. Add in
-      # the `system-probe` as well, which saves us ~140Mb.
+      # ZD9970: build the agent components as separate binaries rather than a
+      # single bundled multicall. Bundling (added upstream in wolfi-dev/os#19608)
+      # shares one Go runtime/text segment to save ~140Mb on disk, but because
+      # every sub-agent (trace/process/security/system-probe) runs as its own
+      # process, each one loads the full multicall binary — inflating per-process
+      # RSS ~2x vs upstream's purpose-built binaries. Building separately matches
+      # the upstream datadog/agent layout and restores per-process memory parity.
+      # Trades disk (~+100Mb) for runtime memory; see PR description. system-probe
+      # is already built separately above and is installed as its own binary.
       invoke -e agent.build \
-        --bundle process-agent \
-        --bundle trace-agent \
-        --bundle system-probe \
-        --bundle security-agent \
         --no-development \
         --python-home-3=/opt/datadog-agent/embedded \
         --embedded-path /usr/lib
-        #--bundle-ebpf \ # Same as above for the system-probe.build Invoke task.
+      invoke -e trace-agent.build
+      invoke -e process-agent.build
+      invoke -e security-agent.build
 
   - name: Build trace-loader
     runs: |
@@ -350,11 +355,19 @@ pipeline:
         ${{targets.contextdir}}${{vars.destd}}/embedded/bin
 
       install -Dm755 bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent
-      # *-agent is just a symlink to the "agent" multicall
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/process-agent"
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/security-agent"
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-agent"
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/system-probe"
+      strip "${{targets.contextdir}}${{vars.destd}}/bin/agent/agent"
+      # ZD9970: install each component as its own stripped binary instead of a
+      # symlink to the bundled multicall. Stripping removes ~70Mb of debug info
+      # per the agent binary (no runtime/RSS impact) and matches upstream, which
+      # ships stripped binaries.
+      install -Dm755 bin/trace-agent/trace-agent "${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-agent"
+      install -Dm755 bin/process-agent/process-agent "${{targets.contextdir}}${{vars.destd}}/embedded/bin/process-agent"
+      install -Dm755 bin/security-agent/security-agent "${{targets.contextdir}}${{vars.destd}}/embedded/bin/security-agent"
+      install -Dm755 bin/system-probe/system-probe "${{targets.contextdir}}${{vars.destd}}/embedded/bin/system-probe"
+      strip "${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-agent"
+      strip "${{targets.contextdir}}${{vars.destd}}/embedded/bin/process-agent"
+      strip "${{targets.contextdir}}${{vars.destd}}/embedded/bin/security-agent"
+      strip "${{targets.contextdir}}${{vars.destd}}/embedded/bin/system-probe"
 
       mkdir -p ${{targets.contextdir}}/etc/datadog-agent/
 

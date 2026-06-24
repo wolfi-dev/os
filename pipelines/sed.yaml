@@ -1,0 +1,122 @@
+name: Guarded in-place sed substitution
+
+description: |
+  Performs an in-place substitution across one or more files, mostly
+  equivalent to:
+
+    sed -i 's/pattern/replacement/g' <path>
+
+  but guarded so the edit fails loudly when it would silently do nothing:
+  before editing, grep for 'pattern' across the matched files and fail if
+  there are no matches anywhere (the substitution would have been a no-op).
+
+  This is useful for patching source files where an upstream change to the
+  text being matched should break the build rather than be silently ignored.
+
+  pattern and replacement are interpreted as extended regular expressions
+  (ERE), matching the behaviour of both sed -E and grep -E. The same
+  expression is used for the sed substitution and the pre-edit grep, so
+  anchors and backreferences in 'pattern' apply to the grep check too.
+
+  The substitution delimiter is auto-selected from a set of common
+  characters ('/', '|', '#', ...), picking one that appears in neither
+  pattern nor replacement so the generated sed expression is always
+  well-formed. It can be pinned explicitly with the 'delimiter' input
+  (it is then an error for it to occur in pattern or replacement):
+
+    - uses: sed
+      with:
+        path: ./config.mk
+        pattern: |-
+          ^PREFIX = .*
+        replacement: PREFIX = /usr
+        delimiter: "|"
+
+  'path' accepts standard shell globs and may list several space-separated
+  paths or globs, e.g. "src/*.c include/*.h". It is passed unquoted to grep
+  and sed so the shell word-splits and expands it; a glob that matches
+  nothing is left literal and makes the edit fail loudly on the missing
+  file rather than silently doing nothing.
+
+inputs:
+  path:
+    description: |
+      File(s) to edit in place. Accepts a single path, a shell glob (e.g.
+      "src/*.c"), or several space-separated paths/globs. The edit fails
+      loudly if a path/glob does not resolve to an existing file.
+    required: true
+  pattern:
+    description: |
+      The extended regular expression to search for. The edit fails if this
+      pattern is not found in the file before the substitution.
+    required: true
+  replacement:
+    description: |
+      The replacement text.
+    required: true
+  delimiter:
+    description: |
+      Optional single-character delimiter for the sed substitution. By
+      default a delimiter is auto-selected from a set of common candidates,
+      choosing one that appears in neither pattern nor replacement. Set this
+      only to force a specific character; it is an error if the chosen
+      delimiter occurs in pattern or replacement.
+    required: false
+    default: ""
+
+pipeline:
+  - name: Guarded sed substitution
+    runs: |
+      set -euo pipefail
+
+      pattern='${{inputs.pattern}}'
+      replacement='${{inputs.replacement}}'
+      delim='${{inputs.delimiter}}'
+
+      # Fail if the pattern is not present in any of the target files. The
+      # path input is left unquoted so the shell word-splits and expands the
+      # glob(s); a glob that matches nothing stays literal and makes grep (and
+      # sed below) fail loudly on the missing file rather than silently doing
+      # nothing.
+      if ! grep -Eq -- "${pattern}" ${{inputs.path}}; then
+        echo "ERROR: sed pipeline: pattern not found in any matched file, refusing to run a no-op substitution: ${pattern}" >&2
+        exit 1
+      fi
+
+      # True if the single character $1 occurs anywhere in the string $2.
+      contains() {
+        case "$2" in
+          *"$1"*) return 0 ;;
+          *) return 1 ;;
+        esac
+      }
+
+      # Pick a substitution delimiter that occurs in neither the pattern nor
+      # the replacement, otherwise the generated sed expression would be
+      # malformed (e.g. a '/' in pattern with a '/' delimiter). If the caller
+      # pinned one, validate it; otherwise auto-select the first conflict-free
+      # candidate.
+      if [ -n "${delim}" ]; then
+        if [ "${#delim}" -ne 1 ]; then
+          echo "ERROR: sed pipeline: delimiter must be a single character: '${delim}'" >&2
+          exit 1
+        fi
+        if contains "${delim}" "${pattern}" || contains "${delim}" "${replacement}"; then
+          echo "ERROR: sed pipeline: delimiter '${delim}' occurs in pattern or replacement; pick another" >&2
+          exit 1
+        fi
+      else
+        for c in '/' '|' '#' '@' ',' ':' ';' '!' '%'; do
+          if ! contains "$c" "${pattern}" && ! contains "$c" "${replacement}"; then
+            delim="$c"
+            break
+          fi
+        done
+        if [ -z "${delim}" ]; then
+          echo "ERROR: sed pipeline: could not auto-select a delimiter absent from pattern and replacement; set 'delimiter' explicitly" >&2
+          exit 1
+        fi
+      fi
+
+      # Perform the in-place global substitution on every matched file.
+      sed -E -i "s${delim}${pattern}${delim}${replacement}${delim}g" ${{inputs.path}}

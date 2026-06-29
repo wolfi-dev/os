@@ -1,0 +1,127 @@
+package:
+  name: gss-ntlmssp
+  version: "1.3.1"
+  epoch: 0
+  description: A GSSAPI mechanism implementing NTLM (MS-NLMP) for SPNEGO/Negotiate
+  copyright:
+    - license: ISC
+  dependencies:
+    runtime:
+      # The mechanism plugin is dlopen'd by the krb5 GSSAPI mechglue
+      # (libgssapi_krb5, shipped by krb5-libs), which also reads the
+      # /etc/gss/mech.d registration this package installs.
+      - krb5-libs
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - gettext-dev
+      - krb5-dev
+      - libtool
+      - libunistring-dev
+      # NOTE: openssl-hardened-dev does NOT work here — it drops the legacy RC4
+      # API (RC4_KEY/RC4_set_key/RC4), but NTLM/MS-NLMP requires RC4 (and MD4)
+      # for its sign/seal, so src/crypto.c fails to compile against it.
+      - openssl-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/gssapi/gss-ntlmssp
+      tag: v${{package.version}}
+      expected-commit: 3a24e4579c4187f6aadff1243610890c9e6d690e
+
+  - runs: autoreconf -fiv
+
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --libdir=/usr/lib \
+        --sysconfdir=/etc \
+        --without-wbclient \
+        --without-manpages \
+        --disable-static
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - runs: |
+      # Drop the libtool archive.
+      rm -f "${{targets.destdir}}"/usr/lib/gssntlmssp/gssntlmssp.la
+      # Register the mechanism with the krb5 GSSAPI mechglue. configure substitutes
+      # @libdir@ in this template, so it points at /usr/lib/gssntlmssp/gssntlmssp.so.
+      # krb5 >= 1.12 reads /etc/gss/mech.d/*.conf.
+      install -Dpm644 examples/mech.ntlmssp \
+        "${{targets.destdir}}"/etc/gss/mech.d/ntlmssp.conf
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: gss-ntlmssp development headers
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  github:
+    identifier: gssapi/gss-ntlmssp
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+        - krb5
+        - krb5-dev
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Mechanism plugin and registration are installed
+      runs: |
+        test -f /usr/lib/gssntlmssp/gssntlmssp.so
+        test -f /etc/gss/mech.d/ntlmssp.conf
+        grep -q '1.3.6.1.4.1.311.2.2.10' /etc/gss/mech.d/ntlmssp.conf
+        grep -q '/usr/lib/gssntlmssp/gssntlmssp.so' /etc/gss/mech.d/ntlmssp.conf
+    - name: GSSAPI advertises the NTLMSSP mechanism
+      runs: |
+        # Functional check: with the mech.d registration in place, the krb5
+        # mechglue must enumerate the NTLM OID (1.3.6.1.4.1.311.2.2.10) via
+        # gss_indicate_mechs — proving the plugin loads and registers.
+        cat > /tmp/ntlm_mech.c <<'EOF'
+        #include <gssapi/gssapi.h>
+        #include <stdio.h>
+        #include <string.h>
+        int main(void) {
+            OM_uint32 maj, min;
+            gss_OID_set mechs = GSS_C_NO_OID_SET;
+            /* DER content of 1.3.6.1.4.1.311.2.2.10 */
+            const unsigned char ntlm[] = {0x2b,0x06,0x01,0x04,0x01,0x82,0x37,0x02,0x02,0x0a};
+            maj = gss_indicate_mechs(&min, &mechs);
+            if (maj != GSS_S_COMPLETE) { fprintf(stderr, "gss_indicate_mechs failed\n"); return 2; }
+            for (size_t i = 0; i < mechs->count; i++) {
+                gss_OID o = &mechs->elements[i];
+                if (o->length == sizeof(ntlm) && memcmp(o->elements, ntlm, sizeof(ntlm)) == 0) {
+                    printf("NTLMSSP mechanism present\n");
+                    gss_release_oid_set(&min, &mechs);
+                    return 0;
+                }
+            }
+            fprintf(stderr, "NTLMSSP mechanism NOT advertised\n");
+            return 1;
+        }
+        EOF
+        cc /tmp/ntlm_mech.c $(krb5-config --cflags gssapi) $(krb5-config --libs gssapi) -o /tmp/ntlm_mech
+        /tmp/ntlm_mech

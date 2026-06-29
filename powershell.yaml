@@ -1,7 +1,7 @@
 package:
   name: powershell
   version: "7.6.3"
-  epoch: 1 # go/wolfi-rsc/powershell
+  epoch: 2
   description: 'cross-platform automation and configuration tool/framework'
   copyright:
     - license: MIT
@@ -92,6 +92,29 @@ pipeline:
 
           # binary link
           ln -s "/usr/lib/${{package.name}}/pwsh" "${{targets.destdir}}"/usr/bin/pwsh
+      - runs: |
+          # Bundle the PowerShell Gallery modules that upstream ships in its packages
+          # (PowerShellGet, PackageManagement, PSResourceGet, Archive, PSReadLine, ThreadJob).
+          # Upstream does this via Restore-PSModuleToBuild/Copy-PSGalleryModules; the bare
+          # `dotnet publish` above omits them, which drops Install-Module/Find-Module and
+          # leaves us without the module-install tooling the upstream image provides.
+          dotnet restore src/Modules/PSGalleryModules.csproj --packages /tmp/psgallery -p:NuGetAudit=false
+          modules_dir="${{targets.destdir}}"/usr/lib/${{package.name}}/Modules
+          install -dm 755 "$modules_dir"
+          # Module directory name == PackageReference Include (matches upstream Copy-PSGalleryModules).
+          for name in PowerShellGet PackageManagement Microsoft.PowerShell.PSResourceGet Microsoft.PowerShell.Archive PSReadLine Microsoft.PowerShell.ThreadJob; do
+            lc=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+            src=$(ls -d /tmp/psgallery/"$lc"/*/ | head -1)
+            dest="$modules_dir/$name"
+            rm -rf "$dest"
+            install -dm 755 "$dest"
+            cp -a "$src". "$dest"/
+            # Drop nuget packaging artifacts and the Windows-only fullclr payload.
+            rm -rf "$dest"/_rels "$dest"/package "$dest"/fullclr \
+                   "$dest"/'[Content_Types].xml' "$dest"/*.nupkg "$dest"/*.nuspec \
+                   "$dest"/*.nupkg.metadata "$dest"/*.nupkg.sha512 "$dest"/*.signature.p7s \
+                   "$dest"/System.Runtime.InteropServices.RuntimeInformation.dll
+          done
 
 update:
   enabled: true
@@ -128,3 +151,13 @@ test:
         set -euo pipefail
         pwsh -Command "'hello','world' | ForEach-Object { \$_.ToUpper() }" | grep -F "HELLO"
         pwsh -Command "'hello','world' | ForEach-Object { \$_.ToUpper() }" | grep -F "WORLD"
+    - name: Bundled Gallery modules and module-install tooling are present
+      runs: |
+        set -euo pipefail
+        # The gallery modules upstream ships must be importable...
+        for m in PowerShellGet PackageManagement Microsoft.PowerShell.PSResourceGet \
+                 Microsoft.PowerShell.Archive PSReadLine Microsoft.PowerShell.ThreadJob; do
+          pwsh -NoProfile -Command "Get-Module -ListAvailable '$m' | Select-Object -First 1 -Expand Name" | grep -F "$m"
+        done
+        # ...and the install/find cmdlets they provide must exist.
+        pwsh -NoProfile -Command "Get-Command Install-Module,Find-Module,Install-PSResource -ErrorAction Stop | Out-Null; 'tooling-ok'" | grep -F "tooling-ok"

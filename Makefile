@@ -208,36 +208,13 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(call set_source_date_epoch $(yamlfile))
 	$(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir=./$(*)/
 
-# A package with an apko.yaml runs an in-test docker/apko/k3s pipeline that builds an
-# OCI image from itself. melange doesn't deliver the local apks into the test guest,
-# so stage the built apks into ./<pkg>/local-packages/<arch> (a signed index resolved
-# via @local). No-op for packages without apko.yaml; in CI the guest's
-# /etc/apk/repositories provides the presubmit repo instead.
-define stage_local_packages
-	@if [ -f ./$(1)/apko.yaml ]; then \
-		ls ./packages/$(ARCH)/$(1)-*.apk >/dev/null 2>&1 || { echo "ERROR: $(1) has apko.yaml (in-test docker+apko) but no built apks in packages/$(ARCH)/; run 'make package/$(1)' first" >&2; exit 1; }; \
-		printf "Staging local apks into ./%s/local-packages\n" "$(1)"; \
-		rm -rf ./$(1)/local-packages; mkdir -p ./$(1)/local-packages/$(ARCH); \
-		cp ./packages/$(ARCH)/$(1)-*.apk ./$(1)/local-packages/$(ARCH)/; \
-		$(MELANGE) index --signing-key $(KEY) -o ./$(1)/local-packages/$(ARCH)/APKINDEX.tar.gz ./$(1)/local-packages/$(ARCH)/*.apk >/dev/null; \
-	fi
-endef
-
-define cleanup_local_packages
-	if [ -f ./$(1)/apko.yaml ]; then rm -rf ./$(1)/local-packages; fi
-endef
-
 test_targets = $(foreach name,$(pkgs),test/$(name))
 $(test_targets): test/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	mkdir -p ./$(*)/
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(call stage_local_packages,$(*))
-	@rc=0; \
-	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir=./$(*)/ || rc=$$?; \
-	$(call cleanup_local_packages,$(*)); \
-	exit $$rc
+	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) --source-dir=./$(*)/
 
 docker_test_targets = $(foreach name,$(pkgs),docker-test/$(name))
 $(docker_test_targets): docker-test/%:
@@ -250,11 +227,7 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 	$(eval yamlfile := $*.yaml)
 	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
 	@printf "Testing package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(call stage_local_packages,$(*))
-	@rc=0; \
-	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir=./$(*)/ || rc=$$?; \
-	$(call cleanup_local_packages,$(*)); \
-	exit $$rc
+	$(MELANGE) test $(yamlfile) $(MELANGE_TEST_OPTS) $(MELANGE_DEBUG_TEST_OPTS) --source-dir=./$(*)/
 
 .PHONY: dev-container
 dev-container:

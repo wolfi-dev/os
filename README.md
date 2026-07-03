@@ -21,6 +21,19 @@ which uses it to provide [lightweight GNU/Linux runtime images][cgi].
 
 The Wolfi APK package repository is located at https://packages.wolfi.dev/os and the signing public key is at https://packages.wolfi.dev/os/wolfi-signing.rsa.pub.
 
+Wolfi is not intended to be a general purpose desktop operating system. Our
+priority is to provide packages that enable containerized and embedded system
+workflows. Packages must use an open source license, ideally FSF or OSI approved
+[licenses](https://spdx.org/licenses/).
+
+Wolfi aims to keep its package set as up-to-date with security patches as
+possible, and uses latest releases of packages by default. Package and version
+in Wolfi must have an actively maintained upstream project.
+
+Find more information in [our organization overview and FAQ](https://github.com/wolfi-dev).
+
+File issues at https://wolfi.dev/os/issues/new/choose
+
 ## Getting Started
 
 A full guide is available on the [org page](https://github.com/wolfi-dev), but the quickest way to try out Wolfi is with the
@@ -41,14 +54,3 @@ HOME_URL="https://wolfi.dev"
 ## Mixing packages with other distributions
 
 Mixing packages with other distributions is not supported and can create security problems. Although both Wolfi and Alpine use the apk package manager, packages are not compatible with each other.
-
-## If Wolfi is missing a package you require
-
-Wolfi is not currently intended to be a general purpose desktop operating system. Our priority is to provide packages
-that enable containerized and embedded system workflows. Please keep this in mind when proposing adding packages to
-Wolfi. Also note that some packages may not be appropriately licensed for inclusion.  FSF or OSI approved [licenses](https://spdx.org/licenses/) are ideal.
-
-Wolfi also aims to keep its package set as up-to-date with security patches as possible. It is a requirement that any 
-package/version contributed to Wolfi has an actively maintained upstream. 
-
-To request inclusion of a package into Wolfi please use our [New Package Request Template](https://wolfi.dev/os/issues/new/choose).

@@ -15,8 +15,8 @@ description: |
   this pipeline:
     1. pip-installs the pinned version into the vendor directory (leaf only,
        overwriting the existing copy), then
-    2. rewrites the package's line in that directory's vendor.txt to the version
-       that was actually installed (read back from the installed metadata).
+    2. rewrites the package's line in that directory's vendor.txt to the pinned
+       version (preserving indentation and any trailing comment).
 
   Use it after the embedded/vendored Python tree exists in the package's
   ${{targets.contextdir}} (i.e. after the interpreter/venv has been assembled):
@@ -37,7 +37,7 @@ description: |
   intended for security version bumps of vendored leaf dependencies within an
   API-compatible range. The package must already be listed in vendor.txt — the
   pipeline refuses to add a new entry (that is a re-vendoring decision, not a
-  bump).
+  bump). Pass an exact pin (`==X.Y.Z`) so the manifest and code agree.
 
 needs:
   packages:
@@ -59,8 +59,8 @@ inputs:
   version:
     description: |
       PEP 440 version specifier passed to pip, e.g. `==80.10.2`. An exact pin
-      (`==X.Y.Z`) is strongly recommended so the vendored tree is reproducible;
-      whatever pip resolves is what gets written back to vendor.txt.
+      (`==X.Y.Z`) is required so the vendored tree is reproducible and the
+      manifest matches the code.
     required: true
 
 pipeline:
@@ -73,70 +73,33 @@ pipeline:
       VENDOR_TXT="${VENDOR_PATH}/vendor.txt"
 
       if [ ! -d "${VENDOR_PATH}" ]; then
-        echo "python/bump-vendored: vendor-path does not exist: ${VENDOR_PATH}" >&2
+        echo "py/bump-vendored: vendor-path does not exist: ${VENDOR_PATH}" >&2
         exit 1
       fi
       if [ ! -f "${VENDOR_TXT}" ]; then
-        echo "python/bump-vendored: vendor.txt not found at: ${VENDOR_TXT}" >&2
+        echo "py/bump-vendored: vendor.txt not found at: ${VENDOR_TXT}" >&2
         exit 1
       fi
 
-      echo "python/bump-vendored: installing ${PACKAGE}${VERSION_SPEC} into ${VENDOR_PATH}"
+      echo "py/bump-vendored: installing ${PACKAGE}${VERSION_SPEC} into ${VENDOR_PATH}"
       # Leaf-only, overwrite the existing vendored copy. --no-deps keeps us from
       # dragging the package's dependencies into the vendored tree.
       pip install --no-deps --upgrade --target "${VENDOR_PATH}" "${PACKAGE}${VERSION_SPEC}"
 
-      # Sync vendor.txt to the version that actually landed on disk (read back
-      # from the installed dist-info), so the manifest and the code agree.
-      python3 - "${VENDOR_PATH}" "${VENDOR_TXT}" "${PACKAGE}" <<'PY'
-      import sys, re, glob, os
+      # Refresh vendor.txt (the SBOM/scanner source of truth) to the pinned
+      # version. Bare version = spec with any leading comparison operators stripped.
+      VERSION="$(printf '%s' "${VERSION_SPEC}" | sed -E 's/^[[:space:]]*[=~!<>]+//')"
 
-      vendor_path, vendor_txt, package = sys.argv[1:4]
+      # Name pattern where -, _ and . are interchangeable (PEP 503 normalization).
+      NAME_RE="$(printf '%s' "${PACKAGE}" | sed -E 's/[-_.]+/[-_.]/g')"
 
-      def canon(name):
-          return re.sub(r'[-_.]+', '-', name).strip().lower()
+      if ! grep -qiE "^[[:space:]]*${NAME_RE}[[:space:]]*==" "${VENDOR_TXT}"; then
+        echo "py/bump-vendored: ${PACKAGE} is not pinned in ${VENDOR_TXT}; refusing to add a new entry" >&2
+        exit 1
+      fi
 
-      # Determine the version pip just installed, from its metadata.
-      installed = None
-      metas = (glob.glob(os.path.join(vendor_path, '*.dist-info', 'METADATA'))
-               + glob.glob(os.path.join(vendor_path, '*.egg-info', 'PKG-INFO')))
-      for meta in metas:
-          name = version = None
-          with open(meta, encoding='utf-8', errors='replace') as fh:
-              for line in fh:
-                  if line.startswith('Name:'):
-                      name = line.split(':', 1)[1].strip()
-                  elif line.startswith('Version:'):
-                      version = line.split(':', 1)[1].strip()
-                  if name and version:
-                      break
-          if name and version and canon(name) == canon(package):
-              installed = version
-              break
+      # Replace only the version token; keep indentation, the original name and
+      # any trailing comment intact.
+      sed -i -E "s|^([[:space:]]*)(${NAME_RE})([[:space:]]*==[[:space:]]*)[^[:space:]#]+|\1\2\3${VERSION}|I" "${VENDOR_TXT}"
 
-      if not installed:
-          sys.exit("python/bump-vendored: could not determine installed version "
-                   f"of {package} under {vendor_path}")
-
-      # Rewrite the existing vendor.txt line, preserving indentation and any
-      # trailing comment. Refuse to add a new entry.
-      line_re = re.compile(r'^(\s*)([A-Za-z0-9][A-Za-z0-9._-]*)(\s*==\s*)(\S+)(.*)$')
-      updated = []
-      found = False
-      for line in open(vendor_txt, encoding='utf-8').read().splitlines():
-          m = line_re.match(line)
-          if m and canon(m.group(2)) == canon(package):
-              updated.append(f"{m.group(1)}{m.group(2)}=={installed}{m.group(5)}")
-              found = True
-          else:
-              updated.append(line)
-
-      if not found:
-          sys.exit(f"python/bump-vendored: {package} is not pinned in {vendor_txt}; "
-                   "refusing to add a new entry")
-
-      with open(vendor_txt, 'w', encoding='utf-8') as fh:
-          fh.write("\n".join(updated) + "\n")
-
-      print(f"python/bump-vendored: {package} -> {installed}; vendor.txt synced")
-      PY
+      echo "py/bump-vendored: ${PACKAGE} -> ${VERSION}; vendor.txt synced"

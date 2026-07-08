@@ -1,0 +1,117 @@
+As we build using a non-system CLang (due to DD having a dependency on a
+version older than we've ever built), it isn't in the hardcoded paths that
+rules_go sets in [0].  7.79 moved to using rules_go for the parts of the build
+which require CLang, so we need to inject it back into PATH.
+
+The cgo -godefs step that generates the eBPF Go type files also needs clang-12's
+resource directory and the kernel headers on the include path (some of the eBPF
+C headers, e.g. prebuilt/offset-guess.h, include <linux/sched.h> directly and
+pull in a large chunk of the kernel-internal header graph). In our build those
+headers are the Debian kernel-headers packages under /usr/src, and the
+kernel-internal headers need -D__KERNEL__ plus the kconfig.h/autoconf.h
+pre-includes so they don't collide with libc's own definitions (sigset_t,
+sigaction, etc.).
+
+Crucially, these flags are injected through a clang wrapper rather than passed
+as cgo args after `--`. cgo -godefs records its full argument list in the
+"// cgo -godefs -- ..." comment at the top of every generated file, and
+DataDog's verify_generated_files diff tests compare that byte-for-byte against
+the committed files. Upstream generates them with the kernel headers already on
+clang's default search path, so only the deps-derived -I flags appear in the
+comment; any extra arg we add there makes every godefs file "out of date" and
+fails the build. cgo also does not read CGO_CFLAGS from the environment (only
+cmd/go does; cgo itself only special-cases CGO_LDFLAGS, for Bazel back-compat),
+so that route does not work either. Wrapping clang keeps the recorded args
+identical to upstream while still giving the compiler the flags it needs.
+
+We add -gdwarf-4 to force DWARF version 4 instead of 5. clang-12 emits DWARF 5
+by default, which triggers a panic in Go's cgo loadDWARF function ("index out of
+range [2] with length 2" in cmd/cgo/gcc.go) on aarch64 when processing certain
+kernel struct types in conntrack_types.go.
+
+Verified locally (linux/amd64 and linux/arm64, via Docker) that cgo -godefs
+succeeds and the recorded "// cgo -godefs -- ..." comment matches the committed
+files for kprobe_types.go, tuple_types.go and conntrack_types.go, against the
+actual pinned clang-12 and kernel-headers versions this package fetches.
+
+[0] https://github.com/bazel-contrib/rules_go/blob/9667748a32de210cd4a813b15e9d987103ba0954/go/private/context.bzl#L981
+
+diff --git a/bazel/rules/ebpf/cgo_godefs.bzl b/bazel/rules/ebpf/cgo_godefs.bzl
+index 21f462db..5aa1c2e0 100644
+--- a/bazel/rules/ebpf/cgo_godefs.bzl
++++ b/bazel/rules/ebpf/cgo_godefs.bzl
+@@ -76,13 +76,63 @@
+     # TODO(ABLD-410): uses the system clang rather than a hermetic toolchain.
+     # On Windows, Go defaults to gcc (MinGW) — no CC override needed, matching
+     # the old ninja behavior.
++    cc_setup = ""
+     cc_prefix = "CC=clang " if platform == "linux" else ""
++    if platform == "linux":
++        # DataDog generates these godefs files with a non-system clang-12 (they
++        # pin a version older than we ever build with) and rely on the kernel
++        # headers sitting on clang's default search path. In our build the
++        # headers are the Debian kernel-headers packages under /usr/src, clang-12
++        # needs its own resource dir, and the kernel-internal headers pulled in
++        # by e.g. prebuilt/offset-guess.h (<linux/sched.h>) need -D__KERNEL__ plus
++        # the kconfig.h/autoconf.h pre-includes so they don't collide with libc.
++        #
++        # These flags must NOT be passed as cgo args after `--`: cgo -godefs
++        # records its full arg list in the "// cgo -godefs -- ..." comment at the
++        # top of every generated file, and datadog's verify_generated_files diff
++        # tests compare that byte-for-byte against the committed files (generated
++        # upstream with the headers on the default path, so only the deps-derived
++        # -I flags appear). Any extra arg makes every godefs file "out of date"
++        # and fails the build. cgo also ignores CGO_CFLAGS from the environment
++        # (only cmd/go honors it; cgo itself only reads CGO_LDFLAGS, for Bazel
++        # back-compat), so that route is out too. Instead we wrap clang: the extra
++        # flags reach the compiler but never appear in the recorded args, so the
++        # generated files match upstream exactly.
++        #
++        # -gdwarf-4 forces DWARF 4 (clang-12 emits 5 by default) to avoid a panic
++        # in Go's cgo loadDWARF on aarch64 (cmd/cgo/gcc.go "index out of range").
++        kernel_headers_version = "5.10.0-44"
++        karch = {"amd64": "x86", "arm64": "arm64"}[go.sdk.goarch]
++        common_hdr = "/usr/src/linux-headers-{}-common".format(kernel_headers_version)
++        arch_hdr = "/usr/src/linux-headers-{}-{}".format(kernel_headers_version, go.sdk.goarch)
++        kflags = " ".join([
++            "-isystem /opt/clang/lib/clang/12.0.1/include",
++            "-D__KERNEL__",
++            "-include {}/include/linux/kconfig.h".format(common_hdr),
++            "-include {}/include/generated/autoconf.h".format(arch_hdr),
++            "-I {}/arch/{}/include/generated".format(arch_hdr, karch),
++            "-I {}/arch/{}/include/generated/uapi".format(arch_hdr, karch),
++            "-I {}/include/generated/uapi".format(arch_hdr),
++            "-I {}/include".format(arch_hdr),
++            "-I {}/arch/{}/include".format(common_hdr, karch),
++            "-I {}/arch/{}/include/uapi".format(common_hdr, karch),
++            "-I {}/include".format(common_hdr),
++            "-I {}/include/uapi".format(common_hdr),
++            "-gdwarf-4",
++        ])
++        cc_setup = (
++            "CGODEFS_CC=$(mktemp) && " +
++            "printf '#!/bin/sh\\nexec clang \"$@\" {kflags}\\n' > \"$CGODEFS_CC\" && " +
++            "chmod +x \"$CGODEFS_CC\" && "
++        ).format(kflags = kflags)
++        cc_prefix = "CC=\"$CGODEFS_CC\" "
+ 
+     cmd = (
+-        "set -euo pipefail && ROOT=$PWD && cd {src_dir} && " +
++        "set -euo pipefail && ROOT=$PWD && {cc_setup}cd {src_dir} && " +
+         "GOROOT=$ROOT/{goroot} {cc_prefix}$ROOT/{go} tool cgo -godefs -- {includes} -fsigned-char {src_file} | " +
+         "$ROOT/{genpost} {genpost_args} > $ROOT/{out}"
+     ).format(
++        cc_setup = cc_setup,
+         cc_prefix = cc_prefix,
+         goroot = go.sdk.root_file.dirname,
+         src_dir = src.dirname,
+@@ -95,6 +145,9 @@
+     )
+ 
+     env = dict(go.env)
++    # PATH is no longer inherited from the environment, so we need to extend it
++    # here so the CC wrapper's bare `clang` resolves to /opt/clang.
++    env["PATH"] = ":".join(["/opt/clang/bin", env["PATH"]])
+     env["CGO_ENABLED"] = "1"
+ 
+     # run_shell needed: genpost reads stdin and writes stdout, so the pipeline

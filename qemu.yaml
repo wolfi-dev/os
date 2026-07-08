@@ -1,7 +1,7 @@
 package:
   name: qemu
   version: "11.0.2"
-  epoch: 0
+  epoch: 1
   description: "fast processor emulator"
   copyright:
     - license: GPL-2.0
@@ -30,7 +30,9 @@ environment:
       - glib
       - glib-dev
       - glib-static
+      - gnutls-dev
       - libaio-dev
+      - libgcrypt-dev
       - libiscsi-dev
       - libjpeg-turbo-dev
       - libseccomp-dev
@@ -67,8 +69,14 @@ pipeline:
       # until this is initialized value don't remove the CFLAGS changes below
       # https://github.com/qemu/qemu/blob/v10.1.0/target/i386/kvm/tdx.c#L827
       # -Wno-discarded-qualifiers: dtc subproject has const-qualifier issues in fdt_overlay.c
+      # gcrypt/gnutls give qemu a crypto backend: gcrypt = qcrypto ciphers (LUKS
+      # + the AES-256 secret libvirt passes for Ceph/RBD auth); gnutls = TLS
+      # (secure live migration, VNC/NBD-TLS). Without one, qemu builds with no
+      # cipher support and RBD-backed disks fail to start.
       CFLAGS="$CFLAGS -Wno-maybe-uninitialized -Wno-discarded-qualifiers" \
           ../../configure \
+              --enable-gcrypt \
+              --enable-gnutls \
               --enable-libiscsi \
               --enable-libusb \
               --enable-modules \
@@ -139,6 +147,7 @@ subpackages:
         contents:
           packages:
             - jq
+            - openssl
       pipeline:
         - uses: test/tw/ver-check
           with:
@@ -180,6 +189,42 @@ subpackages:
               exit 1
             }
             echo "PASS: block-curl module loads: $out"
+        - name: "LUKS aes-256 (qcrypto cipher backend)"
+          runs: |
+            set -euo pipefail
+            # LUKS disk encryption uses the qcrypto AES cipher. A qemu built
+            # with no crypto backend fails here with the exact error
+            # "no crypto library enabled in build".
+            qemu-img create -f luks \
+              --object secret,id=sec0,data=hunter2 \
+              -o key-secret=sec0 luks.img 10M
+            qemu-img info \
+              --object secret,id=sec0,data=hunter2 \
+              --image-opts driver=luks,file.filename=luks.img,key-secret=sec0 \
+              >/dev/null
+            echo "PASS: LUKS aes-256 create+open"
+        - name: "encrypted secret object (libvirt masterKey / Ceph cephx path)"
+          runs: |
+            set -euo pipefail
+            # libvirt hands qemu sensitive values (e.g. the Ceph cephx key) as
+            # an AES-256-CBC-encrypted 'secret' keyed by a masterKey; decrypting
+            # it at object-creation needs the same qcrypto cipher backend.
+            master='0123456789abcdef0123456789abcdef'   # 32-byte AES-256 key
+            iv='fedcba9876543210'                       # 16-byte IV
+            hex() { od -An -v -tx1 | tr -d ' \n'; }
+            printf '%s' "$master" | base64 -w0 > master.b64
+            iv_b64=$(printf '%s' "$iv" | base64 -w0)
+            # PKCS#7 padding (openssl default) — libvirt encrypts secrets the
+            # same way, and qemu strips the padding after decrypting.
+            ct_b64=$(printf 'cephx-secret-key' | \
+              openssl enc -aes-256-cbc \
+                -K "$(printf '%s' "$master" | hex)" \
+                -iv "$(printf '%s' "$iv" | hex)" | base64 -w0)
+            qemu-img create -f raw \
+              --object secret,id=master,format=base64,file=master.b64 \
+              --object secret,id=cephx,keyid=master,iv="$iv_b64",data="$ct_b64",format=base64 \
+              enc.img 1M
+            echo "PASS: AES-256-CBC encrypted secret decrypts"
 
   - name: ${{package.name}}-system-x86_64
     description: "QEMU x86 system"

@@ -3,7 +3,7 @@ package:
   name: ingress-nginx-controller-1.15
   version: "1.15.8"
   # There are manual changes to review between each package update. See 'vars:' section.
-  epoch: 5
+  epoch: 6 # rebuild otel module against patched nginx source
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -717,12 +717,32 @@ subpackages:
           depth: -1
       - working-directory: instrumentation/nginx
         runs: |
+          # Build the module against the same patched nginx source the nginx
+          # binary is built from, instead of letting nginx.cmake download
+          # pristine nginx-${{vars.NGINX_VERSION}} from nginx.org. Our patch
+          # stack changes core struct layouts (e.g. 37_CVE-2026-49975 adds a
+          # field to ngx_http_headers_in_t, shifting every later field of
+          # ngx_http_request_t by 8 bytes), so a module compiled against
+          # unpatched headers misreads r->internal and silently drops every
+          # span (chainguard-dev/customer-issues#3701). --with-compat does
+          # not protect against source patches.
+          grep -q 'URL "http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"' nginx.cmake || \
+            { echo "nginx.cmake URL line changed upstream; update this override"; exit 1; }
+          tar -C ../.. -cf /tmp/nginx-patched-src.tar nginx-${{vars.NGINX_VERSION}}
+          sed -i 's|URL "http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"|URL "file:///tmp/nginx-patched-src.tar"|' nginx.cmake
+
           mkdir build
           cd build
 
           # This must be set to whatever ingress nginx is using
           cmake -DNGINX_VERSION=${{vars.NGINX_VERSION}} ..
           make
+
+          # Fail loudly if the module was somehow compiled against different
+          # nginx headers than the binary.
+          cmp nginx/src/project_nginx/src/http/ngx_http_request.h \
+            ../../../nginx-${{vars.NGINX_VERSION}}/src/http/ngx_http_request.h || \
+            { echo "module built against mismatched ngx_http_request.h"; exit 1; }
 
           # Copy over plugin
           mkdir -p ${{targets.contextdir}}/etc/nginx/modules

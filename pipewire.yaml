@@ -2,10 +2,18 @@
 package:
   name: pipewire
   version: "1.6.8"
-  epoch: 0
+  epoch: 1 # split pipewire-pulse into its own subpackage
   description: server and user space API to deal with multimedia pipelines
   copyright:
     - license: MIT
+
+vars:
+  # PipeWire plugin ABI directory name. Distinct from package.version:
+  # upstream has kept this at "0.3" across all 0.3.x, 1.0.x, and 1.6.x
+  # releases and treats it as a stable module-loading namespace.
+  # Referenced in the pipewire-pulse subpackage below and in the
+  # top-level test block. Bump only if upstream bumps the ABI dir.
+  pipewire-abi: "0.3"
 
 environment:
   contents:
@@ -36,12 +44,87 @@ subpackages:
   - name: pipewire-dev
     pipeline:
       - uses: split/dev
-    description: pulseaudio dev
+    description: pipewire development headers
     test:
       pipeline:
         - uses: test/tw/devpackage
         - uses: test/pkgconf
         - uses: test/tw/ldd-check
+
+  # PulseAudio-compatibility server. Split off so consumers who just
+  # need the pipewire core library (or the JACK / ALSA paths) don't
+  # have to install the pulse-protocol daemon and its modules.
+  #
+  # File set mirrors Alpine's community/pipewire pulse() subpackage.
+  - name: pipewire-pulse
+    description: PulseAudio-compatible replacement server for pipewire
+    dependencies:
+      runtime:
+        - pipewire
+    pipeline:
+      - runs: |
+          set -e
+          d=${{targets.destdir}}
+          s=${{targets.subpkgdir}}
+
+          # Move-if-exists helper — pipewire's meson opts control which
+          # optional pulse modules are built, so we tolerate absence.
+          mv_if() {
+              for src in "$@"; do
+                  if [ -e "$d/$src" ] || [ -L "$d/$src" ]; then
+                      mkdir -p "$s/$(dirname "$src")"
+                      mv "$d/$src" "$s/$src"
+                  fi
+              done
+          }
+
+          # Binary (symlink to the main pipewire binary) — required.
+          mkdir -p "$s/usr/bin"
+          mv "$d/usr/bin/pipewire-pulse" "$s/usr/bin/pipewire-pulse"
+
+          # Protocol module — required; the whole point of the subpkg.
+          mkdir -p "$s/usr/lib/pipewire-${{vars.pipewire-abi}}"
+          mv "$d/usr/lib/pipewire-${{vars.pipewire-abi}}/libpipewire-module-protocol-pulse.so" \
+             "$s/usr/lib/pipewire-${{vars.pipewire-abi}}/"
+
+          # Optional modules that may or may not be built.
+          mv_if usr/lib/pipewire-${{vars.pipewire-abi}}/libpipewire-module-pulse-tunnel.so
+
+          # Pulse configuration — required file, optional .avail/ dir.
+          mkdir -p "$s/usr/share/pipewire"
+          mv "$d/usr/share/pipewire/pipewire-pulse.conf" \
+             "$s/usr/share/pipewire/"
+          if [ -d "$d/usr/share/pipewire/pipewire-pulse.conf.avail" ]; then
+              mv "$d/usr/share/pipewire/pipewire-pulse.conf.avail" \
+                 "$s/usr/share/pipewire/"
+          fi
+
+          # systemd user units, if built.
+          for u in "$d"/usr/lib/systemd/user/pipewire-pulse.*; do
+              [ -e "$u" ] || continue
+              mkdir -p "$s/usr/lib/systemd/user"
+              mv "$u" "$s/usr/lib/systemd/user/"
+          done
+    test:
+      environment:
+        contents:
+          packages:
+            - pipewire-pulse
+      pipeline:
+        - uses: test/tw/ver-check
+          with:
+            bins: pipewire-pulse
+            version: ${{package.version}}
+        - uses: test/tw/help-check
+          with:
+            bins: pipewire-pulse
+        - uses: test/tw/ldd-check
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/bin/pipewire-pulse
+              /usr/lib/pipewire-${{vars.pipewire-abi}}/libpipewire-module-protocol-pulse.so
+              /usr/share/pipewire/pipewire-pulse.conf
 
 update:
   enabled: true
@@ -61,7 +144,6 @@ test:
           pipewire
           pipewire-aes67
           pipewire-avb
-          pipewire-pulse
         version: ${{package.version}}
     - uses: test/tw/help-check
       with:
@@ -69,7 +151,6 @@ test:
           pipewire
           pipewire-aes67
           pipewire-avb
-          pipewire-pulse
     - uses: test/tw/ldd-check
     - name: Test libpipewire API - init, version, and deinit
       runs: |
@@ -95,9 +176,9 @@ test:
             return 0;
         }
         EOF
-        gcc $(pkg-config --cflags libpipewire-0.3) /tmp/pw_test.c \
+        gcc $(pkg-config --cflags libpipewire-${{vars.pipewire-abi}}) /tmp/pw_test.c \
           -o /tmp/pw_test \
-          $(pkg-config --libs libpipewire-0.3)
+          $(pkg-config --libs libpipewire-${{vars.pipewire-abi}})
         /tmp/pw_test
     - name: Test pw-cli version output
       runs: |

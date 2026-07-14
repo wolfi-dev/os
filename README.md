@@ -32,7 +32,11 @@ in Wolfi must have an actively maintained upstream project.
 
 Find more information in [our organization overview and FAQ](https://github.com/wolfi-dev).
 
-File issues at https://wolfi.dev/os/issues/new/choose
+This repository is a read-only public clone, synced from internal Chainguard
+repositories. Pull requests opened here cannot be merged directly. To request an
+update or fix to an existing package, file an issue at
+https://wolfi.dev/os/issues/new/choose. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for details.
 
 ## Getting Started
 

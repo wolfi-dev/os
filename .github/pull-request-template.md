@@ -1,6 +1,12 @@
 <!---
+NOTE: wolfi-dev/os is a read-only public clone synced from internal Chainguard
+repositories. Pull requests opened here cannot be merged directly; changes are
+shepherded by a Chainguard engineer on a best-effort basis. To request an update
+or fix to an existing package, please open an issue instead:
+https://wolfi.dev/os/issues/new/choose
+
 Provide a short summary in the Title above. Examples of good PR titles:
-* "ruby-3.1: new package"
+* "ruby-3.1: update to 3.1.5"
 * "haproxy: fix CVE-2014-123456"
 -->
 

@@ -1,33 +1,60 @@
 # Contributing to wolfi-dev/os
 
 <!-- toc -->
-- [Contribution Guidelines](#contribution-guidelines)
-- [Criteria for packages in Wolfi](#criteria-for-packages-in-wolfi)
-- [Setup development environment](#setup-development-environment)
-- [Write your first Wolfi package](#write-your-first-wolfi-package)
+- [How this repository works](#how-this-repository-works)
+- [Requesting a package update or fix](#requesting-a-package-update-or-fix)
+- [Package inclusion and removal](#package-inclusion-and-removal)
+- [Building and testing packages locally](#building-and-testing-packages-locally)
 - [Package versioning](#package-versioning)
 - [Some tips](#some-tips)
 <!-- /toc -->
 
-## Contribution Guidelines
+## How this repository works
 
-Whether you want to add a new package, or provide a change to an existing package, please follow these guidelines:
+`wolfi-dev/os` is a **read-only public clone** of the core Wolfi OS. As described
+in the [organization overview](https://github.com/wolfi-dev), it is a sync from
+internal Chainguard repositories. Proposed improvements are applied internally
+and then synced back out to this public repository.
 
-1. Create an issue with the details about the change. Use the appropriate template for the type of change you’re making. 
-2. Create the PR referencing the issue. 
+As a result:
 
-To get these changes merged requires engagement from a Chainguard Engineer. On a best effort, we will help shepherd changes through our process. If you are a Chainguard customer, reach out to your Customer Success rep for additional support.
+- **Pull requests opened here cannot be merged directly.**
+- Changes are shepherded by a Chainguard engineer on a **best-effort** basis.
+- Acceptance and timelines are **not guaranteed**.
 
-## Criteria for packages in Wolfi
+If you are a Chainguard customer, please contact your Customer Success
+representative for additional support.
 
-When you're thinking about adding a new package to Wolfi, make sure it meets all of the following criteria before taking the time to define, build, and test the package:
+## Requesting a package update or fix
 
-1. The package must use the latest version of the upstream project, and the package must **not** use a _pre-release_ version.
-2. The package's upstream source must use an [OSI-approved](https://opensource.org/licenses) license.
+To request an update or fix to an existing Wolfi package,
+[open an issue](https://wolfi.dev/os/issues/new/choose) using the package update
+or fix request template. Please include the upstream version and a clear
+description of the problem.
 
-In addition to the above, the Wolfi Maintainers reserve the right to reject other package contributions for other reasons, too. If you are unsure whether a particular package qualifies for acceptance into Wolfi, consider opening an issue on GitHub before putting time into the PR itself, and the maintainers will provide feedback as soon as possible.
+Requests are expected to meet Wolfi's packaging and security model:
 
-## Setup development environment
+- The requested version must be the **latest stable upstream release** (no
+  pre-releases or release candidates).
+- The upstream project must use an
+  [OSI-approved](https://opensource.org/licenses) license.
+- The package must be reasonably maintainable over time, with no known
+  unresolved security or supply-chain concerns.
+
+## Package inclusion and removal
+
+Which packages exist in Wolfi is governed by Chainguard. Wolfi provides the
+packages required to build or run free Chainguard Containers. Package
+definitions are regularly added and removed as upstreams and images change. See
+the FAQ in the [organization overview](https://github.com/wolfi-dev) for the
+current package inclusion, retention, and removal policy.
+
+## Building and testing packages locally
+
+You can build and test Wolfi packages locally, for example to reproduce a build,
+validate a proposed change, or scan a package for vulnerabilities.
+
+### Setup development environment
 
 To ease the development of Wolfi OS, you can use the [Wolfi `sdk` image](https://github.com/wolfi-dev/tools/pkgs/container/sdk) that already includes both [apko](https://github.com/chainguard-dev/apko) and [melange](https://github.com/chainguard-dev/melange).
 On Linux and Mac it is also possible to install both the above tools directly into your system.
@@ -40,23 +67,17 @@ make dev-container
 
 What it does is start the `ghcr.io/wolfi-dev/sdk` image and mount the current working directory into it.
 
-## Write your first Wolfi package
+### Building a package
 
 Wolfi packages are built using melange. If you want to learn how packages are built, you can see all the details in the [Makefile](Makefile).
-
-Start by cloning this repository and create a build configuration YAML file named `<your-new-package-name>.yaml` in its root directory. If you have any patch files that are needed to build this package, create a folder at the root of the repository with the same name as the package and put the patches there.
-
-Once you're done writing the new package configuration file, you can test it by building the new package.
-
-## Building a package
 
 To build an individual package, you can use a `make` command like this:
 
 ```text
-make package/<your-new-package-name>
+make package/<package-name>
 ```
 
-For example, if your package name is "foo", run `make package/foo`.
+For example, if the package name is "foo", run `make package/foo`.
 
 This will build the package by invoking [melange](https://github.com/chainguard-dev/melange) in a particular way. This invocation is defined in the [Makefile](Makefile), if you're interested to see how this is wired up. Also, you can run Melange _directly_ without using `make` if you understand what you're doing.
 
@@ -64,9 +85,9 @@ This will build the package by invoking [melange](https://github.com/chainguard-
 
 When the build finishes, your package(s) should be found in the generated `./packages` directory.
 
-## Scanning your package for vulnerabilities
+### Scanning a package for vulnerabilities
 
-While you're here, you can scan the package you just built for vulnerabilities, using [wolfictl](https://github.com/wolfi-dev/wolfictl)'s `scan` command:
+You can scan a package you built for vulnerabilities, using [wolfictl](https://github.com/wolfi-dev/wolfictl)'s `scan` command:
 
 ```shell
 wolfictl scan ./packages/some-architecture/your-package-name-and-version.apk
@@ -92,6 +113,6 @@ Check for anything unexpected, or for any [CVEs you can patch](./HOW_TO_PATCH_CV
 
 - When deciding how to add `update:` configuration see the [update docs](./docs/UPDATES.md)
 
-- When you're ready to submit a PR for a new package or to update a package, make sure your YAML file(s) are **formatted correctly**, so that they'll pass CI. We use [yam](https://github.com/chainguard-dev/yam) for YAML formatting. You should be able to run the `yam` command from the root of this repo to get all files formatted correctly.
+- Make sure your YAML file(s) are **formatted correctly**, so that they'll pass CI. We use [yam](https://github.com/chainguard-dev/yam) for YAML formatting. You should be able to run the `yam` command from the root of this repo to get all files formatted correctly.
 
 - When running a lot of melange builds using `docker` as a runner (default on Mac) you may want to increase the Docker VM CPU, Memory and especially storage resources, else Docker can easily run out of disk space.

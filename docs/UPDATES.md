@@ -8,9 +8,9 @@ The Wolfi project itself has built automation that fetches the latest package ve
 
 ![sequence_diagram.png](./images/sequence_diagram.png)
 
-## Contributing
+## Update backends
 
-When contributing a new package decide which backend the Wolfi Bot should use to discover latest release versions.  The two currently available are
+When modifying the `update:` section of a package configuration, to ensure new releases are pickup up reliably, decide which backend the Wolfi Bot should use.  The following two are currently available:
 
 - `update.release-monitor` using https://release-monitoring.org
 - `update.github` using GitHub's Graphql API https://api.github.com/graphql

@@ -183,16 +183,16 @@ yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))
 pkg_targets = $(foreach name,$(pkgs),package/$(name))
 $(pkg_targets): package/%: cache
-	$(eval yamlfile := $*.yaml)
-	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	$(eval yamlfile := "$*.yaml")
+	$(eval pkgver := $(shell $(MELANGE) package-version "$(yamlfile)"))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
-	$(MAKE) yamlfile=$(yamlfile) pkgname=$* packages/$(ARCH)/$(pkgver).apk
+	$(MAKE) "yamlfile=$(yamlfile)" "pkgname=$*" "packages/$(ARCH)/$(pkgver).apk"
 
 packages/$(ARCH)/%.apk: $(KEY) $(QEMU_KERNEL_DEP) $(yamlfile)
 	@[ -n "$(pkgname)" ] || { echo "$@: pkgname is not set"; exit 1; }
 	@[ -n "$(yamlfile)" ] || { echo "$@: yamlfile is not set"; exit 1; }
-	mkdir -p ./$(pkgname)/
-	$(MELANGE) build $(yamlfile) $(MELANGE_OPTS) --source-dir=./$(pkgname)/
+	mkdir -p "./$(pkgname)/"
+	$(MELANGE) build "$(yamlfile)" $(MELANGE_OPTS) "--source-dir=./$(pkgname)/"
 
 docker_pkg_targets = $(foreach name,$(pkgs),docker-package/$(name))
 $(docker_pkg_targets): docker-package/%:
@@ -201,12 +201,12 @@ $(docker_pkg_targets): docker-package/%:
 
 dbg_targets = $(foreach name,$(pkgs),debug/$(name))
 $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
-	$(eval yamlfile := $*.yaml)
-	$(eval pkgver := $(shell $(MELANGE) package-version $(yamlfile)))
+	$(eval yamlfile := "$*.yaml")
+	$(eval pkgver := $(shell $(MELANGE) package-version "$(yamlfile)"))
 	@printf "Building package $* with version $(pkgver) from file $(yamlfile)\n"
-	mkdir -p ./"$*"/
-	$(call set_source_date_epoch $(yamlfile))
-	$(MELANGE) build $(yamlfile) $(MELANGE_DEBUG_OPTS) --source-dir=./$(*)/
+	mkdir -p "./$*/"
+	$(call set_source_date_epoch "$(yamlfile)"")
+	$(MELANGE) build "$(yamlfile)" $(MELANGE_DEBUG_OPTS) "--source-dir=./$(*)/"
 
 # A package with an apko.yaml runs an in-test docker/apko/k3s pipeline that builds an
 # OCI image from itself. melange doesn't deliver the local apks into the test guest,
@@ -274,7 +274,7 @@ PACKAGES_CONTAINER_FOLDER ?= /work/packages
 .PHONY: local-wolfi
 local-wolfi: $(KEY)
 	mkdir -p "$(PWD)/packages"
-	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir=$(MELANGE_TMPDIR) -d "$@.XXXXXX"))
+	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir=$(MELANGE_TMPDIR) -d "$@.XXXXXX")) # todo-linter: ignore
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
@@ -331,7 +331,7 @@ endif
 # docker run -it
 .PHONY: dev-container-wolfi
 dev-container-wolfi: $(KEY)
-	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir=$(MELANGE_TMPDIR) -d "$@.XXXXXX"))
+	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir=$(MELANGE_TMPDIR) -d "$@.XXXXXX")) # todo-linter: ignore
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
 	$(eval OUT_LOCAL_DIR ?= /work/out)
 	$(eval OUT_DIR ?= $(shell mktemp --tmpdir=$(MELANGE_TMPDIR) -d))

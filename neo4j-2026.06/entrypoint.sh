@@ -338,7 +338,7 @@ function set_initial_password
             admin_user="${BASH_REMATCH[1]}"
             password="${BASH_REMATCH[2]}"
             do_reset="${BASH_REMATCH[3]}"
-            debug_msg "NEO4J_AUTH has been parsed as user \"${admin_user}\", password \"${password}\", do_reset \"${do_reset}\""
+            debug_msg "NEO4J_AUTH has been parsed as user \"${admin_user}\", password \"[REDACTED]\", do_reset \"${do_reset}\""
 
             if [ "${password}" == "neo4j" ]; then
                 echo >&2 "Invalid value for password. It cannot be 'neo4j', which is the default."
@@ -375,7 +375,7 @@ If Neo4j fails to start, you can:
                 extra_args+=("--verbose")
             fi
             debug_msg "Setting initial password"
-            debug_msg "${neo4j_admin_cmd} dbms set-initial-password ${password} ${extra_args[*]}"
+            debug_msg "${neo4j_admin_cmd} dbms set-initial-password [REDACTED] ${extra_args[*]}"
             ${neo4j_admin_cmd} dbms set-initial-password "${password}" "${extra_args[@]}"
 
         elif [ -n "${_neo4j_auth:-}" ]; then

@@ -1,7 +1,7 @@
 package:
   name: libkrunfw
   version: "5.5.0"
-  epoch: 1 # fix test shell rule violations
+  epoch: 2 # libkrunfw-microvm
   description: Dynamic library bundling a Linux kernel for use by libkrun
   copyright:
     - license: GPL-2.0-only AND LGPL-2.1-only
@@ -126,78 +126,15 @@ pipeline:
       mkdir -p tarballs
       mv linux-${{vars.kernel-version}}.tar.xz tarballs/
 
-  - name: Write our config fragment (9p + IKCONFIG introspection)
+  - name: Build the stock (upstream-config) libkrunfw library
     runs: |
-      # This fragment layers on top of libkrunfw's per-arch base config via
-      # merge_config.sh in the next step. Things we add:
-      #
-      # CONFIG_NETWORK_FILESYSTEMS - parent menu under fs/Kconfig. The base
-      #   libkrunfw config has it off, which means fs/9p/Kconfig is never even
-      #   sourced and CONFIG_9P_FS isn't visible to olddefconfig. Without this
-      #   our 9p options get silently dropped during defconfig resolution.
-      # CONFIG_NET_9P*    - 9p protocol + fd transport (host<->guest sharing).
-      #   May be replaced by virtio-fs in the future; for now we need 9p.
-      # CONFIG_9P_FS      - the 9p filesystem driver itself.
-      # CONFIG_9P_FS_POSIX_ACL - intentionally left off (no POSIX ACL
-      #   forwarding wanted right now).
-      # CONFIG_IKCONFIG*  - exposes the in-kernel config at /proc/config.gz,
-      #   handy for runtime introspection ("what was this kernel built with?").
-      cat > custom.cfg <<'EOF'
-      CONFIG_NETWORK_FILESYSTEMS=y
-      CONFIG_NET_9P=y
-      CONFIG_NET_9P_FD=y
-      CONFIG_9P_FS=y
-      # CONFIG_9P_FS_POSIX_ACL is not set
-      CONFIG_IKCONFIG=y
-      CONFIG_IKCONFIG_PROC=y
-      EOF
-
-  - name: Extract and prepare kernel source tree (no kernel build yet)
-    runs: |
-      # libkrunfw's $(KERNEL_SOURCES) rule (named linux-X.Y.Z) extracts the
-      # tarball, applies patches, copies the per-arch base config to .config,
-      # and runs olddefconfig. We invoke just that target so we end up with a
-      # resolved .config we can merge our fragment over the top of, without
-      # also kicking off the full kernel compile yet.
-      make -j$(nproc) linux-${{vars.kernel-version}}
-
-  - name: Merge custom config on top of base .config (fail loudly on drift)
-    runs: |
-      KSRC=linux-${{vars.kernel-version}}
-      # merge_config.sh -m writes the merged config to $KCONFIG_CONFIG (default
-      # .config) and skips its built-in `make alldefconfig` pass. We skip that
-      # pass because libkrunfw's base config explicitly disables a lot of
-      # things alldefconfig would happily turn back on; we want olddefconfig
-      # semantics instead (preserve all existing decisions, only fill in
-      # defaults for *new* symbols that just became visible thanks to our
-      # fragment - e.g. children under NETWORK_FILESYSTEMS).
-      (cd "$KSRC" && ./scripts/kconfig/merge_config.sh -m .config ../custom.cfg)
-      (cd "$KSRC" && make olddefconfig)
-
-      # Verify every line in our fragment ended up verbatim in .config. This
-      # is what catches "your dep chain wasn't satisfied so olddefconfig
-      # dropped it" as a *build* failure, not a runtime surprise.
-      fail=0
-      while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        if ! grep -qxF "$line" "$KSRC/.config"; then
-          echo "ERROR: requested kernel config not in final .config: $line" >&2
-          # Show what the symbol's actual state is, if any, for debugging.
-          sym=${line%%=*}; sym=${sym#\# }; sym=${sym%% *}
-          grep -E "^(${sym}=|# ${sym} )" "$KSRC/.config" >&2 || \
-            echo "  (symbol ${sym} entirely absent from .config)" >&2
-          fail=1
-        fi
-      done < custom.cfg
-      if [ "$fail" -ne 0 ]; then
-        echo "" >&2
-        echo "olddefconfig dropped one or more requested options." >&2
-        echo "Most common cause: a parent menu/dependency isn't enabled." >&2
-        echo "Inspect $KSRC/.config and the Kconfig graph for the missing symbol." >&2
-        exit 1
-      fi
-
-  - runs: |
+      # The upstream `all` target drives the whole chain: extract the tarball,
+      # apply libkrunfw's patches, copy the per-arch base config to .config,
+      # run olddefconfig, build the kernel, bundle it via bin2cbundle.py, and
+      # link libkrunfw.so. We deliberately build the kernel with the config
+      # exactly as upstream ships it - no fragments layered on top. The
+      # ${{package.name}}-microvm subpackage rebuilds with our extra config
+      # (9p + in-guest Docker networking).
       make -j$(nproc) PREFIX=/usr LIBDIR_Linux=lib
 
   - runs: |
@@ -218,6 +155,222 @@ subpackages:
         - uses: test/tw/ldd-check
           with:
             packages: ${{subpkg.name}}
+
+  # A rebuild of the bundled kernel specifically to target mono/microvm's needs.
+  # same SONAME and file path as the stock package, but with extra kernel
+  # config compiled in. This is a drop-in alternative to ${{package.name}} (it
+  # provides + replaces it), so an image installs EITHER ${{package.name}} OR
+  # ${{package.name}}-microvm, never both. libkrun loads libkrunfw.so.5 by
+  # SONAME at runtime, so swapping in this package changes the guest kernel
+  # without rebuilding libkrun.
+  #
+  # The extra config covers:
+  #   * 9p over vsock (host<->guest filesystem sharing) + IKCONFIG
+  #     introspection - the options we previously baked into the stock build.
+  #   * the legacy-iptables/xtables layer (the base config already has the
+  #     netfilter core and nftables) that dockerd needs to program docker0's
+  #     NAT rules and k3s's kube-proxy needs for service NAT, so the guest can
+  #     run in-guest Docker and k3s (those conformance groups).
+  #   * magic-sysrq, so the conformance suite can kill the guest from inside
+  #     to exercise its transport-death contract.
+  - name: ${{package.name}}-microvm
+    description: ${{package.name}} with support for microvm's needs (9p + iptables/netfilter + sysrq)
+    dependencies:
+      provides:
+        - ${{package.name}}=${{package.full-version}}
+      replaces:
+        - ${{package.name}}
+    pipeline:
+      - name: Rebuild the bundled kernel with the microvm config fragment
+        runs: |
+          # The stock build already ran in this workspace; its files were
+          # captured into the main package's destdir. Clean the in-tree build
+          # artifacts (the linux-${{vars.kernel-version}} source tree,
+          # kernel.c, and the stock libkrunfw.so) so we get a fresh kernel
+          # tree to reconfigure. `make clean` keeps the staged tarball under
+          # tarballs/, so the re-extract below does not re-download anything.
+          make clean
+
+          # config fragment, layered on top of libkrunfw's per-arch base
+          # config via merge_config.sh below. Everything is =y because the
+          # libkrunfw kernel has no loadable-module support.
+          #
+          # 9p + introspection:
+          #   CONFIG_NETWORK_FILESYSTEMS - parent menu under fs/Kconfig; the
+          #     base config has it off, so fs/9p/Kconfig is never sourced and
+          #     CONFIG_9P_FS isn't visible to olddefconfig without this.
+          #   CONFIG_NET_9P*  - 9p protocol + fd transport (host<->guest share).
+          #   CONFIG_9P_FS    - the 9p filesystem driver.
+          #   CONFIG_9P_FS_POSIX_ACL - intentionally left off.
+          #   CONFIG_IKCONFIG* - exposes the in-kernel config at /proc/config.gz.
+          #
+          # In-guest Docker and k3s networking: dockerd programs docker0's NAT
+          # rules, and k3s's kube-proxy programs service NAT rules, via either
+          # legacy iptables or nftables. The base config already has the
+          # netfilter core, nftables and conntrack/NAT; what it lacks is the
+          # legacy xtables/iptables layer (and NFT_CHAIN_NAT), which is what
+          # both daemons actually reach for first -- dockerd reports
+          # "can't initialize iptables table `nat'" and kube-proxy exits,
+          # taking the k3s control plane down with it. Enable both paths plus
+          # bridge/veth. Note there is no CONFIG_NFT_CHAIN_NAT to set: the
+          # symbol is gone in 6.x and nft_chain_nat.o is built by NFT_NAT.
+          #
+          # All four IPv4 tables are needed, not just filter+nat: dockerd
+          # programs `raw` (its DIRECT ACCESS FILTERING drop rules) and
+          # `mangle`, and a missing table is fatal rather than degraded
+          # ("can't initialize iptables table `raw'"). The xt matches are the
+          # ones dockerd and k3s's kube-proxy actually emit -- comment and
+          # statistic in particular, which kube-proxy puts on essentially
+          # every service rule.
+          #
+          # k3s additionally needs VXLAN and ipset. Flannel's default backend
+          # is vxlan, and creating that device is not optional: flannel exits
+          # ("failed to create vxlan device: operation not supported"), which
+          # makes k3s shut the whole control plane down a few seconds after it
+          # came up. ipset backs k3s's network-policy controller, which
+          # otherwise skips itself with "ipset save failed".
+          #
+          # CONFIG_MAGIC_SYSRQ - /proc/sysrq-trigger. Without it there is no
+          # in-guest way to power the VM off abruptly, so the cross-backend
+          # conformance suite cannot exercise its transport-death contract
+          # against this kernel (Robustness/GuestTransportDeath self-skips).
+          # DEFAULT_ENABLE=0x1 turns on all sysrq functions, including 'o'
+          # (poweroff), which is the one the suite uses.
+          cat > microvm.cfg <<'EOF'
+          CONFIG_NETWORK_FILESYSTEMS=y
+          CONFIG_NET_9P=y
+          CONFIG_NET_9P_FD=y
+          CONFIG_9P_FS=y
+          # CONFIG_9P_FS_POSIX_ACL is not set
+          CONFIG_IKCONFIG=y
+          CONFIG_IKCONFIG_PROC=y
+          CONFIG_NETFILTER=y
+          CONFIG_NETFILTER_ADVANCED=y
+          CONFIG_NF_CONNTRACK=y
+          CONFIG_NF_NAT=y
+          CONFIG_NETFILTER_XTABLES=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
+          CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y
+          CONFIG_NETFILTER_XT_MATCH_COMMENT=y
+          CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y
+          CONFIG_NETFILTER_XT_MATCH_STATE=y
+          CONFIG_NETFILTER_XT_MATCH_STATISTIC=y
+          CONFIG_NETFILTER_XT_MATCH_PHYSDEV=y
+          CONFIG_NETFILTER_XT_MARK=y
+          CONFIG_NETFILTER_XT_NAT=y
+          CONFIG_NETFILTER_XT_TARGET_CT=y
+          CONFIG_NETFILTER_XT_TARGET_REDIRECT=y
+          CONFIG_IP_NF_IPTABLES=y
+          CONFIG_IP_NF_NAT=y
+          CONFIG_IP_NF_TARGET_MASQUERADE=y
+          CONFIG_IP_NF_TARGET_REJECT=y
+          CONFIG_IP_NF_FILTER=y
+          CONFIG_IP_NF_MANGLE=y
+          CONFIG_IP_NF_RAW=y
+          CONFIG_NF_TABLES=y
+          CONFIG_NF_TABLES_IPV4=y
+          CONFIG_NFT_NAT=y
+          CONFIG_NFT_MASQ=y
+          CONFIG_BRIDGE=y
+          CONFIG_BRIDGE_NETFILTER=y
+          CONFIG_VETH=y
+          CONFIG_VXLAN=y
+          CONFIG_IP_SET=y
+          CONFIG_IP_SET_HASH_IP=y
+          CONFIG_IP_SET_HASH_NET=y
+          CONFIG_NETFILTER_XT_SET=y
+          CONFIG_MAGIC_SYSRQ=y
+          CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE=0x1
+          EOF
+
+          # Re-extract+patch+base-config+olddefconfig (upstream KERNEL_SOURCES
+          # rule), then merge our fragment with olddefconfig semantics:
+          # preserve all of the base config's decisions and only fill defaults
+          # for symbols newly made visible by our fragment.
+          make -j$(nproc) linux-${{vars.kernel-version}}
+          KSRC=linux-${{vars.kernel-version}}
+          (cd "$KSRC" && ./scripts/kconfig/merge_config.sh -m .config ../microvm.cfg)
+          (cd "$KSRC" && make olddefconfig)
+
+          # Verify every fragment line landed verbatim in .config. This turns
+          # "olddefconfig dropped it because a dependency wasn't satisfied"
+          # into a loud *build* failure rather than a runtime surprise.
+          fail=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if ! grep -qxF "$line" "$KSRC/.config"; then
+              echo "ERROR: requested kernel config not in final .config: $line" >&2
+              sym=${line%%=*}; sym=${sym#\# }; sym=${sym%% *}
+              grep -E "^(${sym}=|# ${sym} )" "$KSRC/.config" >&2 || \
+                echo "  (symbol ${sym} entirely absent from .config)" >&2
+              fail=1
+            fi
+          done < microvm.cfg
+          if [ "$fail" -ne 0 ]; then
+            echo "" >&2
+            echo "olddefconfig dropped one or more requested options." >&2
+            echo "Most common cause: a parent menu/dependency isn't enabled." >&2
+            echo "Inspect $KSRC/.config and the Kconfig graph for the missing symbol." >&2
+            exit 1
+          fi
+
+          make -j$(nproc) PREFIX=/usr LIBDIR_Linux=lib
+      - name: Install the microvm library into the subpackage
+        runs: |
+          make PREFIX=/usr LIBDIR_Linux=lib DESTDIR="${{targets.subpkgdir}}" install
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: Verify SONAME and symlinks
+          runs: |
+            set -euo pipefail
+            test -f /usr/lib/libkrunfw.so.${{package.version}}
+            test -L /usr/lib/libkrunfw.so.5
+            readlink /usr/lib/libkrunfw.so.5 | grep -F libkrunfw.so.${{package.version}}
+        - name: Verify exported symbols
+          runs: |
+            set -euo pipefail
+            for sym in krunfw_get_kernel krunfw_get_version; do
+              if ! nm -D --defined-only /usr/lib/libkrunfw.so.5 | grep -qw "$sym"; then
+                echo "Missing symbol: $sym"
+                nm -D --defined-only /usr/lib/libkrunfw.so.5 || true
+                exit 1
+              fi
+            done
+        - name: Functional test - load kernel data via libkrunfw
+          runs: |
+            set -euo pipefail
+            cat > /tmp/krunfw_test.c <<'EOF'
+            #include <stddef.h>
+            #include <stdio.h>
+
+            extern char *krunfw_get_kernel(size_t *load_addr, size_t *entry_addr, size_t *size);
+            extern int krunfw_get_version(void);
+
+            int main(void) {
+                size_t load_addr = 0, entry_addr = 0, size = 0;
+                char *kernel = krunfw_get_kernel(&load_addr, &entry_addr, &size);
+                if (kernel == NULL) {
+                    fprintf(stderr, "krunfw_get_kernel returned NULL\n");
+                    return 1;
+                }
+                if (size == 0) {
+                    fprintf(stderr, "krunfw_get_kernel returned size 0\n");
+                    return 1;
+                }
+                printf("krunfw kernel size=%zu load=0x%zx entry=0x%zx abi=%d\n",
+                       size, load_addr, entry_addr, krunfw_get_version());
+                return 0;
+            }
+            EOF
+            cc -o /tmp/krunfw_test /tmp/krunfw_test.c /usr/lib/libkrunfw.so.5
+            /tmp/krunfw_test
 
 update:
   enabled: true

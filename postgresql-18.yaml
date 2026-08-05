@@ -1,7 +1,7 @@
 package:
   name: postgresql-18
   version: "18.4"
-  epoch: 7 # toolchain rebuild for  perl-dev-5.44.0
+  epoch: 8
   description: A sophisticated object-relational DBMS
   copyright:
     - license: BSD-3-Clause
@@ -236,6 +236,48 @@ subpackages:
           with:
             allow-absolute: true
 
+  - name: ${{package.name}}-jit
+    description: Just-in-time compilation support for PostgreSQL ${{vars.major-version}}
+    dependencies:
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          libdir="usr/lib/postgresql${{vars.major-version}}"
+          mkdir -p "${{targets.subpkgdir}}/${libdir}/bitcode"
+          mv "${{targets.destdir}}/${libdir}/llvmjit.so" "${{targets.subpkgdir}}/${libdir}/"
+          mv "${{targets.destdir}}/${libdir}/llvmjit_types.bc" "${{targets.subpkgdir}}/${libdir}/"
+          mv "${{targets.destdir}}/${libdir}/bitcode/postgres" "${{targets.subpkgdir}}/${libdir}/bitcode/"
+          mv "${{targets.destdir}}/${libdir}/bitcode/postgres.index.bc" "${{targets.subpkgdir}}/${libdir}/bitcode/"
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}-client
+            - glibc-locales
+            - shadow
+            - sudo-rs
+            - wait-for-it
+        environment:
+          PGDATA: /tmp/jit_test_db
+          PGUSER: wolfi
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: Verify JIT artifacts
+          runs: |
+            test -f /usr/lib/postgresql${{vars.major-version}}/llvmjit.so
+            test -f /usr/lib/postgresql${{vars.major-version}}/llvmjit_types.bc
+            test -f /usr/lib/postgresql${{vars.major-version}}/bitcode/postgres.index.bc
+        - name: Test query JIT
+          runs: |
+            useradd $PGUSER
+            sudo -u $PGUSER initdb -D $PGDATA
+            sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/jit_logfile start
+            wait-for-it localhost:5432 -t 30
+            psql -t -A -d postgres -c "SHOW jit;" | grep -x "on"
+            psql -t -A -d postgres -c "SELECT pg_jit_available();" | grep -x "t"
+            psql -d postgres -c "SET jit_above_cost = 0; EXPLAIN (ANALYZE) SELECT sum(i::bigint * i) FROM generate_series(1, 100000) AS i;" | grep -F "JIT:"
+
   - name: ${{package.name}}-contrib
     dependencies:
       provides:
@@ -252,6 +294,23 @@ subpackages:
     test:
       pipeline:
         - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-contrib-jit
+    description: JIT bitcode for extension modules distributed with PostgreSQL
+    dependencies:
+      runtime:
+        - ${{package.name}}-contrib=${{package.full-version}}
+        - ${{package.name}}-jit=${{package.full-version}}
+    pipeline:
+      - runs: |
+          libdir="usr/lib/postgresql${{vars.major-version}}"
+          mkdir -p "${{targets.subpkgdir}}/${libdir}"
+          mv "${{targets.outdir}}/${{package.name}}-contrib/${libdir}/bitcode" "${{targets.subpkgdir}}/${libdir}/"
+    test:
+      pipeline:
+        - runs: |
+            test -f /usr/lib/postgresql${{vars.major-version}}/bitcode/pg_trgm.index.bc
+            test -f /usr/lib/postgresql${{vars.major-version}}/bitcode/pg_trgm/trgm_op.bc
 
   - name: libpq-18
     description: PostgreSQL libraries
@@ -752,6 +811,7 @@ test:
     contents:
       packages:
         - ${{package.name}}-client
+        - ${{package.name}}-contrib
         - shadow
         - sudo-rs
         - glibc-locales
@@ -760,6 +820,14 @@ test:
       PGUSER: wolfi
   pipeline:
     - uses: test/tw/ldd-check
+    - name: "Verify JIT artifacts are optional"
+      runs: |
+        test ! -e /usr/lib/libLLVM.so.19.1
+        test ! -e /usr/lib/postgresql${{vars.major-version}}/llvmjit.so
+        test ! -e /usr/lib/postgresql${{vars.major-version}}/llvmjit_types.bc
+        ! find /usr/lib/postgresql${{vars.major-version}}/bitcode \
+          -type f -name '*.bc' 2>/dev/null | grep -q .
+        ! ldd /usr/libexec/${{vars.mangled-package-name}}/postgres | grep -F "libLLVM"
     - name: "Test if PostgreSQL binaries are present and runnable"
       runs: |
         command -v initdb
@@ -819,6 +887,10 @@ test:
     - name: "Test server can run and respond to requests"
       runs: |
         psql -d testdb -c "\conninfo"
+    - name: "Test unaccent extension"
+      runs: |
+        psql -d testdb -c "CREATE EXTENSION unaccent;"
+        psql -t -A -d testdb -c "SELECT unaccent('Hôtel');" | grep -x "Hotel"
     - name: "Test XML xpath support"
       runs: |
         psql -d testdb -c "SELECT xpath('/book/title', '<book><title>My Title</title></book>');" | grep "<title>My Title</title>"
@@ -828,9 +900,10 @@ test:
     - name: "Test krb5 config parameter exists"
       runs: |
         psql -d testdb -c "SHOW krb_server_keyfile;" | grep "krb5"
-    - name: "Test JIT is enabled"
+    - name: "Test JIT configuration without provider"
       runs: |
         psql -t -A -d testdb -c "SHOW jit;" | grep "on"
+        psql -t -A -d testdb -c "SELECT pg_jit_available();" | grep -x "f"
     - name: "Test toast compression set to lz4"
       runs: |-
         psql -t -A -d testdb -c "SET default_toast_compression = 'lz4'; SHOW default_toast_compression;" | grep "^lz4$"

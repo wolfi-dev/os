@@ -2,7 +2,7 @@
 package:
   name: pgvector-18
   version: "0.8.6"
-  epoch: 0
+  epoch: 1
   description: Open-source vector similarity search for PostgreSQL
   copyright:
     - license: PostgreSQL
@@ -43,6 +43,47 @@ pipeline:
 
   - uses: strip
 
+subpackages:
+  - name: ${{package.name}}-jit
+    description: JIT bitcode for pgvector
+    dependencies:
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - postgresql-${{vars.pg-version}}-jit
+    pipeline:
+      - runs: |
+          libdir="usr/lib/postgresql${{vars.pg-version}}"
+          mkdir -p "${{targets.subpkgdir}}/${libdir}"
+          mv "${{targets.destdir}}/${libdir}/bitcode" "${{targets.subpkgdir}}/${libdir}/"
+    test:
+      environment:
+        contents:
+          packages:
+            - postgresql-${{vars.pg-version}}-client
+            - glibc-locales
+            - shadow
+            - sudo-rs
+            - wait-for-it
+        environment:
+          PGDATA: /tmp/pgvector_jit_db
+          PGUSER: wolfi
+      pipeline:
+        - name: Verify pgvector JIT artifacts
+          runs: |
+            test -f /usr/lib/postgresql${{vars.pg-version}}/bitcode/vector.index.bc
+            test -f /usr/lib/postgresql${{vars.pg-version}}/bitcode/vector/src/vector.bc
+        - name: Test pgvector with query JIT
+          runs: |
+            useradd $PGUSER
+            sudo -u $PGUSER initdb -D $PGDATA
+            sudo -u $PGUSER pg_ctl -D $PGDATA -l /tmp/pgvector_jit_logfile start
+            wait-for-it localhost:5432 -t 30
+            psql -d postgres -c "CREATE EXTENSION vector;"
+            psql -t -A -d postgres -c "SHOW jit;" | grep -x "on"
+            psql -t -A -d postgres -c "SELECT pg_jit_available();" | grep -x "t"
+            psql -d postgres -c "CREATE TABLE items (embedding vector(3)); INSERT INTO items SELECT ARRAY[random(), random(), random()]::vector FROM generate_series(1, 100000);"
+            psql -d postgres -c "SET jit_above_cost = 0; EXPLAIN (ANALYZE) SELECT avg(embedding <-> '[1,2,3]') FROM items;" | grep -F "JIT:"
+
 update:
   enabled: true
   github:
@@ -63,6 +104,12 @@ test:
     environment:
       PGUSER: wolfi
   pipeline:
+    - name: Verify JIT artifacts are optional
+      runs: |
+        test ! -e /usr/lib/libLLVM.so.19.1
+        ! find /usr/lib/postgresql${{vars.pg-version}}/bitcode \
+          -type f -name '*.bc' 2>/dev/null | grep -q .
+        ! ldd /usr/lib/postgresql${{vars.pg-version}}/vector.so | grep -F "libLLVM"
     - name: Initialize PostgreSQL database
       runs: |
         useradd $PGUSER
@@ -74,6 +121,8 @@ test:
     - name: Create pgvector extension
       runs: |
         psql -c "CREATE EXTENSION vector;" postgres
+        psql -t -A -c "SHOW jit;" postgres | grep -x "on"
+        psql -t -A -c "SELECT pg_jit_available();" postgres | grep -x "f"
     - name: Test vector operations
       runs: |
         # Create a table with a vector column

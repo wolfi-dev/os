@@ -25,22 +25,6 @@ As a result:
 If you are a Chainguard customer, please contact your Customer Success
 representative for additional support.
 
-## Requesting a package update or fix
-
-To request an update or fix to an existing Wolfi package,
-[open an issue](https://wolfi.dev/os/issues/new/choose) using the package update
-or fix request template. Please include the upstream version and a clear
-description of the problem.
-
-Requests are expected to meet Wolfi's packaging and security model:
-
-- The requested version must be the **latest stable upstream release** (no
-  pre-releases or release candidates).
-- The upstream project must use an
-  [OSI-approved](https://opensource.org/licenses) license.
-- The package must be reasonably maintainable over time, with no known
-  unresolved security or supply-chain concerns.
-
 ## Package inclusion and removal
 
 Which packages exist in Wolfi is governed by Chainguard. Wolfi provides the

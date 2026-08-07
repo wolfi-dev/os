@@ -1,0 +1,80 @@
+package:
+  name: abi-compliance-checker
+  version: "2.3"
+  epoch: 0
+  description: Tool for checking backward API/ABI compatibility of a C/C++ library
+  copyright:
+    - license: LGPL-2.1-or-later
+  dependencies:
+    runtime:
+      - abi-dumper
+      - binutils
+      - gcc
+      - universal-ctags
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - make
+      - perl
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/lvc/abi-compliance-checker
+      tag: ${{package.version}}
+      expected-commit: 8e819827e8d707c7addc4a08f5cf74045f2302bb
+
+  # The Makefile.pl installer requires DESTDIR + prefix to exist first.
+  - runs: mkdir -p "${{targets.destdir}}/usr"
+
+  - uses: autoconf/make-install
+
+update:
+  enabled: true
+  github:
+    identifier: lvc/abi-compliance-checker
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+  pipeline:
+    - name: Detect an ABI break between two library versions
+      runs: |
+        # Build two versions of a shared library with DWARF debug info,
+        # dump each ABI with abi-dumper, then have abi-compliance-checker
+        # compare the dumps. This is the DWARF-based workflow upstream
+        # recommends (the bundled -test relies on GCC translation-unit
+        # dumps that no longer work with modern GCC). It exercises both
+        # abi-dumper and the abi-compliance-checker comparison engine.
+
+        # v1 exports compute(int) and legacy_helper().
+        cat > v1.c <<'EOF'
+        int compute(int a) { return a + 1; }
+        int legacy_helper(void) { return 0; }
+        EOF
+        gcc -g -Og -shared -fPIC -o libfoo.v1.so v1.c
+
+        # v2 removes legacy_helper and changes compute's signature: an
+        # ABI break on both counts.
+        cat > v2.c <<'EOF'
+        int compute(int a, int b) { return a + b; }
+        EOF
+        gcc -g -Og -shared -fPIC -o libfoo.v2.so v2.c
+
+        abi-dumper libfoo.v1.so -o v1.dump -lver 1
+        abi-dumper libfoo.v2.so -o v2.dump -lver 2
+
+        # abi-compliance-checker exits non-zero when it finds an
+        # incompatibility, which is exactly what we expect here.
+        abi-compliance-checker -l foo -old v1.dump -new v2.dump 2>&1 | tee acc.log || true
+
+        # The comparison must report binary compatibility problems ...
+        grep -qE "binary compatibility problems: [1-9]" acc.log
+        # ... and the generated report must flag the removed symbol.
+        report=$(find compat_reports -name compat_report.html | head -n1)
+        test -n "$report"
+        grep -q "legacy_helper" "$report"

@@ -1,9 +1,9 @@
 package:
-  name: datadog-agent-7.80
+  name: datadog-agent-7.81
   # This package has two git checkouts. For each new release, the commit SHA for
   # DataDog/integrations-core must also be updated.
-  version: "7.80.4"
-  epoch: 10 # x/text 0.39.0, x/net 0.56.0, cel-go 0.29.0, ddtrace 4.8.2, setuptools 83.0.0
+  version: "7.81.3"
+  epoch: 0
   description: "Collect events and metrics from your hosts that send data to Datadog."
   copyright:
     - license: Apache-2.0
@@ -62,6 +62,11 @@ var-transforms:
 environment:
   contents:
     packages:
+      # invoke runs every task command through bash (run.shell defaults to
+      # "bash"), and bazel needs it for run_shell actions. Until 2026-07-31 this
+      # came in transitively via go-1.26; #206744 dropped that runtime dep, so
+      # declare it here.
+      - bash
       - bazelisk
       - bison
       - build-base
@@ -124,7 +129,7 @@ pipeline:
     with:
       repository: https://github.com/DataDog/datadog-agent
       tag: ${{package.version}}
-      expected-commit: 8b55b8dd4e9ef99b33d3c546cc033675e618068c
+      expected-commit: 2f8546b1a57cf8f5bd980db87ff83b1bf4fba67d
 
   - uses: bump
     with:
@@ -132,7 +137,6 @@ pipeline:
         github.com/containerd/containerd@v1.7.33
         github.com/envoyproxy/gateway@v1.7.4
         github.com/google/cel-go@v0.29.0
-        github.com/prometheus/prometheus@v0.311.3
         go.mongodb.org/mongo-driver@v1.17.7
         go.opentelemetry.io/otel@v1.44.0
         go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc@v0.20.0
@@ -164,8 +168,6 @@ pipeline:
         fix-7.66.0-ftbfs.patch
         fix-7.78-bazel-ebpf-clang-headers.patch
         fix-sqlite-double-registration.patch
-        fix-security-agent-subcommands.patch
-        add-clang-to-cgo-path.patch
 
   - runs: |
       sed -i'' 's/v1\.3\.7/v1.6.1/g' go.mod
@@ -267,11 +269,23 @@ pipeline:
       # its resource directory; fix-7.78-bazel-ebpf-clang-headers.patch points
       # EbpfClang actions at /opt/clang's include dir. Disable Bazel's sandbox
       # so /opt/clang is reachable from inside the action.
+      #
+      # CgoGodefs keeps its sandbox. The three cgo_godefs targets in
+      # pkg/network/ebpf each cd into that one directory and run `go tool cgo
+      # -godefs`, which writes its objects to ./_obj named from a per-process
+      # counter (cmd/cgo gccTmp). Sharing one directory they overwrite each
+      # other, then cgo parses an object built for a different file and dies
+      # with "panic: runtime error: index out of range" in loadDWARF. Passing
+      # -objdir is not an option: cgo records its full argv in the generated
+      # file and upstream's diff tests compare that byte for byte.
       mkdir -p /root
-      echo 'common --spawn_strategy=local' > /root/.bazelrc
+      printf '%s\n' \
+        'common --spawn_strategy=local' \
+        'common --strategy=CgoGodefs=sandboxed' > /root/.bazelrc
 
-      # Build once to correctly setup links/generates. The system-probe we end
-      # up using will be part of the multicall below.
+      # This builds bin/system-probe/system-probe, which is what we ship: 7.81
+      # dropped the agent multicall that used to carry it (see "Build the
+      # agent" below).
       if [ "$(id -u)" -gt 0 ]; then
         # on rootless systems let's use unshare to build
         unshare --user --map-root-user \
@@ -368,17 +382,23 @@ pipeline:
 
   - name: Build the agent
     runs: |
-      # Default includes [process-agent, security-agent, trace-agent]. Add in
-      # the `system-probe` as well, which saves us ~140Mb.
       invoke -e agent.build \
-        --bundle process-agent \
-        --bundle trace-agent \
-        --bundle system-probe \
-        --bundle security-agent \
         --no-development \
         --python-home-3=/opt/datadog-agent/embedded \
         --embedded-path /usr/lib
-        #--bundle-ebpf \ # Same as above for the system-probe.build Invoke task.
+
+  # Up to 7.80 these three rode along in the agent binary via `agent.build
+  # --bundle <name>`, and we shipped symlinks to it. 7.81 deleted that
+  # mechanism (upstream f3062050f, "Remove --bundle flag and legacy agent
+  # bundles": the bundle_* build tags and the launcher helper are gone), so
+  # build them separately the way upstream's own omnibus definition does.
+  # These tasks take no --embedded-path: get_build_flags finds /home/build/dev,
+  # created for the libpcap.a symlink above.
+  - name: Build the process, trace and security agents
+    runs: |
+      invoke -e process-agent.build
+      invoke -e trace-agent.build
+      invoke -e security-agent.build
 
   - name: Build trace-loader
     runs: |
@@ -399,11 +419,14 @@ pipeline:
         ${{targets.contextdir}}${{vars.destd}}/embedded/bin
 
       install -Dm755 bin/agent/agent ${{targets.contextdir}}${{vars.destd}}/bin/agent
-      # *-agent is just a symlink to the "agent" multicall
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/process-agent"
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/security-agent"
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/trace-agent"
-      ln -s "${{vars.destd}}/bin/agent/agent" "${{targets.contextdir}}${{vars.destd}}/embedded/bin/system-probe"
+      # Real binaries as of 7.81; through 7.80 these were symlinks to the agent
+      # multicall. Same paths, so the s6 services and image entrypoints are
+      # unaffected, and they match where upstream's omnibus build copies them.
+      embedded_bin=${{targets.contextdir}}${{vars.destd}}/embedded/bin
+      install -Dm755 bin/process-agent/process-agent "$embedded_bin/process-agent"
+      install -Dm755 bin/security-agent/security-agent "$embedded_bin/security-agent"
+      install -Dm755 bin/trace-agent/trace-agent "$embedded_bin/trace-agent"
+      install -Dm755 bin/system-probe/system-probe "$embedded_bin/system-probe"
 
       mkdir -p ${{targets.contextdir}}/etc/datadog-agent/
 
@@ -594,8 +617,8 @@ subpackages:
               echo "Verified: expected-commit matches the latest commit on branch ${{vars.datadog-major-minor-x}}"
           - uses: patch
             with:
-              # urllib3.patch (bumps urllib3 to 2.7.0) is not applied here because
-              # the 7.80.x branch of integrations-core already includes urllib3 2.7.0.
+              # No urllib3 bump patch is needed here: the 7.81.x branch of
+              # integrations-core already pins urllib3 2.7.0.
               patches: /home/build/int-core-datadog_checks_dev-pyproject-toml.patch /home/build/int-core-mysql-hatch-toml.patch /home/build/int-core-singlestore-hatch-toml.patch
           - runs: |
               # This is needed to work around the error "ValueError: ZIP does not support timestamps before 1980"
@@ -1069,7 +1092,7 @@ test:
           Done running check
           Starting to load the configuration
           Starting Datadog Agent
-    - name: Validate multicall components are correctly linked
+    - name: Validate the sub-agent binaries report their own identity
       runs: |
         : "${mypath:?ERROR: mypath environment variable not set}"
         PATH=$mypath:$PATH
@@ -1087,6 +1110,6 @@ update:
   enabled: true
   github:
     identifier: DataDog/datadog-agent
-    tag-filter: 7.80.
+    tag-filter: 7.81.
   ignore-regex-patterns:
     - "lambda-extension.*"

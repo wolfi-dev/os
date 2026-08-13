@@ -1,7 +1,7 @@
 package:
   name: libkrunfw
   version: "5.5.0"
-  epoch: 3 # provider-priority
+  epoch: 4 # -microvm-image subpackage, -microvm uname -r
   description: Dynamic library bundling a Linux kernel for use by libkrun
   copyright:
     - license: GPL-2.0-only AND LGPL-2.1-only
@@ -206,6 +206,13 @@ subpackages:
           # config via merge_config.sh below. Everything is =y because the
           # libkrunfw kernel has no loadable-module support.
           #
+          # CONFIG_LOCALVERSION - makes `uname -r` in the guest read
+          #   ${{vars.kernel-version}}-r${{package.epoch}}-microvm rather than
+          #   plain ${{vars.kernel-version}}, so a stock kernel and this one
+          #   are told apart from inside the VM, and the epoch says which
+          #   build of the package it came from. LOCALVERSION_AUTO off keeps
+          #   the string exactly that (it would otherwise append scm info).
+          #
           # 9p + introspection:
           #   CONFIG_NETWORK_FILESYSTEMS - parent menu under fs/Kconfig; the
           #     base config has it off, so fs/9p/Kconfig is never sourced and
@@ -248,6 +255,8 @@ subpackages:
           # DEFAULT_ENABLE=0x1 turns on all sysrq functions, including 'o'
           # (poweroff), which is the one the suite uses.
           cat > microvm.cfg <<'EOF'
+          CONFIG_LOCALVERSION="-r${{package.epoch}}-microvm"
+          # CONFIG_LOCALVERSION_AUTO is not set
           CONFIG_NETWORK_FILESYSTEMS=y
           CONFIG_NET_9P=y
           CONFIG_NET_9P_FD=y
@@ -340,13 +349,24 @@ subpackages:
         - uses: test/tw/ldd-check
         - name: Verify SONAME and symlinks
           runs: |
-            set -euo pipefail
             test -f /usr/lib/libkrunfw.so.${{package.version}}
             test -L /usr/lib/libkrunfw.so.5
             readlink /usr/lib/libkrunfw.so.5 | grep -F libkrunfw.so.${{package.version}}
+        - name: Verify the bundled kernel is the microvm one
+          runs: |
+            # bin2cbundle.py embeds the kernel image in the .so as a plain
+            # (uncompressed) byte array, so the kernel's version banner is
+            # greppable here. That banner carries UTS_RELEASE, which is what
+            # `uname -r` reports in a guest booted on this library -- so this
+            # asserts a guest can tell this kernel from the stock one.
+            rel="${{vars.kernel-version}}-r${{package.epoch}}-microvm"
+            if ! grep -qF "Linux version ${rel} " /usr/lib/libkrunfw.so.5; then
+              echo "bundled kernel is not ${rel}:" >&2
+              strings /usr/lib/libkrunfw.so.5 | grep -m1 "^Linux version " >&2
+              exit 1
+            fi
         - name: Verify exported symbols
           runs: |
-            set -euo pipefail
             for sym in krunfw_get_kernel krunfw_get_version; do
               if ! nm -D --defined-only /usr/lib/libkrunfw.so.5 | grep -qw "$sym"; then
                 echo "Missing symbol: $sym"
@@ -356,7 +376,6 @@ subpackages:
             done
         - name: Functional test - load kernel data via libkrunfw
           runs: |
-            set -euo pipefail
             cat > /tmp/krunfw_test.c <<'EOF'
             #include <stddef.h>
             #include <stdio.h>
@@ -382,6 +401,95 @@ subpackages:
             EOF
             cc -o /tmp/krunfw_test /tmp/krunfw_test.c /usr/lib/libkrunfw.so.5
             /tmp/krunfw_test
+
+  # The reconfigured kernel image, shipped as plain data so a host that cannot
+  # compile a Linux kernel can still assemble its own libkrunfw around it.
+  #
+  # macOS is the motivating consumer. libkrun there drives
+  # Hypervisor.framework and dlopen()s libkrunfw.5.dylib by name, resolving a
+  # single symbol (krunfw_get_kernel) -- so replacing the guest kernel never
+  # means rebuilding libkrun. But Homebrew ships stock libkrunfw, so every
+  # feature needing the config above fails on a Mac. Upstream cannot help
+  # directly: its Makefile's darwin path shells out to ./build_on_krunvm.sh,
+  # i.e. it needs a libkrun VM in order to build the kernel for libkrun.
+  #
+  # The split that does work is the one upstream already has. Building the
+  # kernel is Linux work, which we do here, reproducibly. Wrapping it is
+  # native work over a byte array (bin2cbundle.py, then one cc -shared).
+  # Publishing the image lets a Mac fetch our kernel and assemble the library
+  # locally instead of trusting a prebuilt binary of unknown provenance. See
+  # microvm/libkrun/README-mac-libkrunfw.md in the mono repo.
+  #
+  # The resolved .config ships alongside it because otherwise there is no way
+  # to answer "which options does this kernel actually carry" without booting
+  # it.
+  #
+  # ORDERING: this must stay after ${{package.name}}-microvm. That
+  # subpackage's pipeline is what leaves the reconfigured kernel tree in the
+  # workspace, and it opens with `make clean` -- so any subpackage cleaning or
+  # rebuilding in between would leave this shipping the wrong kernel, or none.
+  - name: ${{package.name}}-microvm-image
+    description: Kernel image and resolved config from ${{package.name}}-microvm, for assembling libkrunfw on hosts that cannot build a Linux kernel
+    pipeline:
+      - name: Install the microvm kernel image and its resolved config
+        runs: |
+          ksrc="linux-${{vars.kernel-version}}"
+          # Upstream keeps the kernel under a different name and format per
+          # arch. Install it under one fixed name so a consumer never has to
+          # know its own architecture to find the file, and record the format
+          # separately in bundle-type -- that token is exactly what
+          # bin2cbundle.py's -t flag wants, so a consumer can pass it through
+          # without an arch case of its own.
+          case "${{build.arch}}" in
+            aarch64) img="${ksrc}/arch/arm64/boot/Image" ; ktype="Image" ;;
+            x86_64) img="${ksrc}/vmlinux" ; ktype="vmlinux" ;;
+            *) echo "no known kernel image path for ${{build.arch}}" >&2 ; exit 1 ;;
+          esac
+          [ -f "$img" ] || { echo "$img - not a file"; exit 1; }
+          [ -s "$img" ] || { echo "$img - is zero length"; exit 1; }
+          dest="${{targets.subpkgdir}}/usr/share/${{subpkg.name}}"
+          install -Dm644 "${img}" "${dest}/kernel.image"
+          install -Dm644 "${ksrc}/.config" "${dest}/config"
+          printf '%s\n' "${ktype}" >"${dest}/bundle-type"
+          chmod 0644 "${dest}/bundle-type"
+    test:
+      pipeline:
+        - name: Image and config are present, and are the microvm kernel's
+          runs: |
+            d="/usr/share/${{subpkg.name}}"
+            # Fixed names on every arch: a consumer needs no arch logic.
+            for f in "$d/kernel.image" "$d/config"; do
+              [ -f "$f" ] ||{ echo "$f - not a file"; exit 1; }
+              [ -s "$f" ] ||{ echo "$f - empty file"; exit 1; }
+            done
+
+            # bundle-type must be a token bin2cbundle.py's -t accepts, since
+            # consumers pass it straight through.
+            case "$(cat "${d}/bundle-type")" in
+              Image | vmlinux) ;;
+              *) echo "unexpected bundle-type: $(cat "${d}/bundle-type")" >&2 ; exit 1 ;;
+            esac
+            # Assert provenance, not just presence: these three are exactly
+            # what the -microvm rebuild adds on top of upstream's config, one
+            # per reason that rebuild exists (9p, legacy xtables, sysrq). A
+            # stock kernel that somehow reached this subpackage fails here
+            # rather than shipping quietly and failing inside a guest later.
+            for opt in CONFIG_9P_FS=y CONFIG_IP_NF_RAW=y CONFIG_MAGIC_SYSRQ=y ; do
+              grep -qxF "${opt}" "${d}/config" ||
+                  { echo "$d/config - does not contain $opt"; exit 1; }
+            done
+
+            # The kernel names itself, so a consumer that assembles a
+            # libkrunfw around this image gets a guest whose `uname -r` says
+            # where the kernel came from. Both the config and the image
+            # itself have to agree on it.
+            rel="${{vars.kernel-version}}-r${{package.epoch}}-microvm"
+            grep -qxF "CONFIG_LOCALVERSION=\"-r${{package.epoch}}-microvm\"" "${d}/config" ||
+                { echo "$d/config - wrong CONFIG_LOCALVERSION for ${rel}"; exit 1; }
+            # kernel.image is uncompressed on both arches (arm64 Image, x86_64
+            # vmlinux), so the version banner is greppable.
+            grep -qF "Linux version ${rel} " "${d}/kernel.image" ||
+                { echo "$d/kernel.image - is not the ${rel} kernel"; exit 1; }
 
 update:
   enabled: true

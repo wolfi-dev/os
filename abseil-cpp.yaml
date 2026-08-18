@@ -1,7 +1,7 @@
 package:
   name: abseil-cpp
   version: "20260817.0" # On update, please check if -fdelete-null-pointer-checks is still required
-  epoch: 1 # split gmock-linked test helpers out of libabsl (OS-2758)
+  epoch: 2 # split the remaining gtest-linked test helpers out of libabsl
   description: Abseil Common Libraries (C++)
   copyright:
     - license: Apache-2.0
@@ -62,19 +62,34 @@ pipeline:
 
 subpackages:
   # Must come before libabsl${{vars.soversion}}, which globs whatever .so.* is
-  # left. libabsl_scoped_mock_log links gmock, so shipping it in the runtime
-  # package gave every libabsl generation a hard dep on one gmock soname; two
-  # generations in a single closure then conflict on "gmock" and the solve
-  # fails (OS-2758). These cannot just be dropped -- py3.*-grpcio and
-  # crossplane-function-sdk-python carry real so: deps on them.
+  # left. abseil builds these only because ABSL_BUILD_TEST_HELPERS is on, and
+  # several of them link gtest/gmock -- shipping them in the runtime package
+  # gave every libabsl generation a hard dep on one gtest/gmock soname, so two
+  # generations in a single closure conflict and the solve fails (OS-2758).
+  # They cannot just be dropped: py3.*-grpcio and crossplane-function-sdk-python
+  # carry real so: deps on them, which resolve against this subpackage instead.
+  #
+  # Deliberately narrow: libabsl_cordz_sample_token, libabsl_hashtablez_sampler
+  # and libabsl_periodic_sampler match /sample/ but are real runtime libraries
+  # and must stay in libabsl${{vars.soversion}}.
   - name: libabsl${{vars.soversion}}-test-helpers
-    description: abseil-cpp test-support libraries (link gmock; not used at runtime)
+    description: abseil-cpp test-support libraries (link gtest/gmock; not used at runtime)
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/lib
-          mv ${{targets.destdir}}/usr/lib/libabsl_scoped_mock_log.so.* \
-             ${{targets.destdir}}/usr/lib/libabsl_atomic_hook_test_helper.so.* \
-             ${{targets.contextdir}}/usr/lib/
+          cd ${{targets.destdir}}/usr/lib
+          moved=0
+          for f in libabsl_*_test_*.so.* libabsl_*_testing.so.* \
+                   libabsl_test_*.so.* libabsl_scoped_mock_log.so.* \
+                   libabsl_status_matchers.so.*; do
+              [ -e "$f" ] || continue
+              mv "$f" ${{targets.contextdir}}/usr/lib/
+              moved=$((moved + 1))
+          done
+          # Guard against upstream renaming these out from under us, which
+          # would silently put them back in the runtime package.
+          [ "$moved" -gt 0 ] || { echo "no abseil test-support libs matched"; exit 1; }
+          echo "moved $moved test-support libraries"
     test:
       pipeline:
         - uses: test/tw/ldd-check
@@ -84,6 +99,20 @@ subpackages:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/lib
           mv ${{targets.destdir}}/usr/lib/*.so.* ${{targets.contextdir}}/usr/lib/
+          # The globs above are name-based and will miss a helper that does not
+          # say "test" -- libabsl_status_matchers did exactly that. A gtest or
+          # gmock dep here is what makes two libabsl generations unco-installable
+          # (OS-2758), so make it a build failure rather than a silent one.
+          bad=""
+          for f in ${{targets.contextdir}}/usr/lib/*.so.*; do
+              readelf -d "$f" 2>/dev/null | grep -qE 'lib(gtest|gmock)\.so' &&
+                  bad="$bad $(basename "$f")"
+          done
+          [ -z "$bad" ] || {
+              echo "runtime libs still link gtest/gmock:$bad"
+              echo "move them into libabsl${{vars.soversion}}-test-helpers"
+              exit 1
+          }
     test:
       pipeline:
         - uses: test/tw/ldd-check

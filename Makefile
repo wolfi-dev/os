@@ -16,6 +16,14 @@
 # - MELANGE_TMPDIR - Directory for melange cache and build files. Defaults to
 #                    $TMPDIR or /tmp if that isn't set.
 #
+# - USE_PODMAN - Set to true when the `docker` command is an alias to podman,
+#                running in "rootless" mode. This adds appropriate modifications
+#                to `docker` commands and other utilities that require different
+#                behavior when running as a non-root Linux process. Note that
+#                some of these modifications may be specific to podman, or require
+#                additional external configuration (ex: install the `podman-docker`
+#                package on Fedora).
+#
 # Useful make targets:
 #
 # - make debug/{foo} - Builds the {foo} package in debug mode; if a pipeline
@@ -122,6 +130,20 @@ DOCKER_PLATFORM_ARG := $(shell \
   esac ; \
   echo "--platform=linux/$$darch" \
 )
+
+# Rootless podman on an SELinux-enforcing host cannot read host directories
+# shared with a container unless they are relabeled first. Set USE_PODMAN to
+# true to append "relabel=private" to --mount arguments and ":Z" to --volume
+# arguments, which relabels the source paths on the host. Docker rejects
+# "relabel", hence the default of false.
+USE_PODMAN ?= false
+ifeq ($(filter true yes 1,$(USE_PODMAN)),)
+MOUNT_RELABEL_OPT :=
+VOLUME_RELABEL_OPT :=
+else
+MOUNT_RELABEL_OPT := ,relabel=private
+VOLUME_RELABEL_OPT := :Z
+endif
 
 ifeq ($(BOOTSTRAP), yes)
 	MELANGE_OPTS += --keyring-append=$(BOOTSTRAP_KEY)
@@ -260,13 +282,14 @@ $(testdbg_targets): test-debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 dev-container:
 	docker run $(DOCKER_PLATFORM_ARG) --pull=always --privileged --rm -it \
 		--entrypoint="/bin/bash" \
-			--volume="$(PWD):$(PWD)" \
+			--volume="$(PWD):$(PWD)"$(VOLUME_RELABEL_OPT) \
 			--workdir="$(PWD)" \
 			--env=SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
 			--env=HTTP_AUTH \
 			ghcr.io/wolfi-dev/sdk:latest -il
 
 PACKAGES_CONTAINER_FOLDER ?= /work/packages
+
 # This target spins up a docker container that is helpful for testing local
 # changes to the packages. It mounts the local packages folder as a read-only,
 # and sets up the necessary keys for you to run `apk add` commands, and then
@@ -283,9 +306,9 @@ ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
 endif
 	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
 		--entrypoint="/bin/sh" \
-		--mount=type=bind,source="$(PWD)/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
-		--mount=type=bind,source="$(PWD)/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
-		--mount=type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
+		--mount=type=bind,source="$(PWD)/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly$(MOUNT_RELABEL_OPT) \
+		--mount=type=bind,source="$(PWD)/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly$(MOUNT_RELABEL_OPT) \
+		--mount=type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly$(MOUNT_RELABEL_OPT) \
 		--workdir="$(PACKAGES_CONTAINER_FOLDER)" \
 		"cgr.dev/chainguard/wolfi-base:latest" -il
 	rm "$(TMP_REPOS_FILE)"
@@ -344,11 +367,11 @@ ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
 endif
 	docker run $(DOCKER_PLATFORM_ARG) --pull=always --rm -it \
 		--entrypoint="/bin/bash" \
-		--mount=type=bind,source="$(OUT_DIR)",destination="$(OUT_LOCAL_DIR)" \
-		--mount=type=bind,source="$(OS_DIR)",destination="$(OS_LOCAL_DIR)",readonly \
-		--mount=type=bind,source="$(PWD)/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly \
-		--mount=type=bind,source="$(PWD)/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly \
-		--mount=type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly \
+		--mount=type=bind,source="$(OUT_DIR)",destination="$(OUT_LOCAL_DIR)"$(MOUNT_RELABEL_OPT) \
+		--mount=type=bind,source="$(OS_DIR)",destination="$(OS_LOCAL_DIR)",readonly$(MOUNT_RELABEL_OPT) \
+		--mount=type=bind,source="$(PWD)/packages",destination="$(PACKAGES_CONTAINER_FOLDER)",readonly$(MOUNT_RELABEL_OPT) \
+		--mount=type=bind,source="$(PWD)/$(KEY).pub",destination="/etc/apk/keys/$(KEY).pub",readonly$(MOUNT_RELABEL_OPT) \
+		--mount=type=bind,source="$(TMP_REPOS_FILE)",destination="/etc/apk/repositories",readonly$(MOUNT_RELABEL_OPT) \
 		--workdir="$(PACKAGES_CONTAINER_FOLDER)" \
 		"ghcr.io/wolfi-dev/sdk:latest" -il
 	rm "$(TMP_REPOS_FILE)"

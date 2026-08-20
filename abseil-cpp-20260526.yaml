@@ -1,0 +1,239 @@
+package:
+  name: abseil-cpp-20260526
+  version: "20260526.0" # On update, please check if -fdelete-null-pointer-checks is still required
+  epoch: 6 # outranks the stale -r5 build, which still links gtest/gmock
+  description: Abseil Common Libraries (C++)
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "12"
+    memory: 21Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cmake
+      - gtest-dev
+      - samurai
+  environment:
+    # https://github.com/wolfi-dev/os/issues/34075
+    CMAKE_CXX_FLAGS: -fdelete-null-pointer-checks
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^\d{2}(\d{4}).*$
+    replace: ${1}.0.0
+    to: soversion
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/abseil/abseil-cpp
+      tag: ${{package.version}}
+      expected-commit: 5650e9cf76d3be4318d5fa3af38ee483ddfd5e4a
+
+  - runs: |
+      cmake -B build -G Ninja \
+      -DCMAKE_CXX_FLAGS="$CMAKE_CXX_FLAGS" \
+      -DCMAKE_CXX_STANDARD=17 \
+      -DCMAKE_BUILD_TYPE=MinSizeRel \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DBUILD_SHARED_LIBS=ON \
+      -DABSL_BUILD_TESTING=ON \
+      -DABSL_BUILD_TEST_HELPERS=ON \
+      -DABSL_USE_EXTERNAL_GOOGLETEST=ON \
+      -DABSL_PROPAGATE_CXX_STD=ON \
+      -DABSL_FIND_GOOGLETEST=ON
+      cmake --build build
+
+  - runs: |
+      DESTDIR="${{targets.destdir}}" cmake --install build
+
+  - uses: strip
+
+subpackages:
+  # Must come before libabsl${{vars.soversion}}, which globs whatever .so.* is
+  # left. abseil builds these only because ABSL_BUILD_TEST_HELPERS is on, and
+  # several of them link gtest/gmock -- shipping them in the runtime package
+  # gave every libabsl generation a hard dep on one gtest/gmock soname, so two
+  # generations in a single closure conflict and the solve fails (OS-2758).
+  # They cannot just be dropped: py3.*-grpcio and crossplane-function-sdk-python
+  # carry real so: deps on them, which resolve against this subpackage instead.
+  #
+  # Deliberately narrow: libabsl_cordz_sample_token, libabsl_hashtablez_sampler
+  # and libabsl_periodic_sampler match /sample/ but are real runtime libraries
+  # and must stay in libabsl${{vars.soversion}}.
+  - name: libabsl${{vars.soversion}}-test-helpers
+    description: abseil-cpp test-support libraries (link gtest/gmock; not used at runtime)
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/lib
+          cd ${{targets.destdir}}/usr/lib
+          moved=0
+          for f in libabsl_*_test_*.so.* libabsl_*_testing.so.* \
+                   libabsl_test_*.so.* libabsl_scoped_mock_log.so.* \
+                   libabsl_status_matchers.so.*; do
+              [ -e "$f" ] || continue
+              mv "$f" ${{targets.contextdir}}/usr/lib/
+              moved=$((moved + 1))
+          done
+          # Guard against upstream renaming these out from under us, which
+          # would silently put them back in the runtime package.
+          [ "$moved" -gt 0 ] || { echo "no abseil test-support libs matched"; exit 1; }
+          echo "moved $moved test-support libraries"
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: libabsl${{vars.soversion}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/lib/*.so.* ${{targets.contextdir}}/usr/lib/
+          # The globs above are name-based and will miss a helper that does not
+          # say "test" -- libabsl_status_matchers did exactly that. A gtest or
+          # gmock dep here is what makes two libabsl generations unco-installable
+          # (OS-2758), so make it a build failure rather than a silent one.
+          bad=""
+          for f in ${{targets.contextdir}}/usr/lib/*.so.*; do
+              readelf -d "$f" 2>/dev/null | grep -qE 'lib(gtest|gmock)\.so' &&
+                  bad="$bad $(basename "$f")"
+          done
+          [ -z "$bad" ] || {
+              echo "runtime libs still link gtest/gmock:$bad"
+              echo "move them into libabsl${{vars.soversion}}-test-helpers"
+              exit 1
+          }
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-dev
+    pipeline:
+      - uses: split/dev
+    description: ${{package.name}} dev
+    dependencies:
+      provides:
+        - abseil-cpp-dev=${{package.full-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - libabsl${{vars.soversion}}
+      pipeline:
+        - uses: test/tw/devpackage
+        - uses: test/pkgconf
+        - uses: test/tw/ldd-check
+          with:
+            packages: ${{subpkg.name}}
+        - name: Test abseil header compilation and linkage
+          runs: |
+            # Create a test program that uses Abseil string utilities
+            tee test_abseil.cpp <<'EOF'
+            #include <absl/strings/str_cat.h>
+            #include <absl/strings/string_view.h>
+            #include <iostream>
+
+            int main() {
+                // Test absl::StrCat
+                std::string result = absl::StrCat("Hello", ", ", "Abseil");
+                if (result != "Hello, Abseil") {
+                    std::cerr << "FAIL: StrCat returned '" << result << "'" << std::endl;
+                    return 1;
+                }
+
+                // Test absl::string_view
+                absl::string_view sv = "test string";
+                if (sv.size() != 11) {
+                    std::cerr << "FAIL: string_view size is " << sv.size() << std::endl;
+                    return 1;
+                }
+
+                std::cout << "SUCCESS: Abseil headers and linkage work correctly" << std::endl;
+                return 0;
+            }
+            EOF
+
+            # Compile using pkg-config flags
+            g++ -std=c++17 test_abseil.cpp \
+              $(pkg-config --cflags absl_strings) \
+              $(pkg-config --libs absl_strings) \
+              -o test_abseil
+
+            # Run the test
+            ./test_abseil
+
+update:
+  enabled: true
+  github:
+    identifier: abseil/abseil-cpp
+    tag-filter-prefix: 20260526
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-dev
+        - build-base
+        - libabsl${{vars.soversion}}
+        - pkgconf
+  pipeline:
+    - uses: test/tw/ldd-check
+      with:
+        packages: ${{package.name}}
+    - name: Test abseil library compilation and linkage
+      runs: |
+        # Create a test program that exercises core Abseil functionality
+        tee test_abseil.cpp <<'EOF'
+        #include <absl/strings/str_cat.h>
+        #include <absl/strings/str_join.h>
+        #include <absl/strings/string_view.h>
+        #include <iostream>
+        #include <vector>
+
+        int main() {
+            // Test absl::StrCat
+            std::string greeting = absl::StrCat("Hello", ", ", "World", "!");
+            if (greeting != "Hello, World!") {
+                std::cerr << "FAIL: StrCat returned '" << greeting << "'" << std::endl;
+                return 1;
+            }
+
+            // Test absl::StrJoin
+            std::vector<std::string> parts = {"one", "two", "three"};
+            std::string joined = absl::StrJoin(parts, "-");
+            if (joined != "one-two-three") {
+                std::cerr << "FAIL: StrJoin returned '" << joined << "'" << std::endl;
+                return 1;
+            }
+
+            // Test absl::string_view
+            absl::string_view sv = "abseil-cpp";
+            if (sv.empty() || sv.size() != 10) {
+                std::cerr << "FAIL: string_view size is " << sv.size() << std::endl;
+                return 1;
+            }
+
+            std::cout << "SUCCESS: Abseil library works correctly" << std::endl;
+            return 0;
+        }
+        EOF
+
+        # Compile and link against abseil using pkg-config
+        g++ -std=c++17 test_abseil.cpp \
+          $(pkg-config --cflags absl_strings) \
+          $(pkg-config --libs absl_strings absl_str_format) \
+          -o test_abseil
+
+        # Run the compiled test
+        ./test_abseil

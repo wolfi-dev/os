@@ -1,0 +1,356 @@
+package:
+  name: angie
+  version: 1.11.6
+  epoch: 0
+  description: "Drop-in replacement for nginx, fork by original nginx developers"
+  copyright:
+    - license: BSD-2-Clause
+  dependencies:
+    runtime:
+      - merged-usrsbin
+      - openssl
+      - pcre2
+      - wolfi-baselayout
+      - zlib
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - gd-dev
+      - geoip-dev
+      - libxcrypt-dev
+      - linux-headers
+      - openssl-dev
+      - pcre2-dev
+      - zlib-dev
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://github.com/webserver-llc/angie/archive/refs/tags/Angie-${{package.version}}.tar.gz
+      expected-sha256: 2f1ef07a62b01c357db0ad66e3a7072389f29c3ae70a81f6f66dfbcf5f849aad
+
+  - name: Configure
+    # NOTE: --with-http_v3_module enables HTTP/3 syntax but full QUIC support
+    # (early data, session reuse) requires BoringSSL, LibreSSL, or QuicTLS.
+    # With standard OpenSSL, only OpenSSL-compatible-mode clients are supported.
+    # See: https://en.angie.software/angie/docs/installation/sourcebuild/
+    runs: |
+      ./configure \
+        --prefix=/etc/angie \
+        --sbin-path=/usr/bin/angie \
+        --modules-path=/usr/lib/angie/modules \
+        --conf-path=/etc/angie/angie.conf \
+        --pid-path=/run/angie/angie.pid \
+        --lock-path=/run/angie/angie.lock \
+        --error-log-path=/var/log/angie/error.log \
+        --http-log-path=/var/log/angie/access.log \
+        --http-client-body-temp-path=/var/lib/angie/tmp/client_body \
+        --http-proxy-temp-path=/var/lib/angie/tmp/proxy \
+        --http-fastcgi-temp-path=/var/lib/angie/tmp/fastcgi \
+        --http-uwsgi-temp-path=/var/lib/angie/tmp/uwsgi \
+        --http-scgi-temp-path=/var/lib/angie/tmp/scgi \
+        --user=angie \
+        --group=angie \
+        --with-compat \
+        --with-threads \
+        --with-file-aio \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --with-http_v3_module \
+        --with-http_realip_module \
+        --with-http_addition_module \
+        --with-http_sub_module \
+        --with-http_dav_module \
+        --with-http_gzip_static_module \
+        --with-http_gunzip_module \
+        --with-http_auth_request_module \
+        --with-http_stub_status_module \
+        --with-http_secure_link_module \
+        --with-http_slice_module \
+        --with-http_image_filter_module=dynamic \
+        --with-http_geoip_module=dynamic \
+        --with-stream=dynamic \
+        --with-stream_ssl_module \
+        --with-stream_realip_module \
+        --with-stream_ssl_preread_module \
+        --with-stream_geoip_module=dynamic \
+        --with-mail=dynamic \
+        --with-mail_ssl_module
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - name: Setup runtime directories and tmpfiles
+    runs: |
+      mkdir -p "${{targets.destdir}}"/var/log/angie
+      mkdir -p "${{targets.destdir}}"/var/lib/angie/tmp
+      mkdir -p "${{targets.destdir}}"/etc/angie/conf.d
+      rm -rf "${{targets.destdir}}"/etc/angie/html || true
+
+      mkdir -p "${{targets.destdir}}"/usr/lib/tmpfiles.d
+      cat > "${{targets.destdir}}"/usr/lib/tmpfiles.d/angie.conf <<'EOF'
+      d /run/angie 0755 angie angie -
+      EOF
+
+      mkdir -p "${{targets.destdir}}"/usr/lib/sysusers.d
+      cat > "${{targets.destdir}}"/usr/lib/sysusers.d/angie.conf <<'EOF'
+      u angie 65533 "Angie web server" /var/lib/angie /sbin/nologin
+      g angie 65533
+      EOF
+
+  - uses: strip
+
+subpackages:
+  - name: angie-module-stream
+    description: "angie stream (TCP/UDP proxy) module"
+    dependencies:
+      runtime:
+        - angie
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/angie/modules
+          mv "${{targets.destdir}}"/usr/lib/angie/modules/ngx_stream_module.so \
+             "${{targets.subpkgdir}}"/usr/lib/angie/modules/
+    test:
+      environment:
+        contents:
+          packages:
+            - netcat-openbsd
+            - wait-for-it
+      pipeline:
+        - runs: |
+            test -f /usr/lib/angie/modules/ngx_stream_module.so
+            angie -V 2>&1 | grep -q "with-stream=dynamic"
+        - name: Test stream module loads and proxies TCP
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /run/angie /var/log/angie /var/lib/angie/tmp
+              cat > /tmp/angie-stream.conf <<'EOF'
+              user root;
+              error_log /dev/stderr info;
+              load_module /usr/lib/angie/modules/ngx_stream_module.so;
+              events {}
+              stream {
+                server {
+                  listen 12345;
+                  return "hello-stream\n";
+                }
+              }
+              EOF
+            start: /usr/bin/angie -g "daemon off;" -c /tmp/angie-stream.conf
+            expected_output: "."
+            error_strings: ""
+            post: |
+              wait-for-it localhost:12345 -t 10
+              nc -w1 localhost 12345 </dev/null | grep -F "hello-stream"
+
+  - name: angie-module-geoip
+    description: "angie GeoIP module (HTTP)"
+    dependencies:
+      runtime:
+        - angie
+        - geoip
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/angie/modules
+          mv "${{targets.destdir}}"/usr/lib/angie/modules/ngx_http_geoip_module.so \
+             "${{targets.subpkgdir}}"/usr/lib/angie/modules/
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+            - wait-for-it
+      pipeline:
+        - runs: |
+            test -f /usr/lib/angie/modules/ngx_http_geoip_module.so
+            angie -V 2>&1 | grep -q "with-http_geoip_module=dynamic"
+        - name: Test geoip module loads and serves HTTP
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /run/angie /var/log/angie /var/lib/angie/tmp
+              cat > /tmp/angie-geoip.conf <<'EOF'
+              user root;
+              error_log /dev/stderr info;
+              load_module /usr/lib/angie/modules/ngx_http_geoip_module.so;
+              events {}
+              http {
+                server {
+                  listen 8080;
+                  location / { return 200 "ok\n"; }
+                }
+              }
+              EOF
+            start: /usr/bin/angie -g "daemon off;" -c /tmp/angie-geoip.conf
+            expected_output: "."
+            error_strings: ""
+            post: |
+              wait-for-it localhost:8080 -t 10
+              curl -sf http://localhost:8080/ | grep -F "ok"
+
+  - name: angie-module-stream-geoip
+    description: "angie GeoIP module (stream)"
+    dependencies:
+      runtime:
+        - angie-module-stream
+        - geoip
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/angie/modules
+          mv "${{targets.destdir}}"/usr/lib/angie/modules/ngx_stream_geoip_module.so \
+             "${{targets.subpkgdir}}"/usr/lib/angie/modules/
+    test:
+      environment:
+        contents:
+          packages:
+            - angie-module-stream
+            - netcat-openbsd
+            - wait-for-it
+      pipeline:
+        - runs: |
+            test -f /usr/lib/angie/modules/ngx_stream_geoip_module.so
+            angie -V 2>&1 | grep -q "with-stream_geoip_module=dynamic"
+        - name: Test stream-geoip module loads with stream
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /run/angie /var/log/angie /var/lib/angie/tmp
+              cat > /tmp/angie-stream-geoip.conf <<'EOF'
+              user root;
+              error_log /dev/stderr info;
+              load_module /usr/lib/angie/modules/ngx_stream_module.so;
+              load_module /usr/lib/angie/modules/ngx_stream_geoip_module.so;
+              events {}
+              stream {
+                server {
+                  listen 12346;
+                  return "hello-stream-geoip\n";
+                }
+              }
+              EOF
+            start: /usr/bin/angie -g "daemon off;" -c /tmp/angie-stream-geoip.conf
+            expected_output: "."
+            error_strings: ""
+            post: |
+              wait-for-it localhost:12346 -t 10
+              nc -w1 localhost 12346 </dev/null | grep -F "hello-stream-geoip"
+
+  - name: angie-module-image-filter
+    description: "angie image filter module"
+    dependencies:
+      runtime:
+        - angie
+        - libgd
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/angie/modules
+          mv "${{targets.destdir}}"/usr/lib/angie/modules/ngx_http_image_filter_module.so \
+             "${{targets.subpkgdir}}"/usr/lib/angie/modules/
+    test:
+      pipeline:
+        - runs: |
+            test -f /usr/lib/angie/modules/ngx_http_image_filter_module.so
+            angie -V 2>&1 | grep -q "with-http_image_filter_module=dynamic"
+        - runs: |
+            mkdir -p /run/angie /var/log/angie /var/lib/angie/tmp
+            cat > /tmp/angie-imgfilter.conf <<'EOF'
+            user root;
+            load_module /usr/lib/angie/modules/ngx_http_image_filter_module.so;
+            events {}
+            http {
+              server {
+                listen 8081;
+                location /img { image_filter resize 100 100; }
+              }
+            }
+            EOF
+            angie -t -c /tmp/angie-imgfilter.conf
+
+  - name: angie-module-mail
+    description: "angie mail proxy module (IMAP/POP3/SMTP)"
+    dependencies:
+      runtime:
+        - angie
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/angie/modules
+          mv "${{targets.destdir}}"/usr/lib/angie/modules/ngx_mail_module.so \
+             "${{targets.subpkgdir}}"/usr/lib/angie/modules/
+    test:
+      pipeline:
+        - runs: |
+            test -f /usr/lib/angie/modules/ngx_mail_module.so
+            angie -V 2>&1 | grep -q "with-mail=dynamic"
+        - runs: |
+            mkdir -p /run/angie /var/log/angie /var/lib/angie/tmp
+            cat > /tmp/angie-mail.conf <<'EOF'
+            user root;
+            load_module /usr/lib/angie/modules/ngx_mail_module.so;
+            events {}
+            mail {
+              auth_http localhost:9000/auth;
+              server { listen 143; protocol imap; }
+            }
+            EOF
+            angie -t -c /tmp/angie-mail.conf
+
+update:
+  enabled: true
+  github:
+    identifier: webserver-llc/angie
+    strip-prefix: Angie-
+    tag-filter: Angie-
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - wait-for-it
+  pipeline:
+    - uses: test/tw/ver-check
+      with:
+        bins: angie
+        version: ${{package.version}}
+    - uses: test/tw/ldd-check
+    - name: Test angie serves HTTP
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/angie/www /run/angie /var/log/angie /var/lib/angie/tmp
+          echo '<h1>Hello from angie</h1>' > /tmp/angie/www/index.html
+          cat > /tmp/angie.conf <<'EOF'
+          user root;
+          error_log /dev/stderr info;
+          events {}
+          http {
+            server {
+              listen 8080;
+              root /tmp/angie/www;
+              location / { }
+            }
+          }
+          EOF
+        start: /usr/bin/angie -g "daemon off;" -c /tmp/angie.conf
+        expected_output: "."
+        error_strings: ""
+        post: |
+          wait-for-it localhost:8080 -t 10
+          curl -sf http://localhost:8080/index.html | grep -F "Hello from angie"

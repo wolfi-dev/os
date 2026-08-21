@@ -2,7 +2,7 @@
 package:
   name: glibc-2.43
   version: "2.43"
-  epoch: 14
+  epoch: 15
   description: "the GNU C library"
   copyright:
     - license: LGPL-2.1-or-later
@@ -383,17 +383,64 @@ subpackages:
 
   - name: "${{package.name}}-dev"
     description: "GLIBC development headers"
+    options:
+      no-provides: true
     pipeline:
       - uses: split/dev
-      - runs: |
+      - name: Move libc.so/libm.so linker scripts into -dev
+        runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib
           [ -f "${{targets.destdir}}"/usr/lib/libc.so ] && mv "${{targets.destdir}}"/usr/lib/libc.so "${{targets.subpkgdir}}"/usr/lib/
           [ -f "${{targets.destdir}}"/usr/lib/libm.so ] && mv "${{targets.destdir}}"/usr/lib/libm.so "${{targets.subpkgdir}}"/usr/lib/
+      - name: Pin link-time shared objects to this glibc version
+        runs: |
+          ver="${{package.version}}"
+          dst="${{targets.subpkgdir}}/usr/lib"
+          src="${{targets.destdir}}/usr/lib"
+
+          # 1. Replace the .so symlinks with real copies of this build's libraries.
+          #    We want builds against these to target the version of glibc associated with this
+          #    package, not whatever the current glibc runtime is.
+          #    glibc runtime owns libfoo.so.1, glibc-dev owns libfoo.so -> libfoo.so.1 symlink
+          #    we are replacing.
+          for so in libanl.so libBrokenLocale.so libc_malloc_debug.so \
+                    libmvec.so libnss_compat.so libnss_db.so \
+                    libnss_hesiod.so libresolv.so libthread_db.so; do
+            [ -L "$dst/$so" ] || continue
+            target="$(readlink "$dst/$so")" # e.g. libresolv.so.2
+            rm "$dst/$so"
+            cp "$src/$target" "$dst/$so"
+          done
+
+          # 2. Pin the libc/libm linker scripts to this version stream.
+          #    Copy runtime-owned shared objects mentioned by linker scripts into a
+          #    version-streamed location, modify linker scripts to reference version-streamed
+          #    copies.
+          cp "$src/libc.so.6" "$dst/libc.so-$ver"
+          cp "$src/libm.so.6" "$dst/libm.so-$ver"
+      - name: Pin libc.so GROUP to this build's libc.so.6
+        uses: sed
+        with:
+          path: ${{targets.subpkgdir}}/usr/lib/libc.so
+          pattern: /usr/lib/libc\.so\.6
+          replacement: /usr/lib/libc.so-${{package.version}}
+      - name: Pin libm.so GROUP to this build's libm.so.6
+        uses: sed
+        with:
+          path: ${{targets.subpkgdir}}/usr/lib/libm.so
+          pattern: /usr/lib/libm\.so\.6
+          replacement: /usr/lib/libm.so-${{package.version}}
+      - name: Point libm.so AS_NEEDED at our pinned libmvec copy
+        uses: sed
+        with:
+          path: ${{targets.subpkgdir}}/usr/lib/libm.so
+          pattern: /usr/lib/libmvec\.so\.1
+          replacement: /usr/lib/libmvec.so
     dependencies:
       provides:
         - glibc-dev=${{package.full-version}}
       runtime:
-        - ${{package.name}}=${{package.full-version}}
+        - glibc>=${{package.full-version}}
         - libxcrypt-dev
         - linux-headers
         - merged-lib
@@ -401,8 +448,69 @@ subpackages:
         - merged-usrsbin
         - wolfi-baselayout
     test:
+      environment:
+        contents:
+          packages:
+            - binutils # readelf
+            - gcc
       pipeline:
         - uses: test/tw/devpackage
+        - name: libc.so/libm.so are pinned to this version, interp left on runtime
+          runs: |
+            ver="${{package.version}}"
+            grep -qF "/usr/lib/libc.so-$ver" /usr/lib/libc.so || { cat /usr/lib/libc.so; echo "FAIL: libc.so not pinned"; exit 1; }
+            grep -qF "/usr/lib/libm.so-$ver" /usr/lib/libm.so || { cat /usr/lib/libm.so; echo "FAIL: libm.so not pinned"; exit 1; }
+            grep -q "ld-linux" /usr/lib/libc.so || { echo "FAIL: libc.so lost AS_NEEDED(ld-linux)"; exit 1; }
+            test -f "/usr/lib/libc.so-$ver" && test -f "/usr/lib/libm.so-$ver"
+            # Every file the linker scripts reference must exist. The pinned
+            # entries must be real files, not symlinks back into the runtime.
+            paths="$(cat /usr/lib/libc.so /usr/lib/libm.so | tr '()' '  ' | tr ' ' '\n' | grep '^/[a-z]' | sort -u)"
+            for f in $paths; do
+              test -e "$f" || { echo "FAIL: linker script references missing $f"; exit 1; }
+              case "$f" in
+                */ld-linux*) : ;;
+                *) test ! -L "$f" || { echo "FAIL: $f is a symlink, expected a pinned real file"; exit 1; }
+                   owned_by=$(apk info -qW "$f")
+                   [ "$owned_by" = "${{package.name}}-dev" ] || { echo "FAIL: $f is owned by $owned_by instead of the dev package"; exit 1;}
+                   ;;
+              esac
+            done
+            echo "PASS: linker scripts pinned to $ver"
+        - name: No pinned library references a GLIBC newer than this version
+          runs: |
+            ver="${{package.version}}"; fail=0
+            for f in /usr/lib/libc.so-$ver /usr/lib/libm.so-$ver \
+                     /usr/lib/libresolv.so /usr/lib/libanl.so; do
+              hi="$(readelf -V "$f" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+                    | sed 's/GLIBC_//' | sort -V | tail -1)"
+              [ -z "$hi" ] && continue
+              if [ "$(printf '%s\n%s\n' "$hi" "$ver" | sort -V | tail -1)" != "$ver" ]; then
+                echo "FAIL: $f references GLIBC_$hi > GLIBC_$ver"; fail=1
+              fi
+            done
+            [ "$fail" -eq 0 ] && echo "PASS: nothing exceeds GLIBC_$ver"; exit $fail
+        - name: A built binary's GLIBC floor is <= this dev version, and it runs without requiring the dev package at runtime
+          runs: |
+            ver="${{package.version}}"
+            cat > t.c <<'EOF'
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <math.h>
+            static void bye(void){}
+            int main(void){ atexit(bye); printf("%f\n", sqrt(2.0)); return 0; }
+            EOF
+            # -fstack-protector-all forces __stack_chk_fail_local, proving the
+            # libc.so GROUP still pulls in libc_nonshared.a.
+            gcc -fstack-protector-all t.c -o t -lm
+            apk del ${{package.name}}-dev gcc
+            ./t
+            hi="$(readelf -V ./t 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+                  | sed 's/GLIBC_//' | sort -V | tail -1)"
+            echo "binary floor: ${hi:-none}, dev version: $ver"
+            if [ -n "$hi" ] && [ "$(printf '%s\n%s\n' "$hi" "$ver" | sort -V | tail -1)" != "$ver" ]; then
+              echo "FAIL: binary requires GLIBC_$hi > $ver"; exit 1
+            fi
+            echo "PASS: floor <= $ver and binary runs"
 
   - name: "${{package.name}}-iconv"
     description: "GLIBC iconv tables"

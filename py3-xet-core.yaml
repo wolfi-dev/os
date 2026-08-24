@@ -1,7 +1,7 @@
 package:
   name: py3-xet-core
   version: "1.6.0"
-  epoch: 0 # GHSA-cq8v-f236-94qc
+  epoch: 1 # link the system openssl
   description: Run your *raw* PyTorch training script on any kind of device
   copyright:
     - license: Apache-2.0
@@ -28,10 +28,15 @@ environment:
       - busybox
       - cargo-auditable
       - maturin
-      - openssl-hardened-dev
+      # openssl-dev: hardened's no-deprecated configuration.h FTBFS the openssl
+      # crate (116 errors: AES_set_encrypt_key, DH_new, EC_KEY_new, ...).
+      - openssl-dev
       - py3-supported-build-base
       - py3-supported-maturin
       - rust-1.94
+  environment:
+    # Belt-and-braces against openssl-sys vendoring its own copy.
+    OPENSSL_NO_VENDOR: "1"
 
 pipeline:
   - uses: git-checkout
@@ -40,14 +45,19 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: de71453d952bd8b806edaa997c72313051a49050
 
+  - working-directory: hf_xet
+    runs: |
+      # rustls statically links a non-FIPS AWS-LC into the extension module;
+      # native-tls links the system OpenSSL instead. Both deps need
+      # default-features off, which only the manifest can express.
+      cargo add hf-xet --path ../xet_pkg --rename xet-pkg \
+        --no-default-features --features python,native-tls
+      cargo add xet-client --path ../xet_client --no-default-features
+
   - runs: |
       # This is in workspace.dependencies so our tooling (and `cargo add`)
       # can't update it
       sed -i 's/jsonwebtoken = "9.3"/jsonwebtoken = "10.3"/' Cargo.toml
-
-  - working-directory: hf_xet
-    runs: |
-      cargo update rand@0.9.4 --precise 0.9.4
 
 subpackages:
   - range: py-versions
@@ -60,6 +70,12 @@ subpackages:
           python: python${{range.key}}
       - uses: strip
     test:
+      environment:
+        contents:
+          packages:
+            # ldd + rust-audit-info, for the TLS-backend assertions below
+            - posix-libc-utils
+            - rust-audit-info
       pipeline:
         - uses: test/tw/pip-check
         - uses: test/tw/ldd-check
@@ -67,6 +83,49 @@ subpackages:
           with:
             python: python${{range.key}}
             import: ${{vars.import}}
+        - name: Verify the TLS backend is the system OpenSSL
+          runs: |
+            # __file__ is maturin's generated __init__.py, not the extension
+            pkgdir=$(python${{range.key}} -c 'import hf_xet; print(hf_xet.__path__[0])')
+            so="$pkgdir/hf_xet.abi3.so"
+            [ -f "$so" ] || { echo "extension module not found under $pkgdir"; exit 1; }
+
+            # reqwest must use native-tls against the system OpenSSL
+            deps=$(ldd "$so")
+            echo "$deps"
+            for lib in libssl.so.3 libcrypto.so.3; do
+              case "$deps" in
+                *"$lib"*) ;;
+                *) echo "$lib missing from DT_NEEDED - the rustls backend is back"; exit 1 ;;
+              esac
+            done
+
+            # and no statically linked crypto came along with it
+            for blob in aws_lc_ ring_core_; do
+              if grep -q "$blob" "$so"; then
+                echo "statically linked crypto present: $blob"
+                exit 1
+              fi
+            done
+        - name: Verify the compiled crate set has no static TLS stack
+          runs: |
+            pkgdir=$(python${{range.key}} -c 'import hf_xet; print(hf_xet.__path__[0])')
+            rust-audit-info "$pkgdir/hf_xet.abi3.so" > audit.json
+            python${{range.key}} <<'EOF'
+            import json
+
+            names = {p["name"] for p in json.load(open("audit.json"))["packages"]}
+            want = {"native-tls", "openssl", "openssl-sys"}
+            deny = {"rustls", "aws-lc-rs", "aws-lc-sys", "ring"}
+
+            missing = sorted(want - names)
+            assert not missing, f"native-tls backend not compiled in: {missing}"
+
+            found = sorted(deny & names)
+            assert not found, f"static TLS/crypto crates compiled in: {found}"
+
+            print(f"crate set OK ({len(names)} crates, native-tls, no rustls/aws-lc/ring)")
+            EOF
 
   - name: py3-supported-${{vars.pypi-package}}
     description: meta package providing ${{vars.pypi-package}} for supported python versions.

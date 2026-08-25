@@ -3,7 +3,7 @@ package:
   # MAINLINE VERSIONS MUST USE ODD MINOR VERSIONS (e.g., 1.27.x, 1.29.x)
   # Must also bump njs at the same time
   version: "1.31.4"
-  epoch: 1
+  epoch: 2
   # nginx-otel (and any plugin building with nginx-mainline-src) needs to be rebuilt after this
   # package changes.
   # toolchain-reconciler should do it automatically, you can check recent PRs for it here:
@@ -202,6 +202,233 @@ subpackages:
           runs: |
             set -euo pipefail
             getcap /usr/bin/nginx | grep -F "cap_net_bind_service"
+
+  # nginx with the stream, mail, dav, and http_v3 modules compiled in
+  # statically, so configs using them work without load_module lines. No
+  # dynamic modules are built in this variant.
+  - name: nginx-mainline-full
+    description: nginx with modules statically compiled
+    options:
+      no-provides: true
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - nginx-full-config
+        - nginx-mainline-fastcgi-params
+        - nginx-mainline-mime-types
+        - nginx-mainline-scgi-params
+        - nginx-mainline-uwsgi-params
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          # Build from a copy of the source tree so the nginx-mainline-src
+          # subpackage content is unaffected.
+          cp -a nginx-mainline nginx-mainline-full
+          cd nginx-mainline-full
+          make clean
+
+          ./auto/configure \
+              --prefix=/var/lib/nginx \
+              --sbin-path=/usr/bin/nginx \
+              --modules-path=/usr/lib/nginx/modules \
+              --conf-path=/etc/nginx/nginx.conf \
+              --pid-path=/run/nginx.pid \
+              --lock-path=/run/nginx.lock \
+              --http-client-body-temp-path=/var/lib/nginx/tmp/client_body \
+              --http-proxy-temp-path=/var/lib/nginx/tmp/proxy \
+              --http-fastcgi-temp-path=/var/lib/nginx/tmp/fastcgi \
+              --http-uwsgi-temp-path=/var/lib/nginx/tmp/uwsgi \
+              --http-scgi-temp-path=/var/lib/nginx/tmp/scgi \
+              \
+              --user=nginx \
+              --group=nginx \
+              --with-threads \
+              --with-file-aio \
+              \
+              --with-compat \
+              \
+              --with-http_ssl_module \
+              --with-http_v2_module \
+              --with-http_v3_module \
+              --with-http_realip_module \
+              --with-http_addition_module \
+              --with-http_dav_module \
+              --with-http_sub_module \
+              --with-http_flv_module \
+              --with-http_mp4_module \
+              --with-http_gunzip_module \
+              --with-http_gzip_static_module \
+              --with-http_auth_request_module \
+              --with-http_random_index_module \
+              --with-http_secure_link_module \
+              --with-http_degradation_module \
+              --with-http_slice_module \
+              --with-http_stub_status_module \
+              --with-mail \
+              --with-mail_ssl_module \
+              --with-stream \
+              --with-stream_ssl_module \
+              --with-stream_realip_module \
+              --with-stream_ssl_preread_module
+
+          make -j$(nproc)
+          make DESTDIR=${{targets.subpkgdir}} install
+          # Create parent location for tmp files
+          mkdir -p ${{targets.subpkgdir}}/var/lib/nginx/tmp
+          # This variant ships only the binary. The config that "make install"
+          # writes under /etc/nginx (nginx.conf plus mime.types, fastcgi_params,
+          # scgi_params, uwsgi_params, ...) is owned by the params/mime-types
+          # runtime-dependency packages and by the sibling
+          # nginx-mainline-full-package-config, so drop it here to avoid
+          # duplicate ownership — matching the pkg-config/ stashing the parent
+          # package does.
+          rm -rf ${{targets.subpkgdir}}/etc/nginx
+      - uses: strip
+    test:
+      environment:
+        accounts:
+          users:
+            - username: nginx
+              uid: 65532
+          groups:
+            - groupname: nginx
+              gid: 65532
+        contents:
+          packages:
+            - curl
+            - nginx-mainline-full-package-config
+            - openssl
+            - wait-for-it
+      pipeline:
+        - uses: test/tw/ver-check
+          with:
+            bins: nginx
+        - name: Verify the upstream static module set
+          runs: |
+            nginx -V 2>&1 | tr ' ' '\n' > /tmp/flags
+            grep -x -- --with-stream /tmp/flags
+            grep -x -- --with-mail /tmp/flags
+            grep -x -- --with-http_dav_module /tmp/flags
+            grep -x -- --with-http_v3_module /tmp/flags
+            # No dynamic modules at all; anything dynamic belongs to the non -full packages
+            ! grep -- '=dynamic' /tmp/flags
+        - name: Verify the statically compiled directives parse
+          runs: |
+            # mail, http_dav and http_v3 are only asserted via nginx -V above;
+            # prove their directives are actually recognized by the binary.
+            openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+                -subj /CN=localhost -keyout /tmp/tls.key -out /tmp/tls.crt
+            cat > /tmp/directives-test.conf <<'EOF'
+            pid /run/nginx-directives-test.pid;
+            error_log /dev/stderr notice;
+            events {}
+            http {
+                server {
+                    listen 8443 ssl;
+                    listen 8443 quic;
+                    ssl_certificate     /tmp/tls.crt;
+                    ssl_certificate_key /tmp/tls.key;
+                    location / {
+                        dav_methods PUT DELETE MKCOL COPY MOVE;
+                    }
+                }
+            }
+            mail {
+                auth_http 127.0.0.1:9000/auth;
+                server {
+                    listen 127.0.0.1:8143;
+                    protocol imap;
+                }
+            }
+            EOF
+            nginx -t -c /tmp/directives-test.conf
+        - name: Serve with the default config
+          runs: |
+            # Validate before starting.
+            nginx -t
+            nginx
+            wait-for-it localhost:80 -t 30
+            curl -sfI http://localhost
+            kill $(cat /run/nginx.pid)
+        - name: Serve through a stream block without load_module
+          runs: |
+            cat > /tmp/stream-test.conf <<'EOF'
+            pid /run/nginx-stream-test.pid;
+            error_log /dev/stderr notice;
+            events {}
+            http {
+                server {
+                    listen 127.0.0.1:8081;
+                    return 200 "stream-static-ok\n";
+                }
+            }
+            stream {
+                server {
+                    listen 127.0.0.1:8125;
+                    proxy_pass 127.0.0.1:8081;
+                }
+            }
+            EOF
+            nginx -t -c /tmp/stream-test.conf
+            nginx -c /tmp/stream-test.conf
+            wait-for-it localhost:8125 -t 30
+            curl -sf http://localhost:8125/ | grep stream-static-ok
+            kill $(cat /run/nginx-stream-test.pid)
+        - uses: test/tw/ldd-check
+
+  # Config for the nginx-mainline-full variant. Kept separate from the binary
+  # so nothing constrains ownership of /usr/bin/nginx or /etc/nginx/nginx.conf
+  # against the dynamic-build packages; this depends on nginx-mainline-full
+  # only, never on nginx-mainline. Ships the packaged nginx.conf (which already
+  # sets worker_processes auto and log_format main and includes conf.d), so the
+  # -full build needs no config seds of its own.
+  - name: nginx-mainline-full-package-config
+    description: Config for nginx-mainline-full, from packaged nginx.org bundles at https://hg.nginx.org/pkg-oss/
+    dependencies:
+      runtime:
+        - merged-usrsbin
+        - nginx-mainline-fastcgi-params
+        - nginx-mainline-full
+        - nginx-mainline-mime-types
+        - nginx-mainline-scgi-params
+        - nginx-mainline-uwsgi-params
+        - wolfi-baselayout
+      provides:
+        - nginx-full-config=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/etc/nginx/conf.d
+          install -m644 -D nginx.conf ${{targets.subpkgdir}}/etc/nginx/
+
+          # Ship upstream's default.conf verbatim (listen 80, filename
+          # default.conf) so :latest-full keeps serving on :80 and a user's
+          # -v ./default.conf:/etc/nginx/conf.d/default.conf override replaces
+          # it rather than stacking a second server.
+          install -m644 -D default.conf ${{targets.subpkgdir}}/etc/nginx/conf.d
+
+          # Follow Docker Image and link logs to to stdout/stderr
+          # https://github.com/nginxinc/docker-nginx/blob/73a5acae6945b75b433cafd0c9318e4378e72cbb/mainline/alpine-slim/Dockerfile#L106-L107
+          mkdir -p ${{targets.subpkgdir}}/var/log/nginx
+          ln -sf /dev/stdout ${{targets.subpkgdir}}/var/log/nginx/access.log
+          ln -sf /dev/stderr ${{targets.subpkgdir}}/var/log/nginx/error.log
+          # Package config has a different default location for html files, rather annoyingly
+          # Don't really like using a symlink here, but seems better than copying
+          mkdir -p ${{targets.subpkgdir}}/usr/share/nginx/html
+          ln -sf /var/lib/nginx/html/50x.html ${{targets.subpkgdir}}/usr/share/nginx/html/50x.html
+          ln -sf /var/lib/nginx/html/index.html ${{targets.subpkgdir}}/usr/share/nginx/html/index.html
+      - name: "Create templates directory"
+        runs: |
+          mkdir -p ${{targets.contextdir}}/etc/nginx/templates
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /etc/nginx/nginx.conf
+              /etc/nginx/conf.d/default.conf
+        - uses: test/tw/symlink-check
+          with:
+            allow-absolute: true
 
   - name: nginx-mainline-mime-types
     description: Nginx mime.types file

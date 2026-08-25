@@ -1,0 +1,1270 @@
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: glibc-2.44
+  version: "2.44"
+  epoch: 0
+  description: "the GNU C library"
+  copyright:
+    - license: LGPL-2.1-or-later
+  cpe:
+    vendor: gnu
+    product: glibc
+  resources:
+    cpu: "10"
+    memory: 11Gi
+  dependencies:
+    provides:
+      - glibc=${{package.full-version}}
+    runtime:
+      # This prevents Alpine users from being able to `apk add` any Wolfi packages
+      # that depend on glibc, if they happen to have configured both repositories.
+      # Only apk-tools respects this constraint; apko-based tools don't respect
+      # the ! constraint.
+      - "!musl"
+      - ${{package.name}}-locale-posix
+      - ld-linux-${{package.version}}=${{package.full-version}}
+      - libgcc # Needed for some pthread functionality
+      - merged-lib
+      - merged-sbin
+      - merged-usrsbin
+      - wolfi-baselayout
+  test-resources:
+    cpu: "1"
+    memory: 2Gi
+
+environment:
+  contents:
+    packages:
+      - abi-compliance-checker # compares the new public ABI report against the previous one
+      - abi-dumper # generates the public ABI report shipped in glibc-abi-report
+      - bash # needed by `make check`
+      - bison
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - coreutils # needed by `make check`
+      - flex
+      - gawk
+      - glibc-abi-report<${{package.full-version}}
+      - grep
+      - openssf-compiler-options
+      - py3-supported-beautifulsoup4 # parsing the ABI compatibility report
+      - python3
+      - rdfind
+      - texinfo
+      - wolfi-baselayout
+      - zlib
+  # glibc manages FORTIFY_SOURCE on per-file basis
+  environment:
+    CPPFLAGS: ""
+
+vars:
+  ########################### STOP!!! #############################
+  # Before updating the expected-commit, please ping @sergiodj or #
+  # someone from the OS team!                                     #
+  ########################### STOP!!! #############################
+  glibc-expected-commit: 0b58f5d80d24cf83cfde9d8381aafb11fef0e152
+  # We remove unnecessary charsets that could otherwise increase the
+  # attack surface of the package.
+  charsets-to-remove: "IBM1390 IBM1399"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: ${{vars.glibc-expected-commit}}
+      # sourceware.org often has clone issues, switch to mirror
+      # recommended at https://sourceware.org/glibc/wiki/GlibcGit
+      repository: https://gitlab.com/gnutools/glibc.git
+      branch: release/${{package.version}}/master
+
+  - uses: patch
+    with:
+      patches: |
+        0001-Link-startup-files-without-package-metadata.patch
+        fdo.patch
+        fix-allowed-failures-escaping.patch
+
+  - name: "Set up build directory"
+    runs: |
+      mkdir build
+
+  - name: "Configure glibc"
+    runs: |
+      cd build
+      echo "user-defined-trusted-dirs=/usr/local/lib:/usr/local/lib64:/usr/lib:/usr/lib64:/lib:/lib64" >> configparms.base
+      echo "slibdir=/usr/lib" >> configparms.base
+      echo "libdir=/usr/lib" >> configparms.base
+      echo "rootsbindir=/usr/bin" >> configparms.base
+      echo "build-programs=no" > configparms
+      # If x86_64, set to /lib64, /lib for aarch64
+      if [ ${{build.arch}} == "x86_64" ]; then
+        echo "rtlddir=/lib64" >> configparms.base
+      else
+        echo "rtlddir=/lib" >> configparms.base
+      fi
+      cat configparms.base >> configparms
+
+      ../configure \
+        --prefix=/usr \
+        --libdir=/usr/lib \
+        --datadir=/usr/share \
+        --includedir=/usr/include \
+        --sbindir=/usr/bin \
+        --host=${{host.triplet.gnu}} \
+        --build=${{host.triplet.gnu}} \
+        --enable-bind-now \
+        --enable-fortify-source \
+        --enable-stackguard-randomization \
+        --enable-stack-protector=strong \
+        --enable-cet \
+        --with-pkgversion="glibc-${{package.full-version}}" \
+        --disable-werror \
+        --disable-crypt \
+        --enable-kernel=4.9
+
+  - runs: |
+      make -C build -j$(nproc)
+
+  - runs: |
+      # Build the programs with fortify
+      echo "build-programs=yes" > build/configparms
+      cat build/configparms.base >> build/configparms
+      make -C build -j$(nproc)
+
+  - runs: |
+      make -C build -j$(nproc) install DESTDIR="${{targets.destdir}}"
+
+  - name: "Run the glibc testsuite"
+    runs: |
+      # The glibc test suite runs in two phases (upstream Makerules
+      # check-twopass), which we gate differently:
+      #
+      #   Phase 1 (run-built-tests=no): builds every test program and runs the
+      #   "special" tests -- header/conformance/ABI checks that do not execute a
+      #   compiled binary (conform/*, check-installed-headers, check-abi-*, ...).
+      #   This phase is REQUIRED to pass. Known pre-existing special-test failures
+      #   are allow-listed in allowed-failures.txt (consumed by upstream's
+      #   summarize-tests); any new special-test failure fails the build.
+      #
+      #   Phase 2 (run-built-tests=yes): runs the compiled test binaries. Many of
+      #   these are timing-sensitive or depend on privileges/features unavailable
+      #   in the sandboxed build (e.g. setuid, aarch64 BTI), so they are flaky or
+      #   expected to fail here. We do NOT hard-gate this phase; instead the
+      #   glibc-testresults subpackage enforces a pass/fail ratio over the full
+      #   result set.
+      #
+      # We invoke the phases explicitly (instead of `make check`) so phase 2's
+      # failures do not fail the build while phase 1 stays required.
+      make -C build -j$(nproc) run-built-tests=no tests
+      make -C build -j$(nproc) run-built-tests=yes tests || true
+
+  - name: "Set up ldconfig"
+    runs: |
+      mkdir -p "${{targets.destdir}}"/etc
+      cp vendor/ld.so.conf "${{targets.destdir}}"/etc
+      mkdir -p "${{targets.destdir}}"/etc/ld.so.conf.d
+      cp vendor/ld.so.conf.d/*.conf "${{targets.destdir}}"/etc/ld.so.conf.d
+      mkdir -p ${{targets.destdir}}/etc/apk/commit_hooks.d
+      cp ldconfig-commit.sh -p ${{targets.destdir}}/etc/apk/commit_hooks.d/
+
+  - name: "Clean up /etc/ld.so.cache"
+    runs: |
+      # Having a package own a file that will be different in most
+      # every image poisons our layering mechanism
+      rm ${{targets.destdir}}/etc/ld.so.cache
+
+  - name: "Clean up documentation"
+    runs: |
+      rm -rf ${{targets.destdir}}/usr/share/info
+
+  - name: "Generate and install locale data"
+    runs: |
+      make -C build -j$(nproc) localedata/install-locale-files DESTDIR="${{targets.destdir}}"
+
+  - name: 'Usrmerge /usr/sbin' # Some binaries ignore --sbindir for some reason
+    runs: |
+      mkdir -p "${{targets.destdir}}"/usr/bin
+      mv "${{targets.destdir}}"/usr/sbin/* "${{targets.destdir}}"/usr/bin
+      rmdir "${{targets.destdir}}"/usr/sbin
+
+  - name: "Generate public ABI report"
+    runs: |
+      # Snapshot the public ABI of the core glibc libraries with abi-dumper.
+      # This must run before the strip step, while the libraries still carry
+      # DWARF debug info. -public-headers restricts the detailed symbol info
+      # to interfaces declared in glibc's installed public headers, filtering
+      # out private/internal symbols.
+      report_dir="${{targets.destdir}}/usr/share/abi-reports/${{package.name}}-${{package.version}}"
+      mkdir -p "$report_dir"
+      for so in "${{targets.destdir}}"/usr/lib/lib*.so.*; do
+        # Only dump real shared objects, not the symlinks pointing at them.
+        [ -L "$so" ] && continue
+        lib=$(basename "$so")
+        # These are built with incompatible options and can't be dumped.
+        # We should try to investigate at point, but dumping libc is
+        # more important so just ignore these for now.
+        [ "$lib" = "libnss_dns.so.2" ] && continue
+        [ "$lib" = "libnss_files.so.2" ] && continue
+        abi-dumper "$so" \
+          -o "$report_dir/${lib%.so.*}.dump" \
+          -lver "${{package.version}}" \
+          -public-headers "${{targets.destdir}}/usr/include"
+      done
+
+  - name: "Check libc public ABI against the previous report"
+    runs: |
+      # Compare the freshly generated libc ABI dump against the previously
+      # published one (installed via the glibc-abi-report build dependency) so
+      # we can catch ABI regressions at build time.
+      old_dump="$(find /usr/share/abi-reports/ -name libc.dump -print -quit)"
+      new_dump="${{targets.destdir}}/usr/share/abi-reports/${{package.name}}-${{package.version}}/libc.dump"
+      if [ ! -f "$old_dump" ]; then
+        echo "No baseline ABI report at $old_dump! Nothing to compare to."
+        exit 1
+      else
+        report_path="${{targets.destdir}}/usr/share/abi-reports/${{package.name}}-${{package.version}}/update-report.html"
+        # abi-compliance-checker exits non-zero on any incompatibility. Don't
+        # block the build on that here, we grade compatibility ourselves below.
+        abi-compliance-checker -l libc -old "$old_dump" -new "$new_dump" \
+          -report-path "$report_path" || true
+        # make sure we actually generate the report, since we're masking the exit code from generating it.
+        test -f "$report_path"
+        # Fail the build if binary ABI compatibility drops below the threshold.
+        ./compatibility-gate --kind binary --threshold 98.0 "$report_path"
+      fi
+
+  - uses: strip
+
+data:
+  # This is the list of the most popular locale which get their own subpackages.
+  # All the rest ends up in the glibc-locale-extra package.
+  # NOTE: keep in sync with exclusion tests for glibc-locale-extra package
+  - name: locales-main
+    items:
+      ca: Catalan
+      de: German
+      en: English
+      es: Spanish
+      fr: French
+
+subpackages:
+  - name: "${{package.name}}-testresults"
+    description: "Test results and logs from the current GLIBC build - for Wolfi development only"
+    pipeline:
+      - runs: |
+          resultdir="${{targets.subpkgdir}}"/usr/share/glibc-testresults
+          mkdir -p $resultdir
+          cd build/
+          # Move all the test results and log files
+          find . \( -name "*.test-result" -o -name "*.out" \) \
+            -exec sh -c 'dir=$(dirname $1); mkdir -p $2/$dir; cp $1 $2/$dir' _ {} $resultdir \;
+          cp tests.sum $resultdir
+    dependencies:
+      provides:
+        - glibc-testresults=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/share/glibc-testresults/tests.sum
+        - name: Verify PASS/FAIL ratio in test result files is within acceptable threshold
+          runs: |
+            set -euo pipefail
+            MAX_FAIL_RATIO=0.02
+            fail_count=$(find /usr/share/glibc-testresults -type f -name "*.test-result" -exec grep "^FAIL:" '{}' ';' 2> /dev/null | wc -l)
+            pass_count=$(find /usr/share/glibc-testresults -type f -name "*.test-result" -exec grep "^PASS:" '{}' ';' 2> /dev/null | wc -l)
+            total=$((pass_count + fail_count))
+            echo "PASS: $pass_count, FAIL: $fail_count, TOTAL: $total"
+            [ "$total" -gt 0 ]
+            fail_ratio=$(awk "BEGIN { printf \"%.4f\", $fail_count / $total }")
+            echo "Fail ratio: $fail_ratio (max allowed: $MAX_FAIL_RATIO)"
+            awk "BEGIN { exit ($fail_ratio > $MAX_FAIL_RATIO) ? 1 : 0 }"
+
+  - name: "${{package.name}}-abi-report"
+    description: "Public ABI report of the core GLIBC libraries, generated by abi-dumper"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/share/abi-reports
+          mv "${{targets.destdir}}"/usr/share/abi-reports/${{package.name}}-${{package.version}} \
+            "${{targets.subpkgdir}}"/usr/share/abi-reports/
+          rmdir "${{targets.destdir}}"/usr/share/abi-reports/
+    dependencies:
+      provides:
+        - glibc-abi-report=${{package.full-version}}
+      runtime:
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/share/abi-reports/${{package.name}}-${{package.version}}/libc.dump
+        - name: Verify the report captures the public ABI
+          runs: |
+            report="/usr/share/abi-reports/${{package.name}}-${{package.version}}/libc.dump"
+            check() {
+              grep -q "$1" "$report" || { echo "expected $report to contain $1"; exit 1; }
+            }
+            # Marked as a public-interface dump ...
+            check "'PublicABI' => '1'"
+            # ... carrying detailed symbol info ...
+            check "'SymbolInfo'"
+            # ... including well-known public interfaces exported by libc.
+            check "'ShortName' => 'malloc'"
+            check "'ShortName' => 'free'"
+            check "'ShortName' => 'strlen'"
+
+  - name: "ld-linux-${{package.version}}"
+    description: "the GLIBC ELF interpreter"
+    pipeline:
+      - assertions:
+          required-steps: 1
+        pipeline:
+          - if: ${{build.arch}} == 'aarch64'
+            runs: |
+              mkdir -p "${{targets.subpkgdir}}"/usr/lib
+              mv "${{targets.destdir}}"/lib/ld-linux-aarch64.so.1 "${{targets.subpkgdir}}"/usr/lib/
+              rmdir "${{targets.destdir}}"/lib
+          - if: ${{build.arch}} == 'x86_64'
+            runs: |
+              mkdir -p "${{targets.subpkgdir}}"/usr/lib
+              mv "${{targets.destdir}}"/lib64/ld-linux-x86-64.so.2 "${{targets.subpkgdir}}"/usr/lib/
+              rmdir "${{targets.destdir}}"/lib64
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/etc
+          mv "${{targets.destdir}}"/etc/ld.so.* "${{targets.subpkgdir}}"/etc/
+    dependencies:
+      provider-priority: 10
+      provides:
+        - ld-linux=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      environment:
+        contents:
+          packages:
+            - gcc
+            - ${{package.name}}-dev
+      pipeline:
+        - name: Check lib64 and apk audit locations of ld-linux
+          runs: |
+            set -euo pipefail
+            ld_linux_found=false
+            for f in /lib64/ld-linux-*; do
+              [ -e "$f" ] && ld_linux_found=true
+            done
+            [ "$ld_linux_found" = "true" ]
+            [ -z "$(apk audit --full | grep ld-linux)" ]
+        - name: Test usage of /etc/ld.so.conf.d/ snippets
+          runs: |
+            tmpdir="$(mktemp -d)"
+            tmplibdir="$(mktemp -d)"
+            ldcfg="/etc/ld.so.conf.d/test-snippet.conf"
+            cleanup() {
+              rm -f "$ldcfg"
+              rm -rf "$tmpdir" "$tmplibdir"
+            }
+            trap cleanup EXIT
+            cat > "$tmpdir/ldsoconfdotd.c" << EOF
+            #include <stdio.h>
+
+            void ldsoconfdotd_test(void) {
+              printf("Calling %s\n", __func__);
+            }
+            EOF
+            cat > "$tmpdir/test.c" << EOF
+            void ldsoconfdotd_test(void);
+            int main(void) {
+              ldsoconfdotd_test();
+            }
+            EOF
+            gcc -c -fpic "$tmpdir/ldsoconfdotd.c" -o "$tmpdir/ldsoconfdotd.o"
+            gcc -shared -o "$tmplibdir/libldsoconfdotd.so" \
+              "$tmpdir/ldsoconfdotd.o"
+            echo "$tmplibdir" > "$ldcfg"
+            ldconfig
+            LIBRARY_PATH="$tmplibdir" \
+              gcc "$tmpdir/test.c" -o "$tmpdir/test" -lldsoconfdotd
+            "$tmpdir"/test
+        - name: Confirm that we do not ship/own /etc/ld.so.cache
+          runs: |
+            set -euo pipefail
+            if apk info -L "${{context.name}}" | grep '^etc/ld\.so\.cache$'; then
+              exit 1
+            fi
+            exit 0
+
+  - name: "${{package.name}}-dev"
+    description: "GLIBC development headers"
+    options:
+      no-provides: true
+    pipeline:
+      - uses: split/dev
+      - name: Move libc.so/libm.so linker scripts into -dev
+        runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          [ -f "${{targets.destdir}}"/usr/lib/libc.so ] && mv "${{targets.destdir}}"/usr/lib/libc.so "${{targets.subpkgdir}}"/usr/lib/
+          [ -f "${{targets.destdir}}"/usr/lib/libm.so ] && mv "${{targets.destdir}}"/usr/lib/libm.so "${{targets.subpkgdir}}"/usr/lib/
+      - name: Pin link-time shared objects to this glibc version
+        runs: |
+          ver="${{package.version}}"
+          dst="${{targets.subpkgdir}}/usr/lib"
+          src="${{targets.destdir}}/usr/lib"
+
+          # 1. Replace the .so symlinks with real copies of this build's libraries.
+          #    We want builds against these to target the version of glibc associated with this
+          #    package, not whatever the current glibc runtime is.
+          #    glibc runtime owns libfoo.so.1, glibc-dev owns libfoo.so -> libfoo.so.1 symlink
+          #    we are replacing.
+          for so in libanl.so libBrokenLocale.so libc_malloc_debug.so \
+                    libmvec.so libnss_compat.so libnss_db.so \
+                    libnss_hesiod.so libresolv.so libthread_db.so; do
+            [ -L "$dst/$so" ] || continue
+            target="$(readlink "$dst/$so")" # e.g. libresolv.so.2
+            rm "$dst/$so"
+            cp "$src/$target" "$dst/$so"
+          done
+
+          # 2. Pin the libc/libm linker scripts to this version stream.
+          #    Copy runtime-owned shared objects mentioned by linker scripts into a
+          #    version-streamed location, modify linker scripts to reference version-streamed
+          #    copies.
+          cp "$src/libc.so.6" "$dst/libc.so-$ver"
+          cp "$src/libm.so.6" "$dst/libm.so-$ver"
+      - name: Pin libc.so GROUP to this build's libc.so.6
+        uses: sed
+        with:
+          path: ${{targets.subpkgdir}}/usr/lib/libc.so
+          pattern: /usr/lib/libc\.so\.6
+          replacement: /usr/lib/libc.so-${{package.version}}
+      - name: Pin libm.so GROUP to this build's libm.so.6
+        uses: sed
+        with:
+          path: ${{targets.subpkgdir}}/usr/lib/libm.so
+          pattern: /usr/lib/libm\.so\.6
+          replacement: /usr/lib/libm.so-${{package.version}}
+      - name: Point libm.so AS_NEEDED at our pinned libmvec copy
+        uses: sed
+        with:
+          path: ${{targets.subpkgdir}}/usr/lib/libm.so
+          pattern: /usr/lib/libmvec\.so\.1
+          replacement: /usr/lib/libmvec.so
+    dependencies:
+      provides:
+        - glibc-dev=${{package.full-version}}
+      runtime:
+        - glibc>=${{package.full-version}}
+        - libxcrypt-dev
+        - linux-headers
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils # readelf
+            - gcc
+      pipeline:
+        - uses: test/tw/devpackage
+        - name: libc.so/libm.so are pinned to this version, interp left on runtime
+          runs: |
+            ver="${{package.version}}"
+            grep -qF "/usr/lib/libc.so-$ver" /usr/lib/libc.so || { cat /usr/lib/libc.so; echo "FAIL: libc.so not pinned"; exit 1; }
+            grep -qF "/usr/lib/libm.so-$ver" /usr/lib/libm.so || { cat /usr/lib/libm.so; echo "FAIL: libm.so not pinned"; exit 1; }
+            grep -q "ld-linux" /usr/lib/libc.so || { echo "FAIL: libc.so lost AS_NEEDED(ld-linux)"; exit 1; }
+            test -f "/usr/lib/libc.so-$ver" && test -f "/usr/lib/libm.so-$ver"
+            # Every file the linker scripts reference must exist. The pinned
+            # entries must be real files, not symlinks back into the runtime.
+            paths="$(cat /usr/lib/libc.so /usr/lib/libm.so | tr '()' '  ' | tr ' ' '\n' | grep '^/[a-z]' | sort -u)"
+            for f in $paths; do
+              test -e "$f" || { echo "FAIL: linker script references missing $f"; exit 1; }
+              case "$f" in
+                */ld-linux*) : ;;
+                *) test ! -L "$f" || { echo "FAIL: $f is a symlink, expected a pinned real file"; exit 1; }
+                   owned_by=$(apk info -qW "$f")
+                   [ "$owned_by" = "${{package.name}}-dev" ] || { echo "FAIL: $f is owned by $owned_by instead of the dev package"; exit 1;}
+                   ;;
+              esac
+            done
+            echo "PASS: linker scripts pinned to $ver"
+        - name: No pinned library references a GLIBC newer than this version
+          runs: |
+            ver="${{package.version}}"; fail=0
+            for f in /usr/lib/libc.so-$ver /usr/lib/libm.so-$ver \
+                     /usr/lib/libresolv.so /usr/lib/libanl.so; do
+              hi="$(readelf -V "$f" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+                    | sed 's/GLIBC_//' | sort -V | tail -1)"
+              [ -z "$hi" ] && continue
+              if [ "$(printf '%s\n%s\n' "$hi" "$ver" | sort -V | tail -1)" != "$ver" ]; then
+                echo "FAIL: $f references GLIBC_$hi > GLIBC_$ver"; fail=1
+              fi
+            done
+            [ "$fail" -eq 0 ] && echo "PASS: nothing exceeds GLIBC_$ver"; exit $fail
+        - name: A built binary's GLIBC floor is <= this dev version, and it runs without requiring the dev package at runtime
+          runs: |
+            ver="${{package.version}}"
+            cat > t.c <<'EOF'
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <math.h>
+            static void bye(void){}
+            int main(void){ atexit(bye); printf("%f\n", sqrt(2.0)); return 0; }
+            EOF
+            # -fstack-protector-all forces __stack_chk_fail_local, proving the
+            # libc.so GROUP still pulls in libc_nonshared.a.
+            gcc -fstack-protector-all t.c -o t -lm
+            apk del ${{package.name}}-dev gcc
+            ./t
+            hi="$(readelf -V ./t 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+                  | sed 's/GLIBC_//' | sort -V | tail -1)"
+            echo "binary floor: ${hi:-none}, dev version: $ver"
+            if [ -n "$hi" ] && [ "$(printf '%s\n%s\n' "$hi" "$ver" | sort -V | tail -1)" != "$ver" ]; then
+              echo "FAIL: binary requires GLIBC_$hi > $ver"; exit 1
+            fi
+            echo "PASS: floor <= $ver and binary runs"
+
+  - name: "${{package.name}}-iconv"
+    description: "GLIBC iconv tables"
+    pipeline:
+      - runs: |
+          # Cleanup unnecessary character sets
+          for ch in ${{vars.charsets-to-remove}}; do
+            rm -v "${{targets.destdir}}/usr/lib/gconv/${ch}.so"
+          done
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/gconv "${{targets.subpkgdir}}"/usr/lib/
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/iconvconfig "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/iconv "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              iconvconfig
+              iconv
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              iconvconfig
+              iconv
+            version: ${{package.version}}
+        - name: Check if unnecessary charsets are not being shipped
+          runs: |
+            set -euo pipefail
+            for ch in ${{vars.charsets-to-remove}}; do
+              if iconv -f "${ch}" -t UTF-8 /dev/null ; then
+                echo "Charset $ch is available while it shouldn't be."
+                exit 1
+              fi
+            done
+    dependencies:
+      provides:
+        - glibc-iconv=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "${{package.name}}-locales"
+    description: "GLIBC locale data"
+    pipeline:
+      - uses: split/locales
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/share
+          mv "${{targets.destdir}}"/usr/share/i18n "${{targets.subpkgdir}}"/usr/share/i18n
+    dependencies:
+      provides:
+        - glibc-locales=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: /usr/share/locale/
+
+  - name: "tzutils-${{package.version}}"
+    description: "Timezone utilities"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/tzselect "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/zdump "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/zic "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              tzselect
+              zdump
+              zic
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              tzselect
+              zdump
+              zic
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - tzutils=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "posix-libc-utils-${{package.version}}"
+    description: "POSIX XCU utilities included with the C library"
+    dependencies:
+      provides:
+        - posix-libc-utils=${{package.full-version}}
+      runtime:
+        - bash
+        - ${{package.name}}=${{package.full-version}}
+        - posix-libc-utils-bin=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/ldd "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: ldd
+        - uses: test/tw/ver-check
+          with:
+            bins: ldd
+
+  # splitting posix-libc-utils binaries that don't require bash into their own subpackage
+  # lets us use these binaries without adding an unnecessary bash dependency
+  - name: "posix-libc-utils-bin-${{package.version}}"
+    description: "POSIX XCU utilities included with the C library (excluding ldd)"
+    dependencies:
+      provides:
+        - posix-libc-utils-bin=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/gencat "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/getconf "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/getent "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/locale "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/pldd "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/libexec "${{targets.subpkgdir}}"/usr
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              gencat
+              getconf
+              getent
+              locale
+              pldd
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              gencat
+              getconf
+              getent
+              locale
+              pldd
+
+  - name: "localedef-${{package.version}}"
+    description: "Tool for defining GLIBC locales"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/localedef "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: localedef
+        - uses: test/tw/ver-check
+          with:
+            bins: localedef
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - localedef=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "sotruss-${{package.version}}"
+    description: "Shared object tracing tool"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/audit
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+
+          mv "${{targets.destdir}}"/usr/bin/sotruss "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/lib/audit/* "${{targets.subpkgdir}}"/usr/lib/audit/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/help-check
+          with:
+            bins: sotruss
+        - uses: test/tw/ver-check
+          with:
+            bins: sotruss
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - sotruss=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "nscd-${{package.version}}"
+    description: "NSS caching daemon"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/nscd "${{targets.subpkgdir}}"/usr/bin/
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: nscd
+        - uses: test/tw/ver-check
+          with:
+            bins: nscd
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - nscd=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "nss-db-${{package.version}}"
+    description: "NSS module for database lookups"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mkdir -p "${{targets.subpkgdir}}"/var
+
+          mv "${{targets.destdir}}"/usr/bin/makedb "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/lib/libnss_db.so.2 "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/var/db "${{targets.subpkgdir}}"/var
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/help-check
+          with:
+            bins: makedb
+        - uses: test/tw/ver-check
+          with:
+            bins: makedb
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - nss-db=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "nss-hesiod-${{package.version}}"
+    description: "NSS module for hesiod lookups"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libnss_hesiod.so.2 "${{targets.subpkgdir}}"/usr/lib
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+    dependencies:
+      provides:
+        - nss-hesiod=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "pcprofiledump-${{package.version}}"
+    description: "PC profiling tool"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libpcprofile.so "${{targets.subpkgdir}}"/usr/lib
+
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/pcprofiledump "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: pcprofiledump
+        - uses: test/tw/ver-check
+          with:
+            bins: pcprofiledump
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - pcprofiledump=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "${{package.name}}-tracing"
+    description: "GLIBC tracing and profiling utilities"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/mtrace "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/xtrace "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/sprof "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              sprof
+              xtrace
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              sprof
+              xtrace
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - glibc-tracing=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "sln-${{package.version}}"
+    description: "Staticly-linked symbolic link tool"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/sln "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: sln
+        - uses: test/tw/ver-check
+          with:
+            bins: sln
+            version: ${{package.version}}
+    dependencies:
+      provides:
+        - sln=${{package.full-version}}
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
+  - name: "libcrypt1-${{package.version}}"
+    description: "Password hashing library included with glibc"
+    dependencies:
+      provider-priority: 10
+      provides:
+        - libcrypt1=${{package.full-version}}
+        - so:libcrypt.so.1=1
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - libxcrypt
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    # test added by a robot. The APK was empty when it was checked,
+    # which may not be true forever. If this test fails in the future, please
+    # replace it with a more accurate test.
+    test:
+      pipeline:
+        - uses: test/emptypackage
+
+  - name: "${{package.name}}-locale-posix"
+    description: "POSIX locale data for glibc"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/locale
+          mv "${{targets.destdir}}"/usr/lib/locale/C.utf8 "${{targets.subpkgdir}}"/usr/lib/locale/
+    dependencies:
+      provides:
+        - glibc-locale-posix=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: /usr/lib/locale/C.utf8
+
+  - range: locales-main
+    name: "${{package.name}}-locale-${{range.key}}"
+    description: "${{range.value}} locale data for glibc"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/locale
+          [ -d "${{targets.destdir}}"/usr/lib/locale/${{range.key}} ] \
+            || mv "${{targets.destdir}}"/usr/lib/locale/${{range.key}}_* "${{targets.subpkgdir}}"/usr/lib/locale/
+          [ -d "${{targets.destdir}}"/usr/lib/locale/${{range.key}} ] \
+            && mv "${{targets.destdir}}"/usr/lib/locale/${{range.key}} "${{targets.subpkgdir}}"/usr/lib/locale/
+
+          # Some locale can be ~18x as big as it should be due to duplicate files.
+          # rdfind replaces redundant files with hardlinks.
+          rdfind -makehardlinks true "${{targets.subpkgdir}}"/usr/lib/locale/
+    dependencies:
+      provides:
+        - glibc-locale-${{range.key}}=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      environment:
+        contents:
+          packages:
+            - posix-libc-utils-${{package.version}}
+      pipeline:
+        - runs: |
+            set -euo pipefail
+            pkg=glibc-locale-${{range.key}}
+            out=$(locale --all-locales) || {
+              echo "FAIL: locale --all-locales failed for $pkg"
+              exit 1
+            }
+            matches=$(echo "$out" | grep "^${{range.key}}") || {
+              echo "FAIL: $pkg did not install any locales per 'locale --all-locales'"
+              echo "$ locale --all-locales"
+              echo "$out"
+              exit 1
+            }
+            echo "PASS: $pkg shipped" $matches
+
+  - name: "${{package.name}}-locale-extra"
+    description: "All other extra locale data for glibc"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/locale
+          mv "${{targets.destdir}}"/usr/lib/locale/* "${{targets.subpkgdir}}"/usr/lib/locale/
+
+          # Some locale can be ~18x as big as it should be due to duplicate files.
+          # rdfind replaces redundant files with hardlinks.
+          rdfind -makehardlinks true "${{targets.subpkgdir}}"/usr/lib/locale/
+    dependencies:
+      provides:
+        - glibc-locale-extra=${{package.full-version}}
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      environment:
+        contents:
+          packages:
+            - posix-libc-utils-${{package.version}}
+      pipeline:
+        - runs: |
+            set -euo pipefail
+            pkg=glibc-locale-extra
+            out=$(locale --all-locales) || {
+              echo "FAIL: locale --all-locales failed for $pkg"
+              exit 1
+            }
+            # NOTE: the list of locales to check here needs to be kept in sync
+            # with the locales-main range
+            for lang in ca de en es fr; do
+              matches=$(echo "$out" | grep "^$lang") && {
+                echo "FAIL: $pkg installs one of the stand-alone-package locales"
+                echo "$ locale --all-locales"
+                echo "$out"
+                exit 1
+              }
+            done
+            echo "PASS: $pkg correctly does not ship main locales"
+
+  # Similar to https://packages.debian.org/bookworm/libc-bin
+  - name: "libc-bin-${{package.version}}"
+    description: "GNU C Library: Binaries"
+    dependencies:
+      provides:
+        - libc-bin=${{package.full-version}}
+      runtime:
+        - localedef-${{package.version}}
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - posix-libc-utils-${{package.version}}
+        - tzutils-${{package.version}}
+        - wolfi-baselayout
+    checks:
+      disabled:
+        - empty
+    # test added by a robot. The APK was empty when it was checked,
+    # which may not be true forever. If this test fails in the future, please
+    # replace it with a more accurate test.
+    test:
+      pipeline:
+        - uses: test/emptypackage
+
+test:
+  environment:
+    contents:
+      packages:
+        - gcc
+        - ${{package.name}}-dev
+  pipeline:
+    - runs: |
+        set -euo pipefail
+        # Ensure locales are excluded from glibc
+        cd /usr/lib/locale
+        locales=$(ls | grep -v C.utf8) || locales=""
+
+        if [[ -n "${locales}" ]]; then
+          for locale in ${locales}; do
+            echo "Error: locale $locale found in main glibc package"
+          done
+          exit 1
+        fi
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          ldconfig
+          ld.so
+    - uses: test/tw/ver-check
+      with:
+        bins: |
+          ldconfig
+          ld.so
+        version: ${{package.version}}
+    - name: Confirm that we're still compatible with current gcc
+      runs: |
+        set -euo pipefail
+        # This was a problem due to some legacy fix-includes in gcc that interfered
+        # with new glibc private symbols.  Let's make sure that doesn't break again
+        cat <<EOF >gcc_test.cc
+        #include <thread>
+        #include <future>
+        int main(void)
+        {
+          return 0;
+        }
+        EOF
+        g++ -o test_build gcc_test.cc
+        # Test that glibc startup files do not leak into the binary
+        if [ -n "$(readelf --notes test_build | grep -F '"name":"glibc"')" ]; then
+          readelf --notes test_build
+          echo glibc package note detected in a shared linked binary
+          exit 1
+        fi
+    - name: Verify apk bootstrap works
+      runs: |
+        set -euo pipefail
+        check_bootstrap_log() {
+          local log="$1"
+          cat "$log"
+          # Filter out known-ok "updating directory permissions" errors,
+          # then fail if any real ERROR: lines remain.
+          if grep -e "ERROR:" "$log" | grep -v "updating directory permissions" > errors.log; then
+            echo "Unexpected errors found in bootstrap log:"
+            cat errors.log
+            exit 1
+          fi
+        }
+
+        # Verify that glibc + bash-binsh bootstrap works
+        mkdir -p /tmp/glibc-bash/etc/apk
+        cp -r /etc/apk/repositories /etc/apk/keys /tmp/glibc-bash/etc/apk
+        apk add --initdb --root /tmp/glibc-bash glibc bash-binsh &> bootstrap.log || :
+        check_bootstrap_log bootstrap.log
+
+        # Verify that glibc + busybox bootstrap works
+        mkdir -p /tmp/glibc-busybox/etc/apk
+        cp -r /etc/apk/repositories /etc/apk/keys /tmp/glibc-busybox/etc/apk
+        apk add --initdb --root /tmp/glibc-busybox glibc busybox &> bootstrap.log || :
+        check_bootstrap_log bootstrap.log
+    - name: Verify that frame unwinding doesn't crash (when glibc is compiled with hardening)
+      runs: |
+        # This is the minimal reproducer of the glibc breakage we
+        # experienced when hardening was enabled.  See
+        # https://github.com/wolfi-dev/os/pull/53351#issuecomment-2946134881
+        # for more details.
+        cat > glibc-hardening-test.c << _EOF_
+        #include <execinfo.h>
+
+        int
+        main(int argc, char *argv[])
+        {
+          void *a[4096];
+          backtrace (a, 100);
+          return 0;
+        }
+        _EOF_
+        gcc glibc-hardening-test.c -o glibc-hardening-test
+        # Run the program 1000 times to make sure that unwinding works without problems.
+        for i in $(seq 1000); do ./glibc-hardening-test; done
+    - name: Verify version-streamed virtuals do not resolve to an older package
+      runs: |
+        # Now that glibc is version-streamed, every package it produces is named
+        # with a version-stream suffix/prefix (e.g. ld-linux-2.43) and provides the
+        # bare, un-versioned name as a virtual (e.g. ld-linux). Older, non-
+        # version-streamed packages of those same bare names still exist in the
+        # index and will remain until they are garbage collected. If one of them
+        # is still solveable alongside the current glibc, `apk add`-ing the bare
+        # virtual name could quietly resolve to that stale package instead of the
+        # one we just built (see the ld-linux case in the commit that added this
+        # test).
+        #
+        # For each virtual, install it in a fresh root alongside glibc
+        # and confirm the resolved package is not older than what
+        # we just built. We compare with >= rather than == so that rebuilding
+        # this version still passes after a newer glibc has been published.
+        expected="${{package.full-version}}"
+
+        virtuals="
+          glibc
+          glibc-abi-report
+          glibc-dev
+          glibc-iconv
+          glibc-locale-ca
+          glibc-locale-de
+          glibc-locale-en
+          glibc-locale-es
+          glibc-locale-extra
+          glibc-locale-fr
+          glibc-locale-posix
+          glibc-locales
+          glibc-testresults
+          glibc-tracing
+          ld-linux
+          libc-bin
+          libcrypt1
+          localedef
+          nscd
+          nss-db
+          nss-hesiod
+          pcprofiledump
+          posix-libc-utils
+          posix-libc-utils-bin
+          sln
+          sotruss
+          tzutils
+        "
+
+        # Print the version of the installed package that satisfies $1 (matching
+        # either the package name or one of its provides) in the root at $2.
+        installed_version() {
+          awk -v want="$1" '
+            BEGIN { RS = "" }
+            {
+              pkg = ""; ver = ""; prov = ""
+              n = split($0, lines, "\n")
+              for (i = 1; i <= n; i++) {
+                if (lines[i] ~ /^P:/)      pkg  = substr(lines[i], 3)
+                else if (lines[i] ~ /^V:/) ver  = substr(lines[i], 3)
+                else if (lines[i] ~ /^p:/) prov = substr(lines[i], 3)
+              }
+              matched = (pkg == want)
+              if (!matched) {
+                m = split(prov, provs, " ")
+                for (j = 1; j <= m; j++) {
+                  name = provs[j]; sub(/=.*/, "", name)
+                  if (name == want) { matched = 1; break }
+                }
+              }
+              if (matched) { print ver; exit }
+            }
+          ' "$2/lib/apk/db/installed"
+        }
+
+        rc=0
+        for v in $virtuals; do
+          root="$(mktemp -d)"
+          mkdir -p "$root/etc/apk"
+          cp -r /etc/apk/repositories /etc/apk/keys "$root/etc/apk/"
+          if ! apk add --initdb --root "$root" glibc "$v" > "$root/add.log" 2>&1; then
+            echo "FAIL: apk add glibc-${{package.version}} $v failed to solve"
+            cat "$root/add.log"
+            rc=1
+            rm -rf "$root"
+            continue
+          fi
+          got="$(installed_version "$v" "$root")"
+          if [ -z "$got" ]; then
+            echo "FAIL: apk add glibc-${{package.version}} $v installed nothing satisfying $v"
+            rc=1
+            rm -rf "$root"
+            continue
+          fi
+          rel="$(apk version -t "$got" "$expected" || true)"
+          if [ "$rel" = "<" ]; then
+            echo "FAIL: apk add glibc-${{package.version}} $v resolved $v to $got, expected >= $expected"
+            rc=1
+          else
+            echo "PASS: $v resolved to $got (>= $expected)"
+          fi
+          rm -rf "$root"
+        done
+        exit $rc
+
+update:
+  enabled: true
+  git: {}
+  schedule:
+    period: weekly
+    reason: We are building from the release branch, which isn't tagged.

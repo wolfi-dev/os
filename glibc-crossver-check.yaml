@@ -1,0 +1,131 @@
+package:
+  name: glibc-crossver-check
+  version: "0.1.0"
+  epoch: 0
+  description: "build against an older glibc-dev, run on the newest glibc runtime"
+  copyright:
+    - license: Apache-2.0
+
+vars:
+  # The glibc version stream we link against. The runtime is deliberately left
+  # unversioned so apk resolves whatever the newest stream is.
+  glibc-version: "2.43"
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - wolfi-baselayout
+
+pipeline:
+  - runs: |
+      mkdir -p "${{targets.destdir}}"/usr/share/doc/${{package.name}}
+      echo "see the test stanza" > "${{targets.destdir}}"/usr/share/doc/${{package.name}}/README
+
+update:
+  enabled: false
+
+test:
+  environment:
+    contents:
+      packages:
+        - binutils # readelf
+        - gcc
+        # We want latest, should mismatch with glibc-version
+        - glibc
+        - glibc-${{vars.glibc-version}}-dev
+  pipeline:
+    - name: Resolve which glibc streams we actually got
+      runs: |
+        dev="${{vars.glibc-version}}"
+
+        # /usr/lib/libc.so is the linker script owned by the -dev package;
+        # /usr/lib/libc.so.6 is the shared object owned by the runtime package.
+        dev_pkg="$(apk info -qW /usr/lib/libc.so)"
+        run_pkg="$(apk info -qW /usr/lib/libc.so.6)"
+        run_ver="${run_pkg#glibc-}"
+
+        echo "dev package:     $dev_pkg"
+        echo "runtime package: $run_pkg"
+
+        if [ "$run_ver" = "$dev" ]; then
+          echo "FAIL: runtime and dev are both $dev, want an out of date glibc header package."
+          exit 1
+        fi
+        if [ "$(printf '%s\n%s\n' "$run_ver" "$dev" | sort -V | tail -1)" != "$run_ver" ]; then
+          echo "FAIL: runtime glibc is $run_ver, expected something newer than $dev"
+          exit 1
+        fi
+
+        echo "$run_ver" > /tmp/runtime-version
+        echo "PASS: linking against $dev, running on $run_ver"
+    - name: Build a program that touches a spread of versioned symbols
+      runs: |
+        # -fstack-protector-all forces __stack_chk_fail_local, which only
+        # resolves if the libc.so linker script still pulls in libc_nonshared.a.
+        gcc -O2 -Wall -Wextra -Werror -fstack-protector-all \
+          -o /tmp/crossver crossver.c -lm
+    - name: The binary's GLIBC floor is no newer than the dev stream
+      runs: |
+        dev="${{vars.glibc-version}}"
+
+        readelf -V /tmp/crossver | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV > /tmp/required
+        echo "GLIBC versions required by the binary:"
+        sed 's/^/  /' /tmp/required
+
+        hi="$(sed 's/GLIBC_//' /tmp/required | sort -V | tail -1)"
+        if [ -z "$hi" ]; then
+          echo "FAIL: readelf -V /tmp/crossver found no GLIBC_ version requirements, expected at least one"
+          exit 1
+        fi
+        if [ "$(printf '%s\n%s\n' "$hi" "$dev" | sort -V | tail -1)" != "$dev" ]; then
+          echo "FAIL: binary requires GLIBC_$hi, expected nothing newer than GLIBC_$dev"
+          exit 1
+        fi
+        echo "PASS: highest requirement is GLIBC_$hi, floor is <= $dev"
+    - name: The binary links the runtime sonames, not the pinned dev copies
+      runs: |
+        dev="${{vars.glibc-version}}"
+
+        needed="$(readelf -d /tmp/crossver | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
+        echo "DT_NEEDED: $needed"
+        for so in $needed; do
+          case "$so" in
+            *.so-*)
+              echo "FAIL: DT_NEEDED contains $so, expected a plain soname such as libc.so.6"
+              exit 1
+              ;;
+          esac
+        done
+
+        # The interpreter must come from the runtime's ld-linux package. The
+        # dev package pins libc.so/libm.so to its own stream but deliberately
+        # leaves AS_NEEDED(ld-linux) pointing at the runtime.
+        interp="$(readelf -l /tmp/crossver | sed -n 's/.*program interpreter: \(.*\)\]/\1/p' | sed -E 's#lib(64)?#usr/lib#' )"
+        interp_pkg="$(apk info -qW "$interp")"
+        echo "interpreter: $interp (owned by $interp_pkg)"
+        case "$interp_pkg" in
+          "glibc-$dev-dev")
+            echo "FAIL: apk info -qW $interp returned $interp_pkg, expected the runtime ld-linux package"
+            exit 1
+            ;;
+        esac
+        echo "PASS: linked against runtime sonames and the runtime interpreter"
+    - name: The binary runs on the newest runtime without the dev package
+      runs: |
+        dev="${{vars.glibc-version}}"
+        run_ver="$(cat /tmp/runtime-version)"
+
+        # Removing the dev package deletes /usr/lib/libc.so-$dev and friends, so
+        # anything still bound to them fails to start.
+        apk del gcc binutils "glibc-$dev-dev"
+
+        out="$(/tmp/crossver)"
+        echo "$out"
+
+        reported="${out#runtime-glibc: }"
+        if [ "$reported" != "$run_ver" ]; then
+          echo "FAIL: gnu_get_libc_version() returned $reported, expected $run_ver"
+          exit 1
+        fi
+        echo "PASS: built on $dev, ran on $run_ver"

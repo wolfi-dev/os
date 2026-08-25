@@ -15,7 +15,7 @@ The example below uses the general [`sdk`](https://github.com/wolfi-dev/tools#sd
 docker run -v $(pwd):/src --entrypoint=melange ghcr.io/wolfi-dev/sdk keygen /src/local-melange.rsa
 
 # build a package
-docker run --privileged -v "$PWD":/work --entrypoint=melange --workdir=/work ghcr.io/wolfi-dev/sdk build --keyring-append local-melange.rsa.pub --keyring-append https://packages.wolfi.dev/os/wolfi-signing.rsa.pub --signing-key local-melange.rsa --repository-append https://packages.wolfi.dev/os  --repository-append /work/packages --empty-workspace --arch x86_64 $package
+docker run --privileged -v "$PWD":/work --entrypoint=melange --workdir=/work ghcr.io/wolfi-dev/sdk build --keyring-append local-melange.rsa.pub --signing-key local-melange.rsa --repository-append https://apk.cgr.dev/chainguard  --repository-append /work/packages --empty-workspace --arch x86_64 $package
 ```
 
 > Note that `--privileged` is needed by `melange` to spawn containers that isolate the build process. See the [build-process](https://github.com/chainguard-dev/melange/blob/main/docs/BUILD-PROCESS.md) for more reference.

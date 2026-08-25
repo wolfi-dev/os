@@ -82,6 +82,7 @@ MELANGE_OPTS += --namespace=wolfi
 MELANGE_OPTS += --package-append=busybox
 MELANGE_OPTS += --pipeline-dir=./pipelines/
 MELANGE_OPTS += --repository-append=$(REPO)
+MELANGE_OPTS += --repository-append=https://apk.cgr.dev/chainguard
 MELANGE_OPTS += --signing-key=$(KEY)
 MELANGE_OPTS += $(MELANGE_EXTRA_OPTS)
 
@@ -100,8 +101,7 @@ MELANGE_TEST_OPTS += --repository-append=$(REPO)
 MELANGE_TEST_OPTS += --keyring-append=$(KEY).pub
 MELANGE_TEST_OPTS += --arch=$(ARCH)
 MELANGE_TEST_OPTS += --pipeline-dirs=./pipelines/
-MELANGE_TEST_OPTS += --repository-append=https://packages.wolfi.dev/os
-MELANGE_TEST_OPTS += --keyring-append=https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+MELANGE_TEST_OPTS += --repository-append=https://apk.cgr.dev/chainguard
 MELANGE_TEST_OPTS += --test-package-append=wolfi-base
 MELANGE_TEST_OPTS += --debug
 MELANGE_TEST_OPTS += $(MELANGE_EXTRA_OPTS)
@@ -109,12 +109,6 @@ MELANGE_TEST_OPTS += $(MELANGE_EXTRA_OPTS)
 ifeq ($(LINT), yes)
 	MELANGE_OPTS += --fail-on-lint-warning
 endif
-
-BOOTSTRAP_REPO ?= https://packages.wolfi.dev/bootstrap/stage3
-BOOTSTRAP_KEY ?= https://packages.wolfi.dev/bootstrap/stage3/wolfi-signing.rsa.pub
-WOLFI_REPO ?= https://packages.wolfi.dev/os
-WOLFI_KEY ?= https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
-BOOTSTRAP ?= no
 
 SOURCE_DATE_EPOCH := $(shell git --no-pager log -1 --pretty=%ct 2>/dev/null || jj log -r @ --no-graph -T 'committer.timestamp().utc().format("%s")' 2>/dev/null || echo 0)
 ifeq ($(SOURCE_DATE_EPOCH),0)
@@ -145,13 +139,7 @@ MOUNT_RELABEL_OPT := ,relabel=private
 VOLUME_RELABEL_OPT := :Z
 endif
 
-ifeq ($(BOOTSTRAP), yes)
-	MELANGE_OPTS += --keyring-append=$(BOOTSTRAP_KEY)
-	MELANGE_OPTS += --repository-append=$(BOOTSTRAP_REPO)
-else
-	MELANGE_OPTS += --keyring-append=$(WOLFI_KEY)
-	MELANGE_OPTS += --repository-append=$(WOLFI_REPO)
-endif
+
 
 $(KEY):
 	$(MELANGE) keygen $(KEY)
@@ -299,7 +287,6 @@ local-wolfi: $(KEY)
 	mkdir -p "$(PWD)/packages"
 	$(eval TMP_REPOS_DIR := $(shell mktemp --tmpdir=$(MELANGE_TMPDIR) -d "$@.XXXXXX")) # todo-linter: ignore
 	$(eval TMP_REPOS_FILE := $(TMP_REPOS_DIR)/repositories)
-	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
 ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
 	echo "$(LOCAL_WOLFI_EXTRA_REPO)" >> $(TMP_REPOS_FILE)
@@ -360,7 +347,6 @@ dev-container-wolfi: $(KEY)
 	$(eval OUT_DIR ?= $(shell mktemp --tmpdir=$(MELANGE_TMPDIR) -d))
 	$(eval OS_LOCAL_DIR ?= /work/os)
 	$(eval OS_DIR ?= $(PWD))
-	echo "https://packages.wolfi.dev/os" > $(TMP_REPOS_FILE)
 	echo "$(PACKAGES_CONTAINER_FOLDER)" >> $(TMP_REPOS_FILE)
 ifneq ($(LOCAL_WOLFI_EXTRA_REPO),)
 	echo "$(LOCAL_WOLFI_EXTRA_REPO)" >> $(TMP_REPOS_FILE)

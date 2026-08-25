@@ -1,0 +1,168 @@
+name: Fetch JARs from Chainguard Libraries
+
+# Downloads JAR artifacts from Chainguard Libraries
+# (https://libraries.cgr.dev) and optionally replaces bundled copies
+# in-place and/or installs them into a directory.
+#
+# Use this to remediate CVEs in JARs that are vendored, bundled, or shaded
+# inside a package when no upstream release carries the fix: the vulnerable
+# JAR is overwritten with the fixed version. With the default
+# replace-mode=overwrite the original file name and path are kept so
+# hardcoded classpath references still resolve at runtime; with
+# replace-mode=rename the vulnerable file is deleted and the fixed
+# <artifact-id>-<version>.jar is installed next to it instead.
+#
+# For local development, place a Chainguard Libraries pull token in
+# .libraries.token next to the package YAML. In build automation the token
+# is minted via the GCP metadata server, like the auth/* pipelines do.
+
+needs:
+  packages:
+    - busybox
+    - curl
+    - jq
+
+inputs:
+  artifact-id:
+    description: |
+      The Maven artifact ID of the JAR to fetch (e.g. jackson-databind).
+      May be a whitespace-separated list of artifact IDs sharing the same
+      group-id and version; dest, expected-sha256 and replace require a
+      single artifact ID.
+    required: true
+  dest:
+    description: |
+      Path to store the downloaded JAR at, for use by later pipeline steps.
+      Defaults to /tmp/<artifact-id>-<version>.jar.
+    default: ""
+  expected-sha256:
+    description: |
+      Optional sha256 checksum the downloaded JAR must match; the build
+      fails on mismatch. Note that Chainguard Libraries serves rebuilt
+      artifacts for some coordinates, whose checksums differ from Maven
+      Central and may change when they are rebuilt.
+    default: ""
+  group:
+    description: the group to use for Chainguard Libraries
+    default: "ce2d1984a010471142503340d670612d63ffb9f6"
+  group-id:
+    description: The Maven group ID of the JAR to fetch (e.g. com.fasterxml.jackson.core)
+    required: true
+  identity:
+    description: the identity to use for Chainguard Libraries
+    default: "ce2d1984a010471142503340d670612d63ffb9f6/368543f65e2b1f6f"
+  install-dir:
+    description: |
+      Optional directory to copy the downloaded JAR into, keeping its
+      <artifact-id>-<version>.jar name (e.g. to add a JAR to a classpath
+      directory). The directory is created if it does not exist.
+    default: ""
+  replace:
+    description: |
+      Optional whitespace-separated list of file patterns; every file
+      matching one of them under search-dir is replaced by the downloaded
+      JAR. Patterns containing a slash are matched with find -path, others
+      with find -name.
+    default: ""
+  replace-mode:
+    description: |
+      How matched files are replaced. "overwrite" copies the downloaded JAR
+      over the matched file, keeping the old file name and path. "rename"
+      deletes the matched file and installs <artifact-id>-<version>.jar in
+      its directory instead.
+    default: "overwrite"
+  repository:
+    description: The Chainguard Libraries repository to fetch from
+    default: "java-all"
+  require-match:
+    description: |
+      Fail the build if replace patterns were given but no file matched any
+      of them. Set to "false" when the vulnerable JAR is not always present.
+    default: "true"
+  search-dir:
+    description: The directory searched for files matching replace patterns
+    default: "."
+  version:
+    description: The version of the JAR to fetch
+    required: true
+
+pipeline:
+  - name: Fetch JAR from Chainguard Libraries
+    runs: |
+      set -euo pipefail
+
+      artifacts="${{inputs.artifact-id}}"
+      if [ "$(echo "$artifacts" | wc -w)" -gt 1 ]; then
+        if [ -n "${{inputs.dest}}" ] || [ -n "${{inputs.replace}}" ] || [ -n "${{inputs.expected-sha256}}" ]; then
+          echo "ERROR: dest, replace and expected-sha256 require a single artifact-id"
+          exit 1
+        fi
+      fi
+
+      case "${{inputs.replace-mode}}" in
+        overwrite|rename) ;;
+        *)
+          echo "ERROR: replace-mode must be \"overwrite\" or \"rename\", got \"${{inputs.replace-mode}}\""
+          exit 1
+          ;;
+      esac
+
+      # If libraries token exists in source dir, use that.
+      if [ -f ${{package.srcdir}}/.libraries.token ]; then
+        cgtoken=$(cat ${{package.srcdir}}/.libraries.token)
+      else
+        idtoken=$(curl --fail-with-body -sSL -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=issuer.enforce.dev)
+        cgtoken=$(curl --fail-with-body -sSL -H "Authorization: Bearer ${idtoken}" 'https://issuer.enforce.dev/sts/exchange?aud=libraries.cgr.dev&scope=${{inputs.group}}&identity=${{inputs.identity}}' | jq -r '.token')
+      fi
+
+      group_path=$(echo "${{inputs.group-id}}" | tr '.' '/')
+
+      for artifact in $artifacts; do
+        file_name="${artifact}-${{inputs.version}}.jar"
+
+        dest="${{inputs.dest}}"
+        [ -n "$dest" ] || dest="/tmp/${file_name}"
+        mkdir -p "$(dirname "$dest")"
+
+        echo "Fetching ${file_name} from Chainguard Libraries (${{inputs.repository}})..."
+        curl --fail-with-body -sSL -u ":${cgtoken}" -o "$dest" \
+          "https://libraries.cgr.dev/${{inputs.repository}}/${group_path}/${artifact}/${{inputs.version}}/${file_name}"
+
+        if [ -n "${{inputs.expected-sha256}}" ]; then
+          echo "${{inputs.expected-sha256}}  ${dest}" | sha256sum -c
+        fi
+
+        if [ -n "${{inputs.install-dir}}" ]; then
+          mkdir -p "${{inputs.install-dir}}"
+          echo "Installing ${file_name} into ${{inputs.install-dir}}/"
+          cp "$dest" "${{inputs.install-dir}}/${file_name}"
+        fi
+      done
+
+      patterns="${{inputs.replace}}"
+      if [ -n "$patterns" ]; then
+        replaced=0
+        for pattern in $patterns; do
+          case "$pattern" in
+            */*) matches=$(find "${{inputs.search-dir}}" -type f -path "$pattern") ;;
+            *) matches=$(find "${{inputs.search-dir}}" -type f -name "$pattern") ;;
+          esac
+          for jar in $matches; do
+            if [ "${{inputs.replace-mode}}" = "rename" ]; then
+              jar_dir=$(dirname "$jar")
+              echo "Replacing ${jar} with ${jar_dir}/${file_name}"
+              rm -f "$jar"
+              cp "$dest" "${jar_dir}/${file_name}"
+            else
+              echo "Replacing ${jar} with ${file_name}"
+              cp "$dest" "$jar"
+            fi
+            replaced=$((replaced + 1))
+          done
+        done
+        echo "Replaced ${replaced} JAR(s)"
+        if [ "$replaced" -eq 0 ] && [ "${{inputs.require-match}}" = "true" ]; then
+          echo "ERROR: no files matching '${patterns}' found under '${{inputs.search-dir}}'"
+          exit 1
+        fi
+      fi

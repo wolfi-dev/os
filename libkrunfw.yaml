@@ -1,7 +1,7 @@
 package:
   name: libkrunfw
   version: "5.5.0"
-  epoch: 4 # -microvm-image subpackage, -microvm uname -r
+  epoch: 5 # -microvm eBPF observability (kprobes + BTF in the config fragment)
   description: Dynamic library bundling a Linux kernel for use by libkrun
   copyright:
     - license: GPL-2.0-only AND LGPL-2.1-only
@@ -69,6 +69,10 @@ environment:
       - mpfr-dev
       - openssl
       - openssl-hardened-dev
+      # pahole, for the -microvm subpackage's CONFIG_DEBUG_INFO_BTF build
+      # (same pair the kernel/build pipeline uses).
+      - pahole
+      - pahole-dev
       - patch
       - perl
       - py${{vars.python-version}}-pyelftools
@@ -183,8 +187,12 @@ subpackages:
   #     run in-guest Docker and k3s (those conformance groups).
   #   * magic-sysrq, so the conformance suite can kill the guest from inside
   #     to exercise its transport-death contract.
+  #   * the eBPF observability plane (kprobes, the tracing BPF program
+  #     types, BTF), so falco/tetragon/cilium-class workloads can load and
+  #     attach against this kernel like they do against the qemu and
+  #     firecracker flavors.
   - name: ${{package.name}}-microvm
-    description: ${{package.name}} with support for microvm's needs (9p + iptables/netfilter + sysrq)
+    description: ${{package.name}} with support for microvm's needs (9p + iptables/netfilter + sysrq + eBPF observability)
     dependencies:
       provides:
         - ${{package.name}}=${{package.full-version}}
@@ -254,6 +262,28 @@ subpackages:
           # against this kernel (Robustness/GuestTransportDeath self-skips).
           # DEFAULT_ENABLE=0x1 turns on all sysrq functions, including 'o'
           # (poweroff), which is the one the suite uses.
+          #
+          # eBPF observability (falco/tetragon/cilium-class workloads):
+          #   CONFIG_BPF* - the syscall itself; unprivileged BPF stays off.
+          #   CONFIG_PERF_EVENTS + CONFIG_KPROBES + CONFIG_FTRACE +
+          #     CONFIG_KPROBE_EVENTS - kprobe attach rides the perf_kprobe
+          #     PMU; KPROBE_EVENTS lives under the FTRACE menu, so FTRACE
+          #     must be on for olddefconfig to keep it.
+          #   CONFIG_UPROBE_EVENTS - userspace probes, same PMU plane.
+          #   CONFIG_BPF_EVENTS - the kprobe/tracepoint/perf_event BPF
+          #     program types those tools load.
+          #   CONFIG_DEBUG_KERNEL - pure visibility gate for the debug-info
+          #     choice below, no code of its own. Upstream's x86_64 base
+          #     config carries it, the aarch64 one does not, and without it
+          #     olddefconfig silently drops the two DWARF/BTF options on
+          #     arm64 (which the verbatim check below turns into a loud
+          #     build failure).
+          #   CONFIG_DEBUG_INFO_BTF (+ the DWARF toolchain default it
+          #     needs) - CO-RE relocation reads /sys/kernel/btf/vmlinux.
+          #     Needs pahole in the build environment. The DWARF
+          #     byproduct is stripped from the bundled x86_64 vmlinux after
+          #     the build (see the strip step below); .BTF is an allocated
+          #     section and survives the strip.
           cat > microvm.cfg <<'EOF'
           CONFIG_LOCALVERSION="-r${{package.epoch}}-microvm"
           # CONFIG_LOCALVERSION_AUTO is not set
@@ -302,6 +332,19 @@ subpackages:
           CONFIG_NETFILTER_XT_SET=y
           CONFIG_MAGIC_SYSRQ=y
           CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE=0x1
+          CONFIG_BPF=y
+          CONFIG_BPF_SYSCALL=y
+          CONFIG_BPF_JIT=y
+          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
+          CONFIG_PERF_EVENTS=y
+          CONFIG_KPROBES=y
+          CONFIG_FTRACE=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_UPROBE_EVENTS=y
+          CONFIG_BPF_EVENTS=y
+          CONFIG_DEBUG_KERNEL=y
+          CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+          CONFIG_DEBUG_INFO_BTF=y
           EOF
 
           # Re-extract+patch+base-config+olddefconfig (upstream KERNEL_SOURCES
@@ -336,6 +379,22 @@ subpackages:
           fi
 
           make -j$(nproc) PREFIX=/usr LIBDIR_Linux=lib
+      - name: Strip DWARF from the bundled x86_64 kernel, keeping BTF
+        runs: |
+          # DEBUG_INFO_BTF drags full DWARF into the x86_64 vmlinux, and
+          # bin2cbundle.py embeds that file verbatim into libkrunfw.so —
+          # hundreds of MB of dead weight. .BTF is an allocated section the
+          # guest serves at /sys/kernel/btf/vmlinux, DWARF is build-time-only
+          # pahole input: strip it, then remove the bundle artifacts and
+          # re-run make so the library is relinked around the stripped
+          # kernel (the kernel tree itself is up to date and not rebuilt).
+          # aarch64 bundles arch/arm64/boot/Image, a binary objcopy that
+          # never carried DWARF, so there is nothing to strip there.
+          if [ "${{build.arch}}" = "x86_64" ]; then
+            objcopy --strip-debug "linux-${{vars.kernel-version}}/vmlinux"
+            rm -f kernel.c libkrunfw.so*
+            make -j$(nproc) PREFIX=/usr LIBDIR_Linux=lib
+          fi
       - name: Install the microvm library into the subpackage
         runs: |
           make PREFIX=/usr LIBDIR_Linux=lib DESTDIR="${{targets.subpkgdir}}" install
@@ -469,12 +528,13 @@ subpackages:
               Image | vmlinux) ;;
               *) echo "unexpected bundle-type: $(cat "${d}/bundle-type")" >&2 ; exit 1 ;;
             esac
-            # Assert provenance, not just presence: these three are exactly
+            # Assert provenance, not just presence: these four are exactly
             # what the -microvm rebuild adds on top of upstream's config, one
-            # per reason that rebuild exists (9p, legacy xtables, sysrq). A
-            # stock kernel that somehow reached this subpackage fails here
-            # rather than shipping quietly and failing inside a guest later.
-            for opt in CONFIG_9P_FS=y CONFIG_IP_NF_RAW=y CONFIG_MAGIC_SYSRQ=y ; do
+            # per reason that rebuild exists (9p, legacy xtables, sysrq, eBPF
+            # observability). A stock kernel that somehow reached this
+            # subpackage fails here rather than shipping quietly and failing
+            # inside a guest later.
+            for opt in CONFIG_9P_FS=y CONFIG_IP_NF_RAW=y CONFIG_MAGIC_SYSRQ=y CONFIG_DEBUG_INFO_BTF=y ; do
               grep -qxF "${opt}" "${d}/config" ||
                   { echo "$d/config - does not contain $opt"; exit 1; }
             done

@@ -1,0 +1,153 @@
+package:
+  name: pahole
+  version: "1.31"
+  epoch: 4 # moved from enterprise-packages (epoch 3 there); os is its home now, one bump supersedes
+  description: dwarf manipulation utilities
+  copyright:
+    - license: GPL-2.0-only
+  resources:
+    cpu: "2"
+    memory: 3Gi
+  test-resources:
+    cpu: "2"
+    memory: 5Gi
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - elfutils-dev
+      - glibc-2.43-dev
+      - libbpf-dev
+      - libdwarf-dev
+      - linux-headers
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 1f2805b6eef104df3125143c949b391f6122e5b9
+      repository: https://kernel.googlesource.com/pub/scm/devel/pahole/pahole.git
+      tag: v${{package.version}}
+
+  - uses: cmake/configure
+
+  - uses: cmake/build
+
+  - uses: cmake/install
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    pipeline:
+      - uses: split/dev
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-doc
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/docs
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+  pipeline:
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          codiff
+          ctracer
+          pahole
+          pdwtags
+          pfunct
+          pglobal
+          scncopy
+          syscse
+    - runs: |
+        dtagnames >/dev/null
+        test -x $(which prefcnt)
+    - name: "Test pahole parsing DWARF structs"
+      runs: |
+        # Create a simple C program with structs for pahole to analyze
+        tee /tmp/test_struct.c <<'EOF'
+        struct test_struct {
+            int id;
+            char name[32];
+            double value;
+            struct nested {
+                short x;
+                short y;
+            } pos;
+        };
+
+        int main() {
+            struct test_struct t = {0};
+            return t.id;
+        }
+        EOF
+
+        # Compile with debug info
+        gcc -g -o /tmp/test_struct /tmp/test_struct.c
+
+        # Verify pahole can parse and show the structure layout
+        pahole /tmp/test_struct | grep -F "struct test_struct"
+        pahole /tmp/test_struct | grep "int.*id"
+        pahole /tmp/test_struct | grep -F "name"
+        pahole /tmp/test_struct | grep -F "struct nested"
+    - name: "Test pdwtags extracts DWARF tags"
+      runs: |
+        # pdwtags should extract debug tags from the binary
+        pdwtags /tmp/test_struct > /tmp/pdwtags_output.txt
+        # Check that output contains expected DW_ tags or type information
+        cat /tmp/pdwtags_output.txt
+        test -s /tmp/pdwtags_output.txt
+    - name: "Test pfunct extracts function signatures"
+      runs: |
+        # pfunct should extract function information from DWARF data
+        pfunct /tmp/test_struct > /tmp/pfunct_output.txt
+        cat /tmp/pfunct_output.txt
+        # Should find the main function
+        grep -F "main" /tmp/pfunct_output.txt
+    - name: "Test codiff compares DWARF information"
+      runs: |
+        # Create a second version with a modified struct
+        tee /tmp/test_struct_v2.c <<'EOF'
+        struct test_struct {
+            int id;
+            char name[64];  /* increased from 32 */
+            double value;
+            int extra_field;  /* new field */
+            struct nested {
+                short x;
+                short y;
+            } pos;
+        };
+
+        int main() {
+            struct test_struct t = {0};
+            return t.id;
+        }
+        EOF
+
+        # Compile second version
+        gcc -g -o /tmp/test_struct_v2 /tmp/test_struct_v2.c
+
+        # codiff should detect differences between the two versions
+        codiff /tmp/test_struct /tmp/test_struct_v2 > /tmp/codiff_output.txt || true
+        cat /tmp/codiff_output.txt
+        # The output should show the struct differences
+        grep -E "(test_struct|changed)" /tmp/codiff_output.txt || test -s /tmp/codiff_output.txt
+    - uses: test/tw/ldd-check

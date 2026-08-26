@@ -1,7 +1,11 @@
 Upstream: https://github.com/python/cpython/pull/127301
 
+Extended downstream: the hmac.py hunks close the same FIPS gap for the
+builtin HACL* HMAC that CPython 3.14 added after the upstream PR was
+written. See Lib/test/_test_hashlib_fips.py for the regression tests.
+
 diff --git a/Lib/hashlib.py b/Lib/hashlib.py
-index 1b2c30cc32f..b71fe5eb90e 100644
+index 0e9bd98..72665b9 100644
 --- a/Lib/hashlib.py
 +++ b/Lib/hashlib.py
 @@ -79,6 +79,23 @@
@@ -75,7 +79,7 @@ index 1b2c30cc32f..b71fe5eb90e 100644
      except ImportError:
          pass  # no extension module, this hash is unsupported.
  
-@@ -172,10 +188,15 @@ def __hash_new(name, data=b'', **kwargs):
+@@ -172,10 +189,15 @@ def __hash_new(name, *args, **kwargs):
      __get_hash = __get_openssl_constructor
      algorithms_available = algorithms_available.union(
              _hashlib.openssl_md_meth_names)
@@ -91,12 +95,53 @@ index 1b2c30cc32f..b71fe5eb90e 100644
  
  try:
      # OpenSSL's PKCS5_PBKDF2_HMAC requires OpenSSL 1.0+ with HMAC and SHA
+diff --git a/Lib/hmac.py b/Lib/hmac.py
+index 2d6016c..3bdedfa 100644
+--- a/Lib/hmac.py
++++ b/Lib/hmac.py
+@@ -18,6 +18,14 @@
+ except ImportError:
+     _hmac = None
+ 
++# The HACL* fallbacks below are not part of the OpenSSL FIPS module, and they
++# are only ever reached for a digest that OpenSSL has just refused. In FIPS mode
++# that refusal is the answer, so do not route around it. See gh-127298.
++try:
++    _openssl_fips_mode = _hashopenssl.get_fips_mode() if _hashopenssl else 0
++except ValueError:
++    _openssl_fips_mode = 0
++
+ trans_5C = bytes((x ^ 0x5C) for x in range(256))
+ trans_36 = bytes((x ^ 0x36) for x in range(256))
+ 
+@@ -81,8 +89,9 @@ def __init(self, key, msg, digestmod):
+             try:
+                 self._init_openssl_hmac(key, msg, digestmod)
+                 return
+-            except _hashopenssl.UnsupportedDigestmodError:  # pragma: no cover
+-                pass
++            except _hashopenssl.UnsupportedDigestmodError:
++                if _openssl_fips_mode:
++                    raise
+         if _hmac and isinstance(digestmod, str):
+             try:
+                 self._init_builtin_hmac(key, msg, digestmod)
+@@ -239,7 +248,8 @@ def digest(key, msg, digest):
+             # but large messages.
+             return _compute_digest_fallback(key, msg, digest)
+         except _hashopenssl.UnsupportedDigestmodError:
+-            pass
++            if _openssl_fips_mode:
++                raise
+ 
+     if _hmac and isinstance(digest, str):
+         try:
 diff --git a/Lib/test/_test_hashlib_fips.py b/Lib/test/_test_hashlib_fips.py
 new file mode 100644
-index 00000000000..92537245954
+index 0000000..71966c6
 --- /dev/null
 +++ b/Lib/test/_test_hashlib_fips.py
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,95 @@
 +# Test the hashlib module usedforsecurity wrappers under fips.
 +#
 +#  Copyright (C) 2024   Dimitri John Ledkov (dimitri.ledkov@surgut.co.uk)
@@ -159,11 +204,42 @@ index 00000000000..92537245954
 +                with self.assertRaises(ValueError):
 +                    digest = hashlib.new(name, usedforsecurity=True)
 +
++    def test_hmac_new(self):
++        # hmac has no usedforsecurity escape hatch, so every digest OpenSSL
++        # refuses must be refused here too. Without the fips_mode guard in
++        # hmac.py, the builtin HACL* HMAC answers instead and this passes
++        # silently for md5, sha1, sha2 and sha3.
++        import hashlib
++        import hmac
++        for name in hashlib.algorithms_available:
++            with self.subTest(name):
++                with self.assertRaises(ValueError):
++                    hmac.new(b"key", b"msg", digestmod=name)
++
++    def test_hmac_digest(self):
++        # hmac.digest() is a separate code path from hmac.new() with its own
++        # fallback to HACL*, and its one-shot HACL* entry point supports blake2
++        # even though the streaming one does not.
++        import hashlib
++        import hmac
++        for name in hashlib.algorithms_available:
++            with self.subTest(name):
++                with self.assertRaises(ValueError):
++                    hmac.digest(b"key", b"msg", name)
++
++    def test_hmac_constructor_digestmod(self):
++        # A callable digestmod reaches the builtin through hashlib, which the
++        # wrappers above already cover; assert it stays covered.
++        import hashlib
++        import hmac
++        with self.assertRaises(ValueError):
++            hmac.new(b"key", b"msg", digestmod=hashlib.sha256)
++
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/Lib/test/hashlibdata/openssl.cnf b/Lib/test/hashlibdata/openssl.cnf
 new file mode 100644
-index 00000000000..9a936ddc5ef
+index 0000000..9a936dd
 --- /dev/null
 +++ b/Lib/test/hashlibdata/openssl.cnf
 @@ -0,0 +1,19 @@
@@ -187,7 +263,7 @@ index 00000000000..9a936ddc5ef
 +[algorithm_sect]
 +default_properties = fips=yes
 diff --git a/Lib/test/support/script_helper.py b/Lib/test/support/script_helper.py
-index 46ce950433d..7b83c8e0632 100644
+index 46ce950..7b83c8e 100644
 --- a/Lib/test/support/script_helper.py
 +++ b/Lib/test/support/script_helper.py
 @@ -303,7 +303,14 @@ def make_zip_pkg(zip_dir, zip_basename, pkg_name, script_basename,
@@ -216,20 +292,20 @@ index 46ce950433d..7b83c8e0632 100644
                flush=True)
          if proc.returncode:
 diff --git a/Lib/test/test_hashlib.py b/Lib/test/test_hashlib.py
-index 575b2cd0da7..f1ff7c33004 100644
+index c7d7b80..d3777b5 100644
 --- a/Lib/test/test_hashlib.py
 +++ b/Lib/test/test_hashlib.py
-@@ -21,6 +21,7 @@
+@@ -24,6 +24,7 @@
+ from test.support import hashlib_helper
  from test.support.import_helper import import_fresh_module
- from test.support import os_helper
  from test.support import requires_resource
 +from test.support import script_helper
  from test.support import threading_helper
  from http.client import HTTPException
  
-@@ -1196,6 +1197,18 @@ def test_file_digest(self):
-             with open(os_helper.TESTFN, "wb") as f:
-                 hashlib.file_digest(f, "sha256")
+@@ -1109,6 +1110,18 @@ def test_readonly_types(self):
+                     with self.assertRaisesRegex(TypeError, "immutable type"):
+                         hash_type.value = False
  
 +    def test_builtins_in_openssl_fips_mode(self):
 +        try:
@@ -244,13 +320,13 @@ index 575b2cd0da7..f1ff7c33004 100644
 +        script_helper.run_test_script(child_test_path, env=env)
 +
  
- if __name__ == "__main__":
-     unittest.main()
+ class KDFTests(unittest.TestCase):
+ 
 diff --git a/Makefile.pre.in b/Makefile.pre.in
-index 8d94ba361fd..908717f1791 100644
+index 526d500..20fb9e0 100644
 --- a/Makefile.pre.in
 +++ b/Makefile.pre.in
-@@ -2447,6 +2447,7 @@ TESTSUBDIRS=	idlelib/idle_test \
+@@ -2606,6 +2606,7 @@ TESTSUBDIRS=	idlelib/idle_test \
  		test/decimaltestdata \
  		test/dtracedata \
  		test/encoded_modules \
@@ -260,10 +336,10 @@ index 8d94ba361fd..908717f1791 100644
  		test/mathdata \
 diff --git a/Misc/NEWS.d/next/Library/2024-11-26-16-31-40.gh-issue-127298.jqYJvn.rst b/Misc/NEWS.d/next/Library/2024-11-26-16-31-40.gh-issue-127298.jqYJvn.rst
 new file mode 100644
-index 00000000000..e555661a195
+index 0000000..4faaa57
 --- /dev/null
 +++ b/Misc/NEWS.d/next/Library/2024-11-26-16-31-40.gh-issue-127298.jqYJvn.rst
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,13 @@
 +:mod:`hashlib`'s builtin hash implementations now check ``usedforsecurity=False``,
 +when the OpenSSL library default provider is in OpenSSL's FIPS mode.  This helps
 +ensure that only US FIPS approved implementations are in use by default on systems
@@ -272,3 +348,8 @@ index 00000000000..e555661a195
 +This is only active when :mod:`hashlib` has been built with OpenSSL implementation
 +support and said OpenSSL library includes the FIPS mode feature.  Not all variants
 +do, and OpenSSL is not a *required* build time dependency of ``hashlib``.
++
++:mod:`hmac` no longer falls back to its builtin HACL* implementation when
++OpenSSL is in FIPS mode.  That fallback is reached only for a digest OpenSSL
++has already refused, so it would otherwise compute HMAC-MD5 and HMAC-BLAKE2
++outside the validated module.

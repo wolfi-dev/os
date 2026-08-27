@@ -1,0 +1,251 @@
+package:
+  name: libxml2-2.13
+  version: "2.13.9"
+  epoch: 0
+  description: XML parsing library, version 2
+  copyright:
+    - license: MIT
+  resources:
+    cpu: "1"
+    memory: 5Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+    disk: 2Gi
+
+vars:
+  soversion: 2
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - docbook-xml
+      - doxygen
+      - libtool
+      - libxslt
+      - pkgconf-dev
+      - python3-dev
+      - xz-dev
+      - zlib-dev
+  environment:
+    CFLAGS: -fPIC
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.gnome.org/GNOME/libxml2.git
+      tag: v${{package.version}}
+      expected-commit: 04af2cabb9f859c198b8a553c028a87481199410
+
+  - uses: autoconf/configure
+    with:
+      opts: |
+        PYTHON=/usr/bin/python3 \
+        --enable-shared=yes \
+        --enable-static=yes \
+        --with-lzma \
+        --with-zlib \
+        --with-python
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-${{vars.soversion}}
+    pipeline:
+      - uses: split/lib
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-static
+    pipeline:
+      - uses: split/static
+    dependencies:
+      runtime:
+        - zlib-static
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils # readelf
+            - build-base
+            - ${{package.name}}-dev==${{package.full-version}}
+            - posix-libc-utils # ldd
+      pipeline:
+        - uses: test/tw/staticpackage
+        - name: validate that static library has been built with -fPIC on x86
+          if: ${{build.arch}} == 'x86_64'
+          runs: |
+            if readelf -a -W /usr/lib/libxml2.a | \
+              grep -E 'R_X86_64_PC32\s+0+\sstderr\s'; then
+              echo "ERROR: libxml2.a uses unsupported relocations for dynamic linking against glibc" 1>&2
+              echo "ERROR: This was previously fix by explicitly setting CFLAGS=-fPIC" 1>&2
+              exit 1
+            fi
+        - name: validate that static linking works
+          runs: |
+            echo '#include <libxml/parser.h>' > test.c
+            echo 'int main() {return 0;}' >> test.c
+            gcc -c test.c $(xml2-config --cflags)
+            gcc test.o /usr/lib/libxml2.a $(xml2-config --libs) -o test
+            # Should not be dynamically linked
+            if ldd test | grep libxml2; then
+              exit 1
+            fi
+            ./test || exit 1
+
+  - name: ${{package.name}}-doc
+    pipeline:
+      - uses: split/manpages
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/share/
+          mkdir -p ${{targets.subpkgdir}}/usr/share/doc
+          mv ${{targets.destdir}}/usr/share/doc/libxml2 ${{targets.subpkgdir}}/usr/share/doc/libxml2
+    description: ${{package.name}} manpages
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+  - name: ${{package.name}}-py3
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/lib/python3* ${{targets.subpkgdir}}/usr/lib
+    description: ${{package.name}} python3 bindings
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-utils
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mv ${{targets.destdir}}/usr/bin ${{targets.subpkgdir}}/usr
+    description: ${{package.name}} utils
+    test:
+      pipeline:
+        - name: Verify libxml2 installation
+          runs: |
+            xml2-config --version || exit 1
+            xml2-config --help
+            xmlcatalog version
+            xmlcatalog help
+            xmllint --version
+        - name: Basic XML parsing
+          runs: |
+            cat <<EOF > example.xml
+            <note>
+                <to>User</to>
+                <from>Assistant</from>
+                <heading>Reminder</heading>
+                <body>Don't forget me this weekend!</body>
+            </note>
+            EOF
+            xmllint --noout example.xml || exit 1
+        - name: XML validation with DTD
+          runs: |
+            cat << 'EOF' > example.dtd
+            <!ELEMENT note (to,from,heading,body)>
+            <!ELEMENT to (#PCDATA)>
+            <!ELEMENT from (#PCDATA)>
+            <!ELEMENT heading (#PCDATA)>
+            <!ELEMENT body (#PCDATA)>
+            EOF
+            cat << 'EOF' > note.xml
+            <note>
+                <to>Tove</to>
+                <from>Jani</from>
+                <heading>Reminder</heading>
+                <body>Don't forget me this weekend!</body>
+            </note>
+            EOF
+            xmllint --noout --dtdvalid example.dtd note.xml || exit 1
+
+  - name: ${{package.name}}-dev
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      runtime:
+        - zlib-dev
+        - xz-dev
+        - ${{package.name}}-utils=${{package.full-version}}
+        - ${{package.name}}-${{vars.soversion}}=${{package.full-version}}
+    description: ${{package.name}} dev
+    test:
+      environment:
+        contents:
+          packages:
+            - gcc
+            - glibc-dev
+      pipeline:
+        - uses: test/tw/devpackage
+        - name: Verify libxml2-dev installation
+          runs: |
+            echo '#include <libxml/parser.h>' > test.c
+            echo 'int main() {return 0;}' >> test.c
+            gcc -o test test.c $(xml2-config --cflags) $(xml2-config --libs)
+            ./test || exit 1
+        - name: Functional test - parse XML document via libxml2 API
+          runs: |
+            cat > test_xml.c << 'EOF'
+            #include <libxml/parser.h>
+            #include <libxml/tree.h>
+            #include <string.h>
+            #include <stdio.h>
+
+            int main(void) {
+              const char *xml = "<root><child attr=\"val\">text</child></root>";
+              xmlDocPtr doc = xmlReadMemory(xml, strlen(xml), "noname.xml", NULL, 0);
+              if (doc == NULL) {
+                fprintf(stderr, "Failed to parse XML document\n");
+                return 1;
+              }
+              xmlNodePtr root = xmlDocGetRootElement(doc);
+              if (root == NULL || strcmp((char *)root->name, "root") != 0) {
+                fprintf(stderr, "Unexpected root element\n");
+                xmlFreeDoc(doc);
+                return 1;
+              }
+              xmlNodePtr child = root->children;
+              if (child == NULL || strcmp((char *)child->name, "child") != 0) {
+                fprintf(stderr, "Unexpected child element\n");
+                xmlFreeDoc(doc);
+                return 1;
+              }
+              xmlChar *attr = xmlGetProp(child, (const xmlChar *)"attr");
+              if (attr == NULL || strcmp((char *)attr, "val") != 0) {
+                fprintf(stderr, "Unexpected attribute value\n");
+                xmlFree(attr);
+                xmlFreeDoc(doc);
+                return 1;
+              }
+              xmlFree(attr);
+              xmlFreeDoc(doc);
+              xmlCleanupParser();
+              printf("libxml2 API functional test passed\n");
+              return 0;
+            }
+            EOF
+            gcc -o test_xml test_xml.c $(xml2-config --cflags) $(xml2-config --libs)
+            ./test_xml
+        - uses: test/pkgconf
+        - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  git:
+    tag-filter-prefix: v2.13.
+    strip-prefix: v
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check

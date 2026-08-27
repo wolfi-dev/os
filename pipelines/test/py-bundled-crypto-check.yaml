@@ -1,0 +1,216 @@
+name: Check for bundled crypto in a Python venv
+
+description: |
+  Sweep a Python virtualenv for crypto that arrives bundled inside wheels
+  rather than from Chainguard apks: a second OpenSSL that our updates can
+  never reach (ZD#11353 shipped an EOL OpenSSL 1.1.1k inside psycopg-binary
+  this way), or libsodium, for which no FIPS module exists.
+
+  This is the bundled-crypto arm of test/py-fips-check, split out so that
+  non-FIPS packages can run it too: nothing here needs FIPS mode, or even a
+  Python interpreter. Five failure modes are swept, none of which sees the
+  others':
+
+    (a) a bundled libssl/libcrypto file, whatever its soname
+    (b) a module resolving OpenSSL outside the system libdir
+    (c) OpenSSL linked statically, found in the symbol table
+    (d) the same but stripped, found by its .rodata version banner
+    (e) libsodium, whether linked or compiled in
+
+  By default (a) and (b) FAIL and (c), (d), (e) WARN: outside FIPS we
+  deliberately ship wheels that statically link current, CVE-tracked crypto
+  (the cryptography wheel carries OpenSSL, grpcio carries BoringSSL), and
+  libsodium is legitimate there. A bundled OpenSSL *file* is never
+  legitimate: it is invisible to apk, so it stays at whatever version the
+  wheel froze. With strict: true every arm FAILs, which is the FIPS posture
+  test/py-fips-check delegates with.
+
+  USE THIS PIPELINE WHEN:
+  - A package stages a Python virtualenv from PyPI wheels and you want a
+    build-time guarantee that no wheel smuggled in its own OpenSSL.
+  - For -fips packages, use test/py-fips-check instead; it runs this sweep
+    in strict mode alongside the FIPS-only checks.
+
+  EXAMPLES:
+
+  Example 1 - the common case, a venv staged by uv/venv:
+    - uses: test/py-bundled-crypto-check
+      with:
+        venv: ${{vars.venv-home}}
+
+  Example 2 - waive a wheel whose bundled copy is a known, accepted defect,
+  keeping it visible as WARN in the build log rather than silently passing:
+    - uses: test/py-bundled-crypto-check
+      with:
+        venv: ${{vars.venv-home}}
+        allow: mysql
+
+  WHAT IT DOES NOT DO:
+  - It does not check which OpenSSL a running process actually maps, or
+    whether FIPS mode is on; that is test/py-fips-check's job.
+  - It does not read source. Pure-Python crypto is invisible to it.
+
+needs:
+  packages:
+    - binutils # nm, readelf, strings
+    - busybox
+    - posix-libc-utils # ldd
+
+inputs:
+  venv:
+    description: |
+      Root of the virtualenv (or any directory tree) to sweep, e.g.
+      ${{vars.venv-home}}.
+    required: true
+  strict:
+    description: |
+      "true" promotes the WARN arms -- statically linked OpenSSL/BoringSSL
+      and libsodium -- to FAIL. This is the FIPS posture; test/py-fips-check
+      sets it.
+    default: "false"
+  allow:
+    description: |
+      Space-separated path components to waive, e.g. "mysql" to waive
+      site-packages/mysql/vendor/libcrypto.so.3, or "psycopg_binary.libs".
+      Each arm with waived findings is reported WARN with a sample, so the
+      exception stays visible in the build log and greppable across the tree.
+    default: ""
+  tag:
+    description: |
+      Tag used in the PASS/FAIL/WARN/INFO log lines. A wrapping pipeline can
+      set its own so its log format stays uniform.
+    default: "py-bundled-crypto-check"
+  tally:
+    description: |
+      File the one-letter verdicts are appended to, following
+      test/py-fips-check's tally. A wrapping pipeline can point this at its
+      own tally so the closing summary counts both.
+    default: "/tmp/py-bundled-crypto-tally"
+
+pipeline:
+  - name: No bundled crypto in the tree
+    runs: |
+      set -uo pipefail # melange already sets -e; -u and pipefail it does not
+      VENV="${{inputs.venv}}"
+      STRICT="${{inputs.strict}}"
+      TAG="${{inputs.tag}}"
+      TALLY="${{inputs.tally}}"
+
+      info() { echo "INFO[$TAG]:" "$@"; }
+      pass() { echo "PASS[$TAG]:" "$@"; echo p >> "$TALLY"; }
+      fail() { echo "FAIL[$TAG]:" "$@" >&2; echo f >> "$TALLY"; }
+      warn() { echo "WARN[$TAG]:" "$@"; echo w >> "$TALLY"; }
+      summary() {
+        echo "INFO[$TAG]:" \
+          "$(tr -cd p < "$TALLY" | wc -c) passed," \
+          "$(tr -cd f < "$TALLY" | wc -c) failed," \
+          "$(tr -cd s < "$TALLY" | wc -c) skipped," \
+          "$(tr -cd w < "$TALLY" | wc -c) waived"
+      }
+      # A failing step aborts the pipeline, so the closing tally is unreachable
+      # exactly when it is wanted.
+      trap 'rc=$?; [ "$rc" -eq 0 ] || summary' EXIT
+      touch "$TALLY"
+
+      if [ ! -d "$VENV" ]; then
+        fail "no tree at '$VENV'"
+        exit 1
+      fi
+
+      # PEP 503-ish folding is not wanted here: allow entries are literal
+      # path components, so only regex metacharacters are escaped.
+      allow_re=""
+      for name in $(echo "${{inputs.allow}}"); do
+        esc=$(printf '%s' "$name" | sed 's/[].[^$*/\\+?(){}|]/\\&/g')
+        allow_re="${allow_re:+$allow_re|}$esc"
+      done
+      # Splits a findings file into kept (in place) and waived. One WARN per
+      # arm with a sample, not one per line: a single waived wheel can match
+      # a thousand symbol lines.
+      waive() {
+        [ -n "$allow_re" ] || return 0
+        [ -s "$1" ] || return 0
+        grep -E "/($allow_re)/" "$1" > "$1.waived" || true
+        grep -Ev "/($allow_re)/" "$1" > "$1.kept" || true
+        mv "$1.kept" "$1"
+        [ -s "$1.waived" ] || return 0
+        warn "allow waived $(wc -l < "$1.waived") finding(s):"
+        head -5 "$1.waived"
+      }
+
+      # Five failure modes, none of which sees the others':
+      #  (a) a bundled libssl/libcrypto file, whatever its soname
+      #  (b) a module resolving one outside the system libdir
+      #  (c) OpenSSL linked statically, found in the symbol table
+      #  (d) the same but stripped, found by its .rodata version banner
+      #  (e) libsodium, linked or compiled in
+      find "$VENV" -type f \( -name '*.so' -o -name '*.so.*' \) > "/tmp/$TAG-sos"
+      info "sweeping $(wc -l < "/tmp/$TAG-sos") shared objects under $VENV"
+
+      grep -E '/lib(ssl|crypto)[.-][^/]*$' "/tmp/$TAG-sos" > "/tmp/$TAG-bundled" || true
+
+      : > "/tmp/$TAG-dynamic"
+      : > "/tmp/$TAG-static"
+      : > "/tmp/$TAG-banner"
+      : > "/tmp/$TAG-sodium"
+      while IFS= read -r so; do
+        [ -n "$so" ] || continue
+        ldd "$so" 2>/dev/null | awk -v venv="$VENV/" -v f="$so" '
+          /lib(ssl|crypto)/ {
+            path = ""
+            for (i = 1; i <= NF; i++) if ($i == "=>") path = $(i + 1)
+            if (path !~ /^\/(usr\/)?lib/ || index(path, venv) == 1) print f ": " $0
+          }' >> "/tmp/$TAG-dynamic" || true
+        nm --defined-only "$so" 2>/dev/null |
+          grep -E ' (EVP_|CRYPTO_|BORINGSSL_|SSL_CTX_)[A-Za-z_]' |
+          sed "s#^#${so}: #" >> "/tmp/$TAG-static" || true
+        # (d) only applies when the module neither links a system OpenSSL nor
+        # exposes symbols; otherwise (b) or (c) already has it.
+        # No `grep -q` in a pipe here: it exits on first match, the writer dies
+        # of SIGPIPE and `set -o pipefail` turns the match into a failure.
+        linked=$(readelf -d "$so" 2>/dev/null | grep -E 'lib(ssl|crypto)\.so' || true)
+        if [ -z "$linked" ]; then
+          strings -a "$so" 2>/dev/null |
+            grep -E '^(OpenSSL [0-9]|BoringSSL)' | sort -u |
+            sed "s#^#${so}: #" >> "/tmp/$TAG-banner" || true
+        fi
+        # (e) libsodium, dynamically linked or compiled in.
+        readelf -d "$so" 2>/dev/null | grep -E 'libsodium' |
+          sed "s#^#${so}: NEEDED #" >> "/tmp/$TAG-sodium" || true
+        # Two passes: strip removes .symtab but not .dynsym. (c) cannot do this,
+        # since a statically linked OpenSSL keeps its symbols local.
+        nm --defined-only "$so" 2>/dev/null |
+          grep -E ' (sodium_init|sodium_library_version_major|crypto_box_keypair)$' |
+          sed "s#^#${so}: #" >> "/tmp/$TAG-sodium" || true
+        nm -D --defined-only "$so" 2>/dev/null |
+          grep -E ' (sodium_init|sodium_library_version_major|crypto_box_keypair)$' |
+          sed "s#^#${so}: (dynsym) #" >> "/tmp/$TAG-sodium" || true
+      done < "/tmp/$TAG-sos"
+
+      for arm in bundled dynamic static banner sodium; do
+        waive "/tmp/$TAG-$arm"
+      done
+
+      # Reports an arm's findings under the right verdict, FAIL or WARN.
+      report() { # report <verdict> <findings-file> <message>
+        [ -s "$2" ] || return 0
+        "$1" "$3"
+        head -20 "$2" >&2
+        [ "$(wc -l < "$2")" -le 20 ] || echo "($(wc -l < "$2") lines in total)" >&2
+        [ "$1" = warn ] || rc=1
+      }
+      # (c), (d), (e) are defects under FIPS and accepted-but-visible outside
+      # it; see the description.
+      soft=warn
+      [ "$STRICT" != "true" ] || soft=fail
+
+      rc=0
+      report fail "/tmp/$TAG-bundled" "a non-system OpenSSL is bundled in the tree:"
+      report fail "/tmp/$TAG-dynamic" "a module links an OpenSSL outside the system libdir:"
+      report "$soft" "/tmp/$TAG-static" "a module defines OpenSSL symbols, so it links one statically:"
+      report "$soft" "/tmp/$TAG-banner" "a stripped module carries a bundled OpenSSL/BoringSSL banner:"
+      report "$soft" "/tmp/$TAG-sodium" "a module carries libsodium, for which no FIPS module exists:"
+      [ "$rc" -eq 0 ] || exit 1
+
+      pass "every module resolves the system OpenSSL and carries no bundled crypto"
+      summary

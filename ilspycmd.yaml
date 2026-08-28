@@ -1,0 +1,88 @@
+# ilspycmd: the ICSharpCode.ILSpy command-line decompiler. Emits raw IL and
+# decompiled C# for .NET assemblies. Built from source at a pinned upstream tag.
+package:
+  name: ilspycmd
+  version: "9.1"
+  epoch: 0
+  description: ICSharpCode.ILSpy command-line decompiler for .NET assemblies (raw IL and C#)
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      # /usr/bin/ilspycmd is a #!/bin/sh shim, so a shell is needed standalone.
+      - busybox
+      # Framework-dependent net8.0 payload rolls forward onto this shared runtime.
+      - dotnet-10-runtime
+
+environment:
+  contents:
+    packages:
+      - dotnet-10-sdk
+      # Build-only: ICSharpCode.Decompiler's build shells out to pwsh
+      # (BuildTools/update-assemblyinfo.ps1) to stamp assembly version info.
+      - powershell
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/icsharpcode/ILSpy
+      tag: v${{package.version}}
+      expected-commit: 03b7444943e720b3134d296c0c8dd3876f8ea4ce
+
+  - name: Publish ilspycmd
+    runs: |
+      # net8.0 tool, .NET 10 runtime only: framework-dependent + RollForward=Major
+      # rolls forward at launch. UseAppHost=false emits no native launcher, so the
+      # payload is portable IL and the shim runs it through the shared dotnet host.
+      dotnet publish ICSharpCode.ILSpyCmd/ICSharpCode.ILSpyCmd.csproj \
+        --configuration Release \
+        -p:UseAppHost=false \
+        -p:RollForward=Major \
+        -p:DebugSymbols=false \
+        -p:DebugType=none \
+        --output "${{targets.destdir}}/usr/lib/ilspycmd"
+
+  - name: Install the entrypoint
+    runs: |
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      cat > "${{targets.destdir}}/usr/bin/ilspycmd" <<'EOF'
+      #!/bin/sh
+      exec dotnet /usr/lib/ilspycmd/ilspycmd.dll "$@"
+      EOF
+      chmod +x "${{targets.destdir}}/usr/bin/ilspycmd"
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - dotnet-10-runtime
+  pipeline:
+    - name: The installed layout is present
+      uses: test/tw/contains-files
+      with:
+        files: /usr/bin/ilspycmd /usr/lib/ilspycmd/ilspycmd.dll /usr/lib/ilspycmd/ICSharpCode.Decompiler.dll
+    - name: ilspycmd reports the package version
+      uses: test/tw/ver-check
+      with:
+        bins: ilspycmd
+    - name: ilspycmd decompiles an assembly to C#
+      runs: |
+        # A shipped dll is its own decompilation subject; --disable-updatecheck
+        # keeps the run hermetic.
+        SUBJECT=/usr/lib/ilspycmd/ICSharpCode.Decompiler.dll
+        test -f "$SUBJECT"
+        ilspycmd --disable-updatecheck "$SUBJECT" >/tmp/decomp.cs
+        test -s /tmp/decomp.cs
+        grep -q 'namespace ICSharpCode' /tmp/decomp.cs
+    - name: ilspycmd emits raw IL
+      runs: |
+        # -il selects IL disassembly; .method is an ILAsm directive C# never emits.
+        SUBJECT=/usr/lib/ilspycmd/ICSharpCode.Decompiler.dll
+        ilspycmd --disable-updatecheck -il "$SUBJECT" >/tmp/decomp.il
+        test -s /tmp/decomp.il
+        grep -q '\.method' /tmp/decomp.il

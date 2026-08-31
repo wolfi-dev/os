@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dorinda Bassey <dbassey@redhat.com>
+Date: Tue, 3 Feb 2026 00:49:54 +0100
+Subject: [PATCH 1/6] libkrun/vmm: Add vhost-user infrastructure and API
+
+Implement vhost-user support for connecting
+to external virtio device backends running
+in separate processes.
+Add vhost-user feature flag, vhost dependency,
+and krun_add_vhost_user_device() generalized
+API for adding vhost-user devices.
+
+Signed-off-by: Dorinda Bassey <dbassey@redhat.com>
+(cherry picked from commit ef83728df7b90c2c783941dea122bae0922ff808)
+---
+ Makefile                 |  3 ++
+ include/libkrun.h        | 70 ++++++++++++++++++++++++++++++++
+ src/devices/Cargo.toml   |  2 +
+ src/libkrun/Cargo.toml   |  1 +
+ src/libkrun/src/lib.rs   | 88 ++++++++++++++++++++++++++++++++++++++++
+ src/vmm/Cargo.toml       |  1 +
+ src/vmm/src/resources.rs | 21 ++++++++++
+ 7 files changed, 186 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index 926da37..828ca22 100644
+--- a/Makefile
++++ b/Makefile
+@@ -55,6 +55,9 @@ endif
+ ifeq ($(INPUT),1)
+     FEATURE_FLAGS += --features input
+ endif
++ifeq ($(VHOST_USER),1)
++    FEATURE_FLAGS += --features vhost-user
++endif
+ ifeq ($(AWS_NITRO),1)
+ 	VARIANT = -awsnitro
+ 	FEATURE_FLAGS := --features aws-nitro,net
+diff --git a/include/libkrun.h b/include/libkrun.h
+index b8c9c17..f62963e 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -781,6 +781,76 @@ int krun_add_input_device_fd(uint32_t ctx_id, int input_fd);
+  */
+ int32_t krun_set_snd_device(uint32_t ctx_id, bool enable);
+ 
++/**
++ * Vhost-user device types.
++ * These correspond to virtio device type IDs for devices.
++ */
++#define KRUN_VIRTIO_DEVICE_RNG 4
++#define KRUN_VIRTIO_DEVICE_SND 25
++#define KRUN_VIRTIO_DEVICE_CAN 36
++
++/**
++ * Vhost-user RNG device default queue configuration.
++ * Use these when you want explicit defaults instead of auto-detection.
++ */
++#define KRUN_VHOST_USER_RNG_NUM_QUEUES 1
++#define KRUN_VHOST_USER_RNG_QUEUE_SIZES ((uint16_t[]){256})
++
++/**
++ * Add a vhost-user device to the VM.
++ *
++ * This function adds a vhost-user device by connecting to an external
++ * backend process (e.g., vhost-device-rng, vhost-device-snd). The backend
++ * must be running and listening on the specified socket before starting the VM.
++ *
++ * This API is designed for devices like RNG, sound, and CAN.
++ *
++ * Arguments:
++ *  "ctx_id"       - the configuration context ID.
++ *  "device_type"  - type of vhost-user device (e.g., KRUN_VHOST_USER_DEVICE_RNG).
++ *  "socket_path"  - path to the vhost-user Unix domain socket (e.g., "/tmp/vhost-rng.sock").
++ *  "name"         - device name for logging/debugging (e.g., "vhost-rng", "vhost-snd").
++ *                   NULL = auto-generate from device_type ("vhost-user-4", "vhost-user-25", etc.)
++ *  "num_queues"   - number of virtqueues.
++ *                   0 = auto-detect from backend (requires backend MQ support).
++ *                   >0 = explicit queue count.
++ *                   Or use device-specific constants like KRUN_VHOST_USER_RNG_NUM_QUEUES.
++ *  "queue_sizes"  - array of queue sizes for each queue.
++ *                   NULL = use default size (256) for all queues.
++ *                   When num_queues=0 (auto-detect): array must be 0-terminated (sentinel).
++ *                   When num_queues>0 (explicit): array must have exactly num_queues elements.
++ *                   Use device-specific constants like KRUN_VHOST_USER_RNG_QUEUE_SIZES for defaults.
++ *
++ * Examples:
++ *  // Auto-detect queue count, use default size (256)
++ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_RNG, "/tmp/rng.sock", NULL, 0, NULL);
++ *
++ *  // Auto-detect queue count, use custom size (512) for all queues
++ *  uint16_t custom_size[] = {512, 0};  // 0 = sentinel terminator
++ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_RNG, "/tmp/rng.sock", NULL, 0, custom_size);
++ *
++ *  // Explicit defaults using #define constants
++ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_RNG, "/tmp/rng.sock", "vhost-rng",
++ *                             KRUN_VHOST_USER_RNG_NUM_QUEUES,
++ *                             KRUN_VHOST_USER_RNG_QUEUE_SIZES);
++ *
++ *  // Explicit queue count with custom sizes
++ *  uint16_t sizes[] = {256, 512};
++ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_SND, "/tmp/snd.sock", "vhost-snd", 2, sizes);
++ *
++ * Returns:
++ *  Zero on success or a negative error number on failure.
++ *  -EINVAL  - Invalid parameters (device_type, socket_path, etc.)
++ *  -ENOENT  - Context doesn't exist
++ *  -ENOTSUP - vhost-user support not compiled in
++ */
++int32_t krun_add_vhost_user_device(uint32_t ctx_id,
++                                   uint32_t device_type,
++                                   const char *socket_path,
++                                   const char *name,
++                                   uint16_t num_queues,
++                                   const uint16_t *queue_sizes);
++
+ /**
+  * Configures a map of rlimits to be set in the guest before starting the isolated binary.
+  *
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index 633e3a9..b554eba 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -21,6 +21,7 @@ input = ["zerocopy", "krun_input"]
+ virgl_resource_map2 = []
+ aws-nitro = []
+ test_utils = []
++vhost-user = ["vhost"]
+ 
+ [dependencies]
+ bitflags = "1.2.0"
+@@ -32,6 +33,7 @@ nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"]
+ pw = { package = "pipewire", version = "0.9.2", optional = true }
+ rand = "0.9.2"
+ thiserror = { version = "2.0", optional = true }
++vhost = { version = "0.14", optional = true, features = ["vhost-user-frontend"] }
+ virtio-bindings = "0.2.0"
+ vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
+ zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
+diff --git a/src/libkrun/Cargo.toml b/src/libkrun/Cargo.toml
+index 90f833d..eadcc4f 100644
+--- a/src/libkrun/Cargo.toml
++++ b/src/libkrun/Cargo.toml
+@@ -22,6 +22,7 @@ snd = ["vmm/snd", "devices/snd"]
+ input = ["krun_input", "vmm/input", "devices/input"]
+ virgl_resource_map2 = ["devices/virgl_resource_map2"]
+ aws-nitro = ["vmm/aws-nitro", "devices/aws-nitro", "dep:aws-nitro", "dep:nitro-enclaves"]
++vhost-user = ["vmm/vhost-user", "devices/vhost-user"]
+ 
+ [dependencies]
+ crossbeam-channel = ">=0.5.15"
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index ef89a6d..f0ba37e 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -71,6 +71,9 @@ use krun_input::{InputConfigBackend, InputEventProviderBackend};
+ const KRUN_SUCCESS: i32 = 0;
+ // Maximum number of arguments/environment variables we allow
+ const MAX_ARGS: usize = 4096;
++/// Maximum number of virtqueues allowed by virtio spec (16-bit queue index: 0-65535)
++#[cfg(feature = "vhost-user")]
++const VIRTIO_MAX_QUEUES: usize = 65536;
+ 
+ // krunfw library name for each context
+ #[cfg(all(target_os = "linux", not(feature = "tee")))]
+@@ -1868,6 +1871,91 @@ pub unsafe extern "C" fn krun_set_snd_device(ctx_id: u32, enable: bool) -> i32 {
+     KRUN_SUCCESS
+ }
+ 
++#[allow(clippy::missing_safety_doc)]
++#[no_mangle]
++#[cfg(feature = "vhost-user")]
++pub unsafe extern "C" fn krun_add_vhost_user_device(
++    ctx_id: u32,
++    device_type: u32,
++    socket_path: *const c_char,
++    name: *const c_char,
++    num_queues: u16,
++    queue_sizes: *const u16,
++) -> i32 {
++    use vmm::resources::VhostUserDeviceConfig;
++
++    let socket_path_str = match CStr::from_ptr(socket_path).to_str() {
++        Ok(s) => s,
++        Err(_) => return -libc::EINVAL,
++    };
++
++    if socket_path_str.is_empty() {
++        return -libc::EINVAL;
++    }
++
++    let name_opt = if name.is_null() {
++        None
++    } else {
++        match CStr::from_ptr(name).to_str() {
++            Ok(s) if !s.is_empty() => Some(s.to_string()),
++            _ => None,
++        }
++    };
++
++    let queue_sizes_vec = if queue_sizes.is_null() {
++        Vec::new()
++    } else if num_queues == 0 {
++        // Auto-detect mode: read queue_sizes until we hit 0 (sentinel)
++        let mut sizes = Vec::new();
++        let mut i = 0;
++        loop {
++            let size = *queue_sizes.add(i);
++            if size == 0 {
++                break;
++            }
++            sizes.push(size);
++            i += 1;
++
++            // Safety: prevent infinite loop if user forgets sentinel terminator
++            if i >= VIRTIO_MAX_QUEUES {
++                return -libc::EINVAL;
++            }
++        }
++        sizes
++    } else {
++        std::slice::from_raw_parts(queue_sizes, num_queues as usize).to_vec()
++    };
++
++    match CTX_MAP.lock().unwrap().entry(ctx_id) {
++        Entry::Occupied(mut ctx_cfg) => {
++            let cfg = ctx_cfg.get_mut();
++            cfg.vmr.vhost_user_devices.push(VhostUserDeviceConfig {
++                device_type,
++                socket_path: socket_path_str.to_string(),
++                name: name_opt,
++                num_queues,
++                queue_sizes: queue_sizes_vec,
++            });
++            KRUN_SUCCESS
++        }
++        Entry::Vacant(_) => -libc::ENOENT,
++    }
++}
++
++#[allow(clippy::missing_safety_doc)]
++#[no_mangle]
++#[cfg(not(feature = "vhost-user"))]
++pub unsafe extern "C" fn krun_add_vhost_user_device(
++    _ctx_id: u32,
++    _device_type: u32,
++    _socket_path: *const c_char,
++    _name: *const c_char,
++    _num_queues: u16,
++    _queue_sizes: *const u16,
++) -> i32 {
++    -libc::ENOTSUP
++}
++
+ #[allow(unused_assignments)]
+ #[no_mangle]
+ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index d3a5ba2..c12f1f3 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -19,6 +19,7 @@ gpu = ["devices/gpu", "krun_display"]
+ snd = ["devices/snd"]
+ input = ["devices/input", "krun_input"]
+ aws-nitro = []
++vhost-user = ["devices/vhost-user"]
+ 
+ [dependencies]
+ crossbeam-channel = ">=0.5.15"
+diff --git a/src/vmm/src/resources.rs b/src/vmm/src/resources.rs
+index 2d3e5ef..62756ca 100644
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -40,6 +40,22 @@ type Result<E> = std::result::Result<(), E>;
+ // Re-export TsiFlags from devices crate
+ pub use devices::virtio::TsiFlags;
+ 
++#[cfg(feature = "vhost-user")]
++/// Configuration for a vhost-user device.
++#[derive(Debug, Clone)]
++pub struct VhostUserDeviceConfig {
++    /// Virtio device type ID (e.g., 4 for RNG, 25 for sound, 36 for CAN)
++    pub device_type: u32,
++    /// Path to the vhost-user Unix domain socket
++    pub socket_path: String,
++    /// Device name for logging/debugging (None = auto-generate from type)
++    pub name: Option<String>,
++    /// Number of virtqueues (0 = use device default)
++    pub num_queues: u16,
++    /// Size of each queue (empty = use device defaults)
++    pub queue_sizes: Vec<u16>,
++}
++
+ /// Errors encountered when configuring microVM resources.
+ #[derive(Debug)]
+ pub enum Error {
+@@ -173,6 +189,9 @@ pub struct VmResources {
+     #[cfg(feature = "snd")]
+     /// Enable the virtio-snd device.
+     pub snd_device: bool,
++    #[cfg(feature = "vhost-user")]
++    /// Vhost-user device configurations
++    pub vhost_user_devices: Vec<VhostUserDeviceConfig>,
+     /// File to send console output.
+     pub console_output: Option<PathBuf>,
+     /// SMBIOS OEM Strings
+@@ -429,6 +448,8 @@ mod tests {
+             input_backends: Vec::new(),
+             #[cfg(feature = "snd")]
+             snd_device: false,
++            #[cfg(feature = "vhost-user")]
++            vhost_user_devices: Vec::new(),
+             console_output: None,
+             smbios_oem_strings: None,
+             nested_enabled: false,

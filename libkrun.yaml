@@ -1,7 +1,7 @@
 package:
   name: libkrun
   version: "1.19.4"
-  epoch: 1 # glibc: 2.43->2.44
+  epoch: 2 # 1: glibc 2.43->2.44; 2: vhost-user frontend backport
   description: Dynamic library providing virtualization-based process isolation
   copyright:
     - license: Apache-2.0
@@ -32,6 +32,28 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: 728df8125077d0db44265f6e997c72b81b65c015
 
+  # Backport of the upstream vhost-user frontend (libkrun/libkrun PR #642:
+  # krun_add_vhost_user_device and the memfd-backed guest memory it needs),
+  # which mono's microvm libkrun backend probes for to serve Volumes over
+  # virtio-fs from its vhost-user-fs daemon instead of 9p-over-vsock. The
+  # commits are upstream main, unreleased (post-1.19; upstream main is
+  # 2.0.0-dev, an ABI break we cannot take yet). Patch files rather than
+  # git-checkout cherry-picks because the upstream commits also touch
+  # Cargo.lock, which conflicts against the 1.19.4 lock; the patches carry
+  # everything except the lockfiles, and cargo resolves the two new
+  # feature-gated crates (vhost, vmm-sys-util) at build time — the build is
+  # not --locked, the same property the bump step above relies on. Drop the
+  # series when a release containing PR #642 ships.
+  - uses: patch
+    with:
+      patches: |
+        0001-libkrun-vmm-Add-vhost-user-infrastructure-and-API.patch
+        0002-vmm-Implement-file-backed-memory-using-memfd-for-vho.patch
+        0003-devices-vhost-Add-core-VhostUserDevice-implementatio.patch
+        0004-vmm-Implement-attaching-vhost-user-devices.patch
+        0005-devices-vhost-Add-config-space-support-for-vhost-use.patch
+        0006-devices-vhost-Implement-write_config-for-dynamic-con.patch
+
   - uses: bump
     with:
       # GHSA-cq8v-f236-94qc: low-severity vuln in rand 0.9.2, fixed in 0.9.3
@@ -41,10 +63,12 @@ pipeline:
   - runs: |
       # BLK adds virtio-blk (krun_add_disk, krun_set_root_disk, krun_set_data_disk).
       # NET adds virtio-net (krun_add_net_tap, krun_add_net_unixstream, krun_add_net_unixgram).
-      make -j$(nproc) BLK=1 NET=1 PREFIX=/usr LIBDIR_Linux=lib
+      # VHOST_USER adds the vhost-user frontend (krun_add_vhost_user_device),
+      # from the patch series above.
+      make -j$(nproc) BLK=1 NET=1 VHOST_USER=1 PREFIX=/usr LIBDIR_Linux=lib
 
   - runs: |
-      make BLK=1 NET=1 PREFIX=/usr LIBDIR_Linux=lib DESTDIR="${{targets.destdir}}" install
+      make BLK=1 NET=1 VHOST_USER=1 PREFIX=/usr LIBDIR_Linux=lib DESTDIR="${{targets.destdir}}" install
 
   - uses: strip
 
@@ -119,12 +143,17 @@ test:
       runs: |
         set -euo pipefail
         # Note: krun_add_disk* and krun_add_net_* are only present when the
-        # library is built with BLK=1 / NET=1. Verifying them here pins the
-        # build configuration.
+        # library is built with BLK=1 / NET=1, and krun_add_vhost_user_device
+        # only with VHOST_USER=1 plus the vhost-user backport patches.
+        # Verifying them here pins the build configuration — mono's microvm
+        # libkrun backend dlopens this library and probes
+        # krun_add_vhost_user_device to decide its default volume transport,
+        # so losing the symbol would silently demote every Volume to 9p.
         for sym in krun_create_ctx krun_set_vm_config krun_start_enter \
                    krun_set_log_level krun_set_root krun_set_workdir \
                    krun_add_disk krun_set_root_disk krun_set_data_disk \
-                   krun_add_net_tap krun_add_net_unixstream krun_add_net_unixgram; do
+                   krun_add_net_tap krun_add_net_unixstream krun_add_net_unixgram \
+                   krun_add_vhost_user_device; do
           if ! nm -D --defined-only /usr/lib/libkrun.so.1 | grep -qw "$sym"; then
             echo "Missing symbol: $sym"
             exit 1

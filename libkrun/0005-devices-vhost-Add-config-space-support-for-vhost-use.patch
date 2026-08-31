@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dorinda Bassey <dbassey@redhat.com>
+Date: Thu, 26 Mar 2026 14:45:08 +0100
+Subject: [PATCH 5/6] devices/vhost: Add config space support for vhost-user
+ devices
+
+Implement read_config() for vhost-user devices using the
+VHOST_USER_GET_CONFIG protocol message. This enables vhost-user
+devices to expose their configuration space to the guest.
+
+This provides a general mechanism for any vhost-user device that
+needs to expose configuration to the guest (e.g., virtio-snd).
+
+Signed-off-by: Dorinda Bassey <dbassey@redhat.com>
+(cherry picked from commit e23751dbdb34a2acd415cfec7a036fc9ff67161c)
+---
+ src/devices/src/virtio/vhost_user/device.rs | 47 +++++++++++++++------
+ 1 file changed, 35 insertions(+), 12 deletions(-)
+
+diff --git a/src/devices/src/virtio/vhost_user/device.rs b/src/devices/src/virtio/vhost_user/device.rs
+index 3d4e4e5..3312969 100644
+--- a/src/devices/src/virtio/vhost_user/device.rs
++++ b/src/devices/src/virtio/vhost_user/device.rs
+@@ -15,10 +15,11 @@ use log::{debug, error, warn};
+ use polly::event_manager::{EventManager, Subscriber};
+ use utils::epoll::{EpollEvent, EventSet};
+ use utils::eventfd::{EventFd, EFD_NONBLOCK};
+-use vmm_sys_util::eventfd::EventFd as VhostEventFd;
++use vhost::vhost_user::message::VhostUserConfigFlags;
+ use vhost::vhost_user::{Frontend, VhostUserFrontend, VhostUserProtocolFeatures};
+ use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
+ use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
++use vmm_sys_util::eventfd::EventFd as VhostEventFd;
+ 
+ use crate::virtio::{
+     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
+@@ -150,14 +151,6 @@ impl VhostUserDevice {
+             num_queues as usize
+         };
+ 
+-        debug!(
+-            "{}: using {} queues (requested: {}, sizes provided: {})",
+-            device_name,
+-            actual_num_queues,
+-            num_queues,
+-            queue_sizes.len()
+-        );
+-
+         let default_size = queue_sizes.last().copied().unwrap_or(256);
+         let queue_configs: Vec<_> = (0..actual_num_queues)
+             .map(|i| {
+@@ -368,10 +361,40 @@ impl VirtioDevice for VhostUserDevice {
+     }
+ 
+     fn read_config(&self, offset: u64, data: &mut [u8]) {
+-        // For now, configuration space reads are not supported
+-        // This can be extended using VHOST_USER_GET_CONFIG
++        // Fetch config from backend on every read (same as QEMU/crosvm)
++        // No caching to avoid invalidation issues
++        if self.has_protocol_features {
++            if let Ok(mut frontend) = self.frontend.lock() {
++                match frontend.get_config(
++                    offset as u32,
++                    data.len() as u32,
++                    VhostUserConfigFlags::empty(),
++                    data,
++                ) {
++                    Ok((_, returned_buf)) => {
++                        if data.len() <= returned_buf.len() {
++                            data.copy_from_slice(&returned_buf[..data.len()]);
++                            debug!(
++                                "{}: read {} bytes from config at offset {}",
++                                self.device_name,
++                                data.len(),
++                                offset
++                            );
++                            return;
++                        }
++                    }
++                    Err(e) => {
++                        debug!(
++                            "{}: failed to read config from backend: {:?}",
++                            self.device_name, e
++                        );
++                    }
++                }
++            }
++        }
++
+         debug!(
+-            "{}: config read at offset {} (not yet implemented)",
++            "{}: config read at offset {} returning zeros (backend not available)",
+             self.device_name, offset
+         );
+         data.fill(0);

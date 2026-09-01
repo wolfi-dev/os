@@ -1,0 +1,223 @@
+package:
+  name: haproxy-3.4
+  version: "3.4.4"
+  epoch: 2 # move back to os/ so the public haproxy image can consume it (OS-2990)
+  description: "A TCP/HTTP reverse proxy for high availability environments"
+  copyright:
+    - license: GPL-2.0-or-later
+  dependencies:
+    runtime:
+      - libgcc
+      - merged-usrsbin
+      - wolfi-baselayout
+    provides:
+      - haproxy=${{package.full-version}}
+  resources:
+    cpu: "1"
+    memory: 5Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+\.\d+)\.\d+$
+    replace: "$1"
+    to: major-minor-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - glibc-2.44-dev
+      - libcap-utils
+      - linux-headers
+      - lua5.3-dev
+      - openssl-dev # FTBFS with openssl-hardened-dev due to missing X509_NAME_hash and SSL_get_peer_certificate (deprecated APIs removed by no-deprecated build flag)
+      - pcre2-dev
+  accounts:
+    # Need to run with privilege to be able to do setcap
+    run-as: root
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://git.haproxy.org/git/haproxy-${{vars.major-minor-version}}.git
+      tag: v${{package.version}}
+      expected-commit: 7f03ae65c28605152c7a1a9ba7d9d0bcfb50f8b0
+
+  - uses: autoconf/make
+    with:
+      opts: |
+        TARGET=linux-glibc \
+        USE_THREAD=1 \
+        USE_PCRE2=1 \
+        USE_PCRE2_JIT=1 \
+        USE_OPENSSL=1 \
+        USE_LUA=1 \
+        USE_NS=1 \
+        USE_PROMEX=1 \
+        LUA_LIB=/usr/lib/lua5.3 \
+        LUA_INC=/usr/include/lua5.3 \
+        USE_GETADDRINFO=1 \
+        SBINDIR=/usr/bin
+
+  - runs: |
+      make install DESTDIR="${{targets.destdir}}" PREFIX=/usr DOCDIR=/usr/share/doc/haproxy
+      install -d "${{targets.destdir}}"/var/lib/haproxy
+      mkdir -p "${{targets.destdir}}"/usr/bin
+      mv "${{targets.destdir}}"/usr/sbin/* "${{targets.destdir}}"/usr/bin
+      rmdir "${{targets.destdir}}"/usr/sbin
+
+  - uses: strip
+
+  # This MUST run after strip, which strips capabilities too!
+  - runs: setcap cap_net_bind_service=+eip "${{targets.destdir}}/usr/bin/haproxy"
+
+subpackages:
+  - name: "${{package.name}}-nocaps"
+    description: "haproxy without cap_net_bind_service capabilities"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          cp /home/build/melange-out/${{package.name}}/usr/bin/haproxy ${{targets.contextdir}}/usr/bin/
+    test:
+      environment:
+        contents:
+          packages:
+            - libcap-utils
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: haproxy
+        - name: Test there are no capabilities present
+          runs: |
+            if [ $(getcap /usr/bin/haproxy | wc -l ) -ne 0 ]; then exit 1; fi
+
+  - name: "${{package.name}}-doc"
+    description: "haproxy documentation"
+    pipeline:
+      - uses: split/manpages
+    dependencies:
+      provides:
+        - haproxy-doc=${{package.full-version}}
+      runtime:
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/docs
+
+  - name: ${{package.name}}-oci-entrypoint
+    description: Entrypoint for using HAProxy in OCI containers
+    dependencies:
+      runtime:
+        - busybox
+        - merged-usrsbin
+        - posix-libc-utils # `getent` is required for certain helm chart startups
+        - wolfi-baselayout
+      provides:
+        - haproxy-oci-entrypoint=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/local/bin/
+          cp docker-entrypoint.sh ${{targets.subpkgdir}}/usr/local/bin/
+          chmod +x ${{targets.subpkgdir}}/usr/local/bin/docker-entrypoint.sh
+    test:
+      pipeline:
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: haproxy-oci-entrypoint
+            real-pkg-name: ${{subpkg.name}}
+
+  - name: ${{package.name}}-iamguarded-compat
+    dependencies:
+      provides:
+        - haproxy-iamguarded-compat=${{package.full-version}}
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/iamguarded/haproxy/conf
+
+          mkdir -p ${{targets.contextdir}}/opt/iamguarded/haproxy/bin
+          mkdir -p ${{targets.contextdir}}/opt/iamguarded/haproxy-dataplaneapi/bin
+          mkdir -p ${{targets.contextdir}}/opt/iamguarded/lua/bin
+          chmod g+rwX ${{targets.contextdir}}/opt/iamguarded
+
+          ln -s ../../../../usr/bin/haproxy ${{targets.contextdir}}/opt/iamguarded/haproxy/bin/haproxy
+          ln -s ../../../../usr/bin/dataplaneapi ${{targets.contextdir}}/opt/iamguarded/haproxy-dataplaneapi/bin/dataplaneapi
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}} # provides /usr/bin/haproxy, the symlink target
+            - dataplaneapi # provides /usr/bin/dataplaneapi, the symlink target
+      pipeline:
+        - uses: test/tw/symlink-check
+        - runs: |
+            /opt/iamguarded/haproxy/bin/haproxy -v
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: v3.4
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - libcap-utils
+        - wait-for-it
+  pipeline:
+    - uses: test/tw/ldd-check
+    - runs: |
+        haproxy -v
+    - name: Test file capabilities
+      runs: |
+        getcap /usr/bin/haproxy | cut -d ' ' -f2 | grep -E '^cap_net_bind_service=eip$'
+    - name: Test HAProxy config validation
+      runs: |
+        mkdir -p /tmp/haproxy /var/lib/haproxy
+        cat > /tmp/haproxy/haproxy.cfg << 'EOF'
+        global
+            maxconn 256
+        defaults
+            mode http
+            timeout connect 5s
+            timeout client  30s
+            timeout server  30s
+        frontend stats
+            bind 127.0.0.1:18080
+            stats enable
+            stats uri /stats
+        EOF
+        haproxy -c -f /tmp/haproxy/haproxy.cfg
+        echo "Configuration validation: PASS"
+    - name: Test HAProxy stats page
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/haproxy /var/lib/haproxy
+          cat > /tmp/haproxy/haproxy.cfg << 'EOF'
+          global
+              maxconn 256
+          defaults
+              mode http
+              timeout connect 5s
+              timeout client  30s
+              timeout server  30s
+          frontend stats
+              bind 127.0.0.1:18080
+              stats enable
+              stats uri /stats
+          EOF
+        start: haproxy -f /tmp/haproxy/haproxy.cfg
+        expected_output: "."
+        post: |
+          wait-for-it 127.0.0.1:18080 -t 15
+          curl -sf http://127.0.0.1:18080/stats | grep -F "HAProxy"

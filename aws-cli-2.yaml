@@ -3,13 +3,21 @@
 package:
   name: aws-cli-2
   version: "2.36.36"
-  epoch: 0
+  epoch: 1
   description: "Universal Command Line Interface for Amazon Web Services (v2)"
   copyright:
     - license: Apache-2.0
   dependencies:
     provides:
       - aws-cli=${{package.full-version}}
+      # The retired aws-cli-v2 package (last built at 2.22.13-r0) vendored
+      # OpenSSL 3.4, which cannot parse the OpenSSL 3.5+ TLS policy syntax
+      # written by openssl-config-fipshardened >= 4.0.2-r1, breaking every
+      # TLS connection on FIPS images. Provide/replace its name so `apk add
+      # aws-cli-v2` resolves to this build, which uses the system OpenSSL.
+      - aws-cli-v2=${{package.full-version}}
+    replaces:
+      - aws-cli-v2
     runtime:
       - groff-base
       - python-${{vars.python-version}}-base
@@ -77,6 +85,13 @@ pipeline:
       ln -sf "${{vars.venv-home}}/bin/aws_completer" "${{targets.contextdir}}/usr/bin/aws_completer"
 
 test:
+  environment:
+    contents:
+      packages:
+        # Guard that the retired aws-cli-v2 package name resolves to this
+        # package (which uses the system OpenSSL) rather than the stale
+        # 2.22.13 bundle that vendored its own OpenSSL 3.4.
+        - aws-cli-v2
   pipeline:
     - uses: test/tw/pip-check
       with:
@@ -94,6 +109,36 @@ test:
         set -euo pipefail
         # pipe to cat to workaround 'help' unconditional pagination, which makes the test stall
         aws help | cat
+    - name: "TLS init works under OpenSSL 3.5+ system config syntax"
+      runs: |
+        set -euo pipefail
+        # openssl-config-fipshardened >= 4.0.2-r1 writes OpenSSL 3.5+ group
+        # syntax (a `*` default-keyshare prefix) into the system_default TLS
+        # policy of /etc/ssl/openssl.cnf. The retired aws-cli-v2 bundle
+        # vendored OpenSSL 3.4, so every SSL_CTX_new failed with
+        # "[SSL] error in system default config". aws must link the system
+        # OpenSSL, which understands this syntax.
+        cat > /tmp/fipshardened-style.cnf <<'EOF'
+        config_diagnostics = 1
+        openssl_conf = openssl_init
+
+        [openssl_init]
+        ssl_conf = ssl_module
+
+        [ssl_module]
+        system_default = crypto_policy
+
+        [crypto_policy]
+        Groups = *secp384r1:secp256r1
+        EOF
+        export OPENSSL_CONF=/tmp/fipshardened-style.cnf
+        export AWS_EC2_METADATA_DISABLED=true
+        ${{vars.venv-home}}/bin/python -c 'import ssl; ssl.create_default_context()'
+        # aws exits nonzero without credentials; the regression we guard
+        # against fails during SSL context creation, before credential lookup.
+        output=$(aws sts get-caller-identity 2>&1 || true)
+        echo "$output"
+        echo "$output" | grep -qi "unable to locate credentials"
 
 subpackages:
   - name: ${{package.name}}-iamguarded-compat

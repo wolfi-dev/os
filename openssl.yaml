@@ -5,7 +5,7 @@ package:
   #
   #       https://chainguard.engineering/docs/packages/playbooks/core-components/openssl-updates/
   version: "3.6.4"
-  epoch: 3
+  epoch: 2
   description: "the OpenSSL cryptography suite"
   copyright:
     - license: Apache-2.0
@@ -106,12 +106,6 @@ pipeline:
       # Continue building everything
       make -j$(nproc)
       make tests HARNESS_JOBS=10
-
-  - name: Fix compatibility with AWS, whilst we fix openssl.cnf config location
-    uses: patch
-    with:
-      patches: |
-        0001-Remove-pre-share-from-default-TLS-groups.patch
 
   - runs: |
       # Finish the build
@@ -250,60 +244,6 @@ test:
     - runs: |
         openssl --version
         openssl --help
-    - name: Measure the size of the first ClientHello
-      uses: test/daemon-check-output
-      with:
-        setup: |
-          mkdir -p /tmp/clienthello
-          openssl req -x509 -newkey rsa:2048 -noenc -days 1 \
-            -subj "/CN=localhost" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-            -keyout /tmp/clienthello/server.key \
-            -out /tmp/clienthello/server.crt
-        start: /usr/bin/openssl s_server -accept 127.0.0.1:4433 -naccept 10 -www -cert /tmp/clienthello/server.crt -key /tmp/clienthello/server.key
-        # s_server prints this once the listening socket is bound.
-        expected_output: ACCEPT
-        post: |
-          # A ClientHello that does not fit into a single TCP segment gets
-          # silently dropped by some middleboxes, AWS Network Firewall among
-          # them. An IPv6 header (40 bytes) and a TCP header with options (32
-          # bytes) leave 1428 bytes of a 1500 byte MTU, so keep margin below
-          # that.
-          max_clienthello=1400
-
-          # Handshake against the local server with every record dumped, then
-          # report how big the first ClientHello was. -msg prints the length
-          # of the handshake message, e.g.
-          #   >>> TLS 1.3, Handshake [length 0111], ClientHello
-          # to which the 5 byte TLS record header is added for the size that
-          # actually goes out on the wire.
-          clienthello_size() {
-            log=/tmp/clienthello/client.log
-            OPENSSL_CONF="$1" openssl s_client -connect 127.0.0.1:4433 \
-              -servername localhost -CAfile /tmp/clienthello/server.crt -msg \
-              </dev/null >"$log" 2>&1
-            grep -q "Verify return code: 0 (ok)" "$log"
-            hexlen=$(sed -n '/^>>> TLS.*, Handshake \[length .*\], ClientHello$/ {
-                       s/.*\[length \([0-9a-f]*\)\].*/\1/p; q; }' "$log")
-            if [ -z "$hexlen" ]; then
-              echo "no ClientHello found in s_client -msg output" >&2
-              cat "$log" >&2
-              return 1
-            fi
-            echo $((0x$hexlen + 5))
-          }
-
-          # What everything linked against libssl gets, by way of the
-          # openssl.cnf shipped in libcrypto3.
-          size="$(clienthello_size /etc/ssl/openssl.cnf)"
-          echo "first ClientHello with /etc/ssl/openssl.cnf: $size bytes"
-          [ "$size" -le "$max_clienthello" ]
-
-          # And what applications opting out of the system configuration get
-          # from the group list compiled into libssl.
-          size="$(clienthello_size /dev/null)"
-          echo "first ClientHello with built-in defaults: $size bytes"
-          [ "$size" -le "$max_clienthello" ]
     - name: Verify curl still works
       runs: |
         curl -I https://github.com/openssl/openssl

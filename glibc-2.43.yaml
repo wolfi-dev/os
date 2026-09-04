@@ -2,7 +2,7 @@
 package:
   name: glibc-2.43
   version: "2.43"
-  epoch: 16
+  epoch: 17
   description: "the GNU C library"
   copyright:
     - license: LGPL-2.1-or-later
@@ -342,11 +342,6 @@ subpackages:
         - merged-usrsbin
         - wolfi-baselayout
     test:
-      environment:
-        contents:
-          packages:
-            - gcc
-            - ${{package.name}}-dev
       pipeline:
         - name: Check lib64 and apk audit locations of ld-linux
           runs: |
@@ -357,37 +352,6 @@ subpackages:
             done
             [ "$ld_linux_found" = "true" ]
             [ -z "$(apk audit --full | grep ld-linux)" ]
-        - name: Test usage of /etc/ld.so.conf.d/ snippets
-          runs: |
-            tmpdir="$(mktemp -d)"
-            tmplibdir="$(mktemp -d)"
-            ldcfg="/etc/ld.so.conf.d/test-snippet.conf"
-            cleanup() {
-              rm -f "$ldcfg"
-              rm -rf "$tmpdir" "$tmplibdir"
-            }
-            trap cleanup EXIT
-            cat > "$tmpdir/ldsoconfdotd.c" << EOF
-            #include <stdio.h>
-
-            void ldsoconfdotd_test(void) {
-              printf("Calling %s\n", __func__);
-            }
-            EOF
-            cat > "$tmpdir/test.c" << EOF
-            void ldsoconfdotd_test(void);
-            int main(void) {
-              ldsoconfdotd_test();
-            }
-            EOF
-            gcc -c -fpic "$tmpdir/ldsoconfdotd.c" -o "$tmpdir/ldsoconfdotd.o"
-            gcc -shared -o "$tmplibdir/libldsoconfdotd.so" \
-              "$tmpdir/ldsoconfdotd.o"
-            echo "$tmplibdir" > "$ldcfg"
-            ldconfig
-            LIBRARY_PATH="$tmplibdir" \
-              gcc "$tmpdir/test.c" -o "$tmpdir/test" -lldsoconfdotd
-            "$tmpdir"/test
         - name: Confirm that we do not ship/own /etc/ld.so.cache
           runs: |
             set -euo pipefail
@@ -455,7 +419,7 @@ subpackages:
       provides:
         - glibc-dev=${{package.full-version}}
       runtime:
-        - glibc>=${{package.full-version}}
+        - glibc-2.44 # Once a glibc version is non-latest, it should always run with latest runtime
         - libxcrypt-dev
         - linux-headers
         - merged-lib
@@ -468,6 +432,7 @@ subpackages:
           packages:
             - binutils # readelf
             - gcc
+            - glibc-2.44 # Once a glibc version is non-latest, it should always run with latest runtime
       pipeline:
         - uses: test/tw/devpackage
         - name: libc.so/libm.so are pinned to this version, interp left on runtime
@@ -504,6 +469,77 @@ subpackages:
               fi
             done
             [ "$fail" -eq 0 ] && echo "PASS: nothing exceeds GLIBC_$ver"; exit $fail
+        - name: Test usage of /etc/ld.so.conf.d/ snippets
+          runs: |
+            tmpdir="$(mktemp -d)"
+            tmplibdir="$(mktemp -d)"
+            ldcfg="/etc/ld.so.conf.d/test-snippet.conf"
+            cleanup() {
+              rm -f "$ldcfg"
+              rm -rf "$tmpdir" "$tmplibdir"
+            }
+            trap cleanup EXIT
+            cat > "$tmpdir/ldsoconfdotd.c" << EOF
+            #include <stdio.h>
+
+            void ldsoconfdotd_test(void) {
+              printf("Calling %s\n", __func__);
+            }
+            EOF
+            cat > "$tmpdir/test.c" << EOF
+            void ldsoconfdotd_test(void);
+            int main(void) {
+              ldsoconfdotd_test();
+            }
+            EOF
+            gcc -c -fpic "$tmpdir/ldsoconfdotd.c" -o "$tmpdir/ldsoconfdotd.o"
+            gcc -shared -o "$tmplibdir/libldsoconfdotd.so" \
+              "$tmpdir/ldsoconfdotd.o"
+            echo "$tmplibdir" > "$ldcfg"
+            ldconfig
+            LIBRARY_PATH="$tmplibdir" \
+              gcc "$tmpdir/test.c" -o "$tmpdir/test" -lldsoconfdotd
+            "$tmpdir"/test
+        - name: Confirm that we're still compatible with current gcc
+          runs: |
+            set -euo pipefail
+            # This was a problem due to some legacy fix-includes in gcc that interfered
+            # with new glibc private symbols.  Let's make sure that doesn't break again
+            cat <<EOF >gcc_test.cc
+            #include <thread>
+            #include <future>
+            int main(void)
+            {
+              return 0;
+            }
+            EOF
+            g++ -o test_build gcc_test.cc
+            # Test that glibc startup files do not leak into the binary
+            if [ -n "$(readelf --notes test_build | grep -F '"name":"glibc"')" ]; then
+              readelf --notes test_build
+              echo glibc package note detected in a shared linked binary
+              exit 1
+            fi
+        - name: Verify that frame unwinding doesn't crash (when glibc is compiled with hardening)
+          runs: |
+            # This is the minimal reproducer of the glibc breakage we
+            # experienced when hardening was enabled.  See
+            # https://github.com/wolfi-dev/os/pull/53351#issuecomment-2946134881
+            # for more details.
+            cat > glibc-hardening-test.c << _EOF_
+            #include <execinfo.h>
+
+            int
+            main(int argc, char *argv[])
+            {
+              void *a[4096];
+              backtrace (a, 100);
+              return 0;
+            }
+            _EOF_
+            gcc glibc-hardening-test.c -o glibc-hardening-test
+            # Run the program 1000 times to make sure that unwinding works without problems.
+            for i in $(seq 1000); do ./glibc-hardening-test; done
         - name: A built binary's GLIBC floor is <= this dev version, and it runs without requiring the dev package at runtime
           runs: |
             ver="${{package.version}}"
@@ -1056,11 +1092,6 @@ subpackages:
         - uses: test/emptypackage
 
 test:
-  environment:
-    contents:
-      packages:
-        - gcc
-        - ${{package.name}}-dev
   pipeline:
     - runs: |
         set -euo pipefail
@@ -1086,26 +1117,6 @@ test:
           ldconfig
           ld.so
         version: ${{package.version}}
-    - name: Confirm that we're still compatible with current gcc
-      runs: |
-        set -euo pipefail
-        # This was a problem due to some legacy fix-includes in gcc that interfered
-        # with new glibc private symbols.  Let's make sure that doesn't break again
-        cat <<EOF >gcc_test.cc
-        #include <thread>
-        #include <future>
-        int main(void)
-        {
-          return 0;
-        }
-        EOF
-        g++ -o test_build gcc_test.cc
-        # Test that glibc startup files do not leak into the binary
-        if [ -n "$(readelf --notes test_build | grep -F '"name":"glibc"')" ]; then
-          readelf --notes test_build
-          echo glibc package note detected in a shared linked binary
-          exit 1
-        fi
     - name: Verify apk bootstrap works
       runs: |
         set -euo pipefail
@@ -1132,26 +1143,6 @@ test:
         cp -r /etc/apk/repositories /etc/apk/keys /tmp/glibc-busybox/etc/apk
         apk add --initdb --root /tmp/glibc-busybox glibc busybox &> bootstrap.log || :
         check_bootstrap_log bootstrap.log
-    - name: Verify that frame unwinding doesn't crash (when glibc is compiled with hardening)
-      runs: |
-        # This is the minimal reproducer of the glibc breakage we
-        # experienced when hardening was enabled.  See
-        # https://github.com/wolfi-dev/os/pull/53351#issuecomment-2946134881
-        # for more details.
-        cat > glibc-hardening-test.c << _EOF_
-        #include <execinfo.h>
-
-        int
-        main(int argc, char *argv[])
-        {
-          void *a[4096];
-          backtrace (a, 100);
-          return 0;
-        }
-        _EOF_
-        gcc glibc-hardening-test.c -o glibc-hardening-test
-        # Run the program 1000 times to make sure that unwinding works without problems.
-        for i in $(seq 1000); do ./glibc-hardening-test; done
     - name: Verify version-streamed virtuals do not resolve to an older package
       runs: |
         # Now that glibc is version-streamed, every package it produces is named

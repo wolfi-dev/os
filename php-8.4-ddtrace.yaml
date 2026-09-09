@@ -1,7 +1,7 @@
 package:
   name: php-8.4-ddtrace
-  version: "1.24.2"
-  epoch: 1 # glibc: 2.43->2.44
+  version: "1.25.0"
+  epoch: 0
   description: "Datadog PHP Clients"
   copyright:
     - license: Apache-2.0 OR BSD-3-Clause
@@ -47,7 +47,7 @@ pipeline:
     with:
       repository: https://github.com/DataDog/dd-trace-php
       tag: "${{package.version}}"
-      expected-commit: 7b91d0ada2c27ae1234021d744ff20e472317ed7
+      expected-commit: 3b1267d3cb38cd277fdadb9b9d9d36f55203946b
 
   - name: Clone submodules
     runs: git submodule update --init --recursive
@@ -63,21 +63,29 @@ pipeline:
 
   - name: Build appsec extension
     runs: |
-      # Upstream uses -Werror but has GCC 15 compat issues:
-      # - deprecated std::atomic_load_explicit(shared_ptr*) in the helper
-      # - anonymous structs in components-rs/common.h flagged by -pedantic
+      # Upstream uses -Werror but has a GCC 15 compat issue: anonymous
+      # structs in components-rs/common.h are flagged by -pedantic.
+      # Note: DD_APPSEC_BUILD_HELPER and the ddappsec-helper target were
+      # removed in 1.25.0; the helper is now embedded in the sidecar.
       cmake -S appsec -B tmp/build_appsec \
         -DDD_APPSEC_TESTING=OFF \
-        -DDD_APPSEC_BUILD_HELPER=ON \
         -DDD_APPSEC_BUILD_EXTENSION=ON \
-        -DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations -Wno-error=pedantic" \
+        -DCMAKE_CXX_FLAGS="-Wno-error=pedantic" \
         -DCMAKE_C_FLAGS="-Wno-error=pedantic"
-      cmake --build tmp/build_appsec -j$(nproc) --target extension --target ddappsec-helper
+      cmake --build tmp/build_appsec -j$(nproc) --target extension
 
   - name: Build profiling extension
     runs: |
-      cd profiling
-      CARGO_TARGET_DIR="$(pwd)/../tmp/build_profiler" cargo build --release
+      # As of 1.25.0, the standalone profiling extension is built separately
+      # from the tracer. It uses --no-default-features --features profiling
+      # with the profiler-release cargo profile. The output is
+      # target-profiling/profiler-release/libdatadog_php.so.
+      RUSTFLAGS="--cfg tokio_unstable" \
+        CARGO_TARGET_DIR=/home/build/target-profiling \
+        cargo build \
+        --no-default-features \
+        --features profiling \
+        --profile profiler-release
 
 subpackages:
   - name: ${{package.name}}-config
@@ -118,7 +126,6 @@ subpackages:
           sharedir="${{targets.subpkgdir}}/usr/share/dd-trace-php/etc"
           mkdir -p "$extdir" "$sharedir"
           install -Dm755 tmp/build_appsec/ddappsec.so "$extdir/ddappsec.so"
-          install -Dm755 tmp/build_appsec/libddappsec-helper.so "$extdir/libddappsec-helper.so"
           install -Dm644 appsec/recommended.json "$sharedir/recommended.json"
     test:
       environment:
@@ -137,13 +144,11 @@ subpackages:
           runs: |
             php -i | grep -F "datadog.appsec.enabled"
             php -i | grep -F "datadog.appsec.rules"
-            php -i | grep -F "datadog.appsec.helper_path"
         - name: Verify is_enabled function exists
           runs: |
-            php -r 'var_dump(function_exists("Datadog\AppSec\is_enabled"));' | grep -F "bool(true)"
-        - name: Verify helper and rules files are installed
+            php -r 'var_dump(function_exists("Datadog\\AppSec\\is_enabled"));' | grep -F "bool(true)"
+        - name: Verify rules file is installed
           runs: |
-            stat /usr/lib/php/modules/libddappsec-helper.so
             stat /usr/share/dd-trace-php/etc/recommended.json
         - uses: test/tw/ldd-check
 
@@ -152,7 +157,6 @@ subpackages:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
           echo "extension=ddappsec.so" > "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
-          echo "datadog.appsec.helper_path=/usr/lib/php/modules/libddappsec-helper.so" >> "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
           echo "datadog.appsec.rules=/usr/share/dd-trace-php/etc/recommended.json" >> "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
     test:
       pipeline:
@@ -169,7 +173,7 @@ subpackages:
       - runs: |
           extdir="${{targets.subpkgdir}}/usr/lib/php/modules"
           mkdir -p "$extdir"
-          install -Dm755 tmp/build_profiler/release/libdatadog_php_profiling.so "$extdir/datadog-profiling.so"
+          install -Dm755 target-profiling/profiler-release/libdatadog_php.so "$extdir/datadog-profiling.so"
     test:
       environment:
         contents:

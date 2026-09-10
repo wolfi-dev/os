@@ -1,10 +1,14 @@
 package:
   name: git
   version: "2.55.0"
-  epoch: 6 # rust: 1.97->1.98
+  epoch: 7 # build Perl support so git-svn can ship as a subpackage
   description: "distributed version control system"
   copyright:
-    - license: GPL-2.0-or-later
+    # The git-svn subpackage ships git's bundled CPAN fallbacks
+    # (perl/FromCPAN/Error.pm and Mail/Address.pm), which are "the same terms
+    # as Perl itself". Git.pm unconditionally imports Error, so git-svn cannot
+    # drop it.
+    - license: GPL-2.0-or-later AND ( Artistic-1.0-Perl OR GPL-1.0-or-later )
   dependencies:
     provider-priority: 10
   resources:
@@ -32,6 +36,7 @@ environment:
       - openssl-dev # FTBFS with openssl-hardened-dev: imap-send.c uses removed OpenSSL 1.x APIs (SSL_library_init, SSL_load_error_strings, SSL_get_peer_certificate)
       - patch
       - pcre2-dev
+      - perl
       - rust-${{vars.rust-version}}
       - wolfi-base
       - xmlto
@@ -54,8 +59,10 @@ pipeline:
       ICONV_OMITS_BOM=Yes
       INSTALL_SYMLINKS=1
       USE_LIBPCRE2=YesPlease
-      NO_PERL=YesPlease
       NO_TCLTK=YesPlease
+      # Dropping NO_PERL below would otherwise start installing gitweb, which
+      # NO_PERL used to suppress as a side effect. We do not ship it.
+      NO_GITWEB=YesPlease
       EOF
 
   - runs: |
@@ -71,6 +78,41 @@ pipeline:
         DESTDIR="${{targets.destdir}}" \
         INSTALLDIRS=vendor \
         git-subtree install install-doc
+
+  - name: restore stubs for the Perl commands we do not ship
+    runs: |
+      # Dropping NO_PERL is what makes git-svn buildable, but it also turns
+      # every other SCRIPT_PERL target into a real Perl script. We only ship
+      # git-svn, so put upstream's "unimplemented" stub back for the rest.
+      # This keeps the git and git-email packages free of a Perl runtime
+      # dependency and preserves their current behaviour: a fatal message on
+      # stderr and exit 128. git-svn itself is stubbed by its subpackage,
+      # which has to copy the real script out first.
+      stub=$(mktemp)
+      printf '%s\n' \
+        '#!/bin/sh' \
+        '' \
+        'echo >&2 "fatal: git was built without support for $(basename $0) (not packaged)."' \
+        'exit 128' > "$stub"
+
+      # git-cvsserver is installed into bindir, with libexec/git-core holding
+      # only a symlink to it (INSTALL_SYMLINKS=1). Stub the real file and
+      # leave the symlink alone, otherwise it is replaced by a regular file.
+      # The perl fsmonitor-watchman.sample hook under share/git-core/templates
+      # is deliberately left alone too: melange's scanner does not look there,
+      # so it generates no perl dependency, and it has shipped that way all
+      # along.
+      for path in \
+        usr/libexec/git-core/git-archimport \
+        usr/libexec/git-core/git-cvsexportcommit \
+        usr/libexec/git-core/git-cvsimport \
+        usr/libexec/git-core/git-instaweb \
+        usr/libexec/git-core/git-send-email \
+        usr/bin/git-cvsserver; do
+        install -Dm755 "$stub" "${{targets.destdir}}/$path"
+      done
+
+      rm -f "$stub"
 
   - runs: |
       mkdir -p "${{targets.destdir}}"/var/git
@@ -131,6 +173,84 @@ subpackages:
         - name: "verify some binaries are present"
           runs: |
             stat /usr/libexec/git-core/git-p4
+
+  - name: "git-svn"
+    description: "Git tools for working with Subversion repositories"
+    dependencies:
+      # This subpackage ships the real /usr/libexec/git-core/git-svn, a path
+      # the main git package also owns as a stub. `replaces` is what lets apk
+      # resolve that overlap in our favour when git-svn is installed.
+      replaces:
+        - git
+      runtime:
+        - git=${{package.full-version}}
+        - perl
+        # Git.pm's prompt() does a bare `require Term::ReadKey` when reading a
+        # password, with no fallback, so git-svn dies on an authenticated
+        # remote without it.
+        - perl-term-readkey
+        - subversion-perl
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/libexec/git-core
+
+          # Copy rather than move: the main git package keeps a stub at this
+          # path so `git svn` still fails with a useful message when this
+          # subpackage is not installed.
+          cp "${{targets.destdir}}"/usr/libexec/git-core/git-svn \
+            "${{targets.subpkgdir}}"/usr/libexec/git-core/git-svn
+
+          # Git.pm and the Git::SVN::* modules git-svn loads, plus the bundled
+          # Error.pm/Mail::Address CPAN fallbacks. git bakes this directory
+          # into the script's @INC, so it is not on perl's default search path
+          # and cannot collide with the perl package.
+          mkdir -p "${{targets.subpkgdir}}"/usr/share
+          mv "${{targets.destdir}}"/usr/share/perl5 \
+            "${{targets.subpkgdir}}"/usr/share/perl5
+
+          # Now that the real script is safely in the subpackage, leave the
+          # main git package a stub pointing at us.
+          printf '%s\n' \
+            '#!/bin/sh' \
+            '' \
+            'echo >&2 "fatal: git-svn is not installed. Install the git-svn package."' \
+            'exit 128' > "${{targets.destdir}}"/usr/libexec/git-core/git-svn
+          chmod 0755 "${{targets.destdir}}"/usr/libexec/git-core/git-svn
+    test:
+      environment:
+        contents:
+          packages:
+            - subversion
+        environment:
+          HOME: /tmp
+      pipeline:
+        - name: git svn clones a Subversion repository
+          runs: |
+            git config --global user.name "Wolfi"
+            git config --global user.email "wolf@wolfi.dev"
+
+            svnadmin create /tmp/svnrepo
+            svn checkout "file:///tmp/svnrepo" /tmp/svnwc
+            echo "hello from subversion" > /tmp/svnwc/hello.txt
+            svn add /tmp/svnwc/hello.txt
+            svn commit -m "Initial commit" /tmp/svnwc
+
+            git svn clone "file:///tmp/svnrepo" /tmp/gitsvn
+            cd /tmp/gitsvn
+            grep -Fq "hello from subversion" hello.txt
+            git log --oneline | grep -F "Initial commit"
+            git svn info | grep -F "URL: file:///tmp/svnrepo"
+        - name: git svn dcommit writes back to Subversion
+          runs: |
+            cd /tmp/gitsvn
+            echo "from git" > from-git.txt
+            git add from-git.txt
+            git commit -m "Commit from git"
+            git svn dcommit
+
+            svn update /tmp/svnwc
+            grep -Fq "from git" /tmp/svnwc/from-git.txt
+            svn log "file:///tmp/svnrepo" | grep -F "Commit from git"
 
   - name: "git-completion"
     description: "Shell completion for git commands"
@@ -203,6 +323,36 @@ test:
       runs: |
         git config --list | grep 'user.name=Wolfi'
         git config --list | grep 'user.email=wolf@wolfi.dev'
+    - name: git package stays free of Perl
+      runs: |
+        # git is built with Perl enabled so that git-svn can be split into its
+        # own subpackage. Everything else Perl is either disabled (NO_GITWEB)
+        # or stubbed back out during the build, so the main package must not
+        # end up depending on perl: git is installed in most of our images.
+        # A future git release adding a Perl command would trip this.
+        if apk info -R git | grep -qx "cmd:perl"; then
+          echo "FAIL: git gained a perl runtime dependency:"
+          apk info -R git
+          exit 1
+        fi
+        # Checked against the package's own file list rather than the
+        # filesystem: other packages in the test image legitimately create
+        # /usr/share/perl5.
+        if apk info -L git | grep -qE "^usr/share/(perl5|gitweb)/"; then
+          echo "FAIL: Perl artefacts leaked into the git package:"
+          apk info -L git | grep -E "^usr/share/(perl5|gitweb)/"
+          exit 1
+        fi
+    - name: git svn reports that the git-svn package is missing
+      runs: |
+        # The real script lives in the git-svn subpackage, which replaces this
+        # stub when installed.
+        rc=0; out=$(git svn 2>&1) || rc=$?
+        [ "$rc" -eq 128 ] || { echo "FAIL: expected exit 128, got $rc"; exit 1; }
+        echo "$out" | grep -Fq "git-svn is not installed" || {
+          echo "FAIL: unexpected output: $out"
+          exit 1
+        }
     - name: Verify git subtree
       runs: |
         # subtree with no args exits non-zero but shows usage on stderr

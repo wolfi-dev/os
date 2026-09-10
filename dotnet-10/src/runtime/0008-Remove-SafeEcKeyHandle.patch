@@ -1,0 +1,1165 @@
+From 26130c9bca6d347331e40407c52149ecc9dcf237 Mon Sep 17 00:00:00 2001
+From: Pranav Senthilnathan <pranas@microsoft.com>
+Date: Thu, 25 Jun 2026 11:48:43 -0700
+Subject: [PATCH 8/9] Remove SafeEcKeyHandle
+
+Remove `SafeEcKeyHandle`. Any `EC_KEY` operations are handled in native
+now. The last remaining uses were parameter export (which used
+`SafeEcKeyHandle` in the fallback path for `EC_KEY`-backed `EVP_PKey`s)
+and the `IntPtr` constructors for
+`ECDsaOpenSsl`/`ECDiffieHellmanOpenSsl`.
+
+(cherry picked from commit af008a353c87951e5600a7445453cee5b54e23e6)
+---
+ .../Interop.EcDsa.ImportExport.cs             | 150 -----------
+ .../Interop.EcKey.cs                          |  66 -----
+ .../Interop.EvpPkey.EcKey.cs                  |  20 +-
+ .../Win32/SafeHandles/SafeEcKeyHandle.Unix.cs |  51 ----
+ .../Cryptography/ECOpenSsl.ImportExport.cs    | 102 +------
+ .../src/System.Security.Cryptography.csproj   |   2 -
+ .../Cryptography/ECDiffieHellmanOpenSsl.cs    |  15 +-
+ .../Security/Cryptography/ECDsaOpenSsl.cs     |  15 +-
+ .../entrypoints.c                             |   5 +-
+ .../pal_ecc_import_export.c                   | 253 +++++++++++++-----
+ .../pal_ecc_import_export.h                   |  33 +--
+ .../pal_evp_pkey_eckey.c                      |  36 ++-
+ .../pal_evp_pkey_eckey.h                      |  16 +-
+ 13 files changed, 250 insertions(+), 514 deletions(-)
+ delete mode 100644 src/libraries/Common/src/Microsoft/Win32/SafeHandles/SafeEcKeyHandle.Unix.cs
+
+diff --git a/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcDsa.ImportExport.cs b/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcDsa.ImportExport.cs
+index 3563e43af40..7972ba5bc24 100644
+--- a/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcDsa.ImportExport.cs
++++ b/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcDsa.ImportExport.cs
+@@ -214,14 +214,6 @@ internal static int EvpPKeyGetEcKeySize(SafeEvpPKeyHandle pkey)
+             return CryptoNative_EvpPKeyGetEcKeySize(pkey);
+         }
+ 
+-        [LibraryImport(Libraries.CryptoNative)]
+-        private static partial int CryptoNative_GetECKeyParameters(
+-            SafeEcKeyHandle key,
+-            [MarshalAs(UnmanagedType.Bool)] bool includePrivate,
+-            out SafeBignumHandle qx_bn, out int x_cb,
+-            out SafeBignumHandle qy_bn, out int y_cb,
+-            out IntPtr d_bn_not_owned, out int d_cb);
+-
+         [LibraryImport(Libraries.CryptoNative)]
+         private static partial int CryptoNative_EvpPKeyGetEcKeyParameters(
+             SafeEvpPKeyHandle key,
+@@ -230,57 +222,6 @@ private static partial int CryptoNative_EvpPKeyGetEcKeyParameters(
+             out SafeBignumHandle qy_bn, out int y_cb,
+             out SafeBignumHandle d_bn, out int d_cb);
+ 
+-        internal static ECParameters GetECKeyParameters(
+-            SafeEcKeyHandle key,
+-            bool includePrivate)
+-        {
+-            SafeBignumHandle qx_bn, qy_bn, d_bn;
+-            IntPtr d_bn_not_owned;
+-            int qx_cb, qy_cb, d_cb;
+-
+-            bool refAdded = false;
+-            try
+-            {
+-                key.DangerousAddRef(ref refAdded); // Protect access to d_bn_not_owned
+-                int rc = CryptoNative_GetECKeyParameters(
+-                    key,
+-                    includePrivate,
+-                    out qx_bn, out qx_cb,
+-                    out qy_bn, out qy_cb,
+-                    out d_bn_not_owned, out d_cb);
+-
+-                using (qx_bn)
+-                using (qy_bn)
+-                {
+-                    if (rc == -1)
+-                    {
+-                        throw new CryptographicException(SR.Cryptography_CSP_NoPrivateKey);
+-                    }
+-                    else if (rc != 1)
+-                    {
+-                        throw Interop.Crypto.CreateOpenSslCryptographicException();
+-                    }
+-
+-                    using (d_bn = new SafeBignumHandle(d_bn_not_owned, false))
+-                    {
+-                        // Match Windows semantics where qx, qy, and d have same length
+-                        int keySizeBits = EcKeyGetSize(key);
+-                        int expectedSize = (keySizeBits + 7) / 8;
+-                        return GetEcParameters(
+-                            expectedSize,
+-                            qx_bn, qx_cb,
+-                            qy_bn, qy_cb,
+-                            d_bn, d_cb);
+-                    }
+-                }
+-            }
+-            finally
+-            {
+-                if (refAdded)
+-                    key.DangerousRelease();
+-            }
+-        }
+-
+         internal static ECParameters EvpPKeyGetEcKeyParameters(
+             SafeEvpPKeyHandle key,
+             bool includePrivate)
+@@ -346,23 +287,6 @@ private static ECParameters GetEcParameters(
+             return parameters;
+         }
+ 
+-        [LibraryImport(Libraries.CryptoNative)]
+-        private static partial int CryptoNative_GetECCurveParameters(
+-            SafeEcKeyHandle key,
+-            [MarshalAs(UnmanagedType.Bool)] bool includePrivate,
+-            out ECCurve.ECCurveType curveType,
+-            out SafeBignumHandle qx, out int x_cb,
+-            out SafeBignumHandle qy, out int y_cb,
+-            out IntPtr d_bn_not_owned, out int d_cb,
+-            out SafeBignumHandle p, out int P_cb,
+-            out SafeBignumHandle a, out int A_cb,
+-            out SafeBignumHandle b, out int B_cb,
+-            out SafeBignumHandle gx, out int Gx_cb,
+-            out SafeBignumHandle gy, out int Gy_cb,
+-            out SafeBignumHandle order, out int order_cb,
+-            out SafeBignumHandle cofactor, out int cofactor_cb,
+-            out SafeBignumHandle seed, out int seed_cb);
+-
+         [LibraryImport(Libraries.CryptoNative)]
+         private static unsafe partial int CryptoNative_EvpPKeyGetEcCurveParameters(
+             SafeEvpPKeyHandle key,
+@@ -380,80 +304,6 @@ private static unsafe partial int CryptoNative_EvpPKeyGetEcCurveParameters(
+             out SafeBignumHandle cofactor, out int cofactor_cb,
+             out SafeBignumHandle seed, out int seed_cb);
+ 
+-        internal static ECParameters GetECCurveParameters(
+-            SafeEcKeyHandle key,
+-            bool includePrivate)
+-        {
+-            ECCurve.ECCurveType curveType;
+-            SafeBignumHandle qx_bn, qy_bn, p_bn, a_bn, b_bn, gx_bn, gy_bn, order_bn, cofactor_bn, seed_bn;
+-            IntPtr d_bn_not_owned;
+-            int qx_cb, qy_cb, p_cb, a_cb, b_cb, gx_cb, gy_cb, order_cb, cofactor_cb, seed_cb, d_cb;
+-
+-            bool refAdded = false;
+-            try
+-            {
+-                key.DangerousAddRef(ref refAdded); // Protect access to d_bn_not_owned
+-                int rc = CryptoNative_GetECCurveParameters(
+-                    key,
+-                    includePrivate,
+-                    out curveType,
+-                    out qx_bn, out qx_cb,
+-                    out qy_bn, out qy_cb,
+-                    out d_bn_not_owned, out d_cb,
+-                    out p_bn, out p_cb,
+-                    out a_bn, out a_cb,
+-                    out b_bn, out b_cb,
+-                    out gx_bn, out gx_cb,
+-                    out gy_bn, out gy_cb,
+-                    out order_bn, out order_cb,
+-                    out cofactor_bn, out cofactor_cb,
+-                    out seed_bn, out seed_cb);
+-
+-                using (qx_bn)
+-                using (qy_bn)
+-                using (p_bn)
+-                using (a_bn)
+-                using (b_bn)
+-                using (gx_bn)
+-                using (gy_bn)
+-                using (order_bn)
+-                using (cofactor_bn)
+-                using (seed_bn)
+-                {
+-                    if (rc == -1)
+-                    {
+-                        throw new CryptographicException(SR.Cryptography_CSP_NoPrivateKey);
+-                    }
+-                    else if (rc != 1)
+-                    {
+-                        throw Interop.Crypto.CreateOpenSslCryptographicException();
+-                    }
+-
+-                    using (var d_h = new SafeBignumHandle(d_bn_not_owned, false))
+-                    {
+-                        return GetEcCurveParameters(
+-                            curveType,
+-                            qx_bn, qx_cb,
+-                            qy_bn, qy_cb,
+-                            d_h, d_cb,
+-                            p_bn, p_cb,
+-                            a_bn, a_cb,
+-                            b_bn, b_cb,
+-                            gx_bn, gx_cb,
+-                            gy_bn, gy_cb,
+-                            order_bn, order_cb,
+-                            cofactor_bn, cofactor_cb,
+-                            seed_bn, seed_cb);
+-                    }
+-                }
+-            }
+-            finally
+-            {
+-                if (refAdded)
+-                    key.DangerousRelease();
+-            }
+-        }
+-
+         internal static unsafe ECParameters EvpPKeyGetEcCurveParameters(
+             SafeEvpPKeyHandle key,
+             bool includePrivate)
+diff --git a/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcKey.cs b/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcKey.cs
+index 5e92c58e2ec..67b5eccd5e9 100644
+--- a/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcKey.cs
++++ b/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EcKey.cs
+@@ -3,77 +3,11 @@
+ 
+ using System;
+ using System.Diagnostics;
+-using System.Runtime.InteropServices;
+-using Microsoft.Win32.SafeHandles;
+ 
+ internal static partial class Interop
+ {
+     internal static partial class Crypto
+     {
+-        [LibraryImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EcKeyCreateByOid", StringMarshalling = StringMarshalling.Utf8)]
+-        private static partial SafeEcKeyHandle CryptoNative_EcKeyCreateByOid(string oid);
+-        internal static SafeEcKeyHandle? EcKeyCreateByOid(string oid)
+-        {
+-            SafeEcKeyHandle handle = CryptoNative_EcKeyCreateByOid(oid);
+-            if (handle == null || handle.IsInvalid)
+-            {
+-                ErrClearError();
+-            }
+-
+-            return handle;
+-        }
+-
+-        [LibraryImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EcKeyDestroy")]
+-        internal static partial void EcKeyDestroy(IntPtr a);
+-
+-        [LibraryImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EcKeyGenerateKey")]
+-        [return: MarshalAs(UnmanagedType.Bool)]
+-        internal static partial bool EcKeyGenerateKey(SafeEcKeyHandle eckey);
+-
+-        [LibraryImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EcKeyUpRef")]
+-        [return: MarshalAs(UnmanagedType.Bool)]
+-        internal static partial bool EcKeyUpRef(IntPtr r);
+-
+-        [LibraryImport(Libraries.CryptoNative)]
+-        private static partial int CryptoNative_EcKeyGetSize(SafeEcKeyHandle ecKey, out int keySize);
+-        internal static int EcKeyGetSize(SafeEcKeyHandle key)
+-        {
+-            int keySize;
+-            int rc = CryptoNative_EcKeyGetSize(key, out keySize);
+-            if (rc == 1)
+-            {
+-                return keySize;
+-            }
+-
+-            throw Interop.Crypto.CreateOpenSslCryptographicException();
+-        }
+-
+-        [LibraryImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EcKeyGetCurveName2")]
+-        private static partial int CryptoNative_EcKeyGetCurveName(SafeEcKeyHandle ecKey, out int nid);
+-
+-        internal static string EcKeyGetCurveName(SafeEcKeyHandle key)
+-        {
+-            int rc = CryptoNative_EcKeyGetCurveName(key, out int nidCurveName);
+-            if (rc == 1)
+-            {
+-                return CurveNidToOidValue(nidCurveName);
+-            }
+-
+-            throw Interop.Crypto.CreateOpenSslCryptographicException();
+-        }
+-
+-        internal static bool EcKeyHasCurveName(SafeEcKeyHandle key)
+-        {
+-            int rc = CryptoNative_EcKeyGetCurveName(key, out int nidCurveName);
+-            if (rc == 1)
+-            {
+-                // Key is invalid or doesn't have a curve
+-                return (nidCurveName != Interop.Crypto.NID_undef);
+-            }
+-
+-            throw Interop.Crypto.CreateOpenSslCryptographicException();
+-        }
+-
+         internal static string CurveNidToOidValue(int nidCurveName)
+         {
+             if (nidCurveName == Interop.Crypto.NID_undef)
+diff --git a/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EvpPkey.EcKey.cs b/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EvpPkey.EcKey.cs
+index bd89f4e3bee..e11368329b5 100644
+--- a/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EvpPkey.EcKey.cs
++++ b/src/libraries/Common/src/Interop/Unix/System.Security.Cryptography.Native/Interop.EvpPkey.EcKey.cs
+@@ -1,6 +1,7 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System;
+ using System.Runtime.InteropServices;
+ using System.Security.Cryptography;
+ using Microsoft.Win32.SafeHandles;
+@@ -9,18 +10,19 @@ internal static partial class Interop
+ {
+     internal static partial class Crypto
+     {
+-        [LibraryImport(Libraries.CryptoNative, EntryPoint = "CryptoNative_EvpPkeyGetEcKey")]
+-        internal static partial SafeEcKeyHandle EvpPkeyGetEcKey(SafeEvpPKeyHandle pkey);
+-
+         [LibraryImport(Libraries.CryptoNative)]
+-        [return: MarshalAs(UnmanagedType.Bool)]
+-        private static partial bool CryptoNative_EvpPkeySetEcKey(SafeEvpPKeyHandle pkey, SafeEcKeyHandle key);
++        private static partial SafeEvpPKeyHandle CryptoNative_CreateEvpPkeyFromEcKey(IntPtr ecKey, out int keySize);
+ 
+-        // Calls EVP_PKEY_set1_EC_KEY therefore the key will be duplicated
+-        internal static SafeEvpPKeyHandle CreateEvpPkeyFromEcKey(SafeEcKeyHandle key)
++        /// <summary>
++        /// Creates a new EVP_PKEY from a raw EC_KEY pointer (IntPtr).
++        /// The EC_KEY is duplicated (up-ref'd) so the caller retains ownership.
++        /// Also returns the EC key size. Returns NULL (invalid handle) on failure.
++        /// </summary>
++        internal static SafeEvpPKeyHandle CreateEvpPkeyFromEcKey(IntPtr ecKeyHandle, out int keySize)
+         {
+-            SafeEvpPKeyHandle pkey = Interop.Crypto.EvpPkeyCreate();
+-            if (!CryptoNative_EvpPkeySetEcKey(pkey, key))
++            SafeEvpPKeyHandle pkey = CryptoNative_CreateEvpPkeyFromEcKey(ecKeyHandle, out keySize);
++
++            if (pkey.IsInvalid)
+             {
+                 pkey.Dispose();
+                 throw Interop.Crypto.CreateOpenSslCryptographicException();
+diff --git a/src/libraries/Common/src/Microsoft/Win32/SafeHandles/SafeEcKeyHandle.Unix.cs b/src/libraries/Common/src/Microsoft/Win32/SafeHandles/SafeEcKeyHandle.Unix.cs
+deleted file mode 100644
+index 890d0d422a4..00000000000
+--- a/src/libraries/Common/src/Microsoft/Win32/SafeHandles/SafeEcKeyHandle.Unix.cs
++++ /dev/null
+@@ -1,51 +0,0 @@
+-// Licensed to the .NET Foundation under one or more agreements.
+-// The .NET Foundation licenses this file to you under the MIT license.
+-
+-using System;
+-using System.Diagnostics;
+-using System.Runtime.InteropServices;
+-using System.Security;
+-
+-namespace Microsoft.Win32.SafeHandles
+-{
+-    internal sealed class SafeEcKeyHandle : SafeHandle
+-    {
+-        public SafeEcKeyHandle() :
+-            base(IntPtr.Zero, ownsHandle: true)
+-        {
+-        }
+-
+-        protected override bool ReleaseHandle()
+-        {
+-            Interop.Crypto.EcKeyDestroy(handle);
+-            SetHandle(IntPtr.Zero);
+-            return true;
+-        }
+-
+-        public override bool IsInvalid
+-        {
+-            get { return handle == IntPtr.Zero; }
+-        }
+-
+-        internal static SafeEcKeyHandle DuplicateHandle(IntPtr handle)
+-        {
+-            Debug.Assert(handle != IntPtr.Zero);
+-
+-            // Reliability: Allocate the SafeHandle before calling EC_KEY_up_ref so
+-            // that we don't lose a tracked reference in low-memory situations.
+-            SafeEcKeyHandle safeHandle = new SafeEcKeyHandle();
+-
+-            if (!Interop.Crypto.EcKeyUpRef(handle))
+-            {
+-                Exception e = Interop.Crypto.CreateOpenSslCryptographicException();
+-                safeHandle.Dispose();
+-                throw e;
+-            }
+-
+-            safeHandle.SetHandle(handle);
+-            return safeHandle;
+-        }
+-
+-        internal SafeEcKeyHandle DuplicateHandle() => DuplicateHandle(DangerousGetHandle());
+-    }
+-}
+diff --git a/src/libraries/Common/src/System/Security/Cryptography/ECOpenSsl.ImportExport.cs b/src/libraries/Common/src/System/Security/Cryptography/ECOpenSsl.ImportExport.cs
+index 4c887fd9998..1e8aa459f65 100644
+--- a/src/libraries/Common/src/System/Security/Cryptography/ECOpenSsl.ImportExport.cs
++++ b/src/libraries/Common/src/System/Security/Cryptography/ECOpenSsl.ImportExport.cs
+@@ -2,7 +2,6 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Diagnostics;
+-using Microsoft.Win32.SafeHandles;
+ 
+ namespace System.Security.Cryptography
+ {
+@@ -12,66 +11,6 @@ internal static partial class ECOpenSsl
+         internal const string ECDSA_P384_OID_VALUE = "1.3.132.0.34"; // Also called nistP384 or secP384r1
+         internal const string ECDSA_P521_OID_VALUE = "1.3.132.0.35"; // Also called nistP521or secP521r1
+ 
+-        private static ECParameters ExportExplicitParameters(SafeEcKeyHandle currentKey, bool includePrivateParameters) =>
+-            ExportExplicitCurveParameters(currentKey, includePrivateParameters);
+-
+-        private static ECParameters ExportParameters(SafeEcKeyHandle currentKey, bool includePrivateParameters)
+-        {
+-            ECParameters ecparams;
+-            if (Interop.Crypto.EcKeyHasCurveName(currentKey))
+-            {
+-                ecparams = ExportNamedCurveParameters(currentKey, includePrivateParameters);
+-            }
+-            else
+-            {
+-                ecparams = ExportExplicitCurveParameters(currentKey, includePrivateParameters);
+-            }
+-            return ecparams;
+-        }
+-
+-        private static ECParameters ExportNamedCurveParameters(SafeEcKeyHandle key, bool includePrivateParameters)
+-        {
+-            CheckInvalidKey(key);
+-
+-            ECParameters parameters = Interop.Crypto.GetECKeyParameters(key, includePrivateParameters);
+-
+-            bool hasPrivateKey = (parameters.D != null);
+-
+-            if (hasPrivateKey != includePrivateParameters)
+-            {
+-                throw new CryptographicException(SR.Cryptography_CSP_NoPrivateKey);
+-            }
+-
+-            // Assign Curve
+-            string keyOidValueName = Interop.Crypto.EcKeyGetCurveName(key);
+-            parameters.Curve = ECCurve.CreateFromValue(keyOidValueName);
+-
+-            return parameters;
+-        }
+-
+-        private static ECParameters ExportExplicitCurveParameters(SafeEcKeyHandle key, bool includePrivateParameters)
+-        {
+-            CheckInvalidKey(key);
+-
+-            ECParameters parameters = Interop.Crypto.GetECCurveParameters(key, includePrivateParameters);
+-
+-            bool hasPrivateKey = (parameters.D != null);
+-            if (hasPrivateKey != includePrivateParameters)
+-            {
+-                throw new CryptographicException(SR.Cryptography_CSP_NoPrivateKey);
+-            }
+-
+-            return parameters;
+-        }
+-
+-        private static void CheckInvalidKey(SafeEcKeyHandle key)
+-        {
+-            if (key == null || key.IsInvalid)
+-            {
+-                throw new CryptographicException(SR.Cryptography_OpenInvalidHandle);
+-            }
+-        }
+-
+         private static void CheckInvalidKey(SafeEvpPKeyHandle key)
+         {
+             if (key == null || key.IsInvalid)
+@@ -83,58 +22,37 @@ private static void CheckInvalidKey(SafeEvpPKeyHandle key)
+         public static ECParameters ExportParameters(SafeEvpPKeyHandle pkey, bool includePrivateParameters)
+         {
+             CheckInvalidKey(pkey);
+-
+-            if (SafeEvpPKeyHandle.OpenSslVersion >= 0x3_00_00_00_0)
+-            {
+-                return ExportECParametersFromEvpPKeyUsingParams(pkey, includePrivateParameters);
+-            }
+-
+-            using (SafeEcKeyHandle ecKey = Interop.Crypto.EvpPkeyGetEcKey(pkey))
+-            {
+-                return ECOpenSsl.ExportParameters(ecKey, includePrivateParameters);
+-            }
++            return ExportECParametersFromEvpPKey(pkey, includePrivateParameters);
+         }
+ 
+         public static ECParameters ExportExplicitParameters(SafeEvpPKeyHandle pkey, bool includePrivateParameters)
+         {
+             CheckInvalidKey(pkey);
+-
+-            if (SafeEvpPKeyHandle.OpenSslVersion >= 0x3_00_00_00_0)
+-            {
+-                return ExportExplicitCurveParametersFromEvpPKeyUsingParams(pkey, includePrivateParameters);
+-            }
+-
+-            using (SafeEcKeyHandle ecKey = Interop.Crypto.EvpPkeyGetEcKey(pkey))
+-            {
+-                return ECOpenSsl.ExportExplicitParameters(ecKey, includePrivateParameters);
+-            }
++            return ExportExplicitCurveParametersFromEvpPKey(pkey, includePrivateParameters);
+         }
+ 
+-        /// <summary>
+-        /// Extracts ECParameters from an EVP_PKEY* using OpenSSL 3 params API.
+-        /// This is needed in case EVP_PKEY* was created by provider and getting EC_KEY is not possible.
+-        /// For keys created with EC_KEY, ECOpenSsl.ExportParameters should be used.
+-        /// </summary>
+-        private static ECParameters ExportECParametersFromEvpPKeyUsingParams(SafeEvpPKeyHandle pkey, bool includePrivateParameters)
++        private static ECParameters ExportECParametersFromEvpPKey(SafeEvpPKeyHandle pkey, bool includePrivateParameters)
+         {
+             // Check encoding first — explicit-encoding keys must be exported with
+             // explicit curve parameters even if OpenSSL can match a named curve.
+             if (Interop.Crypto.EvpPKeyEcHasExplicitEncoding(pkey))
+             {
+-                return ExportExplicitCurveParametersFromEvpPKeyUsingParams(pkey, includePrivateParameters);
++                return ExportExplicitCurveParametersFromEvpPKey(pkey, includePrivateParameters);
+             }
+ 
+             string? curveName = Interop.Crypto.EvpPKeyGetCurveName(pkey);
+ 
+             if (curveName is null)
+             {
+-                return ExportExplicitCurveParametersFromEvpPKeyUsingParams(pkey, includePrivateParameters);
++                // If encoding is not explicit, there should always be a named curve.
++                Debug.Fail("Non-explicit key has no curve name.");
++                return ExportExplicitCurveParametersFromEvpPKey(pkey, includePrivateParameters);
+             }
+ 
+-            return ExportNamedCurveParametersFromEvpPKeyUsingParams(pkey, curveName, includePrivateParameters);
++            return ExportNamedCurveParametersFromEvpPKey(pkey, curveName, includePrivateParameters);
+         }
+ 
+-        private static ECParameters ExportNamedCurveParametersFromEvpPKeyUsingParams(SafeEvpPKeyHandle pkey, string curveName, bool includePrivateParameters)
++        private static ECParameters ExportNamedCurveParametersFromEvpPKey(SafeEvpPKeyHandle pkey, string curveName, bool includePrivateParameters)
+         {
+             Debug.Assert(curveName != null);
+             ECParameters parameters = Interop.Crypto.EvpPKeyGetEcKeyParameters(pkey, includePrivateParameters);
+@@ -152,7 +70,7 @@ private static ECParameters ExportNamedCurveParametersFromEvpPKeyUsingParams(Saf
+             return parameters;
+         }
+ 
+-        private static ECParameters ExportExplicitCurveParametersFromEvpPKeyUsingParams(SafeEvpPKeyHandle pkey, bool includePrivateParameters)
++        private static ECParameters ExportExplicitCurveParametersFromEvpPKey(SafeEvpPKeyHandle pkey, bool includePrivateParameters)
+         {
+             ECParameters parameters = Interop.Crypto.EvpPKeyGetEcCurveParameters(pkey, includePrivateParameters);
+ 
+diff --git a/src/libraries/System.Security.Cryptography/src/System.Security.Cryptography.csproj b/src/libraries/System.Security.Cryptography/src/System.Security.Cryptography.csproj
+index 483f002ea62..aff95c83b5c 100644
+--- a/src/libraries/System.Security.Cryptography/src/System.Security.Cryptography.csproj
++++ b/src/libraries/System.Security.Cryptography/src/System.Security.Cryptography.csproj
+@@ -1007,8 +1007,6 @@
+              Link="Common\Microsoft\Win32\SafeHandles\SafeBioHandle.Unix.cs" />
+     <Compile Include="$(CommonPath)Microsoft\Win32\SafeHandles\SafeDsaHandle.Unix.cs"
+              Link="Common\Microsoft\Win32\SafeHandles\SafeDsaHandle.Unix.cs" />
+-    <Compile Include="$(CommonPath)Microsoft\Win32\SafeHandles\SafeEcKeyHandle.Unix.cs"
+-             Link="Common\Microsoft\Win32\SafeHandles\SafeEcKeyHandle.Unix.cs" />
+     <Compile Include="$(CommonPath)Microsoft\Win32\SafeHandles\SafeEvpCipherCtxHandle.Unix.cs"
+              Link="Common\Microsoft\Win32\SafeHandles\SafeEvpCipherCtxHandle.Unix.cs" />
+     <Compile Include="$(CommonPath)Microsoft\Win32\SafeHandles\SafeEvpKdfHandle.Unix.cs"
+diff --git a/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDiffieHellmanOpenSsl.cs b/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDiffieHellmanOpenSsl.cs
+index 32e1b65bb2d..0b0f54182e3 100644
+--- a/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDiffieHellmanOpenSsl.cs
++++ b/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDiffieHellmanOpenSsl.cs
+@@ -70,19 +70,8 @@ public ECDiffieHellmanOpenSsl(IntPtr handle)
+ 
+             ThrowIfNotSupported();
+ 
+-            using (SafeEcKeyHandle ecKeyHandle = SafeEcKeyHandle.DuplicateHandle(handle))
+-            {
+-                // CreateEvpPkeyFromEcKey already uprefs so nothing else to do
+-                _key = new Lazy<SafeEvpPKeyHandle>(Interop.Crypto.CreateEvpPkeyFromEcKey(ecKeyHandle));
+-            }
+-
+-            int keySize = Interop.Crypto.EvpPKeyGetEcKeySize(_key.Value);
+-
+-            if (keySize == 0)
+-            {
+-                throw new CryptographicException(SR.Cryptography_OpenInvalidHandle);
+-            }
+-
++            SafeEvpPKeyHandle pkey = Interop.Crypto.CreateEvpPkeyFromEcKey(handle, out int keySize);
++            _key = new Lazy<SafeEvpPKeyHandle>(pkey);
+             KeySizeValue = keySize;
+         }
+ 
+diff --git a/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDsaOpenSsl.cs b/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDsaOpenSsl.cs
+index 6719d28d228..2df9216d001 100644
+--- a/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDsaOpenSsl.cs
++++ b/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/ECDsaOpenSsl.cs
+@@ -70,19 +70,8 @@ public ECDsaOpenSsl(IntPtr handle)
+ 
+             ThrowIfNotSupported();
+ 
+-            using (SafeEcKeyHandle ecKeyHandle = SafeEcKeyHandle.DuplicateHandle(handle))
+-            {
+-                // CreateEvpPkeyFromEcKey already uprefs so nothing else to do
+-                _key = new Lazy<SafeEvpPKeyHandle>(Interop.Crypto.CreateEvpPkeyFromEcKey(ecKeyHandle));
+-            }
+-
+-            int keySize = Interop.Crypto.EvpPKeyGetEcKeySize(_key.Value);
+-
+-            if (keySize == 0)
+-            {
+-                throw new CryptographicException(SR.Cryptography_InvalidHandle);
+-            }
+-
++            SafeEvpPKeyHandle pkey = Interop.Crypto.CreateEvpPkeyFromEcKey(handle, out int keySize);
++            _key = new Lazy<SafeEvpPKeyHandle>(pkey);
+             ForceSetKeySize(keySize);
+         }
+ 
+diff --git a/src/native/libs/System.Security.Cryptography.Native/entrypoints.c b/src/native/libs/System.Security.Cryptography.Native/entrypoints.c
+index 97dad905c39..ae5882cd52c 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/entrypoints.c
++++ b/src/native/libs/System.Security.Cryptography.Native/entrypoints.c
+@@ -179,9 +179,8 @@ static const Entry s_cryptoNative[] =
+     DllImportEntry(CryptoNative_EvpPKeyFamily)
+     DllImportEntry(CryptoNative_EvpPKeyFromData)
+     DllImportEntry(CryptoNative_EvpPkeyGetDsa)
+-    DllImportEntry(CryptoNative_EvpPkeyGetEcKey)
+     DllImportEntry(CryptoNative_EvpPkeySetDsa)
+-    DllImportEntry(CryptoNative_EvpPkeySetEcKey)
++    DllImportEntry(CryptoNative_CreateEvpPkeyFromEcKey)
+     DllImportEntry(CryptoNative_EvpPKeyBits)
+     DllImportEntry(CryptoNative_EvpPKeyGetEcKeyParameters)
+     DllImportEntry(CryptoNative_EvpPKeyGetEcGroupNid)
+@@ -206,8 +205,6 @@ static const Entry s_cryptoNative[] =
+     DllImportEntry(CryptoNative_GetAsn1StringBytes)
+     DllImportEntry(CryptoNative_GetBigNumBytes)
+     DllImportEntry(CryptoNative_GetDsaParameters)
+-    DllImportEntry(CryptoNative_GetECCurveParameters)
+-    DllImportEntry(CryptoNative_GetECKeyParameters)
+     DllImportEntry(CryptoNative_GetMaxMdSize)
+     DllImportEntry(CryptoNative_GetMemoryBioSize)
+     DllImportEntry(CryptoNative_GetMemoryUse)
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.c b/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.c
+index 5b862e8e692..b5e90523f96 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.c
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.c
+@@ -167,7 +167,7 @@ static int EcPointGetAffineCoordinates(const EC_GROUP *group, const EC_POINT *p,
+     return EC_POINT_get_affine_coordinates(group, p, x, y, NULL) ? 1 : 0;
+ }
+ 
+-int32_t CryptoNative_GetECKeyParameters(
++static int32_t CryptoNative_GetECKeyParameters(
+     const EC_KEY* key,
+     int32_t includePrivate,
+     const BIGNUM** qx, int32_t* cbQx,
+@@ -243,7 +243,7 @@ error:
+     return rc;
+ }
+ 
+-int32_t CryptoNative_GetECCurveParameters(
++static int32_t CryptoNative_GetECCurveParameters(
+     const EC_KEY* key,
+     int32_t includePrivate,
+     ECCurveType* curveType,
+@@ -654,7 +654,8 @@ int32_t CryptoNative_EvpPKeyGetEcKeySize(EVP_PKEY* pkey)
+     return 0;
+ }
+ 
+-int32_t CryptoNative_EvpPKeyGetEcKeyParameters(
++#ifdef NEED_OPENSSL_3_0
++static int32_t EvpPKeyGetEcKeyParameters(
+     const EVP_PKEY* pkey,
+     int32_t includePrivate,
+     BIGNUM** qx, int32_t* cbQx,
+@@ -668,22 +669,23 @@ int32_t CryptoNative_EvpPKeyGetEcKeyParameters(
+     assert(d != NULL);
+     assert(cbD != NULL);
+ 
++    if (
+ #ifdef FEATURE_DISTRO_AGNOSTIC_SSL
+-    if (!API_EXISTS(EVP_PKEY_get_bn_param) ||
++        !API_EXISTS(EVP_PKEY_get_bn_param) ||
+         !API_EXISTS(EVP_PKEY_get_octet_string_param) ||
+-        !API_EXISTS(EVP_PKEY_get_utf8_string_param))
++        !API_EXISTS(EVP_PKEY_get_utf8_string_param) ||
++        !API_EXISTS(EVP_PKEY_get0_provider) ||
++#endif
++        !EVP_PKEY_get0_provider(pkey))
+     {
+         *cbQx = *cbQy = 0;
+-        *qx = *qy = 0;
+-        if (d) *d = NULL;
+-        if (cbD) *cbD = 0;
+-        return 0;
++        *qx = *qy = NULL;
++        *d = NULL;
++        *cbD = 0;
++        return 2;
+     }
+-#endif
+ 
+     int rc = 0;
+-
+-#ifdef NEED_OPENSSL_3_0
+     BIGNUM *xBn = NULL;
+     BIGNUM *yBn = NULL;
+     BIGNUM *dBn = NULL;
+@@ -809,9 +811,9 @@ int32_t CryptoNative_EvpPKeyGetEcKeyParameters(
+ 
+ error:
+     *cbQx = *cbQy = 0;
+-    *qx = *qy = 0;
+-    if (d) *d = NULL;
+-    if (cbD) *cbD = 0;
++    *qx = *qy = NULL;
++    *d = NULL;
++    *cbD = 0;
+ 
+ exit:
+     if (xBn) BN_free(xBn);
+@@ -824,15 +826,99 @@ exit:
+     if (ecA) BN_free(ecA);
+     if (ecB) BN_free(ecB);
+     return rc;
+-#else
+-    (void)pkey;
+-    (void)includePrivate;
+-    *cbQx = *cbQy = 0;
+-    *qx = *qy = 0;
+-    if (d) *d = NULL;
+-    if (cbD) *cbD = 0;
+-    return 0;
++}
+ #endif
++
++// Legacy path: extract EC_KEY from the EVP_PKEY and use EC_KEY APIs.
++// Returns 1 on success, -1 if private key missing, 0 on failure.
++static int32_t EvpPKeyGetEcKeyParameters_Legacy(
++    EVP_PKEY* pkey,
++    int32_t includePrivate,
++    BIGNUM** qx, int32_t* cbQx,
++    BIGNUM** qy, int32_t* cbQy,
++    BIGNUM** d, int32_t* cbD)
++{
++    EC_KEY* ecKey = EVP_PKEY_get1_EC_KEY(pkey);
++    if (!ecKey)
++        return 0;
++
++    const BIGNUM* qxBorrowed = NULL;
++    const BIGNUM* qyBorrowed = NULL;
++    const BIGNUM* dBorrowed = NULL;
++    int32_t cbQxLocal = 0, cbQyLocal = 0, cbDLocal = 0;
++
++    int32_t result = CryptoNative_GetECKeyParameters(
++        ecKey, includePrivate,
++        &qxBorrowed, &cbQxLocal,
++        &qyBorrowed, &cbQyLocal,
++        &dBorrowed, &cbDLocal);
++
++    if (result == 1)
++    {
++        // CryptoNative_GetECKeyParameters returns newly allocated BIGNUMs for qx/qy,
++        // and a borrowed pointer for d. Transfer qx/qy ownership and dup d.
++        *qx = (BIGNUM*)(uintptr_t)qxBorrowed;
++        *cbQx = cbQxLocal;
++        *qy = (BIGNUM*)(uintptr_t)qyBorrowed;
++        *cbQy = cbQyLocal;
++
++        if (includePrivate && dBorrowed)
++        {
++            *d = BN_dup(dBorrowed);
++            if (*d == NULL)
++            {
++                BN_free(*qx);
++                BN_free(*qy);
++                *qx = *qy = NULL;
++                *cbQx = *cbQy = 0;
++                *d = NULL;
++                *cbD = 0;
++                EC_KEY_free(ecKey);
++                return 0;
++            }
++            *cbD = cbDLocal;
++        }
++        else
++        {
++            *d = NULL;
++            *cbD = 0;
++        }
++    }
++    else
++    {
++        *qx = *qy = NULL;
++        *cbQx = *cbQy = 0;
++        *d = NULL;
++        *cbD = 0;
++    }
++
++    EC_KEY_free(ecKey);
++    return result;
++}
++
++// Driver function: tries the OpenSSL 3.0 provider-based API first, then falls back
++// to the legacy EC_KEY path. Returns 1 on success, -1 if private key missing, 0 on failure.
++int32_t CryptoNative_EvpPKeyGetEcKeyParameters(
++    EVP_PKEY* pkey,
++    int32_t includePrivate,
++    BIGNUM** qx, int32_t* cbQx,
++    BIGNUM** qy, int32_t* cbQy,
++    BIGNUM** d, int32_t* cbD)
++{
++    assert(qx != NULL);
++    assert(cbQx != NULL);
++    assert(qy != NULL);
++    assert(cbQy != NULL);
++    assert(d != NULL);
++    assert(cbD != NULL);
++
++#ifdef NEED_OPENSSL_3_0
++    int32_t rc = EvpPKeyGetEcKeyParameters(pkey, includePrivate, qx, cbQx, qy, cbQy, d, cbD);
++    if (rc != 2)
++        return rc;
++#endif
++
++    return EvpPKeyGetEcKeyParameters_Legacy(pkey, includePrivate, qx, cbQx, qy, cbQy, d, cbD);
+ }
+ 
+ EC_KEY* CryptoNative_EcKeyCreateByExplicitParameters(
+@@ -1009,11 +1095,8 @@ static ECCurveType NIDToCurveType(int fieldType)
+     return Unspecified;
+ }
+ 
+-#ifdef NEED_OPENSSL_3_0
+-// Extracts EC curve parameters from a legacy EC_KEY-backed EVP_PKEY by getting
+-// the EC_KEY and delegating to CryptoNative_GetECCurveParameters.
+-// On success, the caller owns the returned BIGNUMs and must free them.
+-static int32_t EvpPKeyGetEcCurveParameters_FromEcKey(
++// Legacy path: extract EC_KEY from the EVP_PKEY and use EC_KEY APIs for curve params.
++static int32_t EvpPKeyGetEcCurveParameters_Legacy(
+     EVP_PKEY* pkey,
+     int32_t includePrivate,
+     ECCurveType* curveType,
+@@ -1033,8 +1116,6 @@ static int32_t EvpPKeyGetEcCurveParameters_FromEcKey(
+     if (!ecKey)
+         return 0;
+ 
+-    // CryptoNative_GetECCurveParameters returns freshly-allocated BIGNUMs for everything
+-    // except d, which is a borrowed reference into the EC_KEY (EC_KEY_get0_private_key).
+     const BIGNUM* qxOwned = NULL;
+     const BIGNUM* qyOwned = NULL;
+     const BIGNUM* dBorrowed = NULL;
+@@ -1063,7 +1144,6 @@ static int32_t EvpPKeyGetEcCurveParameters_FromEcKey(
+ 
+     if (rc == 1)
+     {
+-        // Transfer ownership of the allocated BIGNUMs (cast away const via uintptr_t to avoid -Wcast-qual).
+         *qx = (BIGNUM*)(uintptr_t)qxOwned;
+         *qy = (BIGNUM*)(uintptr_t)qyOwned;
+         *p = (BIGNUM*)(uintptr_t)pOwned;
+@@ -1075,7 +1155,6 @@ static int32_t EvpPKeyGetEcCurveParameters_FromEcKey(
+         *cofactor = (BIGNUM*)(uintptr_t)cofactorOwned;
+         *seed = (BIGNUM*)(uintptr_t)seedOwned;
+ 
+-        // d is borrowed from the EC_KEY, so we must duplicate before EC_KEY_free below.
+         if (includePrivate && dBorrowed)
+         {
+             *d = BN_dup(dBorrowed);
+@@ -1086,7 +1165,7 @@ static int32_t EvpPKeyGetEcCurveParameters_FromEcKey(
+                 if (*seed) BN_free(*seed);
+                 *qx = *qy = *p = *a = *b = *gx = *gy = *order = *cofactor = *seed = NULL;
+                 *cbQx = *cbQy = *cbP = *cbA = *cbB = *cbGx = *cbGy = *cbOrder = *cbCofactor = *cbSeed = 0;
+-                if (cbD) *cbD = 0;
++                *cbD = 0;
+                 rc = 0;
+             }
+         }
+@@ -1099,9 +1178,9 @@ static int32_t EvpPKeyGetEcCurveParameters_FromEcKey(
+     EC_KEY_free(ecKey);
+     return rc;
+ }
+-#endif
+ 
+-int32_t CryptoNative_EvpPKeyGetEcCurveParameters(
++#ifdef NEED_OPENSSL_3_0
++static int32_t EvpPKeyGetEcCurveParameters(
+     EVP_PKEY* pkey,
+     int32_t includePrivate,
+     ECCurveType* curveType,
+@@ -1134,35 +1213,32 @@ int32_t CryptoNative_EvpPKeyGetEcCurveParameters(
+     assert(seed != NULL);
+     assert(cbSeed != NULL);
+ 
++    // For legacy EC_KEY-backed EVP_PKEYs, the OSSL 3.0 params API (get_bn_param etc.)
++    // does not expose curve parameters. Signal to caller to use legacy path.
++    if (
+ #ifdef FEATURE_DISTRO_AGNOSTIC_SSL
+-    if (!API_EXISTS(EC_GROUP_get_field_type) ||
++        !API_EXISTS(EC_GROUP_get_field_type) ||
+         !API_EXISTS(EVP_PKEY_get_octet_string_param) ||
+         !API_EXISTS(EVP_PKEY_get_utf8_string_param) ||
+         !API_EXISTS(EVP_PKEY_get_bn_param) ||
+-        !API_EXISTS(EVP_PKEY_get0_provider))
+-    {
+-        return 0;
+-    }
++        !API_EXISTS(EVP_PKEY_get0_provider) ||
+ #endif
+-
+-#ifdef NEED_OPENSSL_3_0
+-    // For legacy EC_KEY-backed EVP_PKEYs, the OSSL 3.0 params API (get_bn_param etc.)
+-    // does not expose curve parameters. Use EC_KEY APIs directly instead.
+-    if (!EVP_PKEY_get0_provider(pkey))
++        !EVP_PKEY_get0_provider(pkey))
+     {
+-        return EvpPKeyGetEcCurveParameters_FromEcKey(
+-            pkey, includePrivate, curveType,
+-            qx, cbQx, qy, cbQy, d, cbD,
+-            p, cbP, a, cbA, b, cbB,
+-            gx, cbGx, gy, cbGy,
+-            order, cbOrder, cofactor, cbCofactor,
+-            seed, cbSeed);
++        *cbQx = *cbQy = 0;
++        *qx = *qy = NULL;
++        *d = NULL;
++        *cbD = 0;
++        *curveType = Unspecified;
++        *cbP = *cbA = *cbB = *cbGx = *cbGy = *cbOrder = *cbCofactor = *cbSeed = 0;
++        *p = *a = *b = *gx = *gy = *order = *cofactor = *seed = NULL;
++        return 2;
+     }
+ 
+     ERR_clear_error();
+ 
+     // Provider-backed key: use OSSL 3.0 params API
+-    int32_t rc = CryptoNative_EvpPKeyGetEcKeyParameters(pkey, includePrivate, qx, cbQx, qy, cbQy, d, cbD);
++    int32_t rc = EvpPKeyGetEcKeyParameters(pkey, includePrivate, qx, cbQx, qy, cbQy, d, cbD);
+ 
+     EC_POINT* G = NULL;
+     BIGNUM* xBn = BN_new();
+@@ -1180,7 +1256,7 @@ int32_t CryptoNative_EvpPKeyGetEcCurveParameters(
+     int curveTypeNID;
+     int fieldTypeNID;
+ 
+-    // Exit if CryptoNative_EvpPKeyGetEcKeyParameters failed
++    // Exit if EvpPKeyGetEcKeyParameters failed
+     if (rc != 1)
+         goto error;
+ 
+@@ -1318,7 +1394,7 @@ int32_t CryptoNative_EvpPKeyGetEcCurveParameters(
+     goto exit;
+ 
+ error:
+-    // Clear out variables from CryptoNative_EvpPKeyGetEcKeyParameters
++    // Clear out variables from EvpPKeyGetEcKeyParameters
+     if (*qx) BN_free((BIGNUM*)*qx);
+     if (*qy) BN_free(*qy);
+     if (d && *d) BN_clear_free(*d);
+@@ -1349,18 +1425,63 @@ exit:
+     if (seedBuffer) OPENSSL_free(seedBuffer);
+ 
+     return rc;
+-#else
+-    (void)pkey;
+-    (void)includePrivate;
+-    *cbQx = *cbQy = 0;
+-    *qx = *qy = NULL;
+-    if (d) *d = NULL;
+-    if (cbD) *cbD = 0;
+-    *curveType = Unspecified;
+-    *cbP = *cbA = *cbB = *cbGx = *cbGy = *cbOrder = *cbCofactor = *cbSeed = 0;
+-    *p = *a = *b = *gx = *gy = *order = *cofactor = *seed = NULL;
+-    return 0;
++}
++#endif
++
++// Driver function: tries the OpenSSL 3.0 provider-based API first, then falls back
++// to the legacy EC_KEY path. Returns 1 on success, -1 if private key missing, 0 on failure.
++int32_t CryptoNative_EvpPKeyGetEcCurveParameters(
++    EVP_PKEY* pkey,
++    int32_t includePrivate,
++    ECCurveType* curveType,
++    BIGNUM** qx, int32_t* cbQx,
++    BIGNUM** qy, int32_t* cbQy,
++    BIGNUM** d, int32_t* cbD,
++    BIGNUM** p, int32_t* cbP,
++    BIGNUM** a, int32_t* cbA,
++    BIGNUM** b, int32_t* cbB,
++    BIGNUM** gx, int32_t* cbGx,
++    BIGNUM** gy, int32_t* cbGy,
++    BIGNUM** order, int32_t* cbOrder,
++    BIGNUM** cofactor, int32_t* cbCofactor,
++    BIGNUM** seed, int32_t* cbSeed)
++{
++    assert(p != NULL);
++    assert(cbP != NULL);
++    assert(a != NULL);
++    assert(cbA != NULL);
++    assert(b != NULL);
++    assert(cbB != NULL);
++    assert(gx != NULL);
++    assert(cbGx != NULL);
++    assert(gy != NULL);
++    assert(cbGy != NULL);
++    assert(order != NULL);
++    assert(cbOrder != NULL);
++    assert(cofactor != NULL);
++    assert(cbCofactor != NULL);
++    assert(seed != NULL);
++    assert(cbSeed != NULL);
++
++#ifdef NEED_OPENSSL_3_0
++    int32_t rc = EvpPKeyGetEcCurveParameters(
++        pkey, includePrivate, curveType,
++        qx, cbQx, qy, cbQy, d, cbD,
++        p, cbP, a, cbA, b, cbB,
++        gx, cbGx, gy, cbGy,
++        order, cbOrder, cofactor, cbCofactor,
++        seed, cbSeed);
++    if (rc != 2)
++        return rc;
+ #endif
++
++    return EvpPKeyGetEcCurveParameters_Legacy(
++        pkey, includePrivate, curveType,
++        qx, cbQx, qy, cbQy, d, cbD,
++        p, cbP, a, cbA, b, cbB,
++        gx, cbGx, gy, cbGy,
++        order, cbOrder, cofactor, cbCofactor,
++        seed, cbSeed);
+ }
+ 
+ #ifdef NEED_OPENSSL_1_1
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.h b/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.h
+index 084b6166cc8..95280504d31 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.h
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_ecc_import_export.h
+@@ -15,35 +15,6 @@ typedef enum
+ } ECCurveType;
+ 
+ 
+-/*
+-Returns the ECC key parameters.
+-*/
+-PALEXPORT int32_t CryptoNative_GetECKeyParameters(
+-    const EC_KEY* key,
+-    int32_t includePrivate,
+-    const BIGNUM** qx, int32_t* cbQx,
+-    const BIGNUM** qy, int32_t* cbQy,
+-    const BIGNUM** d, int32_t* cbD);
+-
+-/*
+-Returns the ECC key and curve parameters.
+-*/
+-PALEXPORT int32_t CryptoNative_GetECCurveParameters(
+-    const EC_KEY* key,
+-    int32_t includePrivate,
+-    ECCurveType* curveType,
+-    const BIGNUM** qx, int32_t* cbx,
+-    const BIGNUM** qy, int32_t* cby,
+-    const BIGNUM** d, int32_t* cbd,
+-    const BIGNUM** p, int32_t* cbP,
+-    const BIGNUM** a, int32_t* cbA,
+-    const BIGNUM** b, int32_t* cbB,
+-    const BIGNUM** gx, int32_t* cbGx,
+-    const BIGNUM** gy, int32_t* cbGy,
+-    const BIGNUM** order, int32_t* cbOrder,
+-    const BIGNUM** cofactor, int32_t* cbCofactor,
+-    const BIGNUM** seed, int32_t* cbSeed);
+-
+ /*
+ Creates the new EC_KEY instance using the curve oid (friendly name or value) and public key parameters.
+ Returns 1 upon success, -1 if oid was not found, otherwise 0.
+@@ -64,10 +35,11 @@ PALEXPORT int32_t CryptoNative_EvpPKeyGetEcGroupNid(EVP_PKEY *pkey, int32_t* nid
+ 
+ /*
+ Returns the EC key parameters (public coordinates and optional private key) from the given EVP_PKEY.
++Internally dispatches between OpenSSL 3.0 provider API and legacy EC_KEY API.
+ Returns 1 upon success, -1 if includePrivate is set but the key has no private component, otherwise 0.
+ */
+ PALEXPORT int32_t CryptoNative_EvpPKeyGetEcKeyParameters(
+-    const EVP_PKEY* pkey,
++    EVP_PKEY* pkey,
+     int32_t includePrivate,
+     BIGNUM** qx, int32_t* cbQx,
+     BIGNUM** qy, int32_t* cbQy,
+@@ -155,6 +127,7 @@ PALEXPORT int32_t CryptoNative_EvpPKeyCreateByEcExplicitParameters(
+ 
+ /*
+ Returns the ECC curve parameters of the given EVP_PKEY.
++Internally dispatches between OpenSSL 3.0 provider API and legacy EC_KEY API.
+ Returns 1 upon success, -1 if includePrivate is set but the key has no private component, otherwise 0.
+ */
+ PALEXPORT int32_t CryptoNative_EvpPKeyGetEcCurveParameters(
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.c b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.c
+index e7c4389b053..847d931efca 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.c
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.c
+@@ -2,15 +2,37 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ #include "pal_evp_pkey_eckey.h"
++#include "pal_ecc_import_export.h"
+ 
+-EC_KEY* CryptoNative_EvpPkeyGetEcKey(EVP_PKEY* pkey)
+-{
+-    ERR_clear_error();
+-    return EVP_PKEY_get1_EC_KEY(pkey);
+-}
++#include <assert.h>
+ 
+-int32_t CryptoNative_EvpPkeySetEcKey(EVP_PKEY* pkey, EC_KEY* key)
++EVP_PKEY* CryptoNative_CreateEvpPkeyFromEcKey(EC_KEY* ecKey, int32_t* outKeySize)
+ {
++    assert(ecKey != NULL);
++    assert(outKeySize != NULL);
++
+     ERR_clear_error();
+-    return EVP_PKEY_set1_EC_KEY(pkey, key);
++
++    *outKeySize = 0;
++
++    EVP_PKEY* pkey = EVP_PKEY_new();
++    if (!pkey)
++        return NULL;
++
++    // EVP_PKEY_set1_EC_KEY up-refs the EC_KEY internally.
++    if (!EVP_PKEY_set1_EC_KEY(pkey, ecKey))
++    {
++        EVP_PKEY_free(pkey);
++        return NULL;
++    }
++
++    int32_t keySize = CryptoNative_EvpPKeyGetEcKeySize(pkey);
++    if (keySize == 0)
++    {
++        EVP_PKEY_free(pkey);
++        return NULL;
++    }
++
++    *outKeySize = keySize;
++    return pkey;
+ }
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.h b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.h
+index 6777e76e810..0d94b677d64 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.h
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_eckey.h
+@@ -6,16 +6,10 @@
+ #include "opensslshim.h"
+ 
+ /*
+-Shims the EVP_PKEY_get1_EC_KEY method.
++Creates a new EVP_PKEY from a raw EC_KEY pointer.
++The EC_KEY is duplicated (up-ref'd) so the caller retains ownership of the input.
++Also computes and returns the EC key size via outKeySize (may be NULL).
+ 
+-Returns the EC_KEY instance for the EVP_PKEY.
++Returns a new EVP_PKEY* on success, or NULL on failure (including if key size is 0).
+ */
+-PALEXPORT EC_KEY* CryptoNative_EvpPkeyGetEcKey(EVP_PKEY* pkey);
+-
+-/*
+-Shims the EVP_PKEY_set1_EC_KEY method to set the EC_KEY
+-instance on the EVP_KEY.
+-
+-Returns 1 upon success, otherwise 0.
+-*/
+-PALEXPORT int32_t CryptoNative_EvpPkeySetEcKey(EVP_PKEY* pkey, EC_KEY* key);
++PALEXPORT EVP_PKEY* CryptoNative_CreateEvpPkeyFromEcKey(EC_KEY* ecKey, int32_t* outKeySize);
+-- 
+2.53.0
+

@@ -1,0 +1,117 @@
+package:
+  name: py3.14-protobuf
+  version: "7.36.1"
+  epoch: 0
+  description: protobuf installed for python3.14
+  copyright:
+    - license: BSD-3-Clause
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+vars:
+  bazel-version: '8'
+  llvm-version: '22'
+  java-version: '25'
+  pypi-package: 'protobuf'
+  import: 'google.protobuf'
+  python-version: "3.14"
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^\d+\.(.+)$
+    replace: "$1"
+    to: protobuf-tag-version
+
+environment:
+  contents:
+    packages:
+      - bash
+      - bazel-${{vars.bazel-version}}
+      - build-base
+      - busybox
+      - clang-${{vars.llvm-version}}
+      - glibc-2.44-dev
+      - openjdk-${{vars.java-version}}-default-jdk
+      - py${{vars.python-version}}-build-base-dev
+  environment:
+    CC: clang-${{vars.llvm-version}}
+    CXX: clang++-${{vars.llvm-version}}
+    JAVA_HOME: /usr/lib/jvm/java-${{vars.java-version}}-openjdk
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/protocolbuffers/protobuf
+      tag: v${{vars.protobuf-tag-version}}
+      expected-commit: f377bfefc5e2cfab68b816903c25b23e091c439d
+
+  - name: Build sdist
+    runs: |
+      # Provide python3 in path
+      # The bazel system_python extension probes for python3
+      tmpd=$(mktemp -d)
+      ln -s /usr/bin/python${{vars.python-version}} "$tmpd/python3"
+
+      # Build sdist
+      env PATH="$tmpd:$PATH" \
+          bazel build --jobs=$(nproc) \
+            --experimental_repository_downloader_retries=3 \
+            //python/dist:source_wheel
+      bazel shutdown
+
+      # Extract sdist
+      mkdir sdist
+      tar -C sdist -xzf bazel-bin/python/dist/protobuf-*.tar.gz --strip-components=1
+
+  # The upstream code enables aarch64-specific optimizations, which later will segfault in our tests
+  # because illegal CPU instructions are being used. I guess this is because different arm64 instructions extensions are
+  # embedded in the code compared to what most arm64 CPU could run.
+  # Disable the arm64-optimized ASM, and hope the non-optimized version can run just fine and not cause other problems.
+  # Before this change, functions call would be:
+  #   encode_varint() --> encode_longvarint_arm64()
+  # After this change, it would be:
+  #   encode_varint() --> encode_longvarint()
+  - if: ${{build.arch}} == "aarch64"
+    name: Disable aarch64 ASM optimizations
+    working-directory: sdist
+    runs: |
+      find . -type f -name "*.c" -o -name "*.h" | xargs sed -i 's/#ifdef UPB_ARM64_ASM/#if 0/g'
+
+  - uses: py/pip-build-install
+    working-directory: sdist
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: strip
+
+test:
+  pipeline:
+    - uses: test/tw/pip-check
+      with:
+        python: python${{vars.python-version}}
+    - uses: python/import
+      with:
+        python: python${{vars.python-version}}
+        imports: |
+          import ${{vars.import}}
+          from google.protobuf import descriptor_pool, timestamp_pb2
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - ".*-dev$"
+    - ".*-rc.*$"
+    - ".*-alpha.*$"
+    - ".*-beta.*$"
+  version-transform:
+    - match: ^(.+)$
+      replace: "7.$1"
+  github:
+    identifier: protocolbuffers/protobuf
+    strip-prefix: v
+    use-tag: true
+    tag-filter-prefix: v

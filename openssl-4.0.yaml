@@ -1,0 +1,347 @@
+package:
+  name: openssl-4.0
+  version: "4.0.2"
+  epoch: 0
+  description: "the OpenSSL cryptography suite"
+  copyright:
+    - license: Apache-2.0
+  cpe:
+    vendor: openssl
+    product: openssl
+  resources:
+    cpu: "10"
+    memory: 7Gi
+  test-resources:
+    cpu: "3"
+    memory: 4Gi
+
+environment:
+  contents:
+    packages:
+      - brotli-dev
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - glibc-2.44-dev
+      - perl
+  environment:
+    # To support automatic discovery of source code in debug symbols
+    # packaged in openssl-dbg, build with debug symbols &
+    # file-prefix-map. Also see "Create dbg sourcecode" and
+    # split/debug.
+    CFLAGS: "-g -ffile-prefix-map=/home/build=/usr/src/${{package.name}}"
+
+var-transforms:
+  - from: ${{package.version}}
+    match: (\d+\.\d+).*
+    replace: $1
+    to: major-version
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/openssl/openssl
+      tag: openssl-${{package.version}}
+      expected-commit: f089acdf4bc7ba94a79f4bf6eb7362c3e7d14aa9
+
+  - uses: patch
+    with:
+      patches: |
+        0001-fips-block-HMAC-calculation-with-unapproved-digests.patch
+        0001-fips-retain-FIPS-140-2-TLSv1.2-connectivity.patch
+        0001-Remove-pre-share-from-default-TLS-groups.patch
+        0001-Chainguard-Cryptographic-Hardening.patch
+
+  - name: Configure and build
+    runs: |
+      perl ./Configure \
+         --prefix=/usr \
+         --libdir=lib \
+         --openssldir=/etc/ssl \
+         enable-brotli \
+         enable-ec_nistp_64_gcc_128 \
+         enable-ktls \
+         enable-pie \
+         no-aria \
+         enable-bf \
+         enable-camellia \
+         enable-cast \
+         no-dtls1 \
+         no-ec_explicit_curves \
+         no-ec2m \
+         no-gost \
+         no-idea \
+         no-integrity-only-ciphers \
+         no-mdc2 \
+         enable-ocb \
+         enable-psk \
+         no-pvkkdf \
+         enable-rc2 \
+         enable-rc4 \
+         enable-rc5 \
+         enable-rmd160 \
+         no-seed \
+         no-sm2 \
+         no-sm2-precomp \
+         enable-sm3 \
+         no-sm4 \
+         enable-srp \
+         no-tls1 \
+         no-tls1_1 \
+         no-weak-ssl-ciphers \
+         no-whirlpool \
+         -Wa,--noexecstack
+      perl configdata.pm --dump
+
+      # Create generated .c from .c.in
+      make build_all_generated
+
+      # Create debug sources after creating all the generated .c from .c.in
+      SRCDIR=$(mktemp -d)
+      cp -r . $SRCDIR/
+      mkdir -p ${{targets.destdir}}-dbg/usr/src/
+      mv $SRCDIR ${{targets.destdir}}-dbg/usr/src/${{package.name}}
+      # Note that mktemp -d created it as 700, whilst the contents
+      # inside is 644 for files and 755 for dirs, without this gdb
+      # doesn't work for non-root user, fix this up.
+      chmod 755 ${{targets.destdir}}-dbg/usr/src/${{package.name}}
+
+      # Continue building everything
+      make -j$(nproc)
+
+  - uses: autoconf/make-install
+
+  - name: Run full tests, without Chainguard Cryptographic Hardening patches
+    runs: |
+      patch -p1 -R < 0001-Chainguard-Cryptographic-Hardening.patch
+      patch -p1 -R < 0001-Remove-pre-share-from-default-TLS-groups.patch
+
+      # Test-suite wants multiple jobs, but can deadlock if there are
+      # too many, thus run with fixed 10
+      make tests HARNESS_JOBS=10
+
+  - runs: |
+      # Effectively no-op config file, which matches fallback behaviour
+      # The CA cert generation options are not fit for any certs
+      rm ${{targets.destdir}}/etc/ssl/openssl.cnf
+      # Second identical copy of the above
+      rm ${{targets.destdir}}/etc/ssl/openssl.cnf.dist
+      # Empty CT log
+      rm ${{targets.destdir}}/etc/ssl/ct_log_list.cnf
+      # Second copy of CT log
+      rm ${{targets.destdir}}/etc/ssl/ct_log_list.cnf.dist
+      # Keeping etc/ssl/misc CA.pl & tsget perl scripts
+      # without depending on perl
+      rm ${{targets.destdir}}/usr/lib/ossl-modules/legacy.so
+
+      # strip omitted: because we use split/debug to ship debug symbols for certification
+
+subpackages:
+  - name: "${{package.name}}-dbg"
+    description: "OpenSSL debug symbols"
+    pipeline:
+      - uses: split/debug
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}
+            - gdb
+      pipeline:
+        - uses: test/tw/debugpackage
+        - name: Test gdb usage
+          runs: |
+            # Possibly python gdb would be easier to read
+            cat <<EOF >openssl.gdb
+            set pagination off
+            set logging file gdb.log
+            set logging enabled on
+            set width 0
+            set height 0
+            set verbose on
+            set breakpoint pending on
+            break syscall_random
+            commands 1
+              continue
+            end
+            run rand -hex 8
+            EOF
+            gdb --batch --command ./openssl.gdb openssl
+            # Assert that breakpoint worked
+            grep -q 'Breakpoint 1,' gdb.log || exit 1
+
+  - name: "${{package.name}}-doc"
+    description: "OpenSSL documentation"
+    pipeline:
+      - uses: split/manpages
+      - runs: |
+          mv "${{targets.destdir}}"/usr/share/doc "${{targets.subpkgdir}}"/usr/share
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+  - name: "${{package.name}}-dev"
+    description: "OpenSSL headers"
+    pipeline:
+      - uses: split/dev
+    options:
+      # To prevent un-coordinated pc:libcrypto resolution upgrades
+      no-provides: true
+      no-depends: true
+    dependencies:
+      runtime:
+        - so:libcrypto.so.4
+        - so:libssl.so.4
+    test:
+      pipeline:
+        - uses: test/tw/devpackage
+        - uses: test/pkgconf
+        - uses: test/tw/ldd-check
+
+  - name: "${{package.name}}-libcrypto"
+    description: "OpenSSL libcrypto library"
+    dependencies:
+      runtime:
+        - openssl-provider-legacy-allowed
+      replaces:
+        - libcrypto3
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libcrypto.so.* "${{targets.subpkgdir}}"/usr/lib
+          # Provide our hardened configuration for ca & req apps
+          mkdir -p "${{targets.contextdir}}"/etc/ssl
+          cp openssl.cnf ca.cnf ${{targets.contextdir}}/etc/ssl/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: "${{package.name}}-libssl"
+    description: "OpenSSL libssl library"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libssl.so.* "${{targets.subpkgdir}}"/usr/lib
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+test:
+  environment:
+    contents:
+      packages:
+        - curl
+        - git
+        - wget
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/hardening-check
+      with:
+        package-match: |-
+          ${{package.name}}$
+          ${{package.name}}-libcrypto$
+          ${{package.name}}-libssl$
+    - runs: |
+        openssl --version
+        openssl --help
+    - name: Measure the size of the first ClientHello
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/clienthello
+          openssl req -x509 -newkey rsa:2048 -noenc -days 1 \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -keyout /tmp/clienthello/server.key \
+            -out /tmp/clienthello/server.crt
+        start: /usr/bin/openssl s_server -accept 127.0.0.1:4433 -naccept 10 -www -cert /tmp/clienthello/server.crt -key /tmp/clienthello/server.key
+        # s_server prints this once the listening socket is bound.
+        expected_output: ACCEPT
+        post: |
+          # A ClientHello that does not fit into a single TCP segment gets
+          # silently dropped by some middleboxes, AWS Network Firewall among
+          # them. An IPv6 header (40 bytes) and a TCP header with options (32
+          # bytes) leave 1428 bytes of a 1500 byte MTU, so keep margin below
+          # that.
+          max_clienthello=1400
+
+          # Handshake against the local server with every record dumped, then
+          # report how big the first ClientHello was. -msg prints the length
+          # of the handshake message, e.g.
+          #   >>> TLS 1.3, Handshake [length 0111], ClientHello
+          # to which the 5 byte TLS record header is added for the size that
+          # actually goes out on the wire.
+          clienthello_size() {
+            log=/tmp/clienthello/client.log
+            OPENSSL_CONF="$1" openssl s_client -connect 127.0.0.1:4433 \
+              -servername localhost -CAfile /tmp/clienthello/server.crt -msg \
+              </dev/null >"$log" 2>&1
+            grep -q "Verify return code: 0 (ok)" "$log"
+            hexlen=$(sed -n '/^>>> TLS.*, Handshake \[length .*\], ClientHello$/ {
+                       s/.*\[length \([0-9a-f]*\)\].*/\1/p; q; }' "$log")
+            if [ -z "$hexlen" ]; then
+              echo "no ClientHello found in s_client -msg output" >&2
+              cat "$log" >&2
+              return 1
+            fi
+            echo $((0x$hexlen + 5))
+          }
+
+          # What everything linked against libssl gets, by way of the
+          # openssl.cnf shipped in libcrypto3.
+          size="$(clienthello_size /etc/ssl/openssl.cnf)"
+          echo "first ClientHello with /etc/ssl/openssl.cnf: $size bytes"
+          [ "$size" -le "$max_clienthello" ]
+
+          # And what applications opting out of the system configuration get
+          # from the group list compiled into libssl.
+          size="$(clienthello_size /dev/null)"
+          echo "first ClientHello with built-in defaults: $size bytes"
+          [ "$size" -le "$max_clienthello" ]
+    - name: Verify curl still works
+      runs: |
+        curl -I https://github.com/openssl/openssl
+        ! curl https://expired.badssl.com/
+        curl --http3-only -s -o /dev/null https://cloudflare-quic.com/
+    - name: Verify git still works
+      runs: |
+        git ls-remote --exit-code https://github.com/openssl/openssl refs/tags/openssl-${{package.version}}
+    - name: Verify wget still works
+      runs: |
+        wget -O /dev/null https://github.com/openssl/openssl
+        ! wget https://expired.badssl.com/
+    - name: docker-dind certificate generation
+      runs: |
+        # Distilled from dockerd-entrypoint.sh
+        set -x
+        tmpdir="$(mktemp -d)"
+        trap "rm -rf "$tmpdir"" EXIT
+        rm -rf "$tmpdir/certs/"
+        mkdir -p "$tmpdir/certs/ca"
+        openssl genrsa -out "$tmpdir/certs/ca/key.pem" 4096
+        openssl req -new -key "$tmpdir/certs/ca/key.pem" \
+          -out "$tmpdir/certs/ca/cert.pem" -subj '/CN=docker:dind CA' \
+          -x509 -days 825
+        mkdir -p "$tmpdir/certs/server"
+        openssl genrsa -out "$tmpdir/certs/server/key.pem" 4096
+        openssl req -new -key "$tmpdir/certs/server/key.pem" \
+          -out "$tmpdir/certs/server/csr.pem" -subj '/CN=docker:dind server'
+        cat << EOF >"$tmpdir/certs/server/openssl.cnf"
+        [ x509_exts ]
+        subjectAltName = DNS:b51ddd7b8dcd,DNS:docker,DNS:localhost,IP:127.0.0.1,IP:172.17.0.4,IP:::1
+        EOF
+        openssl x509 -req -in "$tmpdir/certs/server/csr.pem"\
+          -CA "$tmpdir/certs/ca/cert.pem" -CAkey "$tmpdir/certs/ca/key.pem" \
+          -CAcreateserial -out "$tmpdir/certs/server/cert.pem" \
+          -days 825 -extfile "$tmpdir/certs/server/openssl.cnf" \
+          -extensions x509_exts
+        cp "$tmpdir/certs/ca/cert.pem" "$tmpdir/certs/server/ca.pem"
+        openssl verify -CAfile "$tmpdir/certs/server/ca.pem" \
+          "$tmpdir/certs/server/cert.pem"
+
+update:
+  enabled: true
+  github:
+    identifier: openssl/openssl
+    strip-prefix: openssl-
+    tag-filter-prefix: openssl-4.0.

@@ -183,11 +183,29 @@ kernel/%/linux.apk: kernel/%/chosen
 	@$(call authget,apk.cgr.dev,$@,$(QEMU_KERNEL_REPO)/$*/linux-qemu-melange-$(shell cat kernel/$*/chosen).apk)
 
 kernel/%/vmlinuz: kernel/%/linux.apk
-	tmpd=kernel/.$$$$ && mkdir -p $$tmpd $(dir $@) && \
-		tar -x -C $$tmpd -f $< boot/ 2> /dev/null && \
-		[ -f $$tmpd/boot/vmlinuz ] && mv $$tmpd/boot/* $(dir $@) && \
-		rc=$$?; rm -Rf $$tmpd; exit $$rc
-	touch $@
+	# Guest kernels install to usr/lib/chainguard/guest-kernels/<flavor>/,
+	# not /boot -- see pipelines/kernel/install.yaml. vmlinuz there is a
+	# symlink to kernel.image, so copy the image to get a real file.
+	# cp gives the target a current mtime, so it stays newer than the
+	# .apk it came from and make does not re-extract on every run.
+	# --warning=no-unknown-keyword silences apk's own
+	# APK-TOOLS.checksum.SHA1 headers and nothing else.
+	tmpd=kernel/.$$$$; \
+	rel=usr/lib/chainguard/guest-kernels/qemu/kernel.image; \
+	mkdir -p $$tmpd $(dir $@); \
+	tar --warning=no-unknown-keyword -x -C $$tmpd -f $< usr/lib/chainguard/guest-kernels/; rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+		if [ -f "$$tmpd/$$rel" ]; then \
+			cp "$$tmpd/$$rel" $@.tmp && mv $@.tmp $@; rc=$$?; \
+		else \
+			echo "ERROR: no qemu guest kernel in $< (looked for $$rel)" >&2; \
+			rc=1; \
+		fi; \
+	else \
+		echo "ERROR: $< has no usr/lib/chainguard/guest-kernels/ tree" >&2; \
+	fi; \
+	rm -Rf $$tmpd; \
+	exit $$rc
 
 yamls := $(wildcard *.yaml)
 pkgs := $(subst .yaml,,$(yamls))

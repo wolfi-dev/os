@@ -188,12 +188,15 @@ kernel/%/vmlinuz: kernel/%/linux.apk
 	# symlink to kernel.image, so copy the image to get a real file.
 	# cp gives the target a current mtime, so it stays newer than the
 	# .apk it came from and make does not re-extract on every run.
-	# --warning=no-unknown-keyword silences apk's own
-	# APK-TOOLS.checksum.SHA1 headers and nothing else.
+	# Do not suppress tar's stderr here. GNU tar warns about apk's own
+	# APK-TOOLS.checksum.SHA1 pax headers; they are harmless and do not
+	# affect exit status, and hiding them also hid the error naming the
+	# missing path -- see a705fd9. --warning=... is GNU-only and BSD tar
+	# (macOS /usr/bin/tar) rejects it outright.
 	tmpd=kernel/.$$$$; \
 	rel=usr/lib/chainguard/guest-kernels/qemu/kernel.image; \
 	mkdir -p $$tmpd $(dir $@); \
-	tar --warning=no-unknown-keyword -x -C $$tmpd -f $< usr/lib/chainguard/guest-kernels/; rc=$$?; \
+	tar -x -C $$tmpd -f $< usr/lib/chainguard/guest-kernels/; rc=$$?; \
 	if [ $$rc -eq 0 ]; then \
 		if [ -f "$$tmpd/$$rel" ]; then \
 			cp "$$tmpd/$$rel" $@.tmp && mv $@.tmp $@; rc=$$?; \

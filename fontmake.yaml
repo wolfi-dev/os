@@ -1,0 +1,291 @@
+package:
+  name: fontmake
+  version: "3.12.1"
+  epoch: 0
+  description: "Compile fonts from sources (UFO, Glyphs) to binary (OpenType, TrueType)"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      # The staged venv's bin/python3 symlinks back to the system interpreter;
+      # SCA does not follow the venv symlink farm, so declare it explicitly or
+      # the shipped venv is unusable in the runtime image.
+      - python-${{vars.python-version}}-base
+  options:
+    # Don't resolve libraries installed in the virtual environment as providers
+    no-provides: true
+
+vars:
+  # fontmake requires Python >=3.10 (setup.py python_requires); 3.13 is
+  # Wolfi's default python3 (python-3.13 provides python3 at full priority;
+  # 3.14 is packaged but provides it at priority 0).
+  python-version: "3.13"
+  venv-home: "/opt/chainguard/fontmake"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      # cffsubr builds AFDKO's tx from source with cmake (see below); AFDKO
+      # links libxml2 and would download its own copy if none is installed.
+      - cmake
+      - libxml2-dev
+      - python-${{vars.python-version}}-dev
+      - uv
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/googlefonts/fontmake
+      tag: v${{package.version}}
+      expected-commit: 7494c86f6671af6da70f3ef8b911fdae8d648751
+
+  # Chainguard Libraries carries every dependency except cffsubr, compreffor
+  # and ufo2ft. Those three are not taken as prebuilt wheels from the fallback
+  # index; the install step below fetches only their sdists and builds them
+  # here (see --no-binary). Everything else is a Libraries-built wheel.
+  - uses: auth/uv
+    with:
+      allow-fallback-indexes: true
+
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv-home}}
+      python: ${{vars.python-version}}
+
+  # uv/install cannot install fontmake from the local checkout (its
+  # --only-binary :all: refuses path sources and --no-binary does not lift
+  # that), and it cannot express the per-command environment variable and
+  # build constraint the cffsubr build below needs. Follow the custom-steps
+  # pattern from uv/venv instead: resolve fontmake's dependency set from its
+  # own metadata, install those as wheels only, then install fontmake itself
+  # from source with --no-deps. Dependency versions are resolved at build
+  # time from setup.py's ranges, so a rebuild may pick up newer dependency
+  # releases. Upstream does pin its own CI/pyz dependencies in
+  # requirements.txt; this build deliberately does not use that file.
+  #
+  # Three dependencies are not on Chainguard Libraries and are built from
+  # their sdists instead of being shipped as upstream-prebuilt wheels:
+  # - cffsubr: its PyPI wheel bundles a prebuilt copy of AFDKO's `tx`
+  #   executable (the CFF subroutinizer ufo2ft runs for OTF output); the
+  #   sdist compiles tx from the vendored AFDKO C sources with cmake, against
+  #   the system libxml2. Note that AFDKO's CMake clones the ANTLR4 C++
+  #   runtime from github.com/antlr/antlr4 during the build, pinned to a
+  #   commit in its CMakeLists.txt; it is built but not linked into tx.
+  # - compreffor: a C++ extension (the alternative subroutinizer fontmake
+  #   requests via ufo2ft[compreffor]).
+  # - ufo2ft: pure Python.
+  #
+  # Extras installed:
+  # - `json` (ufoLib2[json]) is installed because the gftools Noto build
+  #   recipe (recipeProvider: noto) passes instance sources as .ufo.json
+  #   files; without it fontmake fails with "Extras not installed:
+  #   ufoLib2[json]". It resolves to cattrs, orjson and typing-extensions,
+  #   all of which come from Chainguard Libraries (no fallback-index wheel).
+  #
+  # Extras not installed:
+  # - `pathops` would add skia-pathops, a compiled Skia extension that would
+  #   only reach us as a prebuilt PyPI wheel: it is not on Chainguard
+  #   Libraries, and building its sdist means compiling Skia, which nothing
+  #   in stereo does. fontmake's default overlap-removal backend is
+  #   booleanOperations (pyclipper, source-built via Libraries); only callers
+  #   passing `--overlaps-backend pathops` need skia-pathops. Re-add the
+  #   extra once Libraries carries skia-pathops or stereo builds it from
+  #   source.
+  # - `autohint` is left out; consumers should depend on the native
+  #   os/ttfautohint package instead.
+  - name: Install dependencies as wheels, then fontmake from the checkout
+    runs: |
+      set -euo pipefail
+      export VIRTUAL_ENV="${{vars.venv-home}}"
+      # Pin the version so uv pip compile does not rely on git tag metadata.
+      SETUPTOOLS_SCM_PRETEND_VERSION="${{package.version}}" \
+        uv pip compile --extra json --no-header --no-annotate -o /tmp/deps.txt setup.py
+
+      # Everything but cffsubr; compreffor and ufo2ft are built from sdist.
+      # --no-deps: deps.txt is already the fully resolved set, and without it
+      # uv would re-resolve ufo2ft's dependencies and pull cffsubr's prebuilt
+      # wheel in here, ahead of the source build below.
+      grep -v '^cffsubr==' /tmp/deps.txt > /tmp/deps-rest.txt
+      uv pip install --no-deps --only-binary :all: \
+        --no-binary compreffor --no-binary ufo2ft \
+        -r /tmp/deps-rest.txt
+
+      # Note: nothing here enforces that no prebuilt wheel came from the
+      # python-all fallback index; provenance is verified by reading the build
+      # log (every .whl URL under libraries.cgr.dev/python/, only the three
+      # sdists under python-all/).
+
+      # cffsubr's sdist builds tx by running the vendored AFDKO setup.py,
+      # which uses setuptools_scm on a nameless temporary Distribution (via
+      # scikit-build) with no git metadata behind it. Only the unscoped
+      # SETUPTOOLS_SCM_PRETEND_VERSION reaches it, so set that for this one
+      # command; cffsubr itself gets the same (correct) version and nothing
+      # from the intermediate AFDKO build is installed except tx.
+      # cffsubr 0.4.0's setup.py still passes dry_run= to distutils'
+      # file_util.copy_file, which setuptools >= 81 no longer accepts, so
+      # constrain the isolated build's setuptools for this one build.
+      cffsubr_req="$(grep '^cffsubr==' /tmp/deps.txt)"
+      echo 'setuptools<81' > /tmp/cffsubr-build-constraints.txt
+      SETUPTOOLS_SCM_PRETEND_VERSION="${cffsubr_req#cffsubr==}" \
+        uv pip install --no-deps --only-binary :all: --no-binary cffsubr \
+          --build-constraints /tmp/cffsubr-build-constraints.txt "$cffsubr_req"
+
+      # fontmake derives its version from the git tag via setuptools_scm; pin
+      # it so the build does not depend on tag metadata in the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION="${{package.version}}" uv pip install --no-deps .
+      # Same clean-up and staging uv/install performs.
+      uv pip uninstall pip virtualenv
+      uv pip check
+      chmod 644 "${{vars.venv-home}}/.lock"
+      mkdir -p "$(dirname "${{targets.contextdir}}${{vars.venv-home}}")"
+      mv "${{vars.venv-home}}" "${{targets.contextdir}}${{vars.venv-home}}"
+
+  - name: Verify the installed version and expose the CLI
+    runs: |
+      staged="${{targets.contextdir}}${{vars.venv-home}}"
+      "$staged/bin/python" -c "
+      from importlib.metadata import version
+      v = version('fontmake')
+      assert v == '${{package.version}}', f'Expected fontmake==${{package.version}}, got {v}'
+      print(f'fontmake=={v} installed correctly')
+      "
+      # Symlink the fontmake CLI to /usr/bin so os/font-* builds can invoke it
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/fontmake" "${{targets.contextdir}}/usr/bin/fontmake"
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: googlefonts/fontmake
+    strip-prefix: v
+    use-tag: true
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: fontmake
+    - uses: test/tw/help-check
+      with:
+        bins: fontmake
+    - uses: test/tw/pip-check
+      with:
+        python: ${{vars.venv-home}}/bin/python${{vars.python-version}}
+    - name: Generate minimal font sources
+      runs: |
+        # fontmake compiles font sources, so a self-contained test needs real
+        # sources. Build two UFO masters and a single-axis (Weight) designspace
+        # with the venv interpreter (ufoLib2/designspaceLib live in fontmake's
+        # venv, not the system python), then derive a .glyphs source with
+        # glyphsLib so every upstream compile flavor has an input.
+        mkdir -p /tmp/src
+        "${{vars.venv-home}}/bin/python" - <<'EOF'
+        from ufoLib2 import Font
+        from fontTools.designspaceLib import (
+            DesignSpaceDocument, AxisDescriptor, SourceDescriptor, InstanceDescriptor,
+        )
+
+        def make_master(weight, path):
+            font = Font()
+            font.info.familyName = "Test"
+            font.info.styleName = weight["name"]
+            font.info.unitsPerEm = 1000
+            font.info.ascender = 800
+            font.info.descender = -200
+            font.info.capHeight = 700
+            font.info.xHeight = 500
+            # A drawn glyph forces the interpolation/compile path to touch outlines.
+            glyph = font.newGlyph("A")
+            glyph.unicode = 0x41
+            glyph.width = weight["width"]
+            pen = glyph.getPen()
+            pen.moveTo((100, 0))
+            pen.lineTo((weight["stem"], 700))
+            pen.lineTo((weight["stem"] + 100, 700))
+            pen.lineTo((200, 0))
+            pen.closePath()
+            space = font.newGlyph("space")
+            space.unicode = 0x20
+            space.width = 250
+            font.save(path, overwrite=True)
+
+        regular = {"name": "Regular", "width": 600, "stem": 150}
+        bold = {"name": "Bold", "width": 640, "stem": 300}
+        make_master(regular, "/tmp/src/Test-Regular.ufo")
+        make_master(bold, "/tmp/src/Test-Bold.ufo")
+
+        doc = DesignSpaceDocument()
+        axis = AxisDescriptor()
+        axis.name = "Weight"
+        axis.tag = "wght"
+        axis.minimum, axis.default, axis.maximum = 400, 400, 700
+        doc.addAxis(axis)
+        for style, ufo, loc in (
+            ("Regular", "Test-Regular.ufo", 400),
+            ("Bold", "Test-Bold.ufo", 700),
+        ):
+            src = SourceDescriptor()
+            src.filename = ufo
+            src.familyName = "Test"
+            src.styleName = style
+            src.location = {"Weight": loc}
+            doc.addSource(src)
+        inst = InstanceDescriptor()
+        inst.familyName = "Test"
+        inst.styleName = "Medium"
+        inst.location = {"Weight": 550}
+        doc.addInstance(inst)
+        doc.write("/tmp/src/Test.designspace")
+
+        import glyphsLib
+        gsfont = glyphsLib.to_glyphs(doc)
+        gsfont.save("/tmp/src/Test.glyphs")
+        EOF
+    - name: Compile UFO masters to OTF and TTF
+      working-directory: /tmp/src
+      runs: |
+        fontmake -u Test-Regular.ufo Test-Bold.ufo -o otf ttf
+        # Per-master binaries land in master_otf/ and master_ttf/.
+        test -s master_otf/Test-Regular.otf
+        test -s master_otf/Test-Bold.otf
+        test -s master_ttf/Test-Regular.ttf
+        test -s master_ttf/Test-Bold.ttf
+        # fonttools' ttx ships inside fontmake's venv, so decompile with the venv copy.
+        ttx="${{vars.venv-home}}/bin/ttx"
+        # Confirm the produced TTF is a real font with the drawn glyph.
+        "$ttx" -l master_ttf/Test-Regular.ttf | grep -F "glyf"
+        "$ttx" -o - -t cmap master_ttf/Test-Regular.ttf | grep -F "0x41"
+        # Test cffsubr explicitly: subroutinize the OTF with the from-source tx binary.
+        cffsubr="${{vars.venv-home}}/bin/cffsubr"
+        "$cffsubr" -o master_otf/Test-Regular-sub.otf master_otf/Test-Regular.otf
+        test -s master_otf/Test-Regular-sub.otf
+        # Test compreffor explicitly: compile OTF with the compreffor subroutinizer.
+        # Use a separate output dir to avoid colliding with the earlier master_otf/ output.
+        fontmake -u Test-Regular.ufo -o otf --subroutinizer compreffor \
+          --output-dir master_otf_compreffor
+        test -s master_otf_compreffor/Test-Regular.otf
+    - name: Interpolate static instances from a designspace
+      working-directory: /tmp/src
+      runs: |
+        fontmake -i -- Test.designspace
+        # The Medium instance defined in the designspace is interpolated to TTF.
+        test -s instance_ttf/Test-Medium.ttf
+        "${{vars.venv-home}}/bin/ttx" -l instance_ttf/Test-Medium.ttf | grep -F "glyf"
+    - name: Compile a Glyphs source to a variable font
+      working-directory: /tmp/src
+      runs: |
+        fontmake Test.glyphs -o variable
+        # Exactly one variable font is expected; take the first match.
+        set -- variable_ttf/*.ttf
+        variable="$1"
+        test -s "$variable"
+        ttx="${{vars.venv-home}}/bin/ttx"
+        # A variable font carries the fvar table with the Weight axis.
+        "$ttx" -l "$variable" | grep -F "fvar"
+        "$ttx" -o - -t fvar "$variable" | grep -F "wght"

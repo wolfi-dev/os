@@ -1,7 +1,7 @@
 package:
   name: nfs-utils
   version: "2.9.2"
-  epoch: 1 # glibc: 2.43->2.44
+  epoch: 2 # split client/server subpackages
   description: kernel-mode NFS
   copyright:
     - license: GPL-2.0-only
@@ -13,6 +13,11 @@ package:
       - busybox
       - merged-sbin
       - merged-usrsbin
+      # nfs-utils keeps no binaries or libraries of its own; it is a
+      # metapackage over the client and server halves, so every existing
+      # consumer of "nfs-utils" keeps the same file closure at the same paths.
+      - nfs-utils-client
+      - nfs-utils-server
       - wolfi-baselayout
   resources:
     cpu: "1"
@@ -178,6 +183,144 @@ subpackages:
         - merged-usrsbin
         - wolfi-baselayout
 
+  # Client/server split. The boundary is the one the openSUSE-based upstream
+  # longhorn images draw, checked with crane export: longhornio/longhorn-manager,
+  # longhorn-instance-manager and backing-image-manager all carry the same 17 NFS
+  # binaries, and longhorn-share-manager, the component that exports shares, adds
+  # exactly seven (exportfs, fsidd, nfsdclddb, nfsdclnts, nfsref, rpc.mountd,
+  # rpc.nfsd). nfsdctl is new in nfs-utils 2.9.x, has no upstream counterpart and
+  # controls nfsd, so it joins those seven.
+  #
+  # Two of the client binaries run on an NFS server by their own man pages:
+  # nfsdcld tracks NFSv4 clients for nfsd, and rpc.svcgssd is the server-side
+  # rpcsec_gss daemon. Both openSUSE's nfs-client and Debian's nfs-common ship
+  # them, and the client-only longhorn images carry them, so moving them here
+  # would break parity for no STIG gain: the rule matches package names, not
+  # binaries. rpcctl and rpcdebug are kernel RPC diagnostics rather than daemons
+  # and are likewise present in the client-only images.
+  #
+  # Images that only mount NFS should not carry a server they never run. The
+  # DISA GPOS STIG No_Remote_Access rule (SV-263652r982557) also flags any image
+  # whose apk database records a remote-access service, nfs-utils among them.
+  #
+  # Declared server-first so the client pipeline can claim what is left over and
+  # then assert /usr/bin is empty: a binary added by a future upstream release
+  # fails the build here instead of silently landing in the client package.
+  - name: ${{package.name}}-server
+    description: "NFS server: export management and the nfsd/mountd daemons"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          for bin in exportfs fsidd nfsdclddb nfsdclnts nfsdctl nfsref \
+                     rpc.mountd rpc.nfsd; do
+            mv "${{targets.destdir}}"/usr/bin/"$bin" "${{targets.contextdir}}"/usr/bin/
+          done
+
+          # etab and rmtab are the export and remote-mount tables, both written
+          # only by the server side.
+          mkdir -p "${{targets.contextdir}}"/var/lib/nfs
+          mv "${{targets.destdir}}"/var/lib/nfs/etab "${{targets.contextdir}}"/var/lib/nfs/
+          mv "${{targets.destdir}}"/var/lib/nfs/rmtab "${{targets.contextdir}}"/var/lib/nfs/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        # openSUSE's nfs-kernel-server requires nfs-client likewise: the server
+        # daemons share libnfsidmap and rpc.statd with the client half.
+        - ${{package.name}}-client
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: rpc.mountd
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              exportfs
+              rpc.mountd
+
+  - name: ${{package.name}}-client
+    description: "NFS client: mount helpers, statd, idmapd and gssd"
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          for bin in mount.nfs mount.nfs4 umount.nfs umount.nfs4 \
+                     nfsconf nfsdcld nfsidmap nfsstat showmount sm-notify \
+                     start-statd rpc.gssd rpc.idmapd rpc.statd rpc.svcgssd \
+                     rpcctl rpcdebug; do
+            mv "${{targets.destdir}}"/usr/bin/"$bin" "${{targets.contextdir}}"/usr/bin/
+          done
+
+          # Everything else has been claimed by an earlier subpackage, so an
+          # unrecognised binary left here means upstream grew one and it needs
+          # classifying as client or server rather than defaulting to client.
+          rmdir "${{targets.destdir}}"/usr/bin
+
+          # nfsrahead is invoked by 99-nfs.rules to set per-mount readahead.
+          mkdir -p "${{targets.contextdir}}"/usr/libexec
+          mv "${{targets.destdir}}"/usr/libexec/nfsrahead "${{targets.contextdir}}"/usr/libexec/
+          mkdir -p "${{targets.contextdir}}"/usr/lib/udev/rules.d
+          mv "${{targets.destdir}}"/usr/lib/udev/rules.d/99-nfs.rules "${{targets.contextdir}}"/usr/lib/udev/rules.d/
+
+          # libnfsidmap backs nfsidmap and rpc.idmapd, which both live here; the
+          # server half picks it up through its dependency on this package.
+          mv "${{targets.destdir}}"/usr/lib/libnfsidmap.so.* "${{targets.contextdir}}"/usr/lib/
+          mv "${{targets.destdir}}"/usr/lib/libnfsidmap "${{targets.contextdir}}"/usr/lib/
+
+          # sm, sm.bak and state are rpc.statd's lock-recovery state.
+          mkdir -p "${{targets.contextdir}}"/var/lib/nfs
+          mv "${{targets.destdir}}"/var/lib/nfs/sm "${{targets.contextdir}}"/var/lib/nfs/
+          mv "${{targets.destdir}}"/var/lib/nfs/sm.bak "${{targets.contextdir}}"/var/lib/nfs/
+          mv "${{targets.destdir}}"/var/lib/nfs/state "${{targets.contextdir}}"/var/lib/nfs/
+    dependencies:
+      runtime:
+        - busybox
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              mount.nfs
+              mount.nfs4
+              nfsstat
+              rpc.statd
+              showmount
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              nfsdcld
+              nfsidmap
+              nfsstat
+              rpc.idmapd
+              rpc.statd
+              rpcdebug
+              showmount
+        - name: Test nfsidmap domain lookup
+          runs: |
+            # nfsidmap -d prints the configured NFS domain name (from
+            # /etc/idmapd.conf or derived from the DNS domain). This exercises
+            # real ID-mapping functionality without requiring a running NFS server.
+            nfsidmap -d
+        - name: Test nfsstat statistics output
+          runs: |
+            # nfsstat reads NFS statistics from /proc/net/rpc/nfs (client) and
+            # /proc/net/rpc/nfsd (server). The NFS kernel module may not be loaded
+            # in the test environment, so /proc/net/rpc/nfs may not exist. Accept
+            # either a successful parse with "Client" output or the expected error
+            # message indicating the proc file is absent.
+            if [ -f /proc/net/rpc/nfs ]; then
+              nfsstat -c | grep -F "Client"
+            else
+              out=$(nfsstat -c 2>&1 || true)
+              echo "$out" | grep -F "No Client Stats"
+            fi
+
 update:
   enabled: true
   version-transform:
@@ -187,9 +330,13 @@ update:
     tag-filter-prefix: nfs-utils-
     strip-prefix: nfs-utils-
 
+# nfs-utils ships no files of its own; this asserts the metapackage still pulls
+# both halves, so existing consumers keep the same binaries at the same paths.
 test:
   pipeline:
     - uses: test/tw/ldd-check
+      with:
+        packages: nfs-utils-client nfs-utils-server
     - uses: test/tw/ver-check
       with:
         bins: |
@@ -202,31 +349,12 @@ test:
     - uses: test/tw/help-check
       with:
         bins: |
-          nfsidmap
-          rpc.idmapd
-          rpcdebug
           exportfs
           nfsdcld
+          nfsidmap
           nfsstat
+          rpc.idmapd
           rpc.mountd
           rpc.statd
+          rpcdebug
           showmount
-    - name: Test nfsidmap domain lookup
-      runs: |
-        # nfsidmap -d prints the configured NFS domain name (from
-        # /etc/idmapd.conf or derived from the DNS domain). This exercises
-        # real ID-mapping functionality without requiring a running NFS server.
-        nfsidmap -d
-    - name: Test nfsstat statistics output
-      runs: |
-        # nfsstat reads NFS statistics from /proc/net/rpc/nfs (client) and
-        # /proc/net/rpc/nfsd (server). The NFS kernel module may not be loaded
-        # in the test environment, so /proc/net/rpc/nfs may not exist. Accept
-        # either a successful parse with "Client" output or the expected error
-        # message indicating the proc file is absent.
-        if [ -f /proc/net/rpc/nfs ]; then
-          nfsstat -c | grep -F "Client"
-        else
-          out=$(nfsstat -c 2>&1 || true)
-          echo "$out" | grep -F "No Client Stats"
-        fi

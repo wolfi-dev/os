@@ -1,0 +1,330 @@
+package:
+  name: gftools
+  version: "0.10.0"
+  epoch: 0
+  description: "Google Fonts Tools: build, fix, check and package fonts for the Google Fonts library"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      # gftools-builder shells out to these at runtime: fontmake (the compiler
+      # it drives), ttfautohint (gftools-autohint) and hb-subset from
+      # harfbuzz-utils (subsetting step). The package is useless without them,
+      # and none is exposed from the venv (see below), so pull the native
+      # Wolfi packages.
+      - fontmake
+      - harfbuzz-utils
+      # The staged venv's bin/python3 symlinks back to the system interpreter;
+      # SCA does not follow the venv symlink farm, so declare it explicitly or
+      # the shipped venv is unusable in the runtime image.
+      - python-${{vars.python-version}}-base
+      - ttfautohint
+  options:
+    # Don't resolve libraries installed in the virtual environment as providers.
+    no-provides: true
+
+vars:
+  # gftools requires Python >=3.10 (pyproject requires-python); 3.13 is Wolfi's
+  # default python3.
+  python-version: "3.13"
+  venv-home: "/opt/chainguard/gftools"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      # cffsubr builds AFDKO's tx from source with cmake (see below); AFDKO
+      # links libxml2 and would download its own copy if none is installed.
+      - cmake
+      # pygit2 is built from its sdist (no prebuilt wheel) and links libgit2.
+      - libgit2-dev
+      - libxml2-dev
+      - python-${{vars.python-version}}-dev
+      - uv
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/googlefonts/gftools
+      tag: v${{package.version}}
+      expected-commit: 9df8307937692dbac0e9f8e439aa5e72d0448896
+
+  # Resolve dependencies from Chainguard Libraries first, falling back to the
+  # python-all index only where Libraries has no build. The native extensions
+  # below are built from their sdists rather than taken as prebuilt wheels.
+  - uses: auth/uv
+    with:
+      allow-fallback-indexes: true
+
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv-home}}
+      python: ${{vars.python-version}}
+
+  # uv/install cannot install gftools from the local checkout (its
+  # --only-binary :all: refuses path sources) and cannot express the
+  # per-command build constraints and the source builds needed for the native
+  # extensions. Follow fontmake's custom-steps pattern: resolve gftools'
+  # dependency set from its own metadata, install those as wheels (source-
+  # building the native ones), then install gftools itself from the checkout
+  # with --no-deps.
+  #
+  # gftools imports fontmake as a library (builder/__init__.py, subsetmerger.py
+  # use fontmake.font_project.FontProject), so fontmake and its dependency
+  # tree live in this venv too; the fontmake CLI the builder shells out to is
+  # the one from the fontmake package (runtime dependency), not this copy.
+  #
+  # Built from sdist rather than shipped as a prebuilt PyPI wheel (the wheels
+  # bundle compiled binaries; we compile against Wolfi where possible):
+  # - pygit2: C extension linking the system libgit2 (libgit2-dev above).
+  # - ttfautohint-py: gftools-autohint goes through this module. Chainguard
+  #   Libraries has no aarch64 wheel for it, so --only-binary would leave the
+  #   aarch64 resolve unsatisfiable; built from the sdist without
+  #   TTFAUTOHINTPY_BUNDLE_EXE set it is arch-independent pure Python and runs
+  #   the `ttfautohint` found on PATH, i.e. the ttfautohint package (runtime
+  #   dependency), so hinting matches what the other font packages do. The
+  #   pure-Python build needs no dev headers.
+  # - cffsubr and compreffor: fontmake's CFF subroutinizers; the cffsubr
+  #   wheel bundles a prebuilt AFDKO `tx` executable and compreffor's a C++
+  #   extension. Built exactly as in os/fontmake.yaml (cffsubr needs cmake,
+  #   libxml2-dev and a setuptools<81 build constraint).
+  # - ufo2ft: pure Python, only on the fallback index.
+  # - uharfbuzz and vharfbuzz: the uharfbuzz sdist vendors its own HarfBuzz
+  #   sources and builds via Cython with only a C++ compiler (no HarfBuzz dev
+  #   headers needed); vharfbuzz is pure Python on top of it. Forcing sdist
+  #   here keeps the passthrough PyPI wheels out.
+  # - protobuf: the sdist builds the pure-Python implementation, no protoc or
+  #   abseil toolchain required; built from source to avoid the passthrough wheel.
+  #
+  # Taken as wheels because Chainguard Libraries builds them from source: lxml,
+  # opentype-sanitizer, ninja, brotli, pillow, regex, orjson, pynacl,
+  # cryptography. Do not force --no-binary on these: they recompile bundled
+  # C/Cython in a build env without the required dev headers (lxml needs
+  # libxml2/libxslt, opentype-sanitizer's bundled woff2 does not compile under
+  # current GCC).
+  #
+  # Omitted deliberately (pruned from the resolution input, see below): the
+  # nanoemoji subtree. nanoemoji pulls picosvg -> skia-pathops, whose only
+  # distribution is a prebuilt Skia wheel (stereo does not build Skia from
+  # source, and fontmake dropped skia-pathops for the same reason), plus the
+  # pngquant-cli and resvg-cli binary-wrapper packages (prebuilt binaries, no
+  # aarch64 wheel, no from-source build). gftools imports nanoemoji lazily
+  # (inside two functions in fix.py used for color-emoji fonts), so the
+  # gftools-builder path used for the Noto/Google Fonts builds is unaffected;
+  # those emoji subcommands are non-functional. Re-add nanoemoji once Libraries
+  # carries skia-pathops/pngquant-cli/resvg-cli or stereo builds them from
+  # source.
+  - name: Install dependencies as wheels, then gftools from the checkout
+    runs: |
+      export VIRTUAL_ENV="${{vars.venv-home}}"
+
+      # Resolve from gftools' own dependency list minus nanoemoji, so nothing
+      # from that subtree (picosvg, skia-pathops, pngquant-cli, resvg-cli, ...)
+      # can enter the lock. Pruning the compiled lockfile instead would leave
+      # transitive-only packages behind.
+      "${{vars.venv-home}}/bin/python" - <<'EOF' > /tmp/requirements.in
+      import re
+      import tomllib
+      deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]
+      for dep in deps:
+          name = re.split(r"[\s\[<>=!~;]", dep, maxsplit=1)[0].lower()
+          if name != "nanoemoji":
+              print(dep)
+      EOF
+      uv pip compile --no-header --no-annotate -o /tmp/deps.txt /tmp/requirements.in
+
+      # Everything but cffsubr; the native extensions listed above are built
+      # from sdist. --no-deps: deps.txt is already the fully resolved set, and
+      # without it uv would re-resolve ufo2ft's dependencies and pull cffsubr's
+      # prebuilt wheel in here, ahead of the source build below.
+      grep -v '^cffsubr==' /tmp/deps.txt > /tmp/deps-rest.txt
+      uv pip install --no-deps --only-binary :all: \
+        --no-binary compreffor \
+        --no-binary protobuf \
+        --no-binary pygit2 \
+        --no-binary ttfautohint-py \
+        --no-binary ufo2ft \
+        --no-binary uharfbuzz \
+        --no-binary vharfbuzz \
+        -r /tmp/deps-rest.txt
+
+      # cffsubr's sdist builds tx by running the vendored AFDKO setup.py,
+      # which uses setuptools_scm on a nameless temporary Distribution (via
+      # scikit-build) with no git metadata behind it. Only the unscoped
+      # SETUPTOOLS_SCM_PRETEND_VERSION reaches it, so set that for this one
+      # command; cffsubr itself gets the same (correct) version and nothing
+      # from the intermediate AFDKO build is installed except tx.
+      # cffsubr 0.4.0's setup.py still passes dry_run= to distutils'
+      # file_util.copy_file, which setuptools >= 81 no longer accepts, so
+      # constrain the isolated build's setuptools for this one build.
+      cffsubr_req="$(grep '^cffsubr==' /tmp/deps.txt)"
+      echo 'setuptools<81' > /tmp/cffsubr-build-constraints.txt
+      SETUPTOOLS_SCM_PRETEND_VERSION="${cffsubr_req#cffsubr==}" \
+        uv pip install --no-deps --only-binary :all: --no-binary cffsubr \
+          --build-constraints /tmp/cffsubr-build-constraints.txt "$cffsubr_req"
+
+      # gftools derives its version from the git tag via setuptools_scm; pin it
+      # so the build does not depend on tag metadata in the checkout. --no-deps
+      # keeps the nanoemoji subtree from being re-resolved back in.
+      SETUPTOOLS_SCM_PRETEND_VERSION="${{package.version}}" uv pip install --no-deps .
+
+      # Same clean-up and staging uv/install performs.
+      uv pip uninstall pip virtualenv
+      chmod 644 "${{vars.venv-home}}/.lock"
+      mkdir -p "$(dirname "${{targets.contextdir}}${{vars.venv-home}}")"
+      mv "${{vars.venv-home}}" "${{targets.contextdir}}${{vars.venv-home}}"
+
+  - name: Verify the installed venv and expose the gftools CLIs
+    runs: |
+      set -euo pipefail
+      staged="${{targets.contextdir}}${{vars.venv-home}}"
+      "$staged/bin/python" - <<'EOF'
+      from importlib.metadata import version
+      v = version("gftools")
+      assert v == "${{package.version}}", f"Expected gftools=={'${{package.version}}'}, got {v}"
+      # The builder path and the source-built extensions must import; the
+      # pruned subtree must not be present.
+      import gftools.builder, fontmake.font_project, ttfautohint, pygit2, uharfbuzz, ninja  # noqa: F401
+      import importlib.util
+      for absent in ("nanoemoji", "picosvg", "pathops"):
+          assert importlib.util.find_spec(absent) is None, f"{absent} must not be in the venv"
+      print(f"gftools=={v} installed correctly")
+      EOF
+      # cffsubr must carry the tx built here, not a bundled one: both land at
+      # cffsubr/tx, but only the source build links the system libxml2 (the
+      # prebuilt wheel's tx is static).
+      readelf -d "$staged/lib/python${{vars.python-version}}/site-packages/cffsubr/tx" | grep -E 'NEEDED.*libxml2'
+
+      # Expose only the gftools* console scripts on PATH. Deliberately NOT the
+      # venv's own fontmake/fonttools/ttfautohint binaries: those come from the
+      # fontmake, py3.13-fonttools and ttfautohint packages, which the build
+      # environment installs alongside.
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+      for cli in "$staged"/bin/gftools*; do
+        name="$(basename "$cli")"
+        ln -sf "${{vars.venv-home}}/bin/$name" "${{targets.contextdir}}/usr/bin/$name"
+      done
+
+  - uses: strip
+
+capabilities:
+  add:
+    # xcover attaches BPF uprobes to the interpreter, which needs CAP_SYS_ADMIN.
+    - CAP_SYS_ADMIN
+
+test:
+  environment:
+    contents:
+      packages:
+        - busybox
+  pipeline:
+    # Native extensions in the venv (pygit2, lxml, uharfbuzz, ...) are the only
+    # dynamically linked ELF objects the package ships; the console scripts are
+    # text. No pip-check: gftools declares nanoemoji, deliberately dropped from
+    # the venv, so `pip check` would flag it as a missing dependency.
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: gftools
+    - uses: test/tw/help-check
+      with:
+        bins: gftools gftools-builder gftools-add-ds-subsets gftools-autohint gftools-fix-font gftools-gen-stat
+    # Functional tests, profiled for interpreter coverage. gftools console
+    # scripts exec the venv python, which symlinks to /usr/bin/python3.13.
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/python${{vars.python-version}}
+    # The venv interpreter (with the bundled fontTools) both imports gftools and
+    # mints the test fixtures below; only the gftools* scripts are on PATH.
+    - name: gftools and gftools.builder import
+      runs: |
+        "${{vars.venv-home}}/bin/python" -c "import gftools, gftools.builder; print('gftools', gftools.__version__)"
+    - name: gftools builder compiles a UFO source end to end, reproducibly
+      runs: |
+        py="${{vars.venv-home}}/bin/python"
+        work="$(mktemp -d)"
+        cd "$work" || exit 1
+        mkdir sources
+        # A minimal UFO: .notdef, space, A, and o (ttfautohint derives its
+        # standard widths from o, so the autohint step below really hints).
+        "$py" - sources/Test.ufo <<'EOF'
+        import sys
+        from ufoLib2 import Font
+        f = Font()
+        f.info.familyName, f.info.styleName = "Test", "Regular"
+        f.info.unitsPerEm, f.info.ascender, f.info.descender = 1000, 800, -200
+        f.info.xHeight, f.info.capHeight = 500, 700
+        f.info.versionMajor, f.info.versionMinor = 1, 0
+        g = f.newGlyph(".notdef"); g.width = 600
+        g = f.newGlyph("space"); g.width = 300; g.unicodes = [0x20]
+        g = f.newGlyph("A"); g.width = 600; g.unicodes = [0x41]
+        p = g.getPen(); p.moveTo((100, 0)); p.lineTo((100, 700)); p.lineTo((500, 700)); p.lineTo((500, 0)); p.closePath()
+        g = f.newGlyph("o"); g.width = 600; g.unicodes = [0x6F]
+        p = g.getPen(); p.moveTo((100, 0)); p.lineTo((100, 500)); p.lineTo((500, 500)); p.lineTo((500, 0)); p.closePath()
+        p.moveTo((200, 100)); p.lineTo((400, 100)); p.lineTo((400, 400)); p.lineTo((200, 400)); p.closePath()
+        f.save(sys.argv[1], overwrite=True)
+        EOF
+        # The builder reads configs from sources/ and writes to ../fonts/.
+        cat > sources/config.yaml <<'EOF'
+        sources:
+          - Test.ufo
+        familyName: Test
+        buildStatic: true
+        buildVariable: false
+        buildWebfont: false
+        buildOTF: false
+        autohintTTF: false
+        EOF
+        # Two builds from scratch under the same SOURCE_DATE_EPOCH must be
+        # byte-identical. The builder drives the fontmake CLI from the
+        # fontmake package (runtime dependency) and gftools-fix-font.
+        for run in 1 2; do
+          rm -rf fonts sources/build.ninja sources/.ninja_log
+          SOURCE_DATE_EPOCH=0 gftools builder sources/config.yaml
+          test -s fonts/ttf/Test.ttf
+          cp fonts/ttf/Test.ttf "Test-run$run.ttf"
+        done
+        cmp Test-run1.ttf Test-run2.ttf
+        "$py" -c "
+        from fontTools.ttLib import TTFont
+        f = TTFont('Test-run1.ttf')
+        assert f['maxp'].numGlyphs == 4, f['maxp'].numGlyphs
+        assert f['name'].getDebugName(1) == 'Test', f['name'].getDebugName(1)
+        print('built', f['name'].getDebugName(1), f['name'].getDebugName(5))
+        "
+        # gftools-autohint (the ttfautohint-py binding built from source here)
+        # must actually hint: fpgm/prep/cvt appear and ttfautohint signs name ID 5.
+        gftools-autohint --output Test-hinted.ttf Test-run1.ttf
+        "$py" -c "
+        from fontTools.ttLib import TTFont
+        f = TTFont('Test-hinted.ttf')
+        missing = [t for t in ('fpgm', 'prep', 'cvt ', 'gasp') if t not in f]
+        assert not missing, missing
+        assert 'ttfautohint' in f['name'].getDebugName(5), f['name'].getDebugName(5)
+        print('hinted:', f['name'].getDebugName(5))
+        "
+        # fix-nonhinting: rewrites the font so it renders unhinted; assert the
+        # separate output file is produced and is itself a parseable TTF.
+        gftools fix-nonhinting Test-run1.ttf Test-fixed.ttf
+        test -s Test-fixed.ttf
+        "$py" -c "from fontTools.ttLib import TTFont; TTFont('Test-fixed.ttf').get('name')"
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        # Whole-interpreter profiling: the gftools workload hits a small fraction
+        # of the interpreter's C symbols, so the floor is low but still catches a
+        # total regression. Baseline from the first measured CI run.
+        min-coverage: 5
+
+update:
+  enabled: true
+  github:
+    identifier: googlefonts/gftools
+    strip-prefix: v
+    use-tag: true
+  ignore-regex-patterns:
+    # Mis-numbered upstream tag (2026-08-28) that sorts above the whole 0.10
+    # line under PEP 440 and apk; following it would strand us there.
+    - ^v?0\.9991$

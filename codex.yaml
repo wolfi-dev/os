@@ -1,0 +1,249 @@
+package:
+  name: codex
+  version: "0.155.0"
+  epoch: 1 # rust: 1.97->1.98; moved from enterprise-packages/ to os/
+  description: OpenAI Codex CLI - a lightweight coding agent that runs in your terminal
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+      - git
+      - openssh-client
+  resources:
+    # codex-rs is a large (60+ crate) Cargo workspace that links against a
+    # prebuilt V8 static library (rusty_v8); the final link step is
+    # memory-heavy. Successive reductions (36Gi -> 24Gi -> 32Gi) kept failing
+    # at this step, so use the allocation proven by the deno package, which
+    # links the same rusty_v8 crate and builds reliably at cpu 22 / memory
+    # 36Gi. codex's workspace is larger than deno's, so this is not oversized.
+    cpu: "22"
+    memory: 36Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+vars:
+  rust-version: 1.98
+  llvm-version: 22
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cargo-auditable
+      - clang-${{vars.llvm-version}}
+      - cmake
+      - glibc-2.44-dev
+      - libcap-dev
+      - openssl-dev
+      - pkgconf
+      - posix-libc-utils
+      # python3 is required by the transitive rusty_v8 (v8 crate) build.rs,
+      # which shells out to python to download its prebuilt static library.
+      # Without it the build.rs panics with Os NotFound when spawning the
+      # downloader. This mirrors the working deno package's environment.
+      - python3
+      - rust-${{vars.rust-version}}
+      - wolfi-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/openai/codex
+      tag: rust-v${{package.version}}
+      expected-commit: f0a1b8f0849d90960bc406b848f32e5a129b0457
+
+  - uses: bump
+    with:
+      # The Cargo workspace (Cargo.toml / Cargo.lock) lives in codex-rs/, not
+      # the repo root (which is a Bazel + pnpm monorepo with no Cargo.lock).
+      # omnibump must run cargo update --precise inside the workspace, so point
+      # modroot at codex-rs to match the cargo/build step below. Without this
+      # the bump runs at the root and silently no-ops, leaving the vulnerable
+      # crate versions pinned in codex-rs/Cargo.lock.
+      modroot: codex-rs
+      # actix-http@3.12.1 - GHSA-xhj4-vrgc-hr34
+      # cmov@0.5.4 - CVE-2026-50185 / GHSA-3rjw-m598-pq24
+      # NOTE: the gix family (gix@0.83.0, gix-fs@0.21.1, gix-pack@0.69.0) and
+      # jsonwebtoken@10.3.0 are pinned by the runs step below rather than here.
+      # omnibump verifies a bump by building the whole workspace, which compiles
+      # the codex-v8-poc member and so the v8 150.4.0 build.rs, which downloads
+      # a librusty_v8_ptrcomp_sandbox_release prebuilt that upstream never
+      # published (HTTP 404). Every attempted pin therefore failed verification
+      # and omnibump's bisection blamed whichever crate it was pinning.
+      # NOTE: hickory-proto (GHSA-q2qq-hmj6-3wpp fixed in 0.26.1, and
+      # GHSA-3v94-mw7p-v465 which has NO published fix) is intentionally NOT
+      # bumped. Only one hickory-proto (0.25.2) is in the graph and it is pulled
+      # transitively by hickory-resolver 0.25.2, which requires hickory-proto
+      # "^0.25". cargo update -p hickory-proto --precise 0.26.1 fails with a
+      # version-selection conflict against that "^0.25" bound. Reaching 0.26.1
+      # would require also bumping hickory-resolver to 0.26, a major API break
+      # (Message/ResolverConfig/NameServerConfig APIs all changed) that needs a
+      # source port of the transitive consumers — out of scope for an automated
+      # crate bump (see rust-cve-remedy). GHSA-3v94-mw7p-v465 has no fixed
+      # release at all. Reported as a diagnostic.
+      # NOTE: lru (GHSA-rhfx-m35p-ff5j, Low, fixed in 0.16.3) is intentionally
+      # NOT bumped. The workspace already pins lru 0.16.3 directly; the flagged
+      # lru 0.12.5 is a *second*, transitive entry pulled by a consumer that
+      # requires lru "^0.12". Because 0.x minor bumps are SemVer-breaking,
+      # cargo update -p lru@0.12.5 --precise 0.16.3 fails the "^0.12" bound, and
+      # a plain lru@0.16.3 floor is already satisfied by the direct dep so it
+      # never touches the 0.12.5 entry. Remediating requires the consumer to be
+      # ported to lru 0.16 upstream — out of scope for a crate bump. Reported as
+      # a diagnostic.
+      # openssl@0.10.80 - CVE-2026-41678 / CVE-2026-41681 / CVE-2026-41898 / CVE-2026-45784 / CVE-2026-41676 / CVE-2026-41677 / CVE-2026-42327 / CVE-2026-44662
+      # NOTE: opentelemetry_sdk (CVE-2026-48504 / GHSA-w9wp-h8wv-79jx) is
+      # intentionally NOT bumped. The only fixed release is opentelemetry_sdk
+      # 0.32.x, which pulls the opentelemetry 0.32 core into a graph where codex's
+      # own `codex-otel` crate is still written against the 0.31 API
+      # (TraceContextPropagator::inject_context/extract, HttpClient trait). The
+      # mixed 0.31/0.32 graph fails to compile (E0599/E0277 in codex-otel), and
+      # no patched release exists in the 0.31 series. Remediating this requires an
+      # upstream source port to the 0.32 API and is out of scope for an automated
+      # crate bump; including it aborts the entire omnibump run and drops every
+      # other (working) bump below.
+      # quinn-proto@0.11.15 - GHSA-4w2j-m93h-cj5j
+      # serde_with@3.21.0 - GHSA-7gcf-g7xr-8hxj
+      # tar@0.4.46 - GHSA-3pv8-6f4r-ffg2
+      deps: |-
+        actix-http@3.12.1
+        cmov@0.5.4
+        openssl@0.10.80
+        quinn-proto@0.11.15
+        serde_with@3.21.0
+        tar@0.4.46
+
+  # gix is pinned "0.81.0" and ^0.81.0 excludes the fixed 0.83.0, so the
+  # requirement has to move before cargo can select it. 0.82.0 carries the same
+  # fixes but is yanked.
+  - uses: sed
+    with:
+      path: codex-rs/Cargo.toml
+      pattern: '^gix = \{ version = "0\.81\.0"'
+      replacement: 'gix = { version = "0.83.0"'
+
+  # Likewise jsonwebtoken "9.3.1": ^9 excludes the fixed 10.3.0. The 10.x break
+  # does not reach this consumer — decode/decode_header widened from &str to
+  # impl AsRef<[u8]>, and every other symbol used here (DecodingKey,
+  # EncodingKey::from_rsa_pem, Validation::new, Header::new, Algorithm::HS256
+  # and RS256, jwk::JwkSet) is unchanged.
+  - uses: sed
+    with:
+      path: codex-rs/Cargo.toml
+      pattern: '^jsonwebtoken = "9\.3\.1"'
+      replacement: 'jsonwebtoken = "10.3.0"'
+
+  # Lands the gix-family CVE pins that omnibump cannot verify (see the NOTE in
+  # the bump step above). The package build is --bin codex, which never
+  # compiles codex-v8-poc, so the v8 prebuilt is never fetched here. Move this
+  # back into bump deps once rusty_v8 publishes the 150.4.0 prebuilt or codex
+  # drops the v8-poc workspace member.
+  - runs: |
+      set -euo pipefail
+      cd codex-rs
+
+      # 0.83.0 requires gix-fs ^0.21.0 and gix-pack ^0.70.0, so one pin clears
+      # the family.
+      cargo update -p gix --precise 0.83.0
+      cargo update -p jsonwebtoken --precise 10.3.0
+
+      # Fail loudly if any of these did not clear its fixed floor, rather than
+      # shipping a package that still carries the detections.
+      for spec in gix:0.83.0 gix-fs:0.21.1 gix-pack:0.69.0 jsonwebtoken:10.3.0; do
+        name="${spec%%:*}"; min="${spec##*:}"
+        have=$(awk -v n="name = \"${name}\"" '$0==n{getline; gsub(/version = |"/,""); print; exit}' Cargo.lock)
+        if [ -z "${have}" ]; then echo "${name}: not present in Cargo.lock"; exit 1; fi
+        if [ "$(printf '%s\n%s\n' "${min}" "${have}" | sort -V | head -1)" != "${min}" ]; then
+          echo "${name}: ${have} is below the required ${min}"; exit 1
+        fi
+        echo "${name}: ${have} (>= ${min})"
+      done
+
+  - uses: cargo/build
+    with:
+      modroot: codex-rs
+      output: codex
+      opts: --release --bin codex
+
+  - uses: strip
+
+test:
+  environment:
+    environment:
+      # codex is an agentic CLI that resolves a config/home dir on startup.
+      # Point HOME and CODEX_HOME at a writable temp path for EVERY test step
+      # (including the pipeline-based smoke checks below, which cannot set env
+      # inline) so no invocation depends on the sandbox's default home.
+      HOME: /tmp/codex-home
+      CODEX_HOME: /tmp/codex-home/.codex
+  pipeline:
+    # Ensure the writable home dir exists before any codex invocation.
+    - name: Prepare writable home
+      runs: |
+        set -euo pipefail
+        mkdir -p "${CODEX_HOME}"
+    - uses: test/tw/ldd-check
+    # NOTE: xcover coverage profiling is intentionally omitted. codex is a Rust
+    # binary (coverage is not mandated for non-Go packages) and, more
+    # importantly, xcover cannot instrument it: the `strip` pipeline removes the
+    # symbol table, so xcover has no function names to match and falls back to
+    # tracing the whole ELF. Because codex statically links a prebuilt V8
+    # (rusty_v8) with an enormous symbol set, attaching uprobes across all of it
+    # overruns the profiler and `xcover wait` times out before readiness. The
+    # functional completion tests below exercise the installed binary directly.
+    # Smoke: `codex --version` launches the binary and prints a version.
+    - uses: test/tw/ver-check
+      with:
+        bins: codex
+        version: ${{package.version}}
+    # Smoke: `codex --help` confirms the binary starts and enters the CLI.
+    - uses: test/tw/help-check
+      with:
+        bins: codex
+    # Functional: generate a bash completion script and verify real output. This
+    # exercises the CLI's clap command tree end to end via the `completion`
+    # subcommand and proves it emits a non-trivial, codex-specific completion
+    # script. We assert both the binary name and the dialect's completion
+    # registration construct so the test fails if the generator regresses.
+    - name: Generate bash shell completions
+      runs: |
+        set -euo pipefail
+        codex completion bash > /tmp/codex.bash
+        # A real bash completion script must be non-empty, reference the binary
+        # name, and register a completion via the bash `complete` builtin.
+        test -s /tmp/codex.bash
+        grep -F "codex" /tmp/codex.bash
+        grep -F "complete" /tmp/codex.bash
+    # Functional: the generator must also handle other shell dialects, proving
+    # each backend produces distinct, non-empty, codex-specific output.
+    - name: Generate zsh shell completions
+      runs: |
+        set -euo pipefail
+        codex completion zsh > /tmp/_codex
+        # clap_complete emits a `#compdef <bin>` directive and a `_codex` fn.
+        test -s /tmp/_codex
+        grep -F "#compdef" /tmp/_codex
+        grep -F "_codex" /tmp/_codex
+    - name: Generate fish shell completions
+      runs: |
+        set -euo pipefail
+        codex completion fish > /tmp/codex.fish
+        # fish completions are registered with `complete -c codex ...`.
+        test -s /tmp/codex.fish
+        grep -F "complete -c codex" /tmp/codex.fish
+
+update:
+  enabled: true
+  github:
+    identifier: openai/codex
+    use-tag: true
+    tag-filter-prefix: rust-v
+    strip-prefix: rust-v
+  ignore-regex-patterns:
+    - '-alpha'
+    - '-beta'
+    - '-rc'

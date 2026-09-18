@@ -1,10 +1,17 @@
 package:
   name: gpgme
   version: "2.2.0"
-  epoch: 0 # glibc: 2.43->2.44
+  epoch: 1 # declare the GnuPG engine gpgme execs at runtime
   description: GNU - GnuPG Made Easy
   copyright:
     - license: GPL-3.0-or-later
+  dependencies:
+    runtime:
+      # gpgme execs a GnuPG binary for every operation; without one it fails
+      # with "Unsupported protocol". gpg pulls gnupg-gpgconf transitively.
+      - gpg
+      - gpg-agent
+      - gpgsm
   resources:
     cpu: "1"
     memory: 4Gi
@@ -108,21 +115,56 @@ test:
         bins: |
           gpgme-json
           gpgme-tool
-    - name: Test libgpgme compile and link
+    - name: Test libgpgme against a real GnuPG engine
       runs: |
+        # gpgme_check_version alone passes with no engine installed, so
+        # generate and read back a key to prove gpg is actually reachable.
         tee test.c <<'EOF'
         #include <gpgme.h>
         #include <stdio.h>
-        int main() {
-            const char *version = gpgme_check_version(NULL);
-            if (version == NULL) {
-                fprintf(stderr, "FAIL: gpgme_check_version returned NULL\n");
+
+        int main(void) {
+            gpgme_ctx_t ctx;
+            gpgme_key_t key;
+            gpgme_error_t err;
+
+            printf("gpgme version: %s\n", gpgme_check_version(NULL));
+
+            err = gpgme_engine_check_version(GPGME_PROTOCOL_OpenPGP);
+            if (err) {
+                fprintf(stderr, "FAIL: no OpenPGP engine: %s\n", gpgme_strerror(err));
                 return 1;
             }
-            printf("gpgme version: %s\n", version);
+            if ((err = gpgme_new(&ctx))) {
+                fprintf(stderr, "FAIL: gpgme_new: %s\n", gpgme_strerror(err));
+                return 1;
+            }
+            gpgme_set_protocol(ctx, GPGME_PROTOCOL_OpenPGP);
+
+            err = gpgme_op_createkey(ctx, "gpgme test <test@example.invalid>",
+                                     "default", 0, 0, NULL,
+                                     GPGME_CREATE_NOPASSWD | GPGME_CREATE_FORCE);
+            if (err) {
+                fprintf(stderr, "FAIL: createkey: %s\n", gpgme_strerror(err));
+                return 1;
+            }
+            printf("created %s\n", gpgme_op_genkey_result(ctx)->fpr);
+
+            if ((err = gpgme_op_keylist_start(ctx, "test@example.invalid", 0))
+                || (err = gpgme_op_keylist_next(ctx, &key))) {
+                fprintf(stderr, "FAIL: keylist: %s\n", gpgme_strerror(err));
+                return 1;
+            }
+            printf("listed %s\n", key->subkeys->fpr);
+            gpgme_key_unref(key);
+            gpgme_release(ctx);
             return 0;
         }
         EOF
 
         gcc $(pkg-config --cflags gpgme) test.c -o test $(pkg-config --libs gpgme)
+
+        GNUPGHOME="$(mktemp -d)"
+        chmod 700 "$GNUPGHOME"
+        export GNUPGHOME
         ./test

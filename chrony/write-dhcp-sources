@@ -1,0 +1,88 @@
+#!/bin/sh
+# Write /run/chrony.d/dhcp.sources from the NTP servers systemd-networkd
+# learned via DHCP (option 42 / the DHCPv6 NTP-server option), so
+# chronyd's `sourcedir /run/chrony.d` (see chrony.conf) actually has
+# something to read -- without this, chrony-wait.service times out
+# after ~3 minutes on every boot with zero configured sources on any
+# network that doesn't have a chrony-<cloud> sibling's static config.
+#
+# Re-run on every chronyd start and on every systemd-networkd state
+# change (see chrony-dhcp.service and chrony-dhcp.path), rather than
+# gated on the output file not existing yet, so a lease renewal that
+# changes NTP servers is picked up rather than staying stuck with
+# whatever the first boot saw.
+#
+# Collects NTP servers across ALL interfaces, not just one. networkd
+# reports each as either an address literal ("AddressString", DHCPv4
+# and DHCPv6) or a name ("Server", the DHCPv6 NTP FQDN suboption); a
+# static NTP= from a .network file shows up the same way and is
+# included on purpose. jq's `?` skips interfaces with no "NTP" entries
+# rather than erroring, and `unique` merges what the rest reported.
+set -eu
+
+fail() {
+    echo "write-dhcp-sources: $*" 1>&2
+    exit 1
+}
+
+outdir=/run/chrony.d
+outfile="$outdir/dhcp.sources"
+cmdsock=/run/chrony/chronyd.sock
+
+# chronyd reads `sourcedir` only at startup, so a refresh triggered while
+# it is already running needs an explicit reload. Over the unix socket,
+# because chrony.conf sets `cmdport 0`. Skipped when the socket is absent,
+# which is the boot-time case: this runs before chronyd, which then reads
+# the file itself.
+reload_chronyd() {
+    [ -S "$cmdsock" ] || return 0
+    chronyc -h "$cmdsock" reload sources >/dev/null \
+        || fail "chronyc reload sources failed"
+}
+
+mkdir -p "$outdir" || fail "could not create $outdir"
+
+# networkctl's exit status is checked on its own rather than piping it
+# straight into jq: POSIX sh has no 'pipefail', so a networkctl failure
+# would otherwise be masked by jq "succeeding" on empty input, and
+# treating that the same as "no NTP servers configured" would wipe out
+# a perfectly good dhcp.sources left over from an earlier, successful
+# run. The printf below only replays the captured output, so jq's exit
+# status is the one that matters there.
+json=$(networkctl list --json=short) || fail "networkctl list --json=short failed"
+
+# The servers come from an unauthenticated DHCP server and are written
+# straight into chronyd's config, so anything that is not an address
+# literal or a plain hostname is dropped rather than interpolated.
+# networkd formats these from the binary lease itself, so a rejection
+# here is not expected. A missing Interfaces array, though, means the
+# output is not the shape this was written against, and that is an
+# error rather than "no servers".
+sources=$(printf '%s' "$json" | jq -r '
+    [ (.Interfaces // error("no Interfaces array in networkctl output"))[].NTP[]?
+      | (.AddressString // .Server // empty)
+      | select(test("^[0-9A-Fa-f.:]+(%[0-9A-Za-z_-]+)?$")
+               or test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\\.?$"))
+    ] | unique | .[] | "server \(.) iburst"') \
+    || fail "jq failed to extract NTP servers from networkctl output"
+
+if [ -z "$sources" ]; then
+    rm -f "$outfile" || fail "could not remove stale $outfile"
+    reload_chronyd
+    exit 0
+fi
+
+tmpfile=$(mktemp "$outdir/.dhcp.sources.XXXXXX") || fail "mktemp failed in $outdir"
+trap 'rm -f "$tmpfile"' EXIT
+
+printf '%s\n' "$sources" > "$tmpfile" || fail "could not write $tmpfile"
+
+# mktemp creates the file 0600 and mv keeps that. chronyd reads sourcedir
+# as root at startup but has dropped to the chrony user by the time
+# `chronyc reload sources` makes it read this again, so the refresh
+# would silently find nothing it may open.
+chmod 0644 "$tmpfile" || fail "could not chmod $tmpfile"
+
+mv "$tmpfile" "$outfile" || fail "could not move $tmpfile into place at $outfile"
+
+reload_chronyd

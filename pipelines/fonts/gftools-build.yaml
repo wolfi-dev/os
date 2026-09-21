@@ -1,0 +1,139 @@
+name: Build a font family from its sources with gftools-builder
+
+# Runs upstream's own build recipe for Google Fonts projects: `gftools
+# builder <config>` reads the project's sources/config*.yaml, drives fontmake,
+# then applies the release post-processing (instance subsets, ttfautohint via
+# gftools-autohint, gftools-fix-font, hb-subset) exactly as the published fonts
+# were made. Outputs land under fonts/<family>/: hinted/ttf and unhinted/ttf
+# for the statics, unhinted/variable-ttf (and googlefonts/variable-ttf) for
+# the variable fonts.
+#
+# The builder is run on a derived copy of the config (written next to the
+# original, since source paths are resolved relative to the config file) so
+# the pipeline can force a few keys:
+#   - `recipeProvider`, when `recipe-provider` is set. The notofonts family
+#     repositories build with upstream's `notobuilder`, which is gftools-
+#     builder with `recipeProvider: noto` forced on the config; the plain
+#     googlefonts recipe would merge Latin subsets into every family and
+#     write a different output layout.
+#   - `includeSubsets` is dropped unless `subsets` is true. Subsets only feed
+#     the Google Fonts flavours (`full/`, `googlefonts/`), which nothing here
+#     installs, and merging them makes the builder download the subset
+#     source repositories from GitHub at build time, at an unpinned branch.
+#   - `buildWebfont: false` unless `webfonts` is true: nothing here ships
+#     woff2, and that step needs a `fonttools` CLI with brotli on PATH, which
+#     the gftools package deliberately does not expose.
+#   - `buildOTF: false` unless `otf` is true: the CFF flavour doubles the
+#     compile time and is not installed by this pipeline.
+#
+# The step fails when the builder produced nothing for a requested output;
+# what the fonts contain (family, version, count, hinting, coverage) is
+# checked on the installed package by the test/font-family pipeline.
+#
+# Pin the checkout to the family's release tag, never to a branch: upstream
+# repositories carry post-release edits under the same version string.
+# Everything runs inside the gftools virtual environment
+# (/opt/chainguard/gftools): its interpreter carries fontTools, PyYAML and the
+# `fonttools` CLI the recipes shell out to, so no separate python or fonttools
+# package is needed. fontmake, ttfautohint and hb-subset are runtime
+# dependencies of gftools and come from their own packages.
+needs:
+  packages:
+    - gftools
+
+inputs:
+  config:
+    description: |
+      Path of the gftools-builder config, relative to `working-directory`,
+      for example sources/config-sans-hebrew.yaml.
+    required: true
+  family:
+    description: |
+      Family name without spaces as used in the output file names, for
+      example NotoSansHebrew. Also the name of the builder's output directory
+      under fonts/.
+    required: true
+  destination:
+    description: Directory the fonts are installed into.
+    required: true
+  working-directory:
+    description: Directory of the source checkout (the builder runs there).
+    default: .
+  outputs:
+    description: |
+      Which builder outputs to install, relative to fonts/<family>/:
+      hinted/ttf, unhinted/ttf or unhinted/variable-ttf. Space separated
+      for more than one.
+    default: hinted/ttf
+  recipe-provider:
+    description: |
+      gftools-builder recipe provider to force in the config, for example
+      `noto` for the notofonts family repositories. Empty leaves the config's
+      own choice (the googlefonts recipe by default).
+    default: ""
+  subsets:
+    description: |
+      When true, keep the config's `includeSubsets` (needs network access to
+      fetch the subset sources). Off by default: subsets only affect the
+      `full/` and `googlefonts/` flavours.
+    default: "false"
+  webfonts:
+    description: |
+      When true, let the config's webfont settings stand (needs a
+      `fonttools` CLI with brotli on PATH). Off by default: the woff2
+      outputs are not installed by this pipeline.
+    default: "false"
+  otf:
+    description: When true, let the config's buildOTF setting stand.
+    default: "false"
+  extra-args:
+    description: Additional arguments for `gftools builder`.
+    default: ""
+
+pipeline:
+  - name: Build the family with gftools builder
+    runs: |
+      set -euo pipefail
+      cd "${{inputs.working-directory}}"
+      if [ ! -f "${{inputs.config}}" ]; then
+        echo "gftools-builder config ${{inputs.config}} not found in $(pwd); configs present:"
+        find . -maxdepth 2 -name 'config*.yaml' -o -maxdepth 2 -name '*.yaml' -path '*/sources/*' | sort
+        exit 1
+      fi
+      # shellcheck disable=SC1091
+      . /opt/chainguard/gftools/bin/activate
+      config="$(dirname "${{inputs.config}}")/stereo-$(basename "${{inputs.config}}")"
+      python - "${{inputs.config}}" "$config" <<'EOF'
+      import sys
+      import yaml
+      src, dst = sys.argv[1:3]
+      config = yaml.safe_load(open(src))
+      if "${{inputs.recipe-provider}}":
+          config["recipeProvider"] = "${{inputs.recipe-provider}}"
+      if "${{inputs.subsets}}" != "true":
+          config.pop("includeSubsets", None)
+      if "${{inputs.webfonts}}" != "true":
+          config["buildWebfont"] = False
+      if "${{inputs.otf}}" != "true":
+          config["buildOTF"] = False
+      yaml.safe_dump(config, open(dst, "w"), sort_keys=False)
+      EOF
+      echo "== derived config $config"; cat "$config"
+      gftools builder ${{inputs.extra-args}} "$config"
+      for out in ${{inputs.outputs}}; do
+        dir="fonts/${{inputs.family}}/$out"
+        if [ -z "$(find "$dir" -maxdepth 1 -name '*.ttf' -print -quit 2>/dev/null)" ]; then
+          echo "gftools builder produced no fonts in $dir"
+          find fonts -maxdepth 3 -type d
+          exit 1
+        fi
+      done
+
+  - name: Install the built fonts
+    runs: |
+      set -euo pipefail
+      cd "${{inputs.working-directory}}"
+      install -d "${{inputs.destination}}"
+      for out in ${{inputs.outputs}}; do
+        install -m644 "fonts/${{inputs.family}}/$out"/*.ttf "${{inputs.destination}}/"
+      done

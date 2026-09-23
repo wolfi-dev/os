@@ -1,0 +1,85 @@
+name: Check an installed font family
+
+# Verifies the fonts of one family as installed by the package under test:
+# the expected number of files, the family name and release version in the
+# name table, whether the fonts are hinted, that a code point of the family's
+# script is mapped, and that a sample string shapes without .notdef.
+needs:
+  packages:
+    - harfbuzz-utils
+    - py${{inputs.python-version}}-fonttools
+    - python-${{inputs.python-version}}
+
+inputs:
+  family:
+    description: |
+      Family name without spaces as used in the file names, for example
+      NotoSansHebrew. Matches <path>/**/<family>-*.ttf.
+    required: true
+  version:
+    description: |
+      Release version the fonts must carry in name ID 5, as "X.YYY";
+      typically ${{package.version}}.
+    required: true
+  count:
+    description: Exact number of font files expected, if known.
+    default: ""
+  hinted:
+    description: Whether the fonts must carry TrueType hinting (fpgm).
+    default: "true"
+  codepoint:
+    description: A code point of the family's script that must be mapped, e.g. 0x05D0.
+    default: ""
+  text:
+    description: A sample string that must shape without .notdef.
+    default: ""
+  path:
+    description: Directory searched for the font files.
+    default: /usr/share/fonts
+  python-version:
+    description: |
+      Python version whose fonttools package runs the check; pinned so the
+      check does not break when the unversioned python3 moves on.
+    default: "3.13"
+
+pipeline:
+  - name: Check the ${{inputs.family}} family
+    runs: |
+      set -euo pipefail
+      python${{inputs.python-version}} - <<'EOF'
+      import glob
+      import os
+      import subprocess
+
+      from fontTools.ttLib import TTFont
+
+      family, version, count = "${{inputs.family}}", "${{inputs.version}}", "${{inputs.count}}"
+      hinted = "${{inputs.hinted}}" == "true"
+      codepoint, text = "${{inputs.codepoint}}", "${{inputs.text}}"
+      paths = sorted(glob.glob(f"${{inputs.path}}/**/{family}-*.ttf", recursive=True))
+      if not paths:
+          raise SystemExit(f"FAIL: no {family}-*.ttf under ${{inputs.path}}")
+      if count and len(paths) != int(count):
+          raise SystemExit(f"FAIL: {len(paths)} {family} files, expected {count}: {paths}")
+      for path in paths:
+          f = TTFont(path)
+          name = f["name"]
+          # Some families fold the width into the legacy family name and carry
+          # no name ID 16 ("Noto Sans Thai Looped Condensed").
+          typographic = name.getDebugName(16) or name.getDebugName(1) or ""
+          if not typographic.replace(" ", "").startswith(family):
+              raise SystemExit(f"FAIL: {path}: family name {typographic!r} does not match {family}")
+          name5 = name.getDebugName(5) or ""
+          if not name5.startswith(f"Version {version}"):
+              raise SystemExit(f"FAIL: {path}: {name5!r}, expected Version {version}")
+          if ("fpgm" in f) != hinted:
+              raise SystemExit(f"FAIL: {path}: hinted={'fpgm' in f}, expected {hinted}")
+          if codepoint and int(codepoint, 0) not in f.getBestCmap():
+              raise SystemExit(f"FAIL: {path}: {codepoint} is not mapped")
+          if text:
+              out = subprocess.run(["hb-shape", "--no-glyph-names", "--no-positions", "--no-clusters", path, text],
+                                   check=True, capture_output=True, text=True).stdout.strip()
+              if "gid0" in out.replace("[", "|").replace("]", "|").split("|"):
+                  raise SystemExit(f"FAIL: {path}: {text!r} shapes to .notdef: {out}")
+      print(f"{family}: {len(paths)} files, {name5}, hinted={hinted}" + (f", shapes {text!r}" if text else ""))
+      EOF

@@ -1,0 +1,314 @@
+package:
+  name: dotnet-sdk-10.0.4
+  version: "10.0.401"
+  epoch: 0
+  description: ".NET SDK ${{package.version}}"
+  copyright:
+    - license: MIT
+  resources:
+    cpu: "21"
+    memory: 56Gi
+  dependencies:
+    runtime:
+      - aspnet-${{vars.major-version}}-runtime
+      - aspnet-${{vars.major-version}}-targeting-pack
+      - dotnet-${{vars.major-version}}
+      - dotnet-${{vars.major-version}}-runtime
+      - dotnet-${{vars.major-version}}-targeting-pack
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+vars:
+  llvm-version: '22'
+  prefix: 'usr/share/dotnet'
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+$
+    replace: "$1"
+    to: major-version
+
+environment:
+  environment:
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    # No COMPlus_EnableAVX2=0 here. Sibling bands disable AVX2 for two distinct
+    # x86_64 bootstrap-JIT failures: 1xx for an Internal CLR error (0x80131506)
+    # in Crossgen2/ReadyToRun (it also sets DOTNET_EnableAVX2), 3xx for a
+    # FSharp.Core SIGABRT (2xx never set it). The v10.0.401 x86_64 CI build
+    # completes clean with AVX2 on -- no 0x80131506 and no FSharp.Core SIGABRT
+    # in the build log -- so neither workaround is carried here.
+    CFLAGS: "-Wno-error=used-but-marked-unused"
+  contents:
+    packages:
+      - bash
+      - brotli-dev
+      - busybox
+      - clang-${{vars.llvm-version}}
+      - cmake
+      - curl
+      # Bootstrap from the 1xx band: source-build inherits the bootstrap's
+      # runtime as BundledNETCoreAppPackageVersion. 1xx (dotnet-sdk-10.0.1)
+      # carries runtime 10.0.12 (10.0.112), the runtime upstream pairs with SDK
+      # 10.0.401, and it matches the dotnet-10-targeting-pack host pack version
+      # so bundled runtime, targeting pack, and runtime stay aligned (avoids the
+      # NU1101 host-pack lookup miss diagnosed in the bootstrap-alignment test).
+      - dotnet-sdk-${{vars.major-version}}.0.1
+      - dotnet-sdk-${{vars.major-version}}.0.1-artifacts
+      - file
+      - glibc-2.44-dev
+      - icu-dev
+      - krb5-dev
+      - libunwind-dev
+      - lttng-ust-dev
+      - make
+      # openssl-hardened-dev, not the plain openssl-dev the 2xx/3xx bands pin:
+      # those bands hit an exit-134 FSharp.Core SIGABRT on x86_64 with hardened
+      # openssl, but the v10.0.401 tree builds clean against it (verified on
+      # x86_64 CI), so this band takes the hardened variant.
+      - openssl-hardened-dev
+      - python3
+      - rapidjson-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/dotnet/dotnet
+      tag: v${{package.version}}
+      expected-commit: e34a38d2ae1fc26406a317517196e55c68ff83ab
+
+  - runs: |
+      # The v10.0.401 source tree's global.json files pin sdk.version 10.0.302
+      # (root and src/sdk; other sub-repos pin various 10.0.3xx), but the
+      # bootstrap (dotnet-sdk-10.0.1) provides an older 10.0.1xx SDK. Rewrite
+      # every global.json to the installed bootstrap version with rollForward
+      # latestMajor so toolset init accepts it. The build.sh --with-sdk flag
+      # overrides the SDK used for the actual source-build, so this only affects
+      # toolset init. Derive the version from the bootstrap so it does not go
+      # stale when dotnet-sdk-10.0.1 bumps.
+      bootstrap_sdk=$(basename "$(ls -d /${{vars.prefix}}/sdk/*/ | head -1)")
+      # Fail loudly rather than writing an empty "version" into every
+      # global.json if the bootstrap SDK dir is ever missing (empty glob).
+      [ -n "$bootstrap_sdk" ] || { echo "no bootstrap SDK found under /${{vars.prefix}}/sdk"; exit 1; }
+      export BOOTSTRAP_SDK="$bootstrap_sdk"
+      find . -name 'global.json' | while read f; do
+        python3 -c "
+      import json, os, sys
+      path = sys.argv[1]
+      try:
+          with open(path) as fh:
+              g = json.load(fh)
+          if 'sdk' in g and 'version' in g['sdk']:
+              g['sdk']['version'] = os.environ['BOOTSTRAP_SDK']
+              g['sdk']['rollForward'] = 'latestMajor'
+              with open(path, 'w') as fh:
+                  json.dump(g, fh, indent=2)
+      except Exception:
+          pass
+      " "$f"
+      done
+
+      if [ ${{build.arch}} = "aarch64" ]; then
+        # Dotnet does not have support for PAC/BTI which Axion uses
+        # See: https://github.com/dotnet/runtime/pull/110472
+        # EXTRA_${FLAG} is supposed to work, but it doesn't
+        # so directly override the values which is supposedly a no-no
+        # See also: https://github.com/dotnet/runtime/issues/61859
+        export CFLAGS="$CFLAGS -mbranch-protection=none"
+        export CXXFLAGS="-mbranch-protection=none"
+      fi
+
+      # The .NET runtime is built with O0 so we cannot enable FORTIFY_SOURCE
+      sed -i 's/-D_FORTIFY_SOURCE=3//g' /etc/clang-${{vars.llvm-version}}/common.cfg
+
+      # Many scripts in the VMR are not executable
+      find . -name '*.sh' -exec chmod +x {} +
+
+      # NuGet dedupes packages and shared components when they live in the same dir
+      cp -r /${{vars.prefix}}/artifacts ./shared-components
+
+      # Build .NET
+      ./build.sh \
+        --with-sdk /${{vars.prefix}} \
+        --clean-while-building --source-only \
+        --with-packages /${{vars.prefix}}/artifacts \
+        --with-shared-components ${{package.srcdir}}/shared-components \
+        -- \
+        /v:minimal \
+        /p:LogVerbosity=minimal \
+        /p:ContinueOnPrebuiltBaselineError=true \
+        /p:MinimalConsoleLogOutput=true \
+        /p:SkipPortableRuntimeBuild=true \
+        /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind \
+        /p:PublishReadyToRunCrossgen2ExtraArgs="--parallelism=1"
+
+      mkdir -p ${{targets.destdir}}/${{vars.prefix}}
+
+      # Install SDK
+      tar xf ./artifacts/assets/Release/dotnet-sdk-${{vars.major-version}}*.tar.gz \
+          -C ${{targets.destdir}}/${{vars.prefix}}/ \
+          ./sdk \
+          ./sdk-manifests \
+          ./templates
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}-symbols"
+    description: ".NET SDK ${{package.version}} symbols"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/${{vars.prefix}}
+          tar xf ./artifacts/assets/Release/dotnet-symbols-sdk-${{vars.major-version}}*.tar.gz \
+                -C ${{targets.contextdir}}/${{vars.prefix}}/
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            dir: /${{vars.prefix}}
+            name: "*.pdb"
+
+  - name: "${{package.name}}-artifacts"
+    description: ".NET SDK ${{package.version}} build artifacts"
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/${{vars.prefix}}/artifacts
+          tar xf ./artifacts/assets/Release/Private.SourceBuilt.Artifacts.*.tar.gz \
+              -C ${{targets.contextdir}}/${{vars.prefix}}/artifacts
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            dir: /${{vars.prefix}}
+            name: "*.tar.gz"
+
+test:
+  environment:
+    contents:
+      packages:
+        - dotnet-${{vars.major-version}}
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Bootstrap-bundled host pack alignment
+      runs: |
+        # Source-build's BundledNETCoreAppPackageVersion is set by the bootstrap
+        # input runtime, NOT by the source tree's PrivateSourceBuiltSdkVersion
+        # (we've confirmed this empirically: the same v10.0.203 source tag
+        # produced BundledVersions=10.0.5 with bootstrap dotnet-sdk-10.0.1=10.0.105
+        # and BundledVersions=10.0.7 with bootstrap dotnet-sdk-10.0.1=10.0.107).
+        #
+        # The SDK's apphost generation looks up the host pack at:
+        #   /usr/share/dotnet/packs/Microsoft.NETCore.App.Host.<rid>/<bundled>/
+        # which is provided by the dotnet-${{vars.major-version}}-targeting-pack
+        # apk installed at test time. If the targeting-pack's runtime version
+        # has drifted from this SDK's bundled runtime (which happens if a
+        # dotnet-${{vars.major-version}} security bump landed without a
+        # cascading rebuild of this package on top of the realigned bootstrap),
+        # the lookup misses, the SDK falls through to NuGet restore, and
+        # `dotnet publish` / `dotnet run` fail with NU1101.
+        #
+        # Fail this test loudly with that specific diagnosis so future
+        # maintainers don't have to reverse-engineer a cryptic NU1101.
+        case "$(uname -m)" in
+          x86_64)  rid="wolfi.20230201-x64" ;;
+          aarch64) rid="wolfi.20230201-arm64" ;;
+          *)       echo "unexpected uname -m: $(uname -m)"; exit 1 ;;
+        esac
+
+        sdk_props="/usr/share/dotnet/sdk/${{package.version}}/Microsoft.NETCoreSdk.BundledVersions.props"
+        bundled=$(sed -n 's:.*<BundledNETCoreAppPackageVersion>\([^<]*\)</BundledNETCoreAppPackageVersion>.*:\1:p' \
+          "$sdk_props" | head -1)
+        [ -n "$bundled" ] || { echo "could not parse BundledNETCoreAppPackageVersion from $sdk_props"; exit 1; }
+
+        pack_dir="/usr/share/dotnet/packs/Microsoft.NETCore.App.Host.${rid}/${bundled}"
+        if [ -d "$pack_dir" ]; then
+          echo "ok: SDK bundled runtime ${bundled} is covered by host pack at ${pack_dir}"
+          exit 0
+        fi
+
+        # Guard the ls: if the parent packs dir is also missing, an unguarded
+        # ls exits non-zero and set -e aborts the step before the diagnosis
+        # below ever prints.
+        installed_versions=""
+        pack_root="/usr/share/dotnet/packs/Microsoft.NETCore.App.Host.${rid}"
+        if [ -d "$pack_root" ]; then installed_versions=$(ls "$pack_root" | tr '\n' ' '); fi
+        cat <<EOF
+        ERROR: bootstrap-bundled host pack drift detected
+
+          ${{package.name}}=${{package.version}} was built bundled to runtime ${bundled},
+          but no host pack at /packs/Microsoft.NETCore.App.Host.${rid}/${bundled}/
+          is installed alongside it.
+
+          installed host pack version(s) for ${rid}: ${installed_versions:-(none)}
+
+          Cause: source-build's BundledNETCoreAppPackageVersion follows the bootstrap
+          (dotnet-sdk-${{vars.major-version}}.0.1) input runtime, not the
+          dotnet/dotnet@v${{package.version}} source tree's PrivateSourceBuiltSdkVersion.
+          When the dotnet-${{vars.major-version}}-targeting-pack apk's runtime version
+          moves away from what the bootstrap was built against — typically a
+          dotnet-${{vars.major-version}} security bump without a cascading rebuild of
+          this package — the resulting SDK ends up advertising a bundled runtime
+          that the targeting-pack no longer ships. dotnet publish / dotnet run will
+          fail with NU1101 looking for Microsoft.NETCore.App.Host.${rid}.${bundled}.nupkg.
+
+          Fix: bootstrap this package from a dotnet-sdk-${{vars.major-version}}.0.X
+          band whose runtime matches what v${{package.version}} pairs with upstream
+          (dotnet/core release-notes), then rebuild on top of it (epoch bump). The
+          bootstrap's runtime should align bundled, targeting-pack, and runtime again.
+        EOF
+        exit 1
+    - name: Install and verify a global .NET tool
+      runs: |
+        dotnet tool install -g Microsoft.Web.LibraryManager.Cli
+        dotnet tool list -g | grep -Fi librarymanager
+    - name: Compile and run a simple .NET application
+      runs: |
+        cat <<'EOF' > HelloWorld.cs
+        using System;
+
+        class Program
+        {
+            static void Main()
+            {
+                Console.WriteLine("Hello, World!");
+            }
+        }
+        EOF
+        dotnet new console -o HelloWorldApp --force
+        mv HelloWorld.cs HelloWorldApp/Program.cs
+        dotnet run --project HelloWorldApp | grep -F "Hello, World!"
+    - name: Compile and run a .NET application with arguments
+      runs: |
+        cat <<'EOF' > ArgumentEcho.cs
+        using System;
+
+        class Program
+        {
+            static void Main(string[] args)
+            {
+                Console.WriteLine("Arguments: " + String.Join(", ", args));
+            }
+        }
+        EOF
+        dotnet new console -o ArgumentEchoApp --force
+        mv ArgumentEcho.cs ArgumentEchoApp/Program.cs
+        dotnet run --project ArgumentEchoApp -- arg1 arg2 arg3 | grep -F "Arguments: arg1, arg2, arg3"
+    - name: Build and run an ASP.NET application
+      runs: |
+        # The build resolves the Microsoft.AspNetCore.App.Ref targeting pack
+        # (aspnet-10-targeting-pack); running an app that instantiates a type
+        # from the ASP.NET shared framework loads aspnet-10-runtime at run time.
+        # Together they exercise both runtime deps the console tests do not.
+        dotnet new web -o WebApp --force
+        cat <<'EOF' > WebApp/Program.cs
+        WebApplication.CreateBuilder(args).Build();
+        System.Console.WriteLine("aspnet framework: " + typeof(WebApplication).Assembly.GetName().Name);
+        EOF
+        dotnet run --project WebApp | grep -F "aspnet framework: Microsoft.AspNetCore"
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: "v10.0.4"

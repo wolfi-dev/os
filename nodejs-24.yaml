@@ -1,7 +1,7 @@
 package:
   name: nodejs-24
   version: "24.21.0" # On update, please check if -fdelete-null-pointer-checks is still required
-  epoch: 2 # split/manpages for variants
+  epoch: 3 # add libnode137 subpackage
   description: "JavaScript runtime built on V8 engine"
   dependencies:
     provides:
@@ -20,8 +20,13 @@ package:
 vars:
   # SHA256 of docker-entrypoint.sh from nodejs/docker-node
   docker-entrypoint-hash: a15ac9589c04baf9da95b08e0e79b5cf1d75ab8dc64e06a5e68e4ceb0ad7c8ea
+  # configure.py flags shared by the node, -minimal and -libnode builds
+  configure-flags: >-
+    --prefix=/usr --shared-brotli --shared-zlib --shared-openssl --shared-cares --shared-nghttp2 --shared-libuv --ninja --openssl-use-def-ca-store --with-icu-default-data-dir=$(icu-config --icudatadir) --with-intl=system-icu --openssl-conf-name=openssl_conf
   openssl-version: "3.6"
   python-version: 3.13
+  # NODE_MODULE_VERSION of the 24.x line; libnode.so soname version
+  soversion: "137"
 
 environment:
   contents:
@@ -74,18 +79,7 @@ pipeline:
       export CFLAGS="${CFLAGS/-Os/-O2} $common_flags"
       export CXXFLAGS="${CXXFLAGS/-Os/-O2} $common_flags"
       export CPPFLAGS="${CPPFLAGS/-Os/-O2} $common_flags"
-      python${{vars.python-version}} configure.py --prefix=/usr \
-        --shared-brotli \
-        --shared-zlib \
-        --shared-openssl \
-        --shared-cares \
-        --shared-nghttp2 \
-        --shared-libuv \
-        --ninja \
-        --openssl-use-def-ca-store \
-        --with-icu-default-data-dir=$(icu-config --icudatadir) \
-        --with-intl=system-icu \
-        --openssl-conf-name=openssl_conf \
+      python${{vars.python-version}} configure.py ${{vars.configure-flags}} \
         --without-corepack
 
         make BUILDTYPE=Release -j$(nproc)
@@ -157,18 +151,7 @@ subpackages:
           export CXXFLAGS="${CXXFLAGS/-Os/-O2} $common_flags"
           export CPPFLAGS="${CPPFLAGS/-Os/-O2} $common_flags"
 
-          python${{vars.python-version}} configure.py --prefix=/usr \
-            --shared-brotli \
-            --shared-zlib \
-            --shared-openssl \
-            --shared-cares \
-            --shared-nghttp2 \
-            --shared-libuv \
-            --ninja \
-            --openssl-use-def-ca-store \
-            --with-icu-default-data-dir=$(icu-config --icudatadir) \
-            --with-intl=system-icu \
-            --openssl-conf-name=openssl_conf \
+          python${{vars.python-version}} configure.py ${{vars.configure-flags}} \
             --without-inspector \
             --without-npm \
             --without-corepack
@@ -231,6 +214,54 @@ subpackages:
     test:
       pipeline:
         - uses: test/tw/symlink-check
+
+  - name: libnode${{vars.soversion}}
+    description: Node.js ${{package.version}} as a shared library for embedders
+    pipeline:
+      - runs: |
+          # Separate --shared build so the node binary stays self-contained.
+          cd /home/build
+          make clean || true
+          rm -rf out || true
+
+          common_flags="-D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64"
+          export CFLAGS="${CFLAGS/-Os/-O2} $common_flags"
+          export CXXFLAGS="${CXXFLAGS/-Os/-O2} $common_flags"
+          export CPPFLAGS="${CPPFLAGS/-Os/-O2} $common_flags"
+
+          python${{vars.python-version}} configure.py ${{vars.configure-flags}} \
+            --shared \
+            --without-npm \
+            --without-corepack
+
+          ninja -C out/Release -j"$(nproc)" libnode
+
+          abi=$(awk '/^#define NODE_MODULE_VERSION [0-9]+/ {print $3}' src/node_version.h)
+          if [ "$abi" != "${{vars.soversion}}" ]; then
+            echo "NODE_MODULE_VERSION is $abi, update vars.soversion" >&2
+            exit 1
+          fi
+          install -Dm755 out/Release/lib/libnode.so.${{vars.soversion}} \
+            "${{targets.contextdir}}"/usr/lib/libnode.so.${{vars.soversion}}
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - libuv-dev
+            - ${{package.name}}
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: Embed libnode and run JavaScript
+          runs: |
+            cat > embed.cc <<'EOF'
+            #include <node.h>
+            int main(int argc, char **argv) { return node::Start(argc, argv); }
+            EOF
+            g++ -std=c++20 -I/usr/include/node embed.cc \
+              /usr/lib/libnode.so.${{vars.soversion}} -o embed
+            ./embed -e 'console.log(process.versions.node, 6 * 7)' | grep -Fx "${{package.version}} 42"
 
   - name: ${{package.name}}-oci-entrypoint-compat
     description: Docker Hub-compatible entrypoint for Node.js

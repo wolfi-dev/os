@@ -1,29 +1,48 @@
-# cffsubr has issues when building on aarch64
 package:
   name: font-stix-otf
   version: 2.14
-  epoch: 6 # go/wolfi-rsc/font-stix-otf
+  epoch: 7 # go/wolfi-rsc/font-stix-otf
   description: stix-otf fonts
   copyright:
     - license: OFL-1.1
-  target-architecture:
-    - x86_64
+  dependencies:
+    # font-stix-otf-arm shipped upstream's prebuilt 2.13b171 OTFs on aarch64
+    # while this package only built on x86_64; this package now builds from
+    # source on both architectures. `provides` lets a world entry or a
+    # dependency on the old name resolve here, `replaces` lets apk take over
+    # its files on an in-place upgrade.
+    provides:
+      - font-stix-otf-arm=${{package.full-version}}
+    replaces:
+      - font-stix-otf-arm
   resources:
-    cpu: "2"
+    cpu: "4"
     memory: 4Gi
   test-resources:
     memory: 1Gi
+
+vars:
+  python-version: "3.13"
+  venv: /home/build/venv
 
 environment:
   contents:
     packages:
       - build-base
       - busybox
+      - cmake
       - libxml2-dev
-      - py3.12-pip
-      - python-3.12
-      - python-3.12-dev
+      - python-${{vars.python-version}}
+      - python-${{vars.python-version}}-dev
+      - ttfautohint
+      - uv
 
+# Built from the UFO/designspace sources with upstream's tools/tirobuild.py
+# (ufo2ft, psautohint, cffsubr, VTT hinting data from source/*.vtp). The
+# Python toolchain comes from Chainguard Libraries through a venv; the three
+# packages Libraries has no source-built wheel for (skia-pathops, cffsubr,
+# psautohint) are built from their sdists, which is also what makes the build
+# work on aarch64.
 pipeline:
   - uses: git-checkout
     with:
@@ -31,17 +50,63 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: de537a95240e0105546bed58e15b4a61be28cd89
 
-  - runs: |
-      python3 -m venv venv
-      source venv/bin/activate
-      # Pin setuptools<82 because pyfilesystem2 (fs) uses pkg_resources which
-      # was removed in setuptools 82.0.0. Upstream fix pending:
-      # https://github.com/PyFilesystem/pyfilesystem2/issues/577
-      pip3 install 'setuptools<82' -r requirements.txt
+  - uses: auth/uv
+    with:
+      allow-fallback-indexes: true
+
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv}}
+      python: ${{vars.python-version}}
+
+  - name: Install the font build tools
+    runs: |
+      . ${{vars.venv}}/bin/activate
+      # pyfilesystem2 (fs, via fonttools[ufo]) imports pkg_resources, which
+      # setuptools 82 removed: https://github.com/PyFilesystem/pyfilesystem2/issues/577
+      uv pip install "setuptools<82"
+      grep -vE '^(cffsubr|skia-pathops|psautohint|ttfautohint-py)==' requirements.txt > /tmp/requirements-rest.txt
+      uv pip install --no-deps -r /tmp/requirements-rest.txt
+      # upstream pins ttfautohint-py 0.5.1, which loads libttfautohint.so
+      # through ctypes; our ttfautohint package is static-only. 0.6 drives the
+      # ttfautohint executable on $PATH instead, with the same ttfautohint()
+      # API tirobuild calls.
+      uv pip install --no-deps "ttfautohint-py==0.6.1"
+      # The pinned skia-pathops/psautohint sdists still import pkg_resources
+      # in their setup.py, so their isolated builds need setuptools < 82 too.
+      # Note what the skia-pathops sdist build itself pulls in: its
+      # build_skia.py fetches a prebuilt `gn` for the host architecture from
+      # Chromium's CIPD (pinned by revision, not digest) and pip-installs a
+      # ninja wheel into an inner virtualenv. Both are build tools only; the
+      # compiled path-ops library and the fonts are built here from source.
+      echo 'setuptools<82' > /tmp/build-constraints.txt
+      uv pip install --no-deps --no-binary skia-pathops --no-binary psautohint \
+        --build-constraints /tmp/build-constraints.txt \
+        "$(grep '^skia-pathops==' requirements.txt)" "$(grep '^psautohint==' requirements.txt)"
+      # cffsubr's sdist builds tx from the vendored AFDKO sources with
+      # setuptools_scm on a nameless temporary distribution; give it the
+      # version explicitly and keep the isolated build on setuptools < 81
+      # (its setup.py still passes dry_run= to distutils' copy_file). Same
+      # recipe as os/fontmake.yaml, including AFDKO's CMake cloning the ANTLR4
+      # C++ runtime from GitHub during the build. upstream pins 0.3.0, whose
+      # vendored AFDKO does not configure under CMake 4 (its antlr4_runtime
+      # subproject declares a cmake_minimum_required that CMake 4 rejects);
+      # 0.4.0 does, with the same subroutinize() API tirobuild uses.
+      cffsubr_req="cffsubr==0.4.0"
+      echo 'setuptools<81' > /tmp/cffsubr-build-constraints.txt
+      SETUPTOOLS_SCM_PRETEND_VERSION="${cffsubr_req#cffsubr==}" \
+        uv pip install --no-deps --no-binary cffsubr \
+          --build-constraints /tmp/cffsubr-build-constraints.txt "$cffsubr_req"
+
+  - name: Build the STIX Two fonts
+    runs: |
+      . ${{vars.venv}}/bin/activate
       python tools/tirobuild.py STIXbuild.yml
-      mkdir -p "${{targets.contextdir}}/usr/share/fonts/stix-fonts/"
-      mv ./output/STIXbuild/STIXTwoMath/OTF/* "${{targets.contextdir}}/usr/share/fonts/stix-fonts/"
-      mv ./output/STIXbuild/STIXTwoText/OTF/* "${{targets.contextdir}}/usr/share/fonts/stix-fonts/"
+      ls -R output/STIXbuild
+
+  - runs: |
+      install -Dm644 -t "${{targets.destdir}}/usr/share/fonts/stix-fonts/" \
+        output/STIXbuild/STIXTwoMath/OTF/*.otf output/STIXbuild/STIXTwoText/OTF/*.otf
 
 update:
   enabled: false
@@ -50,5 +115,49 @@ update:
     identifier: stipub/stixfonts
 
 test:
+  environment:
+    contents:
+      packages:
+        - fontconfig
+        - harfbuzz-utils
+        - py${{vars.python-version}}-fonttools
+        - python-${{vars.python-version}}
   pipeline:
     - uses: test/fonts
+    - name: STIX Two Text and Math are complete CFF fonts that shape their scripts
+      runs: |
+        set -u
+        cd /usr/share/fonts/stix-fonts
+        python${{vars.python-version}} - <<'EOF'
+        import glob
+        import subprocess
+
+        from fontTools.ttLib import TTFont
+
+        def shape(path, text):
+            out = subprocess.run(["hb-shape", "--no-glyph-names", "--no-positions", "--no-clusters", path, text],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            return [tok for tok in out.strip("[]").split("|") if tok]
+
+        faces = sorted(glob.glob("*.otf"))
+        assert set(faces) == {"STIXTwoMath.otf", "STIXTwoText-Regular.otf", "STIXTwoText-Bold.otf",
+                              "STIXTwoText-Italic.otf", "STIXTwoText-BoldItalic.otf", "STIXTwoText-Medium.otf",
+                              "STIXTwoText-MediumItalic.otf", "STIXTwoText-Semibold.otf",
+                              "STIXTwoText-SemiboldItalic.otf"}, faces
+        for path in faces:
+            f = TTFont(path)
+            assert "CFF " in f and f["maxp"].numGlyphs > 1500, (path, f["maxp"].numGlyphs)
+            assert f["name"].getDebugName(5).startswith("Version ${{package.version}}"), (path, f["name"].getDebugName(5))
+            for text in ("The quick brown fox", "Ταχίστη αλώπηξ", "Съешь ещё"):
+                assert "0" not in shape(path, text), (path, text, shape(path, text))
+            unmapped = next(chr(cp) for cp in range(0xE000, 0xF900) if cp not in f.getBestCmap())
+            assert shape(path, unmapped) == ["0"], (path, "the .notdef check cannot fail")
+        m = TTFont("STIXTwoMath.otf")
+        assert "MATH" in m and m["MATH"].table.MathVariants is not None, "STIX Two Math has no MATH table"
+        # mathematical alphanumerics live outside the BMP; spell them as escapes
+        sample = "∀x∈ℝ ∫∑√ " + "\U0001D504\U0001D54F"
+        assert "0" not in shape("STIXTwoMath.otf", sample), shape("STIXTwoMath.otf", sample)
+        print(f"{len(faces)} STIX Two OTFs: CFF, version, Latin/Greek/Cyrillic and MATH as expected")
+        EOF
+        fc-cache -f
+        fc-list | grep -F "STIX Two Math"

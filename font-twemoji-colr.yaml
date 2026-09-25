@@ -1,40 +1,139 @@
 #nolint:update-disabled-reason
 package:
+  # The upstream font is mozilla/twemoji-colr v0.7.0 (built from the Twemoji
+  # 14.0.1 artwork); this package has always carried 13.0.0, which was never
+  # an upstream version. It stays because apk picks the highest version in the
+  # repository, so a corrected lower version would never be installed.
   name: font-twemoji-colr
   version: 13.0.0
-  epoch: 4
+  epoch: 5
   description: Color emoji font from the Twemoji project
   copyright:
     - license: Apache-2.0
+    - license: CC-BY-4.0
+      paths:
+        - "*.ttf" # the emoji artwork
   resources:
-    cpu: "1"
+    cpu: "2"
     memory: 5Gi
+
+vars:
+  python-version: "3.13"
+  upstream-version: 0.7.0
 
 environment:
   contents:
     packages:
       - build-base
       - busybox
-      - unzip
+      - fontforge
+      - make
+      - nodejs-24
+      - npm
+      - perl
+      - py${{vars.python-version}}-fontforge
+      - py${{vars.python-version}}-fonttools
+      - python-${{vars.python-version}}
 
+# Built from the Twemoji SVG artwork with upstream's own toolchain instead of
+# installing the prebuilt TwemojiMozilla.ttf from CTAN (which is this exact
+# upstream release): layerize.js splits each emoji SVG into colour layers,
+# grunt-webfonts (FontForge engine) turns the layers into glyphs, and the
+# Makefile assembles the COLR/CPAL and GSUB tables with fontTools' ttx and
+# fixes glyph directions with FontForge.
 pipeline:
-  - uses: fetch
+  - uses: git-checkout
     with:
-      expected-sha256: 7210076e5e3829d1607104f300d332af128fa0f929dce4a86d6e3ffd40f2c39b
-      uri: https://mirrors.ctan.org/fonts/twemoji-colr.zip
-      extract: false
+      repository: https://github.com/mozilla/twemoji-colr
+      tag: v${{vars.upstream-version}}
+      expected-commit: c0460fdb2654dee584e75c4913bfa9fd2f873338
+
+  - name: Pin the npm dependency tree
+    runs: |
+      # The 2016-era `unzip` dependency drags in graceful-fs 3 (via fstream),
+      # which does not load on current Node.js; upstream pins graceful-fs 4
+      # for yarn only ("resolutions"), so do the same for npm.
+      npm pkg set 'overrides.graceful-fs=^4.2.11'
+      # The devDependencies (emojibase-data, resemblejs) only serve upstream's
+      # test suite; drop them so they are not resolved at all.
+      npm pkg delete devDependencies
+      # upstream ships no lockfile. os/font-twemoji-colr/package-lock.json
+      # (melange places it in the workspace) was generated from this
+      # package.json, with the two edits above, by `npm install
+      # --package-lock-only`, so every package is pinned by version and
+      # sha512 integrity.
+      test -s package-lock.json
+
+  - name: Install the build tooling (grunt, grunt-webfonts, layerize dependencies)
+    runs: |
+      # Chainguard Libraries rejects this tree (403 on all 257 packages of the
+      # grunt toolchain from the build identity, see the PR), so install the
+      # pinned lockfile from the public registry, as other npm-built os/
+      # packages do. Nothing from it ships: only the generated font does.
+      npm ci --registry https://registry.npmjs.org/ --ignore-scripts --no-audit --no-fund
+      # npm's sigstore TUF cache lands in $HOME (the workspace) as a 0700
+      # directory, which melange cannot record at the end of the build.
+      rm -rf "$HOME/.sigstore" .sigstore
+
+  - name: Build Twemoji Mozilla
+    runs: |
+      export PATH="$PWD/node_modules/.bin:$PATH"
+      make TTX="python${{vars.python-version}} -m fontTools.ttx" PYTHON=python${{vars.python-version}}
+      test -s "build/Twemoji Mozilla.ttf"
 
   - runs: |
-      unzip -o twemoji-colr.zip
-      mkdir -p "${{targets.contextdir}}/usr/share/texlive/texmf-dist/fonts/truetype/public/twemoji-colr"
-      mv ./twemoji-colr/*.ttf "${{targets.contextdir}}/usr/share/texlive/texmf-dist/fonts/truetype/public/twemoji-colr"
+      install -Dm644 "build/Twemoji Mozilla.ttf" \
+        "${{targets.contextdir}}/usr/share/texlive/texmf-dist/fonts/truetype/public/twemoji-colr/TwemojiMozilla.ttf"
 
 update:
   enabled: false
-  exclude-reason: No releases or tags; distributed via CTAN archive only
+  exclude-reason: The package version predates the upstream one and cannot be lowered (see the comment on version)
 
 test:
+  environment:
+    contents:
+      packages:
+        - harfbuzz-utils
+        - py${{vars.python-version}}-fonttools
+        - python-${{vars.python-version}}
   pipeline:
     - uses: test/fonts
       with:
         path-prefix: usr/share/texlive/texmf-dist
+    - name: The font is the complete Twemoji Mozilla 0.7.0 colour font
+      runs: |
+        set -u
+        python${{vars.python-version}} - <<'EOF'
+        import subprocess
+
+        from fontTools.ttLib import TTFont
+
+        path = "/usr/share/texlive/texmf-dist/fonts/truetype/public/twemoji-colr/TwemojiMozilla.ttf"
+        f = TTFont(path)
+        cmap = f.getBestCmap()
+        # counts of the upstream 0.7.0 release
+        assert f["maxp"].numGlyphs == 13723, f["maxp"].numGlyphs
+        assert len(cmap) == 1418, len(cmap)
+        assert f["name"].getDebugName(1) == "Twemoji Mozilla", f["name"].getDebugName(1)
+        assert f["name"].getDebugName(5) == "Version 0.7.0", f["name"].getDebugName(5)
+        assert f["name"].getDebugName(6) == "TwemojiMozilla", f["name"].getDebugName(6)
+        # colour layers: every emoji is a COLR base glyph over one CPAL palette
+        assert len(f["COLR"].ColorLayers) == 3689, len(f["COLR"].ColorLayers)
+        assert len(f["CPAL"].palettes[0]) == 1063, len(f["CPAL"].palettes[0])
+        assert cmap[0x1F600] in f["COLR"].ColorLayers, "grinning face has no colour layers"
+        # sequences (flags, skin tones, ZWJ families) are ccmp ligatures
+        assert {r.FeatureTag for r in f["GSUB"].table.FeatureList.FeatureRecord} == {"ccmp"}
+
+        def shape(text):
+            out = subprocess.run(["hb-shape", "--no-glyph-names", "--no-positions", "--no-clusters", path, text],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            return [tok for tok in out.strip("[]").split("|") if tok]
+        assert shape("\U0001F1FA\U0001F1F8") != ["0", "0"] and len(shape("\U0001F1FA\U0001F1F8")) == 1, ("US flag", shape("\U0001F1FA\U0001F1F8"))
+        assert len(shape("\U0001F44D\U0001F3FD")) == 1, ("thumbs up + medium skin tone", shape("\U0001F44D\U0001F3FD"))
+        assert len(shape("\U0001F468\u200d\U0001F469\u200d\U0001F467")) == 1, ("ZWJ family", shape("\U0001F468\u200d\U0001F469\u200d\U0001F467"))
+        for cp in (0x1F600, 0x1F34A, 0x2764):
+            assert shape(chr(cp)) not in (["0"], ["gid0"]), (hex(cp), shape(chr(cp)))
+        unmapped = next(chr(cp) for cp in range(0xE000, 0xF900) if cp not in cmap)
+        assert shape(unmapped) in (["0"], ["gid0"]), ("the .notdef check cannot fail", shape(unmapped))
+        print("Twemoji Mozilla 0.7.0: 13723 glyphs, 1418 emoji, 3689 colour glyphs, sequences ligate")
+        EOF

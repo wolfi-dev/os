@@ -1,30 +1,53 @@
 package:
   name: font-freefont
   version: 20120503
-  epoch: 4 # add test/fonts pipeline
+  epoch: 5
   description: A set of free high-quality TrueType fonts covering the UCS character set
   copyright:
     - license: GPL-3.0-or-later
   resources:
-    cpu: "1"
-    memory: 1Gi
+    cpu: "2"
+    memory: 2Gi
+
+vars:
+  python-version: "3.13"
 
 environment:
   contents:
     packages:
       - busybox
       - fontconfig
+      - fontforge
+      - make
 
+# Built from the FontForge sources (freefont-src) with upstream's own
+# generator, tools/generate/TrueType, instead of installing the freefont-ttf
+# release archive. The generator is a FontForge Python script; the release
+# was made with FontForge 2012, so the TrueType instructions and the
+# quadratic conversion differ slightly from the shipped files, while the
+# outlines, metrics, coverage and layout features are the same.
 pipeline:
   - uses: fetch
     with:
-      expected-sha256: 7c85baf1bf82a1a1845d1322112bc6ca982221b484e3b3925022e25b5cae89af
-      uri: https://ftp.gnu.org/gnu/freefont/freefont-ttf-${{package.version}}.zip
-      extract: false
+      expected-sha256: 0d62e2e22655f841c3ac5fb8c8059a52fe2c09c695d9e8eda9903406e942657a
+      uri: https://ftp.gnu.org/gnu/freefont/freefont-src-${{package.version}}.tar.gz
+
+  # Two things the 2012 generator needs today: print() for Python 3, and
+  # dropping the 'no-hints' flag, which FontForge's current Python binding
+  # treats as "write no glyf table" (the native scripting Generate() does
+  # not have that flag at all, and the released fonts carry the instructions
+  # autoInstr produces, so the flag never meant "unhinted").
+  - uses: patch
+    with:
+      patches: python3-generator.patch
+
+  - name: Build the twelve TrueType fonts
+    runs: |
+      make -C sfd ttf
+      test "$(ls sfd/*.ttf | wc -l)" -eq 12
 
   - runs: |
-      unzip freefont-ttf-${{package.version}}.zip
-      install -D -m644 ./freefont-${{package.version}}/*.ttf -t "${{targets.destdir}}"/usr/share/fonts/freefont
+      install -D -m644 sfd/*.ttf -t "${{targets.destdir}}"/usr/share/fonts/freefont
 
 update:
   enabled: false
@@ -33,5 +56,72 @@ update:
 
 
 test:
+  environment:
+    contents:
+      packages:
+        - fontconfig
+        - harfbuzz-utils
+        - py${{vars.python-version}}-fonttools
+        - python-${{vars.python-version}}
   pipeline:
     - uses: test/fonts
+    - name: The 12 fonts are present, complete, and shape their scripts
+      runs: |
+        set -u
+        cd /usr/share/fonts/freefont
+        for f in FreeMono FreeMonoBold FreeMonoBoldOblique FreeMonoOblique FreeSans FreeSansBold FreeSansBoldOblique FreeSansOblique \
+                 FreeSerif FreeSerifBold FreeSerifBoldItalic FreeSerifItalic; do
+          test -s "$f.ttf"
+        done
+        python${{vars.python-version}} - <<'EOF'
+        import glob
+        import subprocess
+
+        from fontTools.ttLib import TTFont
+
+        # Glyph counts of the 20120503 release; a build from the .sfd sources
+        # must reproduce them exactly, with the TrueType instructions from
+        # autoInstr and the GSUB/GPOS features from the sources.
+        glyphs = {
+            "FreeMono": 4177, "FreeMonoBold": 2035, "FreeMonoBoldOblique": 1796, "FreeMonoOblique": 2251,
+            "FreeSans": 6272, "FreeSansBold": 2911, "FreeSansBoldOblique": 2403, "FreeSansOblique": 3036,
+            "FreeSerif": 10538, "FreeSerifBold": 4777, "FreeSerifBoldItalic": 2715, "FreeSerifItalic": 3291,
+        }
+        for name, count in glyphs.items():
+            path = name + ".ttf"
+            f = TTFont(path)
+            assert f["maxp"].numGlyphs == count, (path, f["maxp"].numGlyphs, count)
+            for table in ("glyf", "fpgm", "prep", "cvt ", "GSUB", "GPOS"):
+                assert table in f, (path, table)
+            # The release does not set USE_TYPO_METRICS (the generator patch
+            # clears the FontForge default); typo and hhea ascenders differ, so
+            # setting it would change line spacing.
+            assert not f["OS/2"].fsSelection & 0x80, (path, "USE_TYPO_METRICS set")
+            assert f["hhea"].ascent == (800 if name.startswith("FreeMono") else 900), (path, f["hhea"].ascent)
+        # Coverage that made FreeFont worth shipping: Latin, Greek, Cyrillic
+        # and Hebrew in all 12 faces, Arabic, Devanagari and Bengali in
+        # FreeSerif, Braille in FreeMono; check that every sample shapes to
+        # real glyphs, with a .notdef control per face.
+        def notdef(path, text):
+            out = subprocess.run(["hb-shape", "--no-glyph-names", "--no-positions", "--no-clusters", path, text],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            return out, any(tok in ("0", "gid0") for tok in out.replace("[", "|").replace("]", "|").split("|"))
+        for name in glyphs:
+            path = name + ".ttf"
+            f = TTFont(path)
+            unmapped = next(chr(cp) for cp in range(0xE000, 0xF900) if cp not in f.getBestCmap())
+            out, hit = notdef(path, unmapped)
+            assert hit, (path, "the .notdef check cannot fail", out)
+            for text in ("The quick brown fox", "Ταχίστη αλώπηξ", "Съешь ещё", "שלום עולם"):
+                out, hit = notdef(path, text)
+                assert not hit, (path, text, out)
+        for path, text in (("FreeSerif.ttf", "السلام عليكم"), ("FreeSerif.ttf", "नमस्ते"), ("FreeSerif.ttf", "আমার"),
+                           ("FreeMono.ttf", "⠃⠗⠁⠊⠇")):
+            out, hit = notdef(path, text)
+            assert not hit, (path, text, out)
+        print("12 fonts, all samples shape to real glyphs")
+        EOF
+        fc-cache -f
+        fc-list | grep -F "FreeSerif"
+        fc-list | grep -F "FreeSans"
+        fc-list | grep -F "FreeMono"

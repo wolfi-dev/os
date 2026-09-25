@@ -2,26 +2,35 @@
 package:
   name: font-crosextra-caladea
   version: 0_git20200211
-  epoch: 1 # go/wolfi-rsc/font-crosextra-caladea
+  epoch: 2
   description: Caladea serif font, metric-compatible with Cambria
   copyright:
     - license: OFL-1.1
   resources:
-    cpu: "1"
-    memory: 1Gi
+    cpu: "2"
+    memory: 2Gi
   test-resources:
     cpu: "1"
     memory: 1Gi
 
+vars:
+  python-version: "3.13"
+
 environment:
   contents:
     packages:
-      - build-base
       - busybox
-      - ca-certificates-bundle
-      - fontconfig
-      - mkfontscale
+      - fontmake
+      - ttfautohint
 
+# Built from the Glyphs sources (sources/glyphs/Caladea_{Roman,Italics}.glyphs)
+# instead of installing the prebuilt fonts/ttf files. The shipped 1.001 TTFs
+# are fontmake static instances (their features, glyph set and metrics come
+# from the .glyphs files; the older sources/ufo directory is the 1.000
+# release) that were then autohinted with ttfautohint without the version
+# marker (--no-info). The Regular/Bold masters are not point-compatible, which
+# only matters for interpolation; the four instances sit on the masters, so
+# --no-check-compatibility changes nothing in the output.
 pipeline:
   - uses: git-checkout
     with:
@@ -29,8 +38,19 @@ pipeline:
       branch: master
       expected-commit: 336a529cfad3d103d6527752686f8331d13e820a
 
+  - name: Build the four faces with fontmake and autohint them
+    runs: |
+      for g in sources/glyphs/Caladea_Roman.glyphs sources/glyphs/Caladea_Italics.glyphs; do
+        fontmake -g "$g" -o ttf -i --no-check-compatibility --output-dir unhinted
+      done
+      mkdir -p ttf
+      for f in unhinted/*.ttf; do
+        ttfautohint --no-info "$f" "ttf/$(basename "$f")"
+      done
+      test "$(ls ttf/*.ttf | wc -l)" -eq 4
+
   - runs: |
-      install -D -m644 fonts/ttf/*.ttf -t "${{targets.destdir}}"/usr/share/fonts/caladea
+      install -D -m644 ttf/*.ttf -t "${{targets.destdir}}"/usr/share/fonts/caladea
 
 update:
   enabled: false
@@ -41,5 +61,55 @@ update:
     identifier: huertatipografica/Caladea
 
 test:
+  environment:
+    contents:
+      packages:
+        - fontconfig
+        - harfbuzz-utils
+        - py${{vars.python-version}}-fonttools
+        - python-${{vars.python-version}}
   pipeline:
     - uses: test/fonts
+    - name: The four faces match the 1.001 release in glyph set, features and hinting
+      runs: |
+        set -u
+        cd /usr/share/fonts/caladea
+        python${{vars.python-version}} - <<'EOF'
+        import subprocess
+
+        from fontTools.ttLib import TTFont
+
+        faces = {"Caladea-Regular": 464, "Caladea-Bold": 464, "Caladea-Italic": 459, "Caladea-BoldItalic": 459}
+
+        def notdef(path, text):
+            out = subprocess.run(["hb-shape", "--no-glyph-names", "--no-positions", "--no-clusters", path, text],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            return out, any(tok in ("0", "gid0") for tok in out.replace("[", "|").replace("]", "|").split("|"))
+
+        for name, count in faces.items():
+            path = name + ".ttf"
+            f = TTFont(path)
+            assert f["maxp"].numGlyphs == count, (path, f["maxp"].numGlyphs, count)
+            assert f["name"].getDebugName(1) == "Caladea", (path, f["name"].getDebugName(1))
+            assert f["name"].getDebugName(5) == "Version 1.001", (path, f["name"].getDebugName(5))
+            # the Glyphs sources carry the OpenType features and mark attachment
+            gsub = {r.FeatureTag for r in f["GSUB"].table.FeatureList.FeatureRecord}
+            gpos = {r.FeatureTag for r in f["GPOS"].table.FeatureList.FeatureRecord}
+            assert {"ccmp", "frac", "locl", "sups", "tnum"} <= gsub, (path, gsub)
+            assert {"kern", "mark"} <= gpos, (path, gpos)
+            # ttfautohint output
+            for table in ("fpgm", "prep", "cvt ", "gasp"):
+                assert table in f, (path, table)
+            for text in ("The quick brown fox", "Ĉapelo ĝis", "Ærøskøbing", "Łódź"):
+                out, hit = notdef(path, text)
+                assert not hit, (path, text, out)
+            # Cambria metric compatibility: the em and the advance of the space
+            assert f["head"].unitsPerEm == 1000, (path, f["head"].unitsPerEm)
+            assert f["hmtx"][f.getBestCmap()[0x20]][0] == 220, (path, f["hmtx"][f.getBestCmap()[0x20]])
+            unmapped = next(chr(cp) for cp in range(0xE000, 0xF900) if cp not in f.getBestCmap())
+            out, hit = notdef(path, unmapped)
+            assert hit, (path, "the .notdef check cannot fail", out)
+        print("4 faces: 1.001 glyph counts, features, hinting and Latin coverage as expected")
+        EOF
+        fc-cache -f
+        fc-list | grep -F "Caladea:style=Bold Italic"

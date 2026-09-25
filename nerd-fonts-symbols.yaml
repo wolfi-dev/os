@@ -1,38 +1,67 @@
 package:
   name: nerd-fonts-symbols
   version: "3.5.1"
-  epoch: 0
+  epoch: 1
   description: Symbols-only Nerd Fonts (icon glyphs for developer tooling)
   copyright:
     - license: MIT
   resources:
-    cpu: "1"
-    memory: 1Gi
+    cpu: "2"
+    memory: 2Gi
+
+vars:
+  python-version: "3.13"
 
 environment:
   contents:
     packages:
       - busybox
+      - fontforge
+      - py${{vars.python-version}}-fontforge
+      - python-${{vars.python-version}}
 
+# Generated with upstream's font-patcher the way the release is: the patcher
+# is run over the empty template font src/unpatched-fonts/NerdFontsSymbolsOnly
+# and assembles the symbol glyphs from the icon fonts under src/glyphs
+# (Font Awesome, Devicons, Octicons, Material Design, Powerline, Codicons,
+# Weather Icons, Pomicons, Font Logos, IEC power symbols, Seti/custom); the
+# Mono variant is the same run with --mono. Output is identical to the
+# release archive apart from the head.modified timestamp. Only the parts of
+# the repository the patcher needs are checked out (the full repository is
+# >3 GB of patched fonts).
 pipeline:
-  - uses: fetch # blocked-extract-false: pre-built font binaries only; git-checkout would pull the entire nerd-fonts repo (>3 GB)
+  - uses: git-checkout
     with:
-      expected-sha256: 01172f37db8543edb102e5cb5c64101c9f4686630804d49b419aa07b23a69996
-      uri: https://github.com/ryanoasis/nerd-fonts/releases/download/v${{package.version}}/NerdFontsSymbolsOnly.tar.xz
-      extract: false
+      repository: https://github.com/ryanoasis/nerd-fonts
+      tag: v${{package.version}}
+      expected-commit: b894ea7803af6aade63d60a4381e006098ec9c4d
+      sparse-paths: |
+        bin/scripts/name_parser
+        src/glyphs
+        src/unpatched-fonts/NerdFontsSymbolsOnly
+
+  - name: Generate the Symbols Nerd Font and its Mono variant
+    runs: |
+      base=src/unpatched-fonts/NerdFontsSymbolsOnly
+      # FontForge takes the head timestamps from the template's mtime.
+      touch -d "@${SOURCE_DATE_EPOCH:-0}" "$base"/NerdFontsSymbolsNerdFontBlank.sfd
+      mkdir -p out
+      fontforge -quiet -script ./font-patcher "$base"/NerdFontsSymbolsNerdFontBlank.sfd \
+        -q --configfile="$base"/config.cfg -c --no-progressbars --outputdir out
+      fontforge -quiet -script ./font-patcher "$base"/NerdFontsSymbolsNerdFontBlank.sfd \
+        -q -s --configfile="$base"/config.cfg -c --no-progressbars --outputdir out
+      ls -l out
+      test -s out/SymbolsNerdFont-Regular.ttf
+      test -s out/SymbolsNerdFontMono-Regular.ttf
 
   - runs: |
-      set -euo pipefail
-      tar -xJf NerdFontsSymbolsOnly.tar.xz \
-        SymbolsNerdFont-Regular.ttf \
-        SymbolsNerdFontMono-Regular.ttf \
-        10-nerd-font-symbols.conf \
-        LICENSE
-
       install -Dm644 -t "${{targets.destdir}}/usr/share/fonts/nerd-fonts-symbols/" \
-        SymbolsNerdFont-Regular.ttf \
-        SymbolsNerdFontMono-Regular.ttf
+        out/SymbolsNerdFont-Regular.ttf \
+        out/SymbolsNerdFontMono-Regular.ttf
 
+      # The release archive's copy of this file is regenerated at release time
+      # from every patched font family; the committed one differs from it in a
+      # single alias line (IBM 3270 vs IBM 3270 Condensed).
       install -Dm644 10-nerd-font-symbols.conf \
         "${{targets.destdir}}/etc/fonts/conf.avail/10-nerd-font-symbols.conf"
 
@@ -47,6 +76,13 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - fontconfig
+        - harfbuzz-utils
+        - py${{vars.python-version}}-fonttools
+        - python-${{vars.python-version}}
   pipeline:
     - uses: test/fonts
     - name: Verify Nerd Fonts Symbols are installed
@@ -67,3 +103,51 @@ test:
           exit 1
         fi
         echo "PASS: fontconfig symlink is correct"
+    - name: The generated fonts match the 3.5.1 release
+      runs: |
+        set -u
+        cd /usr/share/fonts/nerd-fonts-symbols
+        python${{vars.python-version}} - <<'EOF'
+        import subprocess
+
+        from fontTools.ttLib import TTFont
+
+        def notdef(path, text):
+            out = subprocess.run(["hb-shape", "--no-glyph-names", "--no-positions", "--no-clusters", path, text],
+                                 check=True, capture_output=True, text=True).stdout.strip()
+            return out, any(tok in ("0", "gid0") for tok in out.replace("[", "|").replace("]", "|").split("|"))
+
+        # Both variants carry the same symbol set: 10,624 code points in 3.5.1
+        # (releases only add icons), every glyph but .notdef/.null/nonmarkingreturn
+        # mapped, and the release's version string.
+        counts = {}
+        for path, family in (("SymbolsNerdFont-Regular.ttf", "Symbols Nerd Font"),
+                             ("SymbolsNerdFontMono-Regular.ttf", "Symbols Nerd Font Mono")):
+            f = TTFont(path)
+            cmap = f.getBestCmap()
+            assert len(cmap) >= 10624, (path, len(cmap))
+            assert f["maxp"].numGlyphs == len(cmap) + 3, (path, f["maxp"].numGlyphs, len(cmap))
+            counts[path] = (f["maxp"].numGlyphs, len(cmap))
+            assert f["name"].getDebugName(1) == family, (path, f["name"].getDebugName(1))
+            assert f["name"].getDebugName(5) == "Version 001.000;Nerd Fonts ${{package.version}}", (path, f["name"].getDebugName(5))
+            # one glyph from each of the big icon sets the patcher pulls in
+            for cp, what in ((0xE0A0, "Powerline branch"), (0xE0B0, "Powerline separator"), (0xF015, "Font Awesome home"),
+                             (0xE718, "Devicons node"), (0xF408, "Octicons mark-github"), (0xF0001, "Material Design"),
+                             (0xEA60, "Codicons"), (0xE300, "Weather Icons"), (0xF300, "Font Logos"), (0x23FB, "IEC power")):
+                assert cp in cmap, (path, hex(cp), what)
+                out, hit = notdef(path, chr(cp))
+                assert not hit, (path, what, out)
+            unmapped = next(chr(cp) for cp in range(0xF900, 0xFB00) if cp not in cmap)
+            out, hit = notdef(path, unmapped)
+            assert hit, (path, "the .notdef check cannot fail", out)
+            widths = {f["hmtx"][cmap[cp]][0] for cp in (0xE0A0, 0xF015, 0xE718, 0xF0001, 0xEA60)}
+            if "Mono" in path:
+                # --mono fits every symbol into one cell
+                assert len(widths) == 1, (path, widths)
+            else:
+                assert len(widths) > 1, (path, "variable-width font has a single advance", widths)
+        assert len(set(counts.values())) == 1, ("the two variants differ in glyph set", counts)
+        print(f"both Symbols Nerd Font variants: {counts.popitem()[1]} (glyphs, code points), icon sets present, mono cell width")
+        EOF
+        fc-cache -f
+        fc-list | grep -F "Symbols Nerd Font Mono"

@@ -3,7 +3,7 @@
   -fhardened \
   -Wno-error=hardened \
   -Wno-hardened \
-  -mbranch-protection=standard \
+  %{!mbranch-protection=*:-mbranch-protection=standard} \
   %{!fdelete-null-pointer-checks:-fno-delete-null-pointer-checks} \
   -fno-strict-overflow \
   -fno-strict-aliasing \

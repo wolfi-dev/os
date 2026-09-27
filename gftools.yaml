@@ -1,7 +1,7 @@
 package:
   name: gftools
   version: "0.10.0"
-  epoch: 0
+  epoch: 1
   description: "Google Fonts Tools: build, fix, check and package fonts for the Google Fonts library"
   copyright:
     - license: Apache-2.0
@@ -41,6 +41,7 @@ environment:
       # pygit2 is built from its sdist (no prebuilt wheel) and links libgit2.
       - libgit2-dev
       - libxml2-dev
+      - patch
       - python-${{vars.python-version}}-dev
       - uv
 
@@ -165,6 +166,20 @@ pipeline:
         uv pip install --no-deps --only-binary :all: --no-binary cffsubr \
           --build-constraints /tmp/cffsubr-build-constraints.txt "$cffsubr_req"
 
+      # glyphsLib >= 6.13.0 fails the whole build when a glyph declares
+      # smart-component axes but has no layer mapped to a pole (Noto Sans
+      # Bengali has 22 such glyphs). Glyphs.app exports those as regular
+      # components; the patch does the same. Sent upstream as
+      # https://github.com/googlefonts/glyphsLib/pull/1177 (issue #1176);
+      # drop it once a release with the fix is on Chainguard Libraries:
+      # --forward makes this step fail instead of reverse-applying the patch
+      # when the installed glyphsLib already carries it.
+      # The wheel drops the sdist's Lib/ prefix, hence -p2.
+      glyphslib_req="$(grep '^glyphslib==' /tmp/deps.txt)"
+      echo "patching ${glyphslib_req}"
+      patch -p2 --batch --forward -d "${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages" \
+        < "${{package.srcdir}}/glyphsLib-smart-component-without-poles.patch"
+
       # gftools derives its version from the git tag via setuptools_scm; pin it
       # so the build does not depend on tag metadata in the checkout. --no-deps
       # keeps the nanoemoji subtree from being re-resolved back in.
@@ -215,10 +230,7 @@ capabilities:
     - CAP_SYS_ADMIN
 
 test:
-  environment:
-    contents:
-      packages:
-        - busybox
+  environment: {}
   pipeline:
     # Native extensions in the venv (pygit2, lxml, uharfbuzz, ...) are the only
     # dynamically linked ELF objects the package ships; the console scripts are
@@ -241,6 +253,33 @@ test:
     - name: gftools and gftools.builder import
       runs: |
         "${{vars.venv-home}}/bin/python" -c "import gftools, gftools.builder; print('gftools', gftools.__version__)"
+    # The glyphsLib patch above (googlefonts/glyphsLib#1177): a glyph that
+    # declares a smart-component axis but has no pole layers, used as a plain
+    # component, must come out as a regular component instead of aborting
+    # the build. Unpatched glyphsLib >= 6.13.0 raises ValueError here.
+    - name: glyphsLib treats a smart component without pole layers as a regular component
+      runs: |
+        "${{vars.venv-home}}/bin/python" - <<'EOF'
+        import glyphsLib
+        from glyphsLib.classes import (GSFont, GSFontMaster, GSGlyph, GSLayer, GSComponent,
+                                       GSSmartComponentAxis, GSPath, GSNode)
+        font = GSFont(); font.format_version = 3
+        master = GSFontMaster(); font.masters.append(master)
+        part = GSGlyph("_part"); font.glyphs.append(part)
+        axis = GSSmartComponentAxis(); axis.name = "Length"; axis.bottomValue = 0; axis.topValue = 100
+        part.smartComponentAxes.append(axis)  # axes declared, but no layer mapped to a pole
+        layer = GSLayer(); layer.layerId = layer.associatedMasterId = master.id
+        path = GSPath()
+        for x, y in ((0, 0), (0, 100), (100, 100), (100, 0)):
+            path.nodes.append(GSNode((x, y), "line"))
+        path.closed = True; layer.paths.append(path); part.layers.append(layer)
+        user = GSGlyph("a"); font.glyphs.append(user)
+        ulayer = GSLayer(); ulayer.layerId = ulayer.associatedMasterId = master.id
+        ulayer.components.append(GSComponent("_part")); user.layers.append(ulayer)
+        (ufo,) = glyphsLib.to_ufos(font)
+        assert len(ufo["a"].components) == 1 and len(ufo["a"]) == 0, (ufo["a"].components, len(ufo["a"]))
+        print("glyphsLib", glyphsLib.__version__, "keeps a pole-less smart component as a regular component")
+        EOF
     - name: gftools builder compiles a UFO source end to end, reproducibly
       runs: |
         py="${{vars.venv-home}}/bin/python"

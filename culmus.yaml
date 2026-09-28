@@ -1,7 +1,7 @@
 package:
   name: culmus
   version: "0.140"
-  epoch: 2
+  epoch: 3
   description: A collection of Type1 and TrueType Hebrew fonts
   copyright:
     - license: GPL-2.0-only
@@ -9,33 +9,51 @@ package:
 environment:
   contents:
     packages:
-      - autoconf
-      - automake
-      - build-base
       - busybox
-      - ca-certificates-bundle
+      # 20251009-r5 carries upstream fontforge/fontforge#5702: without it
+      # FontForge writes only four hmtx entries for a fixed-pitch font, and the
+      # 76 zero-width marks in MiriamMonoCLM-Book/Bold/BookOblique come out
+      # with a 600-unit advance. The test below checks the result; this pin
+      # makes a build against an older fontforge fail at resolve time instead.
+      - fontforge>=20251009-r5
 
+# Built from the FontForge .sfd sources in upstream's culmus-src tarball with
+# upstream's own GenerateTTF.py / GenerateOTF.py (FontForge Python scripts:
+# open the source, generate() with opentype + winkern + no-FFTM-table),
+# instead of installing the fonts from the culmus-<version>.tar.gz binary
+# release. The release ships KeterYG, MiriamMonoCLM, Shofar, SimpleCLM and
+# the two Stam fonts as TrueType and the other 30 as CFF OpenType; the same
+# split is kept here. The fontconfig snippet (culmus.conf) exists only in the
+# binary tarball and is carried next to this file.
 pipeline:
-  - uses: fetch
+  - uses: fetch # blocked-no-git-repo: Culmus publishes source tarballs on SourceForge; the project has no git repository for the fonts
     with:
-      expected-sha256: 6daed104481007752a76905000e71c0093c591c8ef3017d1b18222c277fc52e3
-      uri: https://downloads.sourceforge.net/${{package.name}}/${{package.name}}-${{package.version}}.tar.gz
+      expected-sha256: ba7cb2c8bf7011e23cf37671a383a6a483903cffbdca4a327e85a8dbec4ec73a
+      uri: https://downloads.sourceforge.net/${{package.name}}/${{package.name}}-src-${{package.version}}.tar.gz
 
-  # blocked-pending-migration: upstream also publishes culmus-src-<version>.tar.gz with the FontForge .sfd sources and a Makefile; building from them is queued in OS-3339.
+  - name: Build the 48 fonts from their .sfd sources with upstream's scripts
+    runs: |
+      # The head timestamps come from the CreationTime/ModificationTime fields
+      # every .sfd carries; the FontForge version stamp in the name table
+      # follows SOURCE_DATE_EPOCH, which melange sets. Nothing else varies.
+      mkdir -p out
+      # The families the release ships as TrueType; everything else is CFF.
+      for sfd in *.sfd; do
+        case "$sfd" in
+          KeterYG-*|MiriamMonoCLM-*|Shofar*|SimpleCLM-*|StamAshkenazCLM.sfd|StamSefaradCLM.sfd)
+            fontforge -lang=py -script GenerateTTF.py "$sfd" out ;;
+          *)
+            fontforge -lang=py -script GenerateOTF.py "$sfd" out ;;
+        esac
+      done
+      test "$(ls out/*.ttf | wc -l)" -eq 18
+      test "$(ls out/*.otf | wc -l)" -eq 30
+
   - runs: |
-      # install ttf fonts
-      install -Dm755 -d "${{targets.destdir}}"/usr/share/fonts/TTF
-      install -Dm644 ./*.ttf \
-        "${{targets.destdir}}"/usr/share/fonts/TTF
-      # install otf fonts
-      install -Dm755 -d "${{targets.destdir}}"/usr/share/fonts/OTF
-      install -Dm644 ./*.otf \
-        "${{targets.destdir}}"/usr/share/fonts/OTF
-      # install provided config file with priority 61
-      install -Dm755 -d "${{targets.destdir}}"/etc/fonts/conf.avail/
-      install -Dm644 ./culmus.conf \
-        "${{targets.destdir}}/etc/fonts/conf.avail/61-culmus.conf"
-      # symlink for the abovementioned config file
+      install -Dm644 out/*.ttf -t "${{targets.destdir}}"/usr/share/fonts/TTF
+      install -Dm644 out/*.otf -t "${{targets.destdir}}"/usr/share/fonts/OTF
+      # fontconfig aliases (Windows/Guttman names -> Culmus families), priority 61
+      install -Dm644 culmus.conf "${{targets.destdir}}/etc/fonts/conf.avail/61-culmus.conf"
       install -Dm755 -d "${{targets.destdir}}"/etc/fonts/conf.d
       ln -fs "../conf.avail/61-culmus.conf" "${{targets.destdir}}"/etc/fonts/conf.d/
 
@@ -45,5 +63,53 @@ update:
     identifier: 10067
 
 test:
+  environment:
+    contents:
+      packages:
+        - fontconfig
+        - harfbuzz-utils
+        - py3.13-fonttools
+        - python-3.13
   pipeline:
     - uses: test/fonts
+    - name: All 48 fonts are installed and fontconfig sees all 16 families
+      runs: |
+        test "$(ls /usr/share/fonts/TTF/*.ttf | wc -l)" -eq 18
+        test "$(ls /usr/share/fonts/OTF/*.otf | wc -l)" -eq 30
+        fc-cache -f
+        for family in "Aharoni CLM" "Caladings CLM" "David CLM" "Drugulin CLM" "Ellinia CLM" "Frank Ruehl CLM" \
+                      "Hadasim CLM" "Keter YG" "Miriam CLM" "Miriam Mono CLM" "Nachlieli CLM" "Shofar" \
+                      "Simple CLM" "Stam Ashkenaz CLM" "Stam Sefarad CLM" "Yehuda CLM"; do
+          fc-list | grep -F "$family" || { echo "FAIL: $family not found by fontconfig"; exit 1; }
+        done
+        fc-conflist | grep -F 61-culmus.conf
+    - name: Zero-width marks keep a zero advance in the monospace faces
+      runs: |
+        # FontForge 20251009 wrote only four hmtx entries for a fixed-pitch
+        # font, which gave the 76 zero-width Hebrew points and cantillation
+        # marks of Miriam Mono CLM a full 600-unit cell (fontforge/fontforge#5702,
+        # carried as a patch in os/fontforge.yaml). Check the metrics table
+        # directly and check the effect through the shaper.
+        cd /usr/share/fonts/TTF
+        python3 - <<'EOF'
+        from fontTools.ttLib import TTFont
+        for name in ("MiriamMonoCLM-Book", "MiriamMonoCLM-Bold", "MiriamMonoCLM-BookOblique", "MiriamMonoCLM-BoldOblique"):
+            f = TTFont(name + ".ttf")
+            zero = [g for g, (adv, lsb) in f["hmtx"].metrics.items() if adv == 0]
+            assert f["hhea"].numberOfHMetrics > 4, (name, f["hhea"].numberOfHMetrics)
+            assert len(zero) >= 70, (name, len(zero))
+            for cp in (0x05B7, 0x05BC, 0x0591, 0x05A5, 0x0300):  # patah, dagesh, etnahta, merkha, combining grave
+                g = f.getBestCmap()[cp]
+                assert f["hmtx"][g][0] == 0, (name, hex(cp), f["hmtx"][g])
+        print("Miriam Mono: zero-width marks intact in all four faces")
+        EOF
+        # bet + merkha (U+05A5): two glyphs, the base advances one 600-unit
+        # cell and the mark advances nothing. Merkha is GDEF class 1 in this
+        # font, so HarfBuzz does not zero it on its own and the broken build
+        # shaped it as +600 (a GDEF-mark such as patah is zeroed by the shaper
+        # and would pass either way). HarfBuzz emits the mark first for Hebrew.
+        out="$(hb-shape --no-glyph-names --no-clusters MiriamMonoCLM-Book.ttf "ב֥")"
+        echo "$out"
+        test "$(echo "$out" | tr '|' '\n' | wc -l)" -eq 2 || { echo "FAIL: expected two glyphs"; exit 1; }
+        echo "$out" | tr '|' '\n' | grep -qE '[+]0]?$' || { echo "FAIL: merkha advances in Miriam Mono Book"; exit 1; }
+        echo "$out" | tr '|' '\n' | grep -qE '[+]600]?$' || { echo "FAIL: the base does not advance one cell"; exit 1; }

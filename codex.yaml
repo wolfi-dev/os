@@ -1,15 +1,20 @@
 package:
   name: codex
   version: "0.158.0"
-  epoch: 0 # rust: 1.97->1.98; moved from enterprise-packages/ to os/
+  epoch: 1 # install as upstream package layout with code-mode-host
   description: OpenAI Codex CLI - a lightweight coding agent that runs in your terminal
   copyright:
     - license: Apache-2.0
   dependencies:
     runtime:
+      # codex uses bwrap and rg from PATH; see daemon-system-rg-bwrap.patch.
+      - bubblewrap
       - ca-certificates-bundle
       - git
       - openssh-client
+      # The app-server daemon runs `ps -p PID -o lstart=`; busybox ps lacks both.
+      - procps
+      - ripgrep
   resources:
     # codex-rs is a large (60+ crate) Cargo workspace that links against a
     # prebuilt V8 static library (rusty_v8); the final link step is
@@ -24,10 +29,13 @@ package:
     memory: 48Gi
   test-resources:
     cpu: "1"
-    memory: 1Gi
+    # The app-server daemon test is OOM-killed at 1Gi while it copies the
+    # ~460M package into CODEX_HOME.
+    memory: 4Gi
 
 vars:
   rust-version: 1.98
+  rusty-v8-version: 150.4.0
   llvm-version: 22
   openssl-version: "3.6"
 
@@ -41,6 +49,7 @@ environment:
       - cargo-auditable
       - clang-${{vars.llvm-version}}
       - cmake
+      - curl
       - glibc-2.44-dev
       - libcap-dev
       - openssl-${{vars.openssl-version}}-dev
@@ -53,6 +62,10 @@ environment:
       - python3
       - rust-${{vars.rust-version}}
       - wolfi-base
+  environment:
+    # Populated by the "Fetch rusty_v8" step below.
+    RUSTY_V8_ARCHIVE: /home/build/rusty_v8/librusty_v8.a.gz
+    RUSTY_V8_SRC_BINDING_PATH: /home/build/rusty_v8/src_binding.rs
 
 pipeline:
   - uses: git-checkout
@@ -68,6 +81,13 @@ pipeline:
     with:
       patches: chatgpt-recursion-limit.patch
 
+  # The app-server daemon only runs from a package tree that bundles rg and
+  # bwrap. Use the ripgrep and bubblewrap packages from PATH instead, so
+  # their updates reach codex.
+  - uses: patch
+    with:
+      patches: daemon-system-rg-bwrap.patch
+
   - uses: bump
     with:
       # The Cargo workspace (Cargo.toml / Cargo.lock) lives in codex-rs/, not
@@ -82,10 +102,11 @@ pipeline:
       # NOTE: the gix family (gix@0.83.0, gix-fs@0.21.1, gix-pack@0.69.0) and
       # jsonwebtoken@10.3.0 are pinned by the runs step below rather than here.
       # omnibump verifies a bump by building the whole workspace, which compiles
-      # the codex-v8-poc member and so the v8 150.4.0 build.rs, which downloads
-      # a librusty_v8_ptrcomp_sandbox_release prebuilt that upstream never
-      # published (HTTP 404). Every attempted pin therefore failed verification
-      # and omnibump's bisection blamed whichever crate it was pinning.
+      # the v8 150.4.0 build.rs. It wants a librusty_v8_ptrcomp_sandbox_release
+      # prebuilt that denoland does not publish (HTTP 404); the openai-published
+      # one is fetched by the "Fetch rusty_v8" step, which runs after this one.
+      # Every attempted pin therefore failed verification and omnibump's
+      # bisection blamed whichever crate it was pinning.
       # NOTE: hickory-proto (GHSA-q2qq-hmj6-3wpp fixed in 0.26.1, and
       # GHSA-3v94-mw7p-v465 which has NO published fix) is intentionally NOT
       # bumped. Only one hickory-proto (0.25.2) is in the graph and it is pulled
@@ -149,10 +170,8 @@ pipeline:
       replacement: 'jsonwebtoken = "10.3.0"'
 
   # Lands the gix-family CVE pins that omnibump cannot verify (see the NOTE in
-  # the bump step above). The package build is --bin codex, which never
-  # compiles codex-v8-poc, so the v8 prebuilt is never fetched here. Move this
-  # back into bump deps once rusty_v8 publishes the 150.4.0 prebuilt or codex
-  # drops the v8-poc workspace member.
+  # the bump step above). Fetching rusty_v8 before bump may let these move
+  # back into bump deps; that is untested.
   - runs: |
       set -euo pipefail
       cd codex-rs
@@ -174,13 +193,66 @@ pipeline:
         echo "${name}: ${have} (>= ${min})"
       done
 
+  # codex-code-mode-host links V8 with v8_enable_sandbox. denoland does not
+  # publish that prebuilt, so use the one openai publishes, verified against
+  # the checksums in upstream's third_party/v8/rusty_v8_*_manifests.sha256.
+  - name: Fetch rusty_v8
+    runs: |
+      set -euo pipefail
+      case "${{build.arch}}" in
+        x86_64)
+          archive_sha=a35c75d1f26e6a983885a45b33490a4ebe54f05050568b32b89cfb421b30b583
+          binding_sha=7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506
+          ;;
+        aarch64)
+          archive_sha=d1517eed405468537029b005d5fe997ec74d5c8d351f916b3a6df20b7d2811ba
+          binding_sha=7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506
+          ;;
+        *) echo "no rusty_v8 checksum for ${{build.arch}}"; exit 1 ;;
+      esac
+      base=https://github.com/openai/codex/releases/download/rusty-v8-v${{vars.rusty-v8-version}}
+      target=${{build.arch}}-unknown-linux-gnu
+      mkdir -p "$(dirname "${RUSTY_V8_ARCHIVE}")"
+      curl -fsSL -o "${RUSTY_V8_ARCHIVE}" "${base}/librusty_v8_ptrcomp_sandbox_release_${target}.a.gz"
+      curl -fsSL -o "${RUSTY_V8_SRC_BINDING_PATH}" "${base}/src_binding_ptrcomp_sandbox_release_${target}.rs"
+      printf '%s  %s\n%s  %s\n' \
+        "${archive_sha}" "${RUSTY_V8_ARCHIVE}" \
+        "${binding_sha}" "${RUSTY_V8_SRC_BINDING_PATH}" | sha256sum -c -
+
   - uses: cargo/build
     with:
       modroot: codex-rs
       output: codex
-      opts: --release --bin codex
+      opts: --release --bin codex --bin codex-code-mode-host
 
+  # Install in upstream's package layout (scripts/codex_package/layout.py).
+  # The app-server daemon, started by default, refuses to run unless codex
+  # is inside a complete package, which it copies into CODEX_HOME.
+  # The +chainguard build metadata makes the daemon treat this as a local
+  # build: a plain version would start its updater, which replaces the
+  # daemon with upstream's release by piping install.sh into sh.
+  - runs: |
+      set -euo pipefail
+      pkg="${{targets.contextdir}}/usr/lib/codex"
+      mkdir -p "${pkg}/bin"
+      mv "${{targets.contextdir}}/usr/bin/codex" "${pkg}/bin/codex"
+      install -m755 codex-rs/target/release/codex-code-mode-host "${pkg}/bin/"
+      cat > "${pkg}/codex-package.json" <<EOF
+      {
+        "layoutVersion": 1,
+        "version": "${{package.version}}+chainguard",
+        "target": "${{build.arch}}-unknown-linux-gnu",
+        "variant": "codex",
+        "entrypoint": "bin/codex"
+      }
+      EOF
+      ln -s ../lib/codex/bin/codex "${{targets.contextdir}}/usr/bin/codex"
+
+  # The default (-g) keeps the symbol table, ~90M of bin/codex. Match
+  # upstream's release strip flags.
   - uses: strip
+    with:
+      opts: --strip-debug --strip-unneeded
 
 test:
   environment:
@@ -215,6 +287,29 @@ test:
     - uses: test/tw/help-check
       with:
         bins: codex
+    - name: Code mode host is installed
+      runs: |
+        set -euo pipefail
+        /usr/lib/codex/bin/codex-code-mode-host --help
+    # codex starts this daemon by default; it refuses to run unless codex is
+    # installed as a complete package. It must not start its self-updater.
+    - name: App-server daemon starts without auto-update
+      runs: |
+        set -euo pipefail
+        codex app-server daemon start
+        codex app-server daemon version | grep -F '"status":"running"'
+        sleep 2
+        # [p] keeps pgrep from matching this script.
+        if pgrep -af 'pid-update-loo[p]'; then
+          echo "daemon started its self-updater"
+          exit 1
+        fi
+        marker="${CODEX_HOME}/packages/app-server-daemon/auto-update-version"
+        if [ -e "${marker}" ]; then
+          echo "daemon wrote ${marker}"
+          exit 1
+        fi
+        codex app-server daemon stop
     # Functional: generate a bash completion script and verify real output. This
     # exercises the CLI's clap command tree end to end via the `completion`
     # subcommand and proves it emits a non-trivial, codex-specific completion

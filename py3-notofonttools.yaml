@@ -1,0 +1,224 @@
+package:
+  name: py3-notofonttools
+  version: "0.4.1"
+  epoch: 0
+  description: Noto font tools, scripts for release engineering of Noto and similar fonts
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: notofonttools
+  import: nototools
+
+data:
+  - name: py-versions
+    items:
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - py3-supported-build-base
+      - py3-supported-pip
+      - py3-supported-setuptools
+      - py3-supported-setuptools-scm
+      - py3-supported-wheel
+  environment:
+    SETUPTOOLS_SCM_PRETEND_VERSION: ${{package.version}}
+
+# Needed by the xcover/profile test steps, which attach BPF uprobes.
+capabilities:
+  add:
+    - CAP_SYS_ADMIN
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/notofonts/nototools
+      tag: v${{package.version}}
+      expected-commit: 481f809f4de34348e8ba5834f0c2de3b22bf5792
+
+  - name: drop vcs-versioning from setup_requires
+    runs: |
+      # vcs-versioning is not packaged; setuptools-scm alone handles use_scm_version.
+      grep -q '"vcs-versioning"' setup.py
+      sed -i 's/setup_requires=\["setuptools_scm", "vcs-versioning"\]/setup_requires=["setuptools_scm"]/' setup.py
+      grep -q 'setup_requires=\["setuptools_scm"\]' setup.py
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      runtime:
+        - py${{range.key}}-fonttools
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - name: move usr/bin executables for -bin
+        runs: |
+          mkdir -p ./cleanup/${{range.key}}/
+          mv ${{targets.contextdir}}/usr/bin ./cleanup/${{range.key}}/
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              import ${{vars.import}}.add_vs_cmap
+        # The scripts live in -bin, so the library is driven through python -m.
+        - uses: xcover/profile
+          with:
+            executable-path: /usr/bin/python${{range.key}}
+        - name: add_vs_cmap module adds a format-14 cmap subtable
+          working-directory: /tmp/add-vs-cmap-module
+          runs: |
+            # Minimal TrueType font whose only mapped character is U+2640 FEMALE SIGN.
+            cat > mkfont.py <<'EOF'
+            from fontTools.fontBuilder import FontBuilder
+            from fontTools.pens.ttGlyphPen import TTGlyphPen
+            fb = FontBuilder(1000, isTTF=True)
+            fb.setupGlyphOrder([".notdef", "female"])
+            fb.setupCharacterMap({0x2640: "female"})
+            pen = TTGlyphPen(None)
+            pen.moveTo((100, 0)); pen.lineTo((100, 700)); pen.lineTo((500, 700)); pen.lineTo((500, 0)); pen.closePath()
+            fb.setupGlyf({".notdef": TTGlyphPen(None).glyph(), "female": pen.glyph()})
+            fb.setupHorizontalMetrics({".notdef": (500, 0), "female": (600, 100)})
+            fb.setupHorizontalHeader(ascent=800, descent=-200)
+            fb.setupNameTable({"familyName": "VSTest", "styleName": "Regular"})
+            fb.setupOS2()
+            fb.setupPost()
+            fb.save("in.ttf")
+            EOF
+            cat > check.py <<'EOF'
+            import sys
+            from fontTools.ttLib import TTFont
+            def vs_codepoints(path):
+                subtables = [t for t in TTFont(path)["cmap"].tables if t.format == 14]
+                return {cp for t in subtables for seqs in t.uvsDict.values() for cp, _ in seqs}
+            assert not vs_codepoints("in.ttf"), "input already has a format-14 subtable"
+            found = vs_codepoints(sys.argv[1])
+            print("variation-sequence codepoints:", sorted(hex(c) for c in found))
+            assert 0x2640 in found, "U+2640 missing from format-14 cmap"
+            EOF
+            python${{range.key}} mkfont.py
+            python${{range.key}} -m nototools.add_vs_cmap -vs 2640 --dstdir "$PWD" -o out.ttf in.ttf
+            python${{range.key}} check.py out.ttf | grep -F "0x2640"
+        - uses: xcover/stop
+        - uses: xcover/ensure
+          with:
+            min-coverage: 90
+
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: Executable scripts for ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}
+        - py3-${{vars.pypi-package}}-bin
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/
+          mv ./cleanup/${{range.key}}/bin ${{targets.contextdir}}/usr/
+    test:
+      pipeline:
+        - uses: test/tw/virtualpackage
+          with:
+            virtual-pkg-name: py3-${{vars.pypi-package}} py3-${{vars.pypi-package}}-bin
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: test/tw/help-check
+          with:
+            bins: add_vs_cmap.py
+            expect-contains: dstdir
+        # The console scripts are text; their shebang execs this interpreter.
+        - uses: xcover/profile
+          with:
+            executable-path: /usr/bin/python${{range.key}}
+        - name: add_vs_cmap.py adds a format-14 cmap subtable
+          working-directory: /tmp/add-vs-cmap-script
+          runs: |
+            # Minimal TrueType font whose only mapped character is U+2640 FEMALE SIGN.
+            cat > mkfont.py <<'EOF'
+            from fontTools.fontBuilder import FontBuilder
+            from fontTools.pens.ttGlyphPen import TTGlyphPen
+            fb = FontBuilder(1000, isTTF=True)
+            fb.setupGlyphOrder([".notdef", "female"])
+            fb.setupCharacterMap({0x2640: "female"})
+            pen = TTGlyphPen(None)
+            pen.moveTo((100, 0)); pen.lineTo((100, 700)); pen.lineTo((500, 700)); pen.lineTo((500, 0)); pen.closePath()
+            fb.setupGlyf({".notdef": TTGlyphPen(None).glyph(), "female": pen.glyph()})
+            fb.setupHorizontalMetrics({".notdef": (500, 0), "female": (600, 100)})
+            fb.setupHorizontalHeader(ascent=800, descent=-200)
+            fb.setupNameTable({"familyName": "VSTest", "styleName": "Regular"})
+            fb.setupOS2()
+            fb.setupPost()
+            fb.save("in.ttf")
+            EOF
+            cat > check.py <<'EOF'
+            import sys
+            from fontTools.ttLib import TTFont
+            def vs_codepoints(path):
+                subtables = [t for t in TTFont(path)["cmap"].tables if t.format == 14]
+                return {cp for t in subtables for seqs in t.uvsDict.values() for cp, _ in seqs}
+            assert not vs_codepoints("in.ttf"), "input already has a format-14 subtable"
+            found = vs_codepoints(sys.argv[1])
+            print("variation-sequence codepoints:", sorted(hex(c) for c in found))
+            assert 0x2640 in found, "U+2640 missing from format-14 cmap"
+            EOF
+            python${{range.key}} mkfont.py
+            add_vs_cmap.py -vs 2640 --dstdir "$PWD" -o out.ttf in.ttf
+            python${{range.key}} check.py out.ttf | grep -F "0x2640"
+        - name: add_vs_cmap.py rejects a missing input font
+          working-directory: /tmp/add-vs-cmap-missing
+          runs: |
+            if add_vs_cmap.py -vs 2640 --dstdir "$PWD" -o out.ttf missing.ttf; then
+              echo "ERROR: add_vs_cmap.py succeeded on a nonexistent font"
+              exit 1
+            fi
+            if [ -e out.ttf ]; then
+              echo "ERROR: out.ttf written for a nonexistent input"
+              exit 1
+            fi
+        - uses: xcover/stop
+        - uses: xcover/ensure
+          with:
+            min-coverage: 90
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: notofonts/nototools
+    strip-prefix: v
+    tag-filter-prefix: v0.

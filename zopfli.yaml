@@ -1,0 +1,238 @@
+package:
+  name: zopfli
+  version: "1.0.3"
+  epoch: 0
+  description: Zopfli compression library and zopfli/zopflipng tools producing smaller deflate, zlib, gzip and PNG output
+  copyright:
+    - license: Apache-2.0
+    - license: Zlib
+
+vars:
+  glibc-version: "2.44"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - cmake
+      # build-base pulls the glibc-dev virtual; the build environment must pin a glibc header stream.
+      - glibc-${{vars.glibc-version}}-dev
+      - ninja-build
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/google/zopfli
+      tag: zopfli-${{package.version}}
+      expected-commit: bd64b2f0553d4f1ef4e6627647c5d9fc8c71ffc0
+
+  # GetMatch() dereferences unaligned byte pointers as size_t*; GCC 16 at -O3
+  # vectorises that loop with aligned loads on x86_64 and zopfli segfaults in
+  # ZopfliFindLongestMatch on ordinary input (google/zopfli#22). Read the words
+  # with memcpy instead.
+  - uses: patch
+    with:
+      patches: getmatch-unaligned-read.patch
+
+  # Upstream declares cmake_minimum_required(VERSION 2.8.11), which CMake 4 rejects without a policy floor.
+  - uses: cmake/configure
+    with:
+      opts: |
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DZOPFLI_BUILD_SHARED=ON
+
+  - uses: cmake/build
+
+  - uses: cmake/install
+
+  - uses: strip
+
+# Test-only: the xcover/profile step attaches BPF uprobes, which require CAP_SYS_ADMIN.
+capabilities:
+  add:
+    - CAP_SYS_ADMIN
+
+test:
+  environment:
+    contents:
+      packages:
+        - python3
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: zopfli
+        help-flag: -h
+        expect-contains: "Usage: zopfli"
+    - name: zopfli -c writes gzip to stdout that gzip -d restores and that beats gzip -9
+      runs: |
+        mkdir -p /tmp/rt
+        for i in $(seq 1 500); do echo "zopfli round trip line $i: the quick brown fox jumps over the lazy dog"; done > /tmp/rt/input.txt
+        zopfli -c /tmp/rt/input.txt > /tmp/rt/out.gz
+        zopfli --i5 -c /tmp/rt/input.txt > /tmp/rt/out-i5.gz
+        gzip -dc /tmp/rt/out.gz | cmp - /tmp/rt/input.txt
+        gzip -dc /tmp/rt/out-i5.gz | cmp - /tmp/rt/input.txt
+        gzip -9 -c /tmp/rt/input.txt > /tmp/rt/ref.gz
+        in_size=$(wc -c < /tmp/rt/input.txt)
+        z_size=$(wc -c < /tmp/rt/out.gz)
+        g_size=$(wc -c < /tmp/rt/ref.gz)
+        echo "input=$in_size zopfli=$z_size gzip-9=$g_size"
+        [ "$z_size" -lt "$in_size" ]
+        [ "$z_size" -le "$g_size" ]
+    - name: zopfli writes .gz, .zlib and .deflate files that standard inflaters decode
+      runs: |
+        mkdir -p /tmp/fmt
+        for i in $(seq 1 300); do echo "format test $i"; done > /tmp/fmt/data.txt
+        zopfli /tmp/fmt/data.txt
+        zopfli --zlib /tmp/fmt/data.txt
+        zopfli --deflate /tmp/fmt/data.txt
+        ls -l /tmp/fmt
+        gzip -dc /tmp/fmt/data.txt.gz | cmp - /tmp/fmt/data.txt
+        # wbits -15 selects raw deflate (no header), the default selects the zlib container.
+        python3 - <<'EOF'
+        import zlib
+        src = open("/tmp/fmt/data.txt", "rb").read()
+        assert zlib.decompress(open("/tmp/fmt/data.txt.zlib", "rb").read()) == src
+        assert zlib.decompress(open("/tmp/fmt/data.txt.deflate", "rb").read(), -15) == src
+        print("zlib and deflate outputs decode to the original")
+        EOF
+    # The anchored main-only filter keeps inlined libstdc++ template instances and GCC's main.cold fragment
+    # unprobed.
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/zopflipng
+        include-functions: "'^main$'"
+    - uses: test/tw/help-check
+      with:
+        bins: zopflipng
+        help-flag: --help
+        expect-contains: "Usage: zopflipng"
+    - name: zopflipng -y recompresses a PNG losslessly into a smaller valid PNG
+      runs: |
+        mkdir -p /tmp/png
+        # Minimal PNG codec: writes an 8-bit RGB image with stored (level 0) IDAT so zopflipng has
+        # room to shrink it, and decodes 8-bit RGB non-interlaced PNGs (all five filter types) to
+        # compare pixels, verifying chunk CRCs along the way.
+        tee /tmp/png/pngtool.py <<'EOF'
+        import struct, sys, zlib
+        SIG = b"\x89PNG\r\n\x1a\n"
+        def chunk(t, d):
+            return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        def gen(path):
+            w = h = 64
+            raw = b"".join(b"\x00" + bytes(v for x in range(w) for v in (x * 4, y * 4, (x + y) * 2 % 256)) for y in range(h))
+            ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+            open(path, "wb").write(SIG + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 0)) + chunk(b"IEND", b""))
+        def decode(path):
+            data = open(path, "rb").read()
+            assert data[:8] == SIG, "bad PNG signature"
+            pos, idat, ihdr, end = 8, b"", None, False
+            while pos < len(data):
+                n, = struct.unpack(">I", data[pos:pos + 4])
+                t, d = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + n]
+                crc, = struct.unpack(">I", data[pos + 8 + n:pos + 12 + n])
+                assert zlib.crc32(t + d) & 0xffffffff == crc, "bad CRC in %r" % t
+                if t == b"IHDR":
+                    ihdr = struct.unpack(">IIBBBBB", d)
+                elif t == b"IDAT":
+                    idat += d
+                elif t == b"IEND":
+                    end = True
+                pos += 12 + n
+            assert end, "missing IEND"
+            w, h, depth, ctype, _, _, interlace = ihdr
+            assert (depth, ctype, interlace) == (8, 2, 0), ihdr
+            raw, bpp = zlib.decompress(idat), 3
+            stride = w * bpp
+            out, prev = bytearray(), bytearray(stride)
+            for y in range(h):
+                base = y * (stride + 1)
+                f, line = raw[base], bytearray(raw[base + 1:base + 1 + stride])
+                for i in range(stride):
+                    a = line[i - bpp] if i >= bpp else 0
+                    b = prev[i]
+                    c = prev[i - bpp] if i >= bpp else 0
+                    if f == 1:
+                        line[i] = (line[i] + a) & 255
+                    elif f == 2:
+                        line[i] = (line[i] + b) & 255
+                    elif f == 3:
+                        line[i] = (line[i] + (a + b) // 2) & 255
+                    elif f == 4:
+                        p = a + b - c
+                        pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                        pr = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                        line[i] = (line[i] + pr) & 255
+                    else:
+                        assert f == 0, "bad filter %d" % f
+                out += line
+                prev = line
+            return w, h, bytes(out)
+        if sys.argv[1] == "gen":
+            gen(sys.argv[2])
+        else:
+            assert decode(sys.argv[2]) == decode(sys.argv[3]), "pixel data differs"
+            print("pixels identical")
+        EOF
+        python3 /tmp/png/pngtool.py gen /tmp/png/in.png
+        zopflipng -y /tmp/png/in.png /tmp/png/out.png
+        in_size=$(wc -c < /tmp/png/in.png)
+        out_size=$(wc -c < /tmp/png/out.png)
+        echo "in=$in_size out=$out_size"
+        [ "$out_size" -le "$in_size" ]
+        python3 /tmp/png/pngtool.py compare /tmp/png/in.png /tmp/png/out.png
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        min-coverage: 90
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: Development files for zopfli
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - uses: split/dev
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - busybox
+      pipeline:
+        - uses: test/tw/devpackage
+        - name: A C program links libzopfli and produces gzip that gunzip restores
+          runs: |
+            tee /tmp/libtest.c <<'EOF'
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <zopfli.h>
+            int main(int argc, char **argv) {
+                static unsigned char in[65536];
+                FILE *f = fopen(argv[1], "rb");
+                size_t insize = fread(in, 1, sizeof in, f);
+                fclose(f);
+                ZopfliOptions opts;
+                ZopfliInitOptions(&opts);
+                unsigned char *out = NULL;
+                size_t outsize = 0;
+                ZopfliCompress(&opts, ZOPFLI_FORMAT_GZIP, in, insize, &out, &outsize);
+                if (out == NULL || outsize == 0 || outsize >= insize) return 1;
+                fwrite(out, 1, outsize, stdout);
+                free(out);
+                return 0;
+            }
+            EOF
+            gcc /tmp/libtest.c -o /tmp/libtest -lzopfli
+            for i in $(seq 1 200); do echo "libzopfli line $i of repetitive input"; done > /tmp/libin.txt
+            /tmp/libtest /tmp/libin.txt > /tmp/libout.gz
+            gzip -dc /tmp/libout.gz | cmp - /tmp/libin.txt
+
+update:
+  enabled: true
+  github:
+    identifier: google/zopfli
+    strip-prefix: zopfli-
+    tag-filter-prefix: zopfli-

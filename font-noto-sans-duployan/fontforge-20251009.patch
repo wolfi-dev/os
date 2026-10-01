@@ -1,0 +1,433 @@
+Build with the FontForge we package instead of the FontForge of 2019 that
+upstream compiles from source in CI (FONTFORGE_COMMIT aa062f4 of 2019-11-22,
+plus fontforge/fontforge#4232). FontForge rewrote its stroker in 20200314,
+and four of its behaviours changed under the generator:
+
+ 1. layer.stroke() can leave a degenerate open contour
+    (fontforge/fontforge#4490, reported by the Duployan author in 2020, open).
+ 2. Overlap removal inside glyph.stroke() crashes in FindMonoContaining on
+    some inputs (fontforge/fontforge#5357, same author, 2024, open; the
+    crashing input on x86_64 is the one in that report). Which inputs crash
+    differs by architecture: aarch64 crashes on a circle with an exit line
+    that x86_64 strokes fine, with the same coordinates, and no rounding
+    avoided it there (1/1000, 1/100 and 1/10 all crashed on a Raspberry Pi 5
+    and in CI). So every stroke and overlap-removal call runs in a forked
+    child that sends the resulting points back over a pipe; if the child
+    dies, the parent tries again on copies rounded to 1/100, 1/10 and 1 unit
+    and, for a stroke, finally on a copy nudged by a thousandth of a unit
+    (the aarch64 case survives at 1/100). If every attempt at a stroke dies
+    the build fails, naming the input; if every attempt at an overlap
+    removal dies, the overlapping contours are kept and a warning printed.
+    A Python exception inside the child is passed back and re-raised in the
+    parent, so a generator bug still stops the build as it always did.
+    In-process the same crash would take the build with it. Cost: the build
+    takes about six minutes per weight instead of one. The child's
+    faulthandler trace ("Fatal Python error: Segmentation fault") appears in
+    the build log when this happens; it is the child.
+    On x86_64 the output is the same as without the guard (same glyphs,
+    advances and bounding boxes; two glyphs lose a zero-area two-point
+    contour that the release does not have either).
+ 3. A zero-length path strokes to nothing ("Warning: No stroke output for
+    contour") where the old stroker produced the round cap, a filled circle.
+    The generator draws every dot that way (Dot.draw), so period, colon,
+    U+1BC00 and the other dots came out empty: replace a zero-length contour
+    with an explicit circle of the stroke's diameter.
+ 4. glyph.removeOverlap() on the stenographic period (four round-capped
+    strokes through one point) returns a single open contour, which
+    _remove_bad_contours then deletes; rounding to 1/100 unit first gives the
+    closed contour the 2019 build produced. One- and two-point open leftovers
+    are dropped as before.
+
+Also, 'no-hints' in the generate flags makes FontForge 20251009 write a font
+without its CFF table (fontforge/fontforge#5678, fixed upstream 2026-02-06),
+and the Noto name-table path imported font-v (PyPI, needs GitPython) only to
+write "Version 3.002" into name ID 5 for a release build.
+
+The same retry ladder handles a stroke or overlap removal that survives but
+comes back with an open contour; set DUPLOYAN_STROKE_LOG=<file> to get a
+JSON line per workaround applied (for 3.002 on x86_64: 77 dots per weight,
+17/50 stroke retries, 5/1 overlap retries, 149 degenerate leftovers, 0
+crashes; on aarch64 one crash per weight at most, retried at 1/100).diff --git a/sources/build.py b/sources/build.py
+index 29a4ce5..025f16d 100755
+--- a/sources/build.py
++++ b/sources/build.py
+@@ -53,7 +53,8 @@ def build_font(options: argparse.Namespace, font: fontforge.font) -> None:
+     font.selection.all()
+     font.correctReferences()
+     font.selection.none()
+-    flags = ['no-hints', 'omit-instructions', 'opentype']
++    # 'no-hints' makes FontForge 20251009 omit the CFF table (fontforge/fontforge#5678).
++    flags = ['omit-instructions', 'opentype']
+     os.makedirs(os.path.dirname(os.path.realpath(options.output)), exist_ok=True)
+     font.generate(options.output, flags=flags)
+ 
+@@ -124,15 +125,21 @@ def set_version(
+     tt_font['head'].fontRevision = version
+     if noto:
+         os.environ['GIT_PYTHON_REFRESH'] = 'warn'
+-        import fontv.libfv
+-        fontv_version = fontv.libfv.FontVersion(tt_font)
+-        fontv_version.set_version_number(f'{version:.03f}')
+-        if not release:
++        # font-v (and its GitPython dependency) is only needed for the
++        # development-build suffix; a release build writes the plain string.
++        if release:
++            for name in tt_font['name'].names:
++                if name.nameID == 5:
++                    name.string = f'Version {version:.03f}'
++        else:
++            import fontv.libfv
++            fontv_version = fontv.libfv.FontVersion(tt_font)
++            fontv_version.set_version_number(f'{version:.03f}')
+             try:
+                 fontv_version.set_state_git_commit_sha1(development=True)
+             except OSError:
+                 fontv_version.set_development_status()
+-        fontv_version.write_version_string()
++            fontv_version.write_version_string()
+     else:
+         for name in tt_font['name'].names:
+             if name.nameID == 5:
+diff --git a/sources/shapes.py b/sources/shapes.py
+index fbe922b..51f81ee 100644
+--- a/sources/shapes.py
++++ b/sources/shapes.py
+@@ -113,6 +113,263 @@ LINE_FACTOR: Final[float] = 500
+ RADIUS: Final[float] = 50
+ 
+ 
++
++def _layer_to_data(layer):
++    return {'q': bool(layer.is_quadratic),
++            'c': [{'closed': bool(c.closed), 'p': [(pt.x, pt.y, bool(pt.on_curve)) for pt in c]} for c in layer]}
++
++
++def _layer_from_data(data):
++    layer = fontforge.layer()
++    layer.is_quadratic = data['q']
++    for c in data['c']:
++        contour = fontforge.contour()
++        contour.is_quadratic = data['q']
++        for x, y, on in c['p']:
++            contour += fontforge.point(x, y, on)
++        contour.closed = c['closed']
++        layer += contour
++    return layer
++
++
++def _guarded(fn, layer):
++    """Runs `fn(layer)` in a forked child and returns the resulting layer, or
++    None if the child died (a segfault in FontForge's overlap removal,
++    fontforge/fontforge#5357). The child serialises the layer's points back
++    over a pipe; nothing else in the process is affected."""
++    import json
++    import os
++    import sys
++    sys.stdout.flush()
++    sys.stderr.flush()
++    import traceback
++    r, w = os.pipe()
++    pid = os.fork()
++    if pid == 0:
++        os.close(r)
++        code = 0
++        try:
++            fn(layer)
++            payload = json.dumps(_layer_to_data(layer)).encode()
++        except BaseException:
++            # A Python error in the generator is not a FontForge crash: pass
++            # it to the parent so the build fails the way it always did.
++            payload = b'EXC\n' + traceback.format_exc().encode()
++            code = 2
++        view = memoryview(payload)
++        while view:
++            n = os.write(w, view)
++            view = view[n:]
++        os.close(w)
++        os._exit(code)
++    os.close(w)
++    chunks = []
++    while True:
++        chunk = os.read(r, 1 << 16)
++        if not chunk:
++            break
++        chunks.append(chunk)
++    os.close(r)
++    _, status = os.waitpid(pid, 0)
++    data = b''.join(chunks)
++    if data.startswith(b'EXC\n'):
++        raise RuntimeError('error in forked FontForge call:\n' + data[4:].decode(errors='replace'))
++    if os.WIFSIGNALED(status) or status != 0 or not data:
++        # The child died (a FontForge segfault) or could not report.
++        return None
++    return _layer_from_data(json.loads(data))
++
++
++def _stroke_guarded(layer, args, kwargs):
++    """Strokes a copy of `layer` in a child; None if FontForge crashed."""
++    return _guarded(lambda l: l.stroke(*args, **kwargs), layer.dup())
++
++
++def _remove_overlap_guarded(layer):
++    return _guarded(lambda l: l.removeOverlap(), layer.dup())
++
++
++def _log_stroke_event(record):
++    import json
++    import os
++    if path := os.environ.get('DUPLOYAN_STROKE_LOG'):
++        with open(path, 'a') as f:
++            f.write(json.dumps(record) + '\n')
++
++
++def _has_open_contour(layer):
++    return any(len(contour) and not contour.closed for contour in layer)
++
++
++def _split_zero_length(layer):
++    """Separates zero-length contours (all points coincident) from the rest."""
++    kept = fontforge.layer()
++    kept.is_quadratic = layer.is_quadratic
++    centers = []
++    for contour in layer:
++        points = [(point.x, point.y) for point in contour]
++        if points and all(abs(x - points[0][0]) < 1e-6 and abs(y - points[0][1]) < 1e-6 for x, y in points):
++            centers.append(points[0])
++        else:
++            kept += contour
++    return kept, centers
++
++
++def _circle(cx, cy, r):
++    """A clockwise (FontForge outer-contour direction) cubic circle."""
++    k = 0.5522847498307936 * r
++    contour = fontforge.contour()
++    contour.moveTo(cx + r, cy)
++    contour.cubicTo((cx + r, cy - k), (cx + k, cy - r), (cx, cy - r))
++    contour.cubicTo((cx - k, cy - r), (cx - r, cy - k), (cx - r, cy))
++    contour.cubicTo((cx - r, cy + k), (cx - k, cy + r), (cx, cy + r))
++    contour.cubicTo((cx + k, cy + r), (cx + r, cy + k), (cx + r, cy))
++    contour.closed = True
++    if contour.isClockwise() == 0:
++        contour.reverseDirection()
++    return contour
++
++
++def _stroke_layer(layer, args, kwargs):
++    """Strokes `layer` the way FontForge 2019 did, on FontForge 20200314 and later.
++
++    Zero-length contours become explicit circles (the old stroker's round cap);
++    the rest is stroked on the exact input first and, if the result has an open
++    contour, again on copies rounded to 1/1000, 1/100, 1/10 and 1 unit.
++    """
++    nib = args[0]
++    kept, centers = _split_zero_length(layer)
++    cap = args[2] if len(args) > 2 else kwargs.get('cap', 'nib')
++    if centers and not (nib == 'circular' and cap == 'round'):
++        _log_stroke_event({'zero_length_dropped': len(centers), 'args': [repr(a) for a in args]})
++        centers = []
++    original = kept.dup()
++    result = kept
++    if len(kept):
++        # Every stroke runs in a forked child (see _guarded): FontForge's
++        # overlap removal inside stroke() segfaults on some inputs
++        # (fontforge/fontforge#5357), and which inputs differs by
++        # architecture (x86_64 and aarch64 round floating point differently),
++        # so the crash can be neither predicted nor caught in-process.
++        # Rounded and nudged copies are tried in turn until one survives and
++        # comes back without an open contour (fontforge/fontforge#4490).
++        attempts = [('round', 1000), ('round', 100), ('round', 10), ('round', 1), ('nudge', 0.0007)]
++        result = None
++        first_closed = None
++        for i, (how, value) in enumerate(attempts):
++            candidate = original.dup()
++            if how == 'round':
++                candidate.round(value)
++            else:
++                candidate.transform((1, 0, 0, 1, value, value / 2))
++            stroked = _stroke_guarded(candidate, args, kwargs)
++            if stroked is None:
++                _log_stroke_event({'args': [repr(a) for a in args], 'points': sum(len(c) for c in original), 'crashed_at': [how, value]})
++                continue
++            if how == 'nudge':
++                stroked.transform((1, 0, 0, 1, -value, -value / 2))
++            if not _has_open_contour(stroked):
++                if i:
++                    _log_stroke_event({'args': [repr(a) for a in args], 'points': sum(len(c) for c in original), 'fixed_by': [how, value]})
++                result = stroked
++                break
++            if first_closed is None:
++                first_closed = stroked
++        if result is None:
++            if first_closed is None:
++                # Every attempt crashed FontForge. Shipping the unstroked
++                # path would silently lose the stroke; stop the build.
++                raise RuntimeError(
++                    f'FontForge crashed in stroke{args} on every attempt (rounded to 1/1000, 1/100, 1/10, 1 unit and nudged); input: '
++                    f'{[[(pt.x, pt.y, bool(pt.on_curve)) for pt in c] for c in original]}')
++            # Every survivor had an open contour: keep the first (its open
++            # leftovers are dropped later, as the generator always did).
++            _log_stroke_event({'args': [repr(a) for a in args], 'points': sum(len(c) for c in original), 'fixed_by': None})
++            result = first_closed
++    for cx, cy in centers:
++        result += _circle(cx, cy, args[1] / 2)
++        _log_stroke_event({'dot': (cx, cy), 'diameter': args[1]})
++    return result
++
++
++def _round_and_stroke(glyph, *args, **kwargs):
++    """Rounds the glyph to 1/1000 unit (fontforge/fontforge#5357), then strokes it via _stroke_layer."""
++    if hasattr(glyph, 'foreground'):
++        layer = glyph.foreground
++        layer.round(1000)
++        glyph.foreground = _stroke_layer(layer, args, kwargs)
++    else:
++        glyph.stroke(*args, **kwargs)
++
++
++def _remove_overlap_closed(glyph):
++    """`glyph.removeOverlap()` that never answers with an open contour.
++
++    FontForge 20251009 turns some sets of overlapping closed contours into one
++    open contour (the stenographic period's four round-capped strokes through
++    the origin). Retry on rounded copies; if nothing closes, keep the overlapping
++    contours rather than lose the glyph.
++    """
++    if not hasattr(glyph, 'foreground'):
++        glyph.removeOverlap()
++        return
++    original = glyph.foreground.dup()
++    layer = glyph.foreground
++    layer.round(1000)
++    removed = _remove_overlap_guarded(layer)
++    crashed = removed is None
++    if crashed:
++        _log_stroke_event({'overlap': glyph.glyphname, 'crashed_at': 1000})
++    else:
++        glyph.foreground = removed
++        if not _has_open_contour(removed):
++            return
++
++    def degenerate(layer):
++        # Open leftovers of one or two points carry no area; dropping them is
++        # what _remove_bad_contours does. An open contour with more points is
++        # a real outline that failed to close.
++        return all(contour.closed or len(contour) <= 2 for contour in layer)
++
++    def without_degenerate(layer):
++        cleaned = fontforge.layer()
++        cleaned.is_quadratic = layer.is_quadratic
++        for contour in layer:
++            if contour.closed:
++                cleaned += contour
++        return cleaned
++
++    if not crashed and degenerate(glyph.foreground):
++        _log_stroke_event({'overlap': glyph.glyphname, 'dropped_degenerate': sum(1 for c in glyph.foreground if not c.closed)})
++        glyph.foreground = without_degenerate(glyph.foreground)
++        return
++    for factor in (100, 10, 1):
++        retry = original.dup()
++        retry.round(factor)
++        retry = _remove_overlap_guarded(retry)
++        if retry is None:
++            _log_stroke_event({'overlap': glyph.glyphname, 'crashed_at': factor})
++            continue
++        if not _has_open_contour(retry):
++            _log_stroke_event({'overlap': glyph.glyphname, 'fixed_by': factor})
++            glyph.foreground = retry
++            return
++        if degenerate(retry):
++            _log_stroke_event({'overlap': glyph.glyphname, 'fixed_by': factor, 'dropped_degenerate': sum(1 for c in retry if not c.closed)})
++            glyph.foreground = without_degenerate(retry)
++            return
++    if crashed:
++        # Every rung crashed: keep the overlapping contours rather than lose
++        # the glyph, and say so.
++        _log_stroke_event({'overlap': glyph.glyphname, 'fixed_by': None, 'all_crashed': True})
++        import sys
++        print(f'warning: FontForge crashed in removeOverlap of {glyph.glyphname} on every attempt; overlaps left in place', file=sys.stderr)
++    else:
++        _log_stroke_event({'overlap': glyph.glyphname, 'fixed_by': None,
++                           'open_sizes': [len(c) for c in glyph.foreground if not c.closed], 'closed': sum(1 for c in glyph.foreground if c.closed)})
++    glyph.foreground = original
++
++
+ def _rect(r: float, theta: float) -> Tuple[float, float]:
+     """Converts from polar to rectangular coordinates.
+ 
+@@ -950,7 +1207,7 @@ class Notdef(Shape):
+         pen.lineTo((360 + stroke_width / 2, stroke_width / 2))
+         pen.lineTo((stroke_width / 2, stroke_width / 2))
+         pen.endPath()
+-        glyph.stroke('caligraphic', stroke_width, stroke_width, 0)
++        _round_and_stroke(glyph, 'caligraphic', stroke_width, stroke_width, 0)
+         return False
+ 
+     @staticmethod
+@@ -1090,7 +1347,7 @@ class Bound(Shape):
+         pen.endPath()
+         pen.moveTo((stroke_width / 2, CAP_HEIGHT - stroke_width / 2))
+         pen.endPath()
+-        glyph.stroke('caligraphic', stroke_width, stroke_width, 0)
++        _round_and_stroke(glyph, 'caligraphic', stroke_width, stroke_width, 0)
+         return False
+ 
+     @staticmethod
+@@ -1394,7 +1651,7 @@ class Dot(Shape):
+         stroke_width *= self.SCALAR ** (size - 1)
+         pen.moveTo((0, 0))
+         pen.lineTo((0, 0))
+-        glyph.stroke('circular', stroke_width, 'round')
++        _round_and_stroke(glyph, 'circular', stroke_width, 'round')
+         if anchor:
+             glyph.addAnchorPoint(mkmk(anchor), 'mark', *_rect(0, 0))
+             glyph.addAnchorPoint(anchor, 'mark', *_rect(0, 0))
+@@ -1637,7 +1894,7 @@ class Line(Shape):
+             fontTools.misc.transform.Identity.rotate(math.radians(self.angle)),
+             ('round',)
+         )
+-        glyph.stroke('circular', stroke_width, 'round')
++        _round_and_stroke(glyph, 'circular', stroke_width, 'round')
+         floating = False
+         if not anchor:
+             if self.secant is None:
+@@ -2110,7 +2367,7 @@ class Curve(Shape):
+                         min(stroke_width, r - (stroke_width / 2 + stroke_gap + Dot.SCALAR * light_line / 2)),
+                         math.radians(relative_mark_angle))))
+                 glyph.addAnchorPoint(anchor_name(anchors.RELATIVE_2), base, *_rect(r + stroke_width / 2 + stroke_gap + Dot.SCALAR * light_line / 2, math.radians(relative_mark_angle)))
+-        glyph.stroke('circular', stroke_width, 'round')
++        _round_and_stroke(glyph, 'circular', stroke_width, 'round')
+         if not anchor:
+             x_min, y_min, x_max, y_max = glyph.boundingBox()
+             x_center = (x_max + x_min) / 2
+@@ -2527,9 +2784,9 @@ class Circle(Shape):
+             glyph.addAnchorPoint(anchor_name(anchors.RELATIVE_2), base, *_rect(scale_x * r + stroke_width / 2 + stroke_gap + Dot.SCALAR * light_line / 2, math.radians(angle_in)))
+         else:
+             glyph.addAnchorPoint(anchor_name(anchors.RELATIVE_2), base, *_rect(r + stroke_width / 2 + stroke_gap + Dot.SCALAR * light_line / 2, math.radians((a1 + a2) / 2)))
+-        glyph.stroke('circular', stroke_width, 'round')
++        _round_and_stroke(glyph, 'circular', stroke_width, 'round')
+         if diphthong_1 or diphthong_2:
+-            glyph.removeOverlap()
++            _remove_overlap_closed(glyph)
+         x_min, y_min, x_max, y_max = glyph.boundingBox()
+         x_center = (x_max + x_min) / 2
+         glyph.addAnchorPoint(anchor_name(anchors.ABOVE), base, x_center, y_max + stroke_gap)
+@@ -2867,7 +3124,7 @@ class Complex(Shape):
+                 args: Further arguments.
+                 kwargs: Further keyword arguments.
+             """
+-            self._layer.stroke(nib_type, width_or_contour, *args, **kwargs)
++            self._layer = _stroke_layer(self._layer, (nib_type, width_or_contour, *args), kwargs)
+ 
+         def boundingBox(self) -> Tuple[float, float, float, float]:
+             """Simulates `fontforge.glyph.boundingBox`.
+@@ -3096,7 +3353,7 @@ class Complex(Shape):
+             first_is_invisible,
+             singular_anchor_points,
+         ) = self.draw_to_proxy(pen, stroke_width, light_line, stroke_gap, size)
+-        glyph.removeOverlap()
++        _remove_overlap_closed(glyph)
+         self._remove_bad_contours(glyph)
+         if not (anchor or child or joining_type == Type.NON_JOINING):
+             entry = singular_anchor_points[(anchors.CURSIVE, 'entry')][0 if self.enter_on_first_path() else -1]

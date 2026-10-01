@@ -1,0 +1,90 @@
+libimagequant: make quantisation independent of the architecture
+
+The same image quantises to a different palette on x86_64 and aarch64
+(for noto-emoji's UN flag: 111 colours on x86_64, 120 on aarch64; 92 of
+the 4,004 Noto Color Emoji bitmaps differed between the architectures'
+builds). Two things in libimagequant depend on the architecture:
+
+1. Histogram order. The colour histogram lives in a HashMap and is read
+   back in iteration order in two places: Histogram::finalize_builder turns
+   the map into the item list (`temp.extend(self.hashmap.values()...)`),
+   and init_posterize_bits re-keys the map when it exceeds
+   max_histogram_entries, where collapsing keys are resolved last-wins.
+   Everything downstream of the item list is order-sensitive (cluster
+   bucketing by position, an f64 weight sum, median cut tie-breaking,
+   k-means 256-item chunks). The hasher is deterministic, but hashbrown's
+   probe-group width is 16 bytes with SSE2 on x86_64 and 8 bytes with NEON
+   on aarch64, so the map iterates in a different order on each. Sort the
+   entries by colour before the cluster pass and re-insert the posterized
+   entries in key order.
+
+2. Colour-distance addition order. f_pixel::diff has hand-written SIMD
+   paths; the x86_64 and scalar paths sum the three channel terms as
+   (r + g) + b, the NEON path used a pairwise add that sums r + (g + b).
+   Float addition is not associative, so the distance metric itself differed
+   by an ulp here and there, which the refinement loop turns into a
+   different palette for some images (visible with --quality 0-100). Make
+   the NEON path add in the same order as the others.
+
+With both changes the x86_64 and aarch64 builds produce identical pixels
+and palettes for every image tested. Output on each architecture also
+changes for images where either effect mattered: same quality target, same
+algorithm, a fixed tie order and a consistent metric.
+
+Upstream: https://github.com/ImageOptim/libimagequant/issues/130, fix proposed in
+https://github.com/ImageOptim/libimagequant/pull/131 (same three changes against main).
+Applies to the libimagequant submodule pngquant 3.0.3 pins (6e980576).
+
+diff --git a/lib/src/hist.rs b/lib/src/hist.rs
+index 99662ed..fb9922d 100644
+--- a/lib/src/hist.rs
++++ b/lib/src/hist.rs
+@@ -248,7 +248,13 @@ impl Histogram {
+ 
+         let new_size = (self.hashmap.len()/3).max(self.hashmap.capacity()/5);
+         let old_hashmap = std::mem::replace(&mut self.hashmap, HashMap::with_capacity_and_hasher(new_size, U32Hasher(0)));
+-        self.hashmap.extend(old_hashmap.into_iter().map(move |(k, v)| {
++        // Re-insert in key order: when several keys collapse to one posterized
++        // key the last one wins, and the old map's iteration order depends on
++        // the hash table's bucket layout (hashbrown's group width differs
++        // between x86_64 and aarch64). See libimagequant#130.
++        let mut entries: Vec<(u32, (u32, RGBA))> = old_hashmap.into_iter().collect();
++        entries.sort_unstable_by_key(|&(k, _)| k);
++        self.hashmap.extend(entries.into_iter().map(move |(k, v)| {
+             (k & new_posterize_mask, v)
+         }));
+     }
+@@ -304,6 +310,10 @@ impl Histogram {
+             let weight = boost as f32;
+             TempHistItem { color, weight, cluster_index }
+         }));
++        // Make the histogram order independent of the hash table's bucket layout
++        // (hashbrown's group width differs between x86_64 and aarch64), so the
++        // result does not depend on the architecture. See libimagequant#130.
++        temp.sort_unstable_by_key(|t| (t.color.r, t.color.g, t.color.b, t.color.a, t.cluster_index));
+ 
+         let mut clusters = [Cluster { begin: 0, end: 0 }; LIQ_MAXCLUSTER];
+         let mut next_begin = 0;
+diff --git a/lib/src/pal.rs b/lib/src/pal.rs
+index da42d73..58a8a53 100644
+--- a/lib/src/pal.rs
++++ b/lib/src/pal.rs
+@@ -74,12 +74,12 @@ impl f_pixel {
+             let mut max_r = [0.; 4];
+             vst1q_f32(max_r.as_mut_ptr(), max);
+ 
+-            let mut max_gb = [0.; 4];
+-            vst1q_f32(max_gb.as_mut_ptr(), vpaddq_f32(max, max));
+-
+-            // add rgb, not a
+-            
+-            max_r[1] + max_gb[1]
++            // add rgb, not a. Add in the same order as the x86_64 and scalar
++            // paths, (r + g) + b: the pairwise add used here before summed
++            // r + (g + b), and float addition is not associative, so the
++            // distance metric, and with it the palette, differed between
++            // architectures. See libimagequant#130.
++            max_r[1] + max_r[2] + max_r[3]
+         }
+     }
+ 

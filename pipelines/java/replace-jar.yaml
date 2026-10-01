@@ -1,0 +1,852 @@
+name: Replace vulnerable JARs with fixed versions from a Maven repository
+
+# Replaces vulnerable JARs in a built package with fixed versions fetched
+# from a Maven repository.
+#
+# Replaces JARs that exist in the package; to add one, use java/fetch-jar
+# with destination-dir. Replacing a component merged inside another archive
+# is prohibited by policy, so this step only copies and deletes whole files
+# and never writes into an archive.
+#
+# The download is delegated to java/fetch-jar, which honours
+# ~/.m2/settings.xml, so the source repository is whatever that file
+# configures. With no settings.xml the source is Maven Central. This step is
+# therefore two steps: the nested download, then the replacement logic.
+#
+# Forwarding an input to a nested pipeline input of the same name needs a
+# melange new enough to resolve it; v0.55.0 is the reported minimum and
+# v0.59.0 is what this repo pins and is verified to work. An older binary
+# fails to compile any caller.
+#
+# Two target modes, at most one per invocation:
+#
+#   match        Replace every file under search-dir matching a pattern,
+#                defaulting to a Maven-layout pattern derived from the
+#                coordinate. Every matched file is classified by the Maven
+#                descriptors it carries: another group's file is ignored, so a
+#                broad pattern may be used over a tree holding other projects'
+#                JARs, while one of group-id's that no listed artifact-id
+#                claims fails the build in a report naming it.
+#   destination  Replace exactly one file whose name is unrelated to the
+#                coordinate, always in place.
+#
+# In match mode a replaced file is renamed to <artifact-id>-<version>.jar
+# when nothing in the package refers to its old name, because a stale
+# filename manufactures a false finding: trivy derives a package from the
+# filename as well as from the descriptor. Where the name is in use it is
+# kept, and those findings must be suppressed downstream. The check for a
+# reference looks only inside search-dir. A launcher script or config outside
+# that tree that names the old file is not seen, so the file would be renamed
+# and the package would break at run time. Keep search-dir wide enough to
+# hold every reference to the JARs it replaces.
+#
+# needs.packages names a Maven client and GNU grep. Maven is needed for the
+# maven-artifact JAR that carries ComparableVersion, not for the download,
+# which java/fetch-jar performs.
+#
+# It deliberately names no JVM, even though ComparableVersion needs one and
+# maven does not depend on one. Every candidate breaks a package that builds
+# with a JDK. An openjdk-<n>-default-jvm or the virtual default-jvm conflicts
+# outright on /usr/lib/jvm/default-jvm. A plain openjdk-<n>-jre is worse:
+# apk reports no conflict and silently overlays the JRE's module image on the
+# JDK's own /usr/lib/jvm/java-<n>-openjdk/lib/modules, which drops
+# jdk.compiler. javac then fails with "Java compiler is not available" while
+# the binary is still on disk. Measured: lib/modules falls from 155 MB to 101
+# MB and compilation stops working.
+#
+# A JVM is present regardless, because mvn cannot run without one, so java is
+# located at run time and a missing one stops the build with a clear error.
+#
+# GNU grep is named because busybox grep stops at the first NUL byte, which
+# would silently skip a serialized classpath index holding a filename
+# between NULs.
+needs:
+  packages:
+    - busybox
+    - grep
+    - maven
+
+inputs:
+  artifact-id:
+    description: |
+      The Maven artifact ID to fetch (e.g. jackson-databind). May be a
+      whitespace-separated list of artifact IDs sharing the same group-id and
+      version; destination mode requires a single value.
+    required: true
+  destination:
+    description: |
+      Pattern selecting exactly one existing file to overwrite in place,
+      keeping its name. Use this where the target's name is unrelated to the
+      coordinate. A pattern holding a slash is matched against the path below
+      search-dir; start it with */ to match at any depth. One without a slash
+      matches the basename at any depth. Mutually exclusive with match.
+    default: ""
+  group-id:
+    description: The Maven group ID to fetch (e.g. com.fasterxml.jackson.core)
+    required: true
+  match:
+    description: |
+      Pattern selecting the files to replace. A pattern holding a slash is
+      matched against the path below search-dir; start it with */ to match at
+      any depth. One without a slash matches the basename at any depth.
+      Defaults to */<group-path>/<artifact-id>/*/<artifact-id>-*.jar, which
+      selects a Maven-layout tree. Mutually exclusive with destination.
+    default: ""
+  on-downgrade:
+    description: |
+      What to do when the version already installed is newer than version.
+      "fail" stops the build, "skip" leaves the matched files untouched and
+      warns, "force" replaces them anyway. Use "force" to install an older
+      version on purpose.
+    default: "fail"
+  require-match:
+    description: |
+      Fail the build unless every listed artifact-id was attributed at least
+      one matched file. Set to "false" where the vulnerable JAR is not always
+      present.
+    default: "true"
+  search-dir:
+    description: |
+      Root of the tree searched for targets. Must be set deliberately: a
+      /-rooted search takes tens of seconds and will have unintended matches.
+      In match mode it is also the only tree searched for references to a
+      file's old name, which decide whether the file is renamed. A reference
+      outside it is not seen, so keep it wide enough to hold them all.
+    required: true
+  version:
+    description: |
+      The version to fetch. Every listed artifact-id is fetched at this one
+      version, so a family spanning two versions needs two invocations.
+    required: true
+
+pipeline:
+  # Nested inputs are fixed at template time, so the staging directory cannot
+  # come from mktemp. It carries the group, so two invocations sharing an
+  # artifact-id and version under different groups do not share a file.
+  - uses: java/fetch-jar
+    with:
+      artifact-id: ${{inputs.artifact-id}}
+      destination-dir: /tmp/java-replace-jar/${{inputs.group-id}}
+      group-id: ${{inputs.group-id}}
+      version: ${{inputs.version}}
+
+  - name: Replace JARs
+    runs: |
+      set -euo pipefail
+
+      group_id="${{inputs.group-id}}"
+      artifact_ids="${{inputs.artifact-id}}"
+      version="${{inputs.version}}"
+      match="${{inputs.match}}"
+      destination="${{inputs.destination}}"
+      search_dir="${{inputs.search-dir}}"
+      on_downgrade="${{inputs.on-downgrade}}"
+      require_match="${{inputs.require-match}}"
+
+      tab=$(printf '\t')
+
+      # A repository path uses the group with dots turned into directory
+      # separators; a descriptor inside a JAR uses the dotted group verbatim
+      # as a single directory name.
+      group_path=$(echo "$group_id" | tr '.' '/')
+
+      # Collapse whatever whitespace a folded YAML scalar produced.
+      artifact_ids=$(echo $artifact_ids)
+
+      die() {
+        echo "ERROR: $*" >&2
+        exit 1
+      }
+
+      # ---------------------------------------------------------------- #
+      # Input validation                                                 #
+      # ---------------------------------------------------------------- #
+
+      if [ -n "$match" ] && [ -n "$destination" ]; then
+        die "at most one of match and destination may be set"
+      fi
+
+      if [ -n "$destination" ]; then
+        mode="destination"
+      else
+        mode="match"
+      fi
+
+      case "$require_match" in
+        true|false) ;;
+        *) die "require-match must be \"true\" or \"false\", got \"$require_match\"" ;;
+      esac
+
+      case "$on_downgrade" in
+        fail|skip|force) ;;
+        *) die "on-downgrade must be \"fail\", \"skip\" or \"force\", got \"$on_downgrade\"" ;;
+      esac
+
+      set -- $artifact_ids
+      artifact_count=$#
+      if [ "$artifact_count" -eq 0 ]; then
+        die "artifact-id must name at least one artifact"
+      fi
+      if [ "$mode" = "destination" ] && [ "$artifact_count" -gt 1 ]; then
+        die "destination requires a single artifact-id, got \"$artifact_ids\""
+      fi
+
+      # find prints paths beginning with exactly the start directory it was
+      # given, so stripping a trailing slash keeps the anchor below from
+      # producing a doubled one.
+      search_dir=${search_dir%/}
+      if [ -z "$search_dir" ]; then
+        die "search-dir must not be /; scope it to the tree holding the target"
+      fi
+      # Said plainly here. Left to the require-match check it would be
+      # reported as an artifact that upstream had renamed or moved.
+      if [ ! -d "$search_dir" ]; then
+        if [ "$require_match" = "true" ]; then
+          die "search-dir $search_dir is not a directory"
+        fi
+        echo "WARNING: search-dir $search_dir is not a directory; nothing to replace"
+        exit 0
+      fi
+
+      # Found here rather than at the point of use, so that a missing JVM or
+      # maven-artifact JAR stops the build before anything is replaced.
+      java_bin=""
+      if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
+        java_bin="${JAVA_HOME}/bin/java"
+      elif command -v java > /dev/null 2>&1; then
+        java_bin=$(command -v java)
+      fi
+      if [ -z "$java_bin" ]; then
+        die "no java found; add a JDK or JRE to the build environment so that Maven version ordering can be evaluated"
+      fi
+      maven_artifact_jar=$(find /usr/share/java/maven/lib -name 'maven-artifact-*.jar' 2>/dev/null | sed -n '1p')
+      if [ -z "$maven_artifact_jar" ]; then
+        die "no maven-artifact JAR found under /usr/share/java/maven/lib"
+      fi
+
+      work=$(mktemp -d)
+      fetched="/tmp/java-replace-jar/${group_id}"
+
+      # ---------------------------------------------------------------- #
+      # Helpers                                                          #
+      # ---------------------------------------------------------------- #
+
+      # Reassemble MANIFEST.MF continuation lines, which fold at 72 bytes
+      # onto a following line beginning with a space.
+      unfold_manifest() {
+        sed -e ':a' -e 'N;$!ba' -e 's/\r//g' -e 's/\n //g'
+      }
+
+      # busybox unzip exits 0 for an absent entry while Info-ZIP exits 11, so
+      # callers must test the output rather than the exit status.
+      read_entry() {
+        unzip -p "$1" "$2" 2>/dev/null || :
+      }
+
+      # Group and artifact of every descriptor the archive holds, one
+      # "<group> <artifact>" pair per line. Both are read from the entry path
+      # and never from the entry's contents, so a component cannot misreport
+      # itself. A file that is not an archive yields nothing.
+      #
+      # This needs the archive's table of contents, and unzip -l is the only
+      # listing busybox offers. Its output is three header lines, one line per
+      # entry carrying the name from column 31, then two summary lines that the
+      # filter does not match. Column 31 holds in both busybox and Info-ZIP:
+      # their date formats differ but have equal width.
+      descriptor_coordinates() {
+        { unzip -l "$1" 2>/dev/null || :; } \
+          | sed -e '1,3d' -e 's/^.\{30\}//' \
+          | sed -n 's|^META-INF/maven/\([^/][^/]*\)/\([^/][^/]*\)/pom\.properties$|\1 \2|p'
+      }
+
+      # The coordinate a file publishes itself under: the descriptor whose
+      # artifact, followed by a digit, is the longest prefix of the basename.
+      # A merged component's descriptor never matches the filename, so a fat
+      # JAR resolves to what it was published as, and a file whose name no
+      # descriptor claims has no own descriptor at all. Sets own_group and
+      # own_artifact, both empty when there is none.
+      read_own_descriptor() {
+        _base=${1##*/}
+        own_group=""
+        own_artifact=""
+        while read -r _group _artifact; do
+          [ -n "$_artifact" ] || continue
+          case "$_base" in
+            "$_artifact"-[0-9]*)
+              if [ "${#_artifact}" -gt "${#own_artifact}" ]; then
+                own_group="$_group"
+                own_artifact="$_artifact"
+              fi
+              ;;
+          esac
+        done < "$2"
+      }
+
+      # The artifacts a listing carries descriptors for under group-id,
+      # comma-separated, and empty when it carries none.
+      in_group_artifacts() {
+        awk -v g="$group_id" '$1 == g { print $2 }' "$1" \
+          | sort -u | tr '\n' ',' | sed -e 's/,$//' -e 's/,/, /g'
+      }
+
+      is_listed() {
+        for _listed in $artifact_ids; do
+          if [ "$_listed" = "$1" ]; then
+            return 0
+          fi
+        done
+        return 1
+      }
+
+      # Version recorded by a JAR's own descriptor for the coordinate being
+      # installed. Requiring the group to match as well as the artifact is
+      # what stops a merged component's descriptor being read as the file's
+      # own version. Classification guarantees more: every file that reaches
+      # here either publishes itself at this coordinate or carries no
+      # descriptor at all, so this entry is the file's own descriptor or
+      # nothing.
+      descriptor_version() {
+        read_entry "$1" "META-INF/maven/$group_id/$2/pom.properties" \
+          | tr -d '\r' \
+          | sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' \
+          | sed -n '1p'
+      }
+
+      # Everything between the <artifact-id>- prefix and .jar. Never split on
+      # punctuation: guava-33.0.0-jre.jar is version 33.0.0-jre.
+      filename_version() {
+        _base="$1"
+        _rest=${_base#"$2"-}
+        if [ "$_rest" = "$_base" ]; then
+          return 0
+        fi
+        case "$_rest" in
+          *.jar) echo "${_rest%.jar}" ;;
+        esac
+      }
+
+      manifest_version() {
+        read_entry "$1" META-INF/MANIFEST.MF \
+          | unfold_manifest \
+          | { grep -i '^Implementation-Version:' || :; } \
+          | sed -n '1s/^[^:]*:[[:space:]]*//p'
+      }
+
+      # Maven's version ordering, which string comparison cannot stand in for:
+      # 4.1.137.Final must outrank 4.1.99.Final. ComparableVersion always
+      # exits 0, so the result is parsed from the third line of stdout, which
+      # reads "<a> <op> <b>" with <op> one of < > ==. The second line holds
+      # the canonical form of <a> and so contains -> rather than an operator.
+      #
+      # Every caller must take the result through a plain assignment guarded
+      # with "|| exit 1". A die inside a command substitution ends only the
+      # subshell, so a comparison used directly inside a test would evaluate
+      # to the empty string and let a downgrade through unnoticed.
+      version_compare() {
+        _result=$("$java_bin" -cp "$maven_artifact_jar" \
+          org.apache.maven.artifact.versioning.ComparableVersion "$1" "$2" \
+          | sed -n '3p' | awk '{print $2}')
+        case "$_result" in
+          '<'|'>'|'==') echo "$_result" ;;
+          *) die "could not compare versions \"$1\" and \"$2\" with ComparableVersion" ;;
+        esac
+      }
+
+      # find -path matches the whole path as printed, which begins with
+      # search-dir, so a pattern holding a slash is anchored there. One
+      # starting with / or * is left alone, so */ keeps its any-depth meaning.
+      anchor_pattern() {
+        case "$1" in
+          "" | /* | \**) echo "$1" ;;
+          */*) echo "$search_dir/$1" ;;
+          *) echo "$1" ;;
+        esac
+      }
+
+      find_pattern() {
+        if [ ! -d "$search_dir" ]; then
+          return 0
+        fi
+        case "$1" in
+          */*) find "$search_dir" -type f -path "$1" ;;
+          *) find "$search_dir" -type f -name "$1" ;;
+        esac
+      }
+
+      # ---------------------------------------------------------------- #
+      # Select targets                                                   #
+      # ---------------------------------------------------------------- #
+
+      match=$(anchor_pattern "$match")
+      destination=$(anchor_pattern "$destination")
+
+      candidates="$work/candidates"
+      : > "$work/candidates.raw"
+
+      if [ "$mode" = "destination" ]; then
+        find_pattern "$destination" >> "$work/candidates.raw"
+      elif [ -n "$match" ]; then
+        find_pattern "$match" >> "$work/candidates.raw"
+      else
+        for artifact in $artifact_ids; do
+          find_pattern "*/$group_path/$artifact/*/$artifact-*.jar" >> "$work/candidates.raw"
+        done
+      fi
+      sort -u "$work/candidates.raw" > "$candidates"
+
+      candidate_count=$(wc -l < "$candidates")
+
+      if [ "$mode" = "destination" ]; then
+        # The caller asserted one specific path, so neither zero nor several
+        # matches can be right, whatever require-match says.
+        if [ "$candidate_count" -eq 0 ]; then
+          die "destination \"$destination\" matched no file under $search_dir"
+        fi
+        if [ "$candidate_count" -gt 1 ]; then
+          cat "$candidates" >&2
+          die "destination \"$destination\" matched $candidate_count files under $search_dir; it must resolve to exactly one"
+        fi
+      fi
+
+      # ---------------------------------------------------------------- #
+      # Classification, target version and classifier detection          #
+      # ---------------------------------------------------------------- #
+
+      # Surviving targets, one per line:
+      #   <path><tab><artifact><tab><version><tab><version the name states>
+      # The last field is kept apart from the third because the visibility
+      # gate turns on what the filename asserts, not on what the file is.
+      # An empty version is written as "-", because read with IFS set to a tab
+      # collapses adjacent tabs and would shift the later fields left.
+      targets="$work/targets"
+      : > "$targets"
+
+      # Files a decision is owed on, one per classification. They are collected
+      # rather than failed on so that one report names every one of them: the
+      # first is rarely the only one, and a build per finding is a slow way to
+      # learn what a pattern reaches.
+      descriptors="$work/descriptors"
+      unlisted="$work/unlisted"
+      ambiguous="$work/ambiguous"
+      unknown="$work/unknown"
+      : > "$unlisted"
+      : > "$ambiguous"
+      : > "$unknown"
+
+      while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        base=$(basename "$target")
+
+        descriptor_coordinates "$target" > "$descriptors"
+        read_own_descriptor "$target" "$descriptors"
+
+        if [ "$mode" = "destination" ]; then
+          # The caller named the file, so there is nothing to attribute. What
+          # is still worth refusing is a file that is a different coordinate,
+          # which its own descriptor states outright, and which descriptors
+          # carrying no trace of group-id imply.
+          if [ -n "$own_group" ] && [ "$own_group" != "$group_id" ]; then
+            die "destination $target is ${own_group}:${own_artifact}, not ${group_id}. Overwriting it would install the wrong code under its name."
+          fi
+          if [ -z "$own_group" ] && [ -s "$descriptors" ] \
+              && [ -z "$(in_group_artifacts "$descriptors")" ]; then
+            die "destination $target carries Maven descriptors and none of them is ${group_id}, so it is a different coordinate. Overwriting it would install the wrong code under its name."
+          fi
+          artifact="$artifact_ids"
+        elif [ -n "$own_artifact" ]; then
+          # The file states its own coordinate. Another group's is not ours to
+          # touch, whatever its name suggests: a netty-*.jar pattern reaches
+          # software.amazon.awssdk:netty-nio-client, and a Maven-shade fat JAR
+          # that merges our component keeps a descriptor of its own.
+          if [ "$own_group" != "$group_id" ]; then
+            echo "Ignoring $target: ${own_group}:${own_artifact}"
+            continue
+          fi
+          if ! is_listed "$own_artifact"; then
+            printf '%s\t%s\n' "$own_artifact" "$target" >> "$unlisted"
+            continue
+          fi
+          artifact="$own_artifact"
+        elif [ -s "$descriptors" ]; then
+          # Descriptors, but none the filename claims: a fat JAR, or a file
+          # under a name nobody chose. Ours to answer for only if one of the
+          # descriptors is group-id's.
+          if [ -z "$(in_group_artifacts "$descriptors")" ]; then
+            echo "Ignoring $target: carries no ${group_id} descriptor"
+            continue
+          fi
+          printf '%s\t(%s)\n' "$target" "$(in_group_artifacts "$descriptors")" >> "$ambiguous"
+          continue
+        else
+          # No descriptor at all, so the name is the only evidence there is.
+          # This is what keeps the Gradle-published families remediable:
+          # Spring, JUnit, Kotlin and OkHttp publish none.
+          #
+          # Longest <artifact-id>- prefix wins, which is what separates
+          # netty-codec from netty-codec-http. The prefix must be followed by
+          # a digit, so that a sibling coordinate is not taken for a shorter
+          # one: netty-codec-socks-4.1.100.Final.jar leaves "socks-4.1..."
+          # after the netty-codec- prefix, and overwriting it with netty-codec
+          # would delete the socks codec and report the result as fixed.
+          artifact=""
+          for candidate_artifact in $artifact_ids; do
+            case "$base" in
+              "$candidate_artifact"-[0-9]*)
+                if [ "${#candidate_artifact}" -gt "${#artifact}" ]; then
+                  artifact="$candidate_artifact"
+                fi
+                ;;
+            esac
+          done
+          if [ -z "$artifact" ]; then
+            echo "$target" >> "$unknown"
+            continue
+          fi
+        fi
+
+        desc_version=$(descriptor_version "$target" "$artifact")
+        file_version=$(filename_version "$base" "$artifact")
+
+        # A classifier artifact shares the plain artifact's name prefix and so
+        # is reached by any pattern that reaches it. It is not the vulnerable
+        # artifact, and the fetch resolves the coordinate without a classifier
+        # so cannot obtain a replacement for it. Drop it before the
+        # single-version invariant sees its suffix as a second version. The
+        # post-build scan reads its descriptor and reports it. Detection needs
+        # a descriptor to anchor on: without one a classifier suffix cannot be
+        # told from a hyphenated version by shape alone.
+        if [ "$mode" != "destination" ] && [ -n "$desc_version" ] && [ -n "$file_version" ]; then
+          case "$file_version" in
+            "$desc_version"-?*)
+              classifier=${file_version#"$desc_version"-}
+              echo "Skipping $target: classifier \"$classifier\" of ${artifact} ${desc_version}, which the fetch cannot obtain"
+              continue
+              ;;
+          esac
+        fi
+
+        # Maven names a release file <artifactId>-<version>.jar from the same
+        # version its descriptor records, so a pristine artifact agrees by
+        # construction and a disagreement means the file is not what its name
+        # says.
+        if [ -n "$desc_version" ] && [ -n "$file_version" ]; then
+          agreement=$(version_compare "$desc_version" "$file_version") || exit 1
+          if [ "$agreement" != "==" ]; then
+            die "$target states version $file_version in its name but $desc_version in its descriptor. Causes: an earlier replace-jar step replaced it and kept its name, so ask for the final version once instead of stepping through; a classifier artifact with no plain sibling; or a Maven snapshot, which is out of scope."
+          fi
+        fi
+
+        target_version="$desc_version"
+        if [ -z "$target_version" ]; then
+          target_version="$file_version"
+        fi
+        if [ -z "$target_version" ]; then
+          target_version=$(manifest_version "$target")
+        fi
+
+        printf '%s\t%s\t%s\t%s\n' "$target" "$artifact" \
+          "${target_version:--}" "${file_version:--}" >> "$targets"
+      done < "$candidates"
+
+      # ---------------------------------------------------------------- #
+      # Classification report                                            #
+      # ---------------------------------------------------------------- #
+
+      # One report for everything the pattern reached and could not place, so
+      # that a caller edits its artifact list or its pattern once.
+      if [ -s "$unlisted" ] || [ -s "$ambiguous" ] || [ -s "$unknown" ]; then
+        match_phrase="match \"$match\""
+        [ -n "$match" ] || match_phrase="the derived match pattern"
+        {
+          echo "ERROR: $match_phrase reached files that need a decision:"
+          if [ -s "$unlisted" ]; then
+            echo
+            echo "Belong to $group_id but are not in artifact-id:"
+            sort -u "$unlisted" | sed 's/^/  /'
+          fi
+          if [ -s "$ambiguous" ]; then
+            echo
+            echo "Carry $group_id descriptors but their name identifies no coordinate:"
+            sort -u "$ambiguous" | sed 's/^/  /'
+          fi
+          if [ -s "$unknown" ]; then
+            echo
+            echo "Have no descriptor, so their group cannot be determined:"
+            sort -u "$unknown" | sed 's/^/  /'
+          fi
+          echo
+          echo "Add the artifact-ids to the list, narrow match so it does not reach these"
+          echo "files, or split the work into several invocations, one per set of artifacts"
+          echo "a pattern can isolate."
+        } >&2
+        exit 1
+      fi
+
+      target_count=$(wc -l < "$targets")
+
+      # ---------------------------------------------------------------- #
+      # require-match                                                    #
+      # ---------------------------------------------------------------- #
+
+      # Counted per artifact-id, against the set as it now stands, so that one
+      # hit cannot mask nine misses. Counted before the downgrade decision, so
+      # that a set which was found and then skipped as already-newer still
+      # satisfies it. A file classification could not place has already failed
+      # the build; a file it ignored as another group's, and a dropped
+      # classifier file, count for no artifact. So jackson 3 alone in a tree
+      # under a jackson 2 invocation is ignored and then reported here as a
+      # miss for the artifact it shares a name with, which is the right error.
+      if [ "$require_match" = "true" ] && [ "$mode" != "destination" ]; then
+        cut -f 2 "$targets" | sort -u > "$work/attributed"
+        for artifact in $artifact_ids; do
+          if ! grep -qxF "$artifact" "$work/attributed"; then
+            die "no file was attributed to $artifact under $search_dir. Upstream may have renamed or moved it: correct the pattern, drop the artifact from the list, or set require-match to false."
+          fi
+        done
+      fi
+
+      if [ "$target_count" -eq 0 ]; then
+        echo "Nothing to replace under $search_dir"
+        exit 0
+      fi
+
+      # ---------------------------------------------------------------- #
+      # Single-version invariant                                         #
+      # ---------------------------------------------------------------- #
+
+      # One invocation acts on exactly one version, which is what lets the
+      # downgrade decision be a single comparison rather than a per-file
+      # judgement. Versioned mixed with unversioned is refused too, because
+      # the two carry different downgrade semantics.
+      distinct_versions=$(cut -f 3 "$targets" | sort -u | tr '\n' ' ')
+      distinct_versions=${distinct_versions% }
+      unversioned_count=$(awk -F"$tab" '$3 == "-" { n++ } END { print n + 0 }' "$targets")
+
+      if [ "$unversioned_count" -gt 0 ] && [ "$unversioned_count" -ne "$target_count" ]; then
+        cat "$targets" >&2
+        die "the match set mixes versioned and unversioned targets, which carry different downgrade semantics. Use one invocation per group."
+      fi
+
+      set_version=""
+      if [ "$unversioned_count" -eq 0 ]; then
+        for candidate_version in $distinct_versions; do
+          if [ -z "$set_version" ]; then
+            set_version="$candidate_version"
+          else
+            sameness=$(version_compare "$set_version" "$candidate_version") || exit 1
+            if [ "$sameness" != "==" ]; then
+              cat "$targets" >&2
+              die "the match set carries more than one version ($distinct_versions). Use one invocation per version."
+            fi
+          fi
+        done
+      fi
+
+      # ---------------------------------------------------------------- #
+      # Downgrade decision                                               #
+      # ---------------------------------------------------------------- #
+
+      # An unversioned set is replaced with no comparison: there is nothing to
+      # compare against, so there is no way to know whether the result is a
+      # downgrade.
+      downgrade="no"
+      set_is_requested="no"
+      if [ -n "$set_version" ]; then
+        ordering=$(version_compare "$set_version" "$version") || exit 1
+        if [ "$ordering" = ">" ]; then
+          downgrade="yes"
+        elif [ "$ordering" = "==" ]; then
+          set_is_requested="yes"
+        fi
+      fi
+      if [ "$downgrade" = "yes" ]; then
+        case "$on_downgrade" in
+          fail)
+            die "$search_dir already carries $set_version, which is newer than the requested $version. Raise version, or set on-downgrade to skip or force."
+            ;;
+          skip)
+            echo "WARNING: leaving $set_version in place under $search_dir, which is newer than the requested $version"
+            exit 0
+            ;;
+          force)
+            echo "Forcing a downgrade from $set_version to $version"
+            ;;
+        esac
+      fi
+
+      # ---------------------------------------------------------------- #
+      # Reference check                                                  #
+      # ---------------------------------------------------------------- #
+
+      # Answers, per target, whether the existing filename is referred to
+      # anywhere such that changing it would break the package. Three passes
+      # are needed because no single technique sees every way a filename can
+      # be in use. The two sweeping passes are built once for the whole set,
+      # so their cost does not scale with the number of targets. The records
+      # are a snapshot of the tree as it stands now and are deliberately not
+      # shared with other invocations, which may add, remove or rewrite an
+      # archive.
+
+      classpath_refs="$work/classpath-refs"
+      flat_refs="$work/flat-refs"
+      index_built=""
+
+      # A Class-Path header cannot be reached by a filesystem search, because
+      # a manifest inside an archive is compressed. Only an archive sitting on
+      # disk is read: a Class-Path entry is a relative URL resolved against
+      # the URL of the JAR that declares it, so one inside a nested JAR can
+      # only name entries inside the same archive and can never make a loose
+      # file in use. Bundle-ClassPath is bundle-internal by definition and is
+      # ignored for the same reason. Reading either would produce only false
+      # positives, and a false positive keeps a stale filename and can flip
+      # the visibility gate from pass to fail.
+      collect_classpath_headers() {
+        read_entry "$1" META-INF/MANIFEST.MF \
+          | unfold_manifest \
+          | { grep -i '^Class-Path:' || :; }
+      }
+
+      build_reference_index() {
+        [ -z "$index_built" ] || return 0
+        index_built="yes"
+        : > "$classpath_refs"
+        : > "$flat_refs"
+
+        # A grep that stops at the first NUL byte answers "not in use" for a
+        # name held in a binary classpath index, and the rename that follows
+        # breaks the package at run time with nothing to show at build time.
+        # Prove the grep on PATH can see past a NUL before trusting it.
+        if ! printf 'a\000needle\000b' | grep -q -a -F needle; then
+          die "the grep on PATH cannot search past a NUL byte, so a filename held in a binary classpath index would be missed. GNU grep is a declared dependency of this pipeline: something is shadowing it."
+        fi
+
+        cut -f 1 "$targets" | sed 's|.*/||' | sort -u > "$work/basenames"
+
+        find "$search_dir" -type f \( -name '*.jar' -o -name '*.war' \
+          -o -name '*.ear' -o -name '*.zip' \) > "$work/archives"
+        find "$search_dir" -type f ! \( -name '*.jar' -o -name '*.war' \
+          -o -name '*.ear' -o -name '*.zip' \) -print0 > "$work/plain-files"
+
+        # Launcher scripts, configuration and binary classpath indexes, in one
+        # pass over the tree for every basename at once.
+        if [ -s "$work/plain-files" ]; then
+          xargs -0 grep -a -o -h -F -f "$work/basenames" \
+            < "$work/plain-files" | sort -u > "$flat_refs" || :
+        fi
+
+        while IFS= read -r archive; do
+          collect_classpath_headers "$archive" >> "$classpath_refs"
+        done < "$work/archives"
+      }
+
+      filename_in_use() {
+        _path="$1"
+        _artifact="$2"
+        _base=${_path##*/}
+
+        # A resolver that computes the filename from the coordinate leaves no
+        # literal reference anywhere, so no search can find one and the
+        # repository-shaped path is itself the evidence.
+        case "$_path" in
+          */"$group_path"/"$_artifact"/*/"$_base") return 0 ;;
+        esac
+
+        build_reference_index
+        if grep -qxF "$_base" "$flat_refs"; then
+          return 0
+        fi
+        if grep -qF "$_base" "$classpath_refs"; then
+          return 0
+        fi
+        return 1
+      }
+
+      # ---------------------------------------------------------------- #
+      # Replace                                                          #
+      # ---------------------------------------------------------------- #
+
+      replacement_has_descriptor() {
+        [ -n "$(descriptor_version "$fetched/$1-$version.jar" "$1")" ]
+      }
+
+      # Whether the filename asserts a version, which is what trivy resolves
+      # against its bundled Maven index. In match mode the version derived
+      # from the <artifact-id>- prefix answers this. In destination mode the
+      # name is unrelated to the coordinate, so the shape of the name is all
+      # there is to go on: rabbitmq-client.jar states nothing, foo-1.2.3.jar
+      # states 1.2.3.
+      name_states_version() {
+        if [ -n "$2" ]; then
+          return 0
+        fi
+        case "${1%.jar}" in
+          *-[0-9]*) return 0 ;;
+        esac
+        return 1
+      }
+
+      replaced=0
+      while IFS="$tab" read -r target artifact target_version file_version; do
+        [ -n "$target" ] || continue
+        [ "$target_version" = "-" ] && target_version=""
+        [ "$file_version" = "-" ] && file_version=""
+
+        base=${target##*/}
+        dir=${target%/*}
+        new_base="$base"
+
+        # The name is fixed by the caller in destination mode, so no reference
+        # check is needed or meaningful there.
+        if [ "$mode" = "match" ]; then
+          if filename_in_use "$target" "$artifact"; then
+            echo "Keeping the name $base: something in the package refers to it"
+          else
+            new_base="${artifact}-${version}.jar"
+          fi
+        fi
+
+        # Where the replacement carries no descriptor, the name states a
+        # version, and the name cannot change, the name goes on asserting the
+        # old version, trivy goes on reporting it, and this step has no way to
+        # clear it: the descriptor cannot be added without repacking. That is
+        # the one combination that makes a false finding permanent. A name
+        # stating no version, such as app.jar or rabbitmq-client.jar, draws no
+        # finding either way and so passes.
+        #
+        # A set already at the requested version is exempt: every filename
+        # that states a version states the one being installed, so it asserts
+        # the truth afterwards and there is no stale version for a scanner to
+        # report. Without the exemption a descriptor-less coordinate blocks
+        # its own re-installation, which is how org.bouncycastle:bcpkix-jdk18on
+        # already at 1.84 failed a build.
+        if [ "$new_base" = "$base" ] && [ "$set_is_requested" = "no" ] \
+            && name_states_version "$base" "$file_version" \
+            && ! replacement_has_descriptor "$artifact"; then
+          if [ -n "$file_version" ]; then
+            stated="version $file_version"
+          else
+            stated="a version"
+          fi
+          die "${group_id}:${artifact}:${version} carries no META-INF/maven descriptor and $target must keep its name, which states $stated. Scanners would go on reporting it with no way to clear it, so this coordinate cannot be remediated by file replacement here."
+        fi
+
+        if [ "$new_base" = "$base" ]; then
+          # Writing through the existing file leaves its mode and owner
+          # untouched.
+          echo "Replacing $target with ${artifact} ${version}"
+          cp -f "$fetched/${artifact}-${version}.jar" "$target"
+        else
+          # Deleting the old file discards its mode and owner, so capture them
+          # first and apply them to the installed file.
+          old_mode=$(stat -c '%a' "$target")
+          old_owner=$(stat -c '%u:%g' "$target")
+          echo "Replacing $target with $dir/$new_base"
+          rm -f "$target"
+          cp -f "$fetched/${artifact}-${version}.jar" "$dir/$new_base"
+          chmod "$old_mode" "$dir/$new_base"
+          chown "$old_owner" "$dir/$new_base"
+        fi
+        replaced=$((replaced + 1))
+      done < "$targets"
+
+      echo "Replaced ${replaced} JAR(s) with ${group_id} ${version}"

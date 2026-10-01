@@ -1,45 +1,140 @@
-# Generated from https://git.alpinelinux.org/aports/plain/main/font-liberation/APKBUILD
 package:
   name: font-noto-emoji
-  version: "2.051"
-  epoch: 2
-  description: Google Noto emoji fonts
+  version: "2.057"
+  epoch: 0
+  description: Google Noto Color Emoji font, built from the emoji artwork
   copyright:
     - license: OFL-1.1
   resources:
-    cpu: "1"
-    memory: 5Gi
+    # 3,787 images through ImageMagick, pngquant and zopflipng, in parallel.
+    cpu: "16"
+    memory: 8Gi
 
 environment:
   contents:
     packages:
-      - autoconf
-      - automake
       - build-base
       - busybox
-      - ca-certificates-bundle
-      - fontconfig
+      - cairo-dev
+      - imagemagick
+      - make
+      - pkgconf
+      - pngquant
+      - py3.13-fonttools
+      - py3.13-fonttools-bin
+      - py3.13-notofonttools
+      - py3.13-notofonttools-bin
+      - python-3.13
+      - zopfli
 
+# Built with upstream's own Makefile from the 128 px emoji bitmaps and the
+# region-flag artwork: ImageMagick pads each image to 136x128, waveflag.c
+# (cairo) waves the flags, pngquant quantises, zopflipng recompresses,
+# add_glyphs.py fills the ttx template, emoji_builder.py packs the PNGs into
+# CBDT/CBLC, map_pua_emoji.py adds the PUA mappings and nototools'
+# add_vs_cmap.py the variation sequences. This is the pipeline behind the
+# NotoColorEmoji.ttf upstream commits (2D/fonts/), which this package used to
+# install as-is.
+#
+# Architecture note: pngquant (libimagequant) used to quantise the same
+# image differently on x86_64 and aarch64 (its histogram order followed the
+# hash table's bucket layout, and its NEON colour distance added terms in a
+# different order), so about 90 of the 4,004 bitmaps differed between the
+# two builds. os/pngquant 3.0.3-r5 carries the fix (ImageOptim/libimagequant
+# #130, #131), so both architectures now produce the same pixels. Against
+# Google's committed font, which was quantised with the unpatched x86_64
+# order, 83 of the 4,004 bitmaps differ at dither level; every other table
+# is identical.
+#
+# Versioning: the font's own version is the head.fontRevision / name ID 5 of
+# NotoColorEmoji.tmpl.ttx.tmpl (2.057 at this tag). Upstream's tags moved from
+# v2.051-style names to date + Unicode names (v2026-09-24-unicode18_0), so the
+# tag is pinned here and the update bot is off (see below).
 pipeline:
   - uses: git-checkout
     with:
-      expected-commit: 8998f5dd683424a73e2314a8c1f1e359c19e8742
       repository: https://github.com/googlefonts/noto-emoji
-      tag: v${{package.version}}
+      tag: v2026-09-24-unicode18_0
+      expected-commit: e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e
+      # The repository also carries ~1 GB of 3D artwork, the SVG sources of the
+      # COLRv1 font and the committed binaries; none of it is needed here.
+      sparse-paths: |
+        2D/png/128
+        third_party/color_emoji
+        third_party/region-flags/png
 
-  # blocked-pending-migration: the SVG/PNG sources and the Makefile (nototools, pngquant, zopflipng, cairo) are in the checkout; the from-source build of NotoColorEmoji is queued in OS-3339.
-  - runs: install -Dm644 -t ${{targets.destdir}}/usr/share/fonts/${{package.name}} fonts/NotoColorEmoji.ttf
+  - name: Build NotoColorEmoji.ttf
+    runs: |
+      # The Makefile refuses to run outside a Python virtualenv; the tools it
+      # wants from one (ttx, add_vs_cmap.py, nototools, fontTools) are the
+      # packaged ones on PATH. The emoji bitmaps moved to 2D/png/128 in this
+      # release while the Makefile default still says png/128.
+      make -j"$(nproc)" VIRTUAL_ENV=/usr EMOJI_SRC_DIR=2D/png/128 NotoColorEmoji.ttf
+      install -Dm644 -t "${{targets.destdir}}/usr/share/fonts/${{package.name}}" NotoColorEmoji.ttf
+      install -Dm644 LICENSE "${{targets.destdir}}/usr/share/licenses/${{package.name}}/LICENSE"
 
 update:
-  enabled: true
-  ignore-regex-patterns:
-    - '.*-unicode*'
-    - '.*-color-emoji-binary'
-    - '.*-license-apache'
-  github:
-    identifier: googlefonts/noto-emoji
-    strip-prefix: v
+  enabled: false
+  exclude-reason: >
+    Upstream's release tags (v2026-09-24-unicode18_0) carry a date and a Unicode release name that cannot be derived from the font's version (2.057, from NotoColorEmoji.tmpl.ttx.tmpl); new releases are picked up by hand, see OS-3339.
+
 
 test:
+  environment:
+    contents:
+      packages:
+        - fontconfig
+        - harfbuzz-utils
+        - py3.13-fonttools
+        - python-3.13
   pipeline:
     - uses: test/fonts
+    - name: The font is the CBDT colour font upstream builds, with its version, tables and variation sequences
+      runs: |
+        cd /usr/share/fonts/font-noto-emoji
+        test "$(ls)" = "NotoColorEmoji.ttf"
+        python3.13 - <<'EOF'
+        from fontTools.ttLib import TTFont
+        f = TTFont("NotoColorEmoji.ttf")
+        name = f["name"]
+        assert name.getDebugName(1) == "Noto Color Emoji", name.getDebugName(1)
+        assert name.getDebugName(5).startswith("Version 2.057;GOOG;noto-emoji:"), name.getDebugName(5)
+        assert round(f["head"].fontRevision, 3) == 2.057, f["head"].fontRevision
+        for table in ("CBDT", "CBLC", "GSUB", "cmap"):
+            assert table in f, table
+        assert "glyf" not in f, "a bitmap-only font must not carry outlines"
+        assert f["maxp"].numGlyphs == 4046, f["maxp"].numGlyphs
+        strikes = [(s.bitmapSizeTable.ppemX, s.bitmapSizeTable.bitDepth) for s in f["CBLC"].strikes]
+        assert strikes == [(109, 32)], strikes
+        cmap = f.getBestCmap()
+        # A sample across the range: grinning face, red heart, flag component,
+        # skin-tone modifier, a keycap base and a Unicode 15 addition.
+        for cp in (0x1F600, 0x2764, 0x1F1FA, 0x1F3FD, 0x0023, 0x1FA77):
+            assert cp in cmap, hex(cp)
+        # The variation sequences add_vs_cmap.py adds (female/male sign, medical symbol).
+        uvs = [t for t in f["cmap"].tables if t.format == 14]
+        assert uvs, "no format-14 cmap subtable"
+        seqs = {cp for t in uvs for lst in t.uvsDict.values() for cp, _ in lst}
+        for cp in (0x2640, 0x2642, 0x2695):
+            assert cp in seqs, hex(cp)
+        # Every bitmap glyph carries PNG data.
+        n = 0
+        for strike in f["CBDT"].strikeData:
+            for g, glyph in strike.items():
+                glyph.decompile()
+                assert bytes(glyph.imageData[:8]) == b"\x89PNG\r\n\x1a\n", g
+                n += 1
+        assert n == 4004, n
+        print("NotoColorEmoji.ttf: version, tables, cmap, variation sequences and", n, "PNG bitmaps as expected")
+        EOF
+        # Sequences shape to single glyphs: a flag (two regional indicators), a
+        # ZWJ family and a skin-toned emoji; a plain letter is not in the font.
+        shape() { hb-shape --no-glyph-names --no-positions --no-clusters NotoColorEmoji.ttf "$(python3.13 -c "import sys; sys.stdout.write('$1')")"; }
+        for seq in '\U0001F1FA\U0001F1F8' '\U0001F468\u200D\U0001F469\u200D\U0001F467' '\U0001F44D\U0001F3FD'; do
+          out="$(shape "$seq")"
+          case "$out" in *"|"*|"[0]") echo "FAIL: $seq did not shape to one non-.notdef glyph: $out"; exit 1 ;; esac
+        done
+        test "$(shape 'A')" = "[0]" || { echo "FAIL: the .notdef control cannot fail"; exit 1; }
+        fc-cache -f
+        fc-match -f '%{family} %{file|basename}\n' "Noto Color Emoji" | grep -F "NotoColorEmoji.ttf"
+        fc-match -f '%{family}\n' "emoji" | grep -F "Noto Color Emoji"

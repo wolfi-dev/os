@@ -1,0 +1,220 @@
+package:
+  name: grcompiler
+  version: "5.2.1"
+  epoch: 0
+  description: SIL Graphite compiler that builds Graphite-enabled fonts from GDL sources and TrueType fonts
+  copyright:
+    # license/LICENSING.txt offers the compiler under CPL-0.5 or
+    # LGPL-2.1-or-later; we take the LGPL arm, because CPL-0.5 has no SPDX
+    # identifier (SPDX has CPL-1.0 only) and a LicenseRef would land in every
+    # SBOM that consumes this package. Upstream also marks preprocessor/*
+    # (installed here as /usr/bin/gdlpp) MIT and compiler/Grammar/* public
+    # domain, both compatible with the LGPL arm for redistribution.
+    - license: LGPL-2.1-or-later
+  dependencies:
+    runtime:
+      # GDL string literals are code page 1252 by default (GrcEnv.h), and the
+      # compiler converts them with iconv_open("UCS-2LE", "CP1252"), whose
+      # converters glibc keeps in a separate package. Without it, compiling a
+      # GDL file that has any string literal fails with "iconv_open: Invalid
+      # argument", which is how upstream's own Scheherazade, Charis and
+      # PigLatin test fonts fail. Unversioned on purpose: the stream pin
+      # belongs in the build environment only (melange-basics
+      # references/glibc-version-stream.md).
+      - glibc-iconv
+
+vars:
+  glibc-version: "2.44"
+  # Test-only: picks the py3.X-fonttools stream the tests use to read the
+  # compiled font's Silf/Glat/Gloc tables; grcompiler itself has no Python dependency.
+  python-version: "3.13"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - glibc-${{vars.glibc-version}}-dev
+      - glibc-${{vars.glibc-version}}-iconv
+      - icu-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/silnrsi/grcompiler
+      tag: v${{package.version}}
+      expected-commit: 0f3b355a25b67d4a2d6ad9a926f53b6cb7087c18
+
+  # v5.2.1 (2021) is the last tag; upstream master has eight small fixes
+  # since, two of which v5.2.1 needs to build at all today:
+  # - CMake >= 3.28 rejects the unconditional FetchContent_Declare with an
+  #   empty URL (ICU_URL is unset on Linux, the system icu-dev is used):
+  #   f49b87f6, 2024-03-13.
+  # - GrcRegressionTest's main.h uses uint32_t without <cstdint>, an error
+  #   with GCC >= 13; the test is built by the default target: 21532df9 +
+  #   1bb05131, 2024-03-13.
+  - uses: patch
+    with:
+      patches: fetchcontent-empty-url-cmake-3.28.patch grcregressiontest-cstdint-gcc13.patch
+
+  # ICU_URL stays unset so find_package(ICU) uses the system icu-dev.
+  - uses: cmake/configure
+
+  - uses: cmake/build
+
+  # Upstream's own regression suite: compile the four GDL test fonts
+  # (PigLatin at GDL v2 and v3, Charis, Padauk, Scheherazade) and compare
+  # every Graphite table against the benchmark fonts it ships. Needs the
+  # source tree, so it runs here rather than in the package test.
+  - runs: |
+      cd output
+      ctest --output-on-failure
+
+  - uses: cmake/install
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-doc
+    description: Documentation and man pages for ${{package.name}}
+    pipeline:
+      - uses: split/alldocs
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+update:
+  enabled: true
+  github:
+    identifier: silnrsi/grcompiler
+    strip-prefix: v
+
+# Required by the xcover/profile test step, which attaches BPF uprobes.
+capabilities:
+  add:
+    - CAP_SYS_ADMIN
+
+test:
+  environment:
+    contents:
+      packages:
+        - py${{vars.python-version}}-fonttools
+        - python-${{vars.python-version}}
+        - ttf-dejavu
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/grcompiler
+    - name: Compile a GDL description into a Graphite font (upstream PigLatin invocation shape)
+      runs: |
+        mkdir -p /tmp/grc && cd /tmp/grc || exit 1
+        cp /usr/share/fonts/ttf-dejavu/DejaVuSans.ttf input.ttf
+        # The #include makes grcompiler run gdlpp from PATH, which must
+        # resolve stddef.gdh from /usr/share/grcompiler.
+        # The feature name is a GDL string literal, which the compiler
+        # converts from code page 1252 with iconv_open("UCS-2LE", "CP1252").
+        # That is the only call into glibc's converters, so this input is
+        # what makes the glibc-iconv runtime dependency load-bearing; the
+        # negative control below proves it.
+        cat > test.gdl <<'EOF'
+        #include "stddef.gdh"
+
+        table(glyph)
+          clsA = unicode(0x0041);
+          clsB = unicode(0x0042);
+        endtable;
+
+        table(feature)
+        swapAB {
+          id = "cv01";
+          name.1033 = string("Swap A for B");
+          settings {
+            off { value = 0; name.1033 = string("Off"); }
+            on  { value = 1; name.1033 = string("On"); }
+          }
+        }
+        endtable;
+
+        table(substitution)
+        pass(1)
+          clsA > clsB;
+        endpass;
+        endtable;
+        EOF
+
+        grcompiler -D -v3 test.gdl input.ttf output.ttf > compile.log 2>&1
+        cat compile.log
+
+        # Negative control: hide the files glibc-iconv provides and the same
+        # compile must fail inside iconv_open. Without this, dropping that
+        # runtime dependency would leave every assertion below still passing.
+        # GCONV_PATH is not enough: it prepends to glibc's search path rather
+        # than replacing it, so the converters are still found.
+        mv /usr/lib/gconv /usr/lib/gconv.hidden
+        if grcompiler -D -v3 test.gdl input.ttf control.ttf > control.log 2>&1; then
+          mv /usr/lib/gconv.hidden /usr/lib/gconv
+          cat control.log
+          echo "FAIL: the compile succeeded with no converters installed, so this test does not pin glibc-iconv"
+          exit 1
+        fi
+        mv /usr/lib/gconv.hidden /usr/lib/gconv
+        cat control.log
+        if grep -qF 'iconv_open("UCS-2LE", "CP1252")' control.log; then
+          echo "PASS: the string literal reaches iconv_open, so glibc-iconv is load-bearing"
+        else
+          echo "FAIL: the control failed for some reason other than iconv_open"
+          exit 1
+        fi
+        cat gdlerr.txt
+        grep -F "Graphite Compiler" compile.log
+        test -s output.ttf
+        ls dbg_*.txt
+
+        python${{vars.python-version}} - <<'EOF'
+        from fontTools.ttLib import TTFont
+        src = TTFont("input.ttf")
+        out = TTFont("output.ttf")
+        for tag in ("Silf", "Glat", "Gloc"):
+            assert tag not in src, tag + " already in input font"
+            assert tag in out, tag + " missing from compiled font"
+        assert out["maxp"].numGlyphs == src["maxp"].numGlyphs
+        print("Graphite tables:", sorted(t for t in out.keys() if t in ("Silf", "Glat", "Gloc", "Feat", "Sill")))
+        EOF
+    # GrcRegressionTest is an upstream build-tree tool, not installed; upstream
+    # compares against a benchmark built by the same compiler, so a fresh
+    # rebuild must produce byte-identical Graphite tables.
+    - name: Compiled Graphite tables match a benchmark build
+      working-directory: /tmp/grc
+      runs: |
+        grcompiler -v3 test.gdl input.ttf benchmark.ttf > bench.log 2>&1
+        cat bench.log
+        python${{vars.python-version}} - <<'EOF'
+        from fontTools.ttLib import TTFont
+        a = TTFont("benchmark.ttf")
+        b = TTFont("output.ttf")
+        for tag in ("Silf", "Glat", "Gloc"):
+            assert a.reader[tag] == b.reader[tag], tag + " differs from benchmark"
+        print("Graphite tables match benchmark")
+        EOF
+    - name: Invalid GDL is rejected
+      working-directory: /tmp/grc
+      runs: |
+        cat > bad.gdl <<'EOF'
+        table(substitution)
+        pass(1)
+          clsUndefined > ;
+        endpass
+        EOF
+        if grcompiler bad.gdl input.ttf bad.ttf > bad.log 2>&1; then
+          cat bad.log
+          echo "ERROR: grcompiler accepted invalid GDL"
+          exit 1
+        fi
+        cat bad.log
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        # A three-rule GDL file exercises a small part of the compiler; the
+        # broad coverage comes from upstream's ctest suite in the build.
+        min-coverage: 20

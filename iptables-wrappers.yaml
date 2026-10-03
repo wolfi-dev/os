@@ -1,7 +1,7 @@
 package:
   name: iptables-wrappers
   version: "3"
-  epoch: 8 # toolchain rebuild for  go-1.27-1.27.1
+  epoch: 9 # pass stdin through (0003)
   description: Wrapper scripts for using iptables in containers
   copyright:
     - license: Apache-2.0
@@ -40,6 +40,7 @@ pipeline:
       patches: |
         0001-Fix-invocation-of-iptables-if-redirection-fails.patch
         0002-Ignore-redirection-error-if-target-already-exists.patch
+        0003-Pass-stdin-through-to-the-iptables-binary.patch
 
   # This package is used in FIPS context
   - uses: go/assert-no-crypto
@@ -63,6 +64,12 @@ pipeline:
       done
 
 test:
+  environment:
+    contents:
+      packages:
+        # mount and unshare, for the netns/mountns restore test.
+        - mount
+        - util-linux-misc
   pipeline:
     - uses: test/tw/ldd-check
     - runs: |
@@ -124,6 +131,30 @@ test:
           # point to the detected variant
           symlinks_point_to="detected"
           check_target "$cmd" "$symlinks_point_to"
+        done
+    - name: restore through the wrapper lands in the host's backend
+      runs: |
+        set -euo pipefail
+        wrapped_cmds="${{vars.wrapped-commands}}"
+        for cmd in $wrapped_cmds; do
+          ln -sf iptables-wrapper "/usr/bin/$cmd"
+        done
+        # Per backend: a fresh netns marked with kubelet's hint chain, and a
+        # read-only /usr/bin so the wrapper cannot redirect its symlinks and
+        # takes the fallback path read-only containers hit. The restored
+        # chain must reach that backend and only that one.
+        for mode in nft legacy; do
+          other=legacy
+          [ "$mode" = legacy ] && other=nft
+          unshare -n -m sh -euc '
+            mount --bind /usr/bin /usr/bin
+            mount -o remount,bind,ro /usr/bin
+            "iptables-$1" -t mangle -N KUBE-IPTABLES-HINT
+            printf "*filter\n:STDIN-TEST - [0:0]\nCOMMIT\n" | iptables-restore -n
+            test "$(readlink /usr/bin/iptables-restore)" = iptables-wrapper
+            "iptables-$1-save" -t filter | grep -F ":STDIN-TEST"
+            ! "iptables-$2-save" -t filter 2>/dev/null | grep -F ":STDIN-TEST"
+          ' sh "$mode" "$other"
         done
 
 update:

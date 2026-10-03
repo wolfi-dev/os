@@ -8,7 +8,7 @@
   -Wp,-D_FORTIFY_SOURCE=3 \
   -Wp,-D_GLIBCXX_ASSERTIONS \
   -ftrivial-auto-var-init=zero \
-  -mbranch-protection=standard \
+  %{!mbranch-protection=*:-mbranch-protection=standard} \
   -fstack-clash-protection \
   -fstack-protector-strong
 

@@ -2,19 +2,24 @@
 package:
   name: font-opensans
   version: 0_git20210927
-  epoch: 2
+  epoch: 3
   description: Humanist Sans Serif Typeface
   copyright:
-    - license: Apache-2.0
+    - license: OFL-1.1
+
+vars:
+  # Pin the interpreter and its fonttools together; the unversioned python3
+  # can move ahead of the py3.X-fonttools package.
+  python-version: "3.13"
 
 environment:
   contents:
     packages:
-      - build-base
       - busybox
-      - ca-certificates-bundle
-      - fontconfig
-      - mkfontscale
+      - fontmake
+      - py${{vars.python-version}}-fonttools
+      - python-${{vars.python-version}}
+      - ttfautohint
 
 pipeline:
   - uses: git-checkout
@@ -23,8 +28,85 @@ pipeline:
       branch: main
       expected-commit: bd7e37632246368c60fdcbd374dbf9bad11969b6
 
+  # Build the fonts from the UFO/designspace sources instead of installing
+  # the TTFs upstream committed to fonts/ttf. This follows the sources/build.sh
+  # that produced those files (commit a94aeafe, "regenerate fonts") step for
+  # step: fontmake with features expanded per instance, drop the Thin
+  # instances (upstream: "extrapolated Hebrew"), then the same post-processing
+  # (empty DSIG, ttfautohint with default parameters, head flag 3 for hinted
+  # fonts) and the same pyftsubset call that trims the 3,422 source glyphs to
+  # the 1,150-glyph release set in sources/OpenSans-glyphset.txt. The gftools
+  # fix-dsig and fix-hinting steps are each a few lines of fontTools,
+  # reproduced inline rather than pulling in gftools.
+  #
+  # Verified against the previously shipped prebuilt files (built upstream
+  # with the same fontmake 3.x / ttfautohint 1.8.4 toolchain): all 20 fonts
+  # have identical glyph sets and glyph order, byte-identical cmap, hmtx,
+  # GDEF, OS/2, post, name, fpgm, prep and cvt tables, render
+  # pixel-identically hinted and unhinted, and shape identically; the
+  # remaining byte differences are table serialization and the build
+  # timestamp in head.
+  #
+  # Note on kerning: upstream's pyftsubset --layout-features list omits
+  # `kern`, so the released Open Sans 3.003 statics (here and on Google
+  # Fonts) carry no kerning although the UFO sources define 945 pairs. This
+  # build reproduces upstream's list deliberately, so text metrics do not
+  # change for existing consumers; restoring kerning is an upstream question.
+  - name: Build the static fonts from source
+    runs: |
+      set -euo pipefail
+      cd sources
+      for ds in OpenSans-Roman OpenSans-Italic; do
+        fontmake --expand-features-to-instances -m "$ds.designspace" -i -o ttf \
+          --output-dir ../build/ttf
+      done
+      rm -f ../build/ttf/*Thin*.ttf
+
+  - name: Post-process like upstream (DSIG, ttfautohint, hinting flag)
+    runs: |
+      set -euo pipefail
+      cd build/ttf
+      for ttf in *.ttf; do
+        python${{vars.python-version}} - "$ttf" <<'EOF'
+      import sys
+      from fontTools.ttLib import TTFont, newTable
+      f = TTFont(sys.argv[1])
+      # gftools fix-dsig: an empty DSIG table, as in the previously shipped files.
+      d = newTable("DSIG"); d.ulVersion = 1; d.usFlag = 0; d.usNumSigs = 0; d.signatureRecords = []
+      f["DSIG"] = d
+      f.save(sys.argv[1])
+      EOF
+        ttfautohint "$ttf" "$ttf.hinted"
+        mv "$ttf.hinted" "$ttf"
+        python${{vars.python-version}} - "$ttf" <<'EOF'
+      import sys
+      from fontTools.ttLib import TTFont
+      f = TTFont(sys.argv[1])
+      # gftools fix-hinting: hinted fonts set head.flags bit 3
+      # ("instructions may alter advance width").
+      if "fpgm" in f:
+          f["head"].flags |= 1 << 3
+      f.save(sys.argv[1])
+      EOF
+      done
+      test "$(ls *.ttf | wc -l)" -eq 20
+
+  # Upstream's release subset, verbatim from sources/build.sh (a94aeafe).
+  - name: Subset to the release glyph set like upstream
+    runs: |
+      set -euo pipefail
+      cd build/ttf
+      for ttf in *.ttf; do
+        python${{vars.python-version}} -m fontTools.subset "$ttf" --drop-tables= --recalc-bounds --recalc-average-width \
+          --name-IDs='*' --name-legacy --glyph-names \
+          --glyphs-file=../../sources/OpenSans-glyphset.txt \
+          --layout-features="aalt,rvrn,ccmp,dnom,frac,liga,lnum,locl,mark,mkmk,numr,onum,ordn,pnum,rtlm,salt,ss01,ss02,ss03,ss04,subs,sups,tnum,zero" \
+          --output-file="$ttf.subset"
+        mv "$ttf.subset" "$ttf"
+      done
+
   - runs: |
-      install -D -m644 fonts/ttf/*.ttf -t "${{targets.destdir}}"/usr/share/fonts/opensans
+      install -D -m644 build/ttf/*.ttf -t "${{targets.destdir}}"/usr/share/fonts/opensans
 
 update:
   enabled: false
@@ -35,5 +117,50 @@ update:
     identifier: googlefonts/opensans
 
 test:
+  environment:
+    contents:
+      packages:
+        - harfbuzz-utils
+        - py${{vars.python-version}}-fonttools
+        - python-${{vars.python-version}}
   pipeline:
     - uses: test/fonts
+    - name: The 20 expected fonts are present, hinted, and shape text
+      runs: |
+        set -euo pipefail
+        cd /usr/share/fonts/opensans
+        for style in Regular Italic Light LightItalic SemiBold SemiBoldItalic Bold BoldItalic ExtraBold ExtraBoldItalic \
+                     CondensedRegular CondensedItalic CondensedLight CondensedLightItalic CondensedSemiBold \
+                     CondensedSemiBoldItalic CondensedBold CondensedBoldItalic CondensedExtraBold CondensedExtraBoldItalic; do
+          test -s "OpenSans-$style.ttf"
+        done
+        # Every font is a hinted ttfautohint output: fpgm, prep, cvt and gasp
+        # present, head flag 3 (force ppem to integer) set by fix-hinting.
+        python${{vars.python-version}} - OpenSans-*.ttf <<'EOF'
+        import sys
+        from fontTools.ttLib import TTFont
+        for path in sys.argv[1:]:
+            f = TTFont(path)
+            missing = [t for t in ("fpgm", "prep", "cvt ", "gasp") if t not in f]
+            flag3 = bool(f["head"].flags & (1 << 3))
+            if missing or not flag3:
+                sys.exit(f"FAIL: {path}: missing={missing} head.flag3={flag3}")
+            print(f"{path}: hinted, {f['maxp'].numGlyphs} glyphs")
+        EOF
+        # Latin, Greek, Cyrillic and Hebrew coverage: every character shapes to
+        # a real glyph (gid0 would be .notdef) in the Regular and the Italic.
+        # With --no-glyph-names hb-shape prints bare glyph ids, "[55|75|3|...]"
+        # (older builds print "gid55"); split on the brackets and bars and look
+        # for a whole "0" token. The previous check grepped for "gid0" with a
+        # bracket expression that busybox grep reads differently, so it could
+        # never fail; the Thai line below proves this one can.
+        has_notdef() { tr '[]|' '\n\n\n' | grep -qxE '(gid)?0'; }
+        for font in OpenSans-Regular.ttf OpenSans-Italic.ttf; do
+          for text in "The quick brown fox AVATAR" "Ταχίστη αλώπηξ" "Съешь ещё" "שלום עולם"; do
+            out="$(hb-shape --no-glyph-names --no-positions --no-clusters "$font" "$text")"
+            test -n "$out"
+            echo "$out" | has_notdef && { echo "FAIL: $font cannot shape '$text': $out"; exit 1; }
+          done
+          # The check must be able to fail: Thai is outside Open Sans' coverage.
+          hb-shape --no-glyph-names --no-positions --no-clusters "$font" "ก" | has_notdef
+        done

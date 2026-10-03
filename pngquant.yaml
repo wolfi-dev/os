@@ -1,7 +1,7 @@
 package:
   name: pngquant
   version: 3.0.3
-  epoch: 3 # rust: 1.96->1.97
+  epoch: 5
   description: Lossy PNG compressor — pngquant command based on libimagequant library
   copyright:
     - license: GPL-3.0-or-later
@@ -10,13 +10,13 @@ package:
     memory: 5Gi
 
 vars:
-  rust-version: "1.97"
+  rust-version: "1.98"
 
 environment:
   contents:
     packages:
-      - glibc-2.43-dev
       - glibc-2.44
+      - glibc-2.44-dev
       - rust-${{vars.rust-version}}
 
 pipeline:
@@ -26,6 +26,18 @@ pipeline:
       repository: https://github.com/kornelski/pngquant
       tag: ${{package.version}}
       expected-commit: 53a332a58f44357b6b41842a54d74aa1e245913d
+
+  # libimagequant quantises the same image to a different palette on x86_64
+  # and aarch64: it reads its colour histogram back in HashMap iteration
+  # order (when building the item list and when re-keying the map after
+  # posterization) and hashbrown's probe-group width differs between the two
+  # (16 bytes with SSE2, 8 with NEON), and its NEON colour-distance code adds
+  # the channel terms in a different order from the x86_64 and scalar code.
+  # Fix the order in all three places so the output does not depend on the
+  # architecture; reported upstream as ImageOptim/libimagequant#130.
+  - uses: patch
+    with:
+      patches: libimagequant-deterministic-histogram-order.patch
 
   - name: Configure and Build
     uses: cargo/build
@@ -42,6 +54,11 @@ update:
     use-tag: true
 
 test:
+  environment:
+    contents:
+      packages:
+        - py3.13-pillow
+        - python-3.13
   pipeline:
     - uses: test/tw/ldd-check
     - uses: test/tw/ver-check
@@ -52,12 +69,131 @@ test:
         bins: pngquant
     - name: Compress a PNG image and verify output
       runs: |
-        # Create a minimal valid 1x1 red PNG using raw bytes
-        printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82' > /tmp/input.png
-
-        # Compress with pngquant (outputs input-fs8.png by default)
+        # A small RGBA image with a few hundred colours, written by Python so the
+        # PNG is valid (the hand-typed 1x1 PNG this step used before had a bad
+        # IDAT checksum, which current pngquant rejects).
+        python3.13 - <<'EOF'
+        import struct, zlib
+        w = h = 32
+        rows = b"".join(bytes([0]) + b"".join(bytes((x * 8, y * 8, (x * y) & 255, 255 if (x + y) % 7 else 128)) for x in range(w)) for y in range(h))
+        def chunk(t, d):
+            return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        open("/tmp/input.png", "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+        EOF
         pngquant --force --output /tmp/output.png /tmp/input.png
-
-        # Verify the output file was created and is a valid PNG
         stat /tmp/output.png
-        head -c 4 /tmp/output.png | grep -F $'\x89PNG'
+        python3.13 -c '
+        from PIL import Image
+        im = Image.open("/tmp/output.png"); im.load()
+        assert im.mode == "P" and im.size == (32, 32), (im.mode, im.size)
+        print("quantised to", len(im.getpalette()) // 3, "colours")
+        '
+    - name: Quantisation is a function of the input, not of the architecture
+      runs: |
+        # A 136x128 RGBA emoji bitmap (noto-emoji's U+1F9D4 U+1F3FE after the
+        # Makefile's ImageMagick padding, losslessly recompressed). Without the
+        # carried libimagequant patch, pngquant 3.0.3 quantised it to 35 colours
+        # on x86_64 and 37 on aarch64 with different pixels; with the patch both
+        # architectures produce this exact result. The PNG container bytes are
+        # not stable across architectures, so compare the decoded pixels.
+        base64 -d > /tmp/fixture.png <<'EOF'
+        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
+        TkSuQmCC
+        EOF
+        test "$(sha256sum /tmp/fixture.png | cut -d' ' -f1)" = "9da684c041d68043c2b27bc14ca3b20f00dce211680d24accf790ae15293d958"
+        pngquant --speed 1 --skip-if-larger --quality 85-95 --force -o /tmp/fixture-fs8.png /tmp/fixture.png
+        python3.13 - <<'EOF'
+        import hashlib
+        from PIL import Image
+        im = Image.open("/tmp/fixture-fs8.png")
+        assert im.mode == "P", im.mode
+        colours = len(im.getpalette()) // 3
+        digest = hashlib.md5(im.convert("RGBA").tobytes()).hexdigest()
+        print("palette colours:", colours, "decoded RGBA md5:", digest)
+        assert colours == 35, colours
+        assert digest == "35305e33f6f555e2638920ada27e9a6d", digest
+        EOF

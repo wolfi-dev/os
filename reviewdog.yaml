@@ -1,0 +1,101 @@
+package:
+  name: reviewdog
+  version: "0.21.2"
+  epoch: 0
+  description: Automated code review tool integrated with any code analysis tools regardless of programming language
+  copyright:
+    - license: MIT
+  resources:
+    cpu: "2"
+    memory: 4Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+environment:
+  contents:
+    packages:
+      - go-1.27
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: a431794dd959800d59924993457dc58b32f03cad
+      repository: https://github.com/reviewdog/reviewdog
+      tag: v${{package.version}}
+
+  - uses: go/build
+    with:
+      go-package: go-1.27
+      ldflags: -X github.com/reviewdog/reviewdog/commands.Version=${{package.version}}
+      output: reviewdog
+      packages: ./cmd/reviewdog
+
+update:
+  enabled: true
+  github:
+    identifier: reviewdog/reviewdog
+    strip-prefix: v
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: reviewdog
+        version-flag: -version
+    - name: List supported formats
+      runs: |
+        set -o pipefail
+        reviewdog -list | grep -F "golint"
+        reviewdog -list | grep -F "rdjson"
+    - name: Parse errorformat input with local reporter
+      runs: |
+        set -o pipefail
+        printf 'line one\nline two\n' > sample.txt
+        printf 'sample.txt:2:1: something is wrong here\n' > errors.txt
+
+        reviewdog -efm="%f:%l:%c: %m" -name=mylinter -reporter=local \
+          -filter-mode=nofilter < errors.txt | tee out.txt
+        grep -F "something is wrong here" out.txt
+        grep -F "sample.txt:2:1" out.txt
+
+        # -fail-level=any must exit non-zero when findings are reported
+        if reviewdog -efm="%f:%l:%c: %m" -reporter=local \
+          -filter-mode=nofilter -fail-level=any < errors.txt; then
+          echo "expected non-zero exit with -fail-level=any"
+          exit 1
+        fi
+    - name: Parse rdjsonl input
+      runs: |
+        set -o pipefail
+        printf 'hello\n' > a.go
+        echo '{"message":"rdjsonl finding","location":{"path":"a.go","range":{"start":{"line":1,"column":1}}},"severity":"ERROR"}' > in.jsonl
+        reviewdog -f=rdjsonl -name=rdtest -reporter=local -filter-mode=nofilter < in.jsonl | tee out.txt
+        grep -F "rdjsonl finding" out.txt
+
+        # An ERROR diagnostic must trip -fail-level=error, proving it was parsed
+        if reviewdog -f=rdjsonl -reporter=local -filter-mode=nofilter \
+          -fail-level=error < in.jsonl; then
+          echo "expected non-zero exit with -fail-level=error"
+          exit 1
+        fi
+
+        # A WARNING diagnostic must not trip -fail-level=error
+        sed 's/"ERROR"/"WARNING"/' in.jsonl > warn.jsonl
+        reviewdog -f=rdjsonl -reporter=local -filter-mode=nofilter \
+          -fail-level=error < warn.jsonl
+    - name: Run linters from config file
+      runs: |
+        set -o pipefail
+        printf 'x\n' > b.txt
+        printf 'b.txt:1:1: config runner finding\n' > findings.txt
+        cat > .reviewdog.yml <<'EOF'
+        runner:
+          fakelint:
+            cmd: cat findings.txt
+            errorformat:
+              - "%f:%l:%c: %m"
+        EOF
+        reviewdog -reporter=local -filter-mode=nofilter -conf=.reviewdog.yml | tee out.txt
+        grep -F "config runner finding" out.txt

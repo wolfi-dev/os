@@ -1,7 +1,7 @@
 package:
   name: libpulsar
   version: "4.2.0"
-  epoch: 2 # glibc: 2.43->2.44
+  epoch: 5 # openssl-hardened: 3.6->4.0
   description: Optimizer and compiler/toolchain library for WebAssembly
   copyright:
     - license: Apache-2.0
@@ -9,8 +9,11 @@ package:
     cpu: "2"
     memory: 8Gi
   test-resources:
-    cpu: "1"
-    memory: 1Gi
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  openssl-version: "4.0"
 
 environment:
   contents:
@@ -27,10 +30,12 @@ environment:
       - glibc-2.44-dev
       - gmock
       - gtest-dev
-      - openssl-hardened-dev
+      - openssl-hardened-${{vars.openssl-version}}-dev
       - protobuf-dev
       - python3
       - samurai
+      - snappy-dev
+      - zstd-dev
 
 pipeline:
   - uses: git-checkout
@@ -80,6 +85,11 @@ test:
         - libpulsar-dev
         - build-base
         - pkgconf
+        - apache-pulsar-4.2
+    environment:
+      JAVA_HOME: /usr/lib/jvm/default-jvm
+      PULSAR_MEM: -Xms1g -Xmx1g -XX:MaxDirectMemorySize=1g
+      PULSAR_PID_DIR: /usr/share/java/pulsar/logs
   pipeline:
     - uses: test/tw/ldd-check
     # They python library dynamically links against this package,
@@ -105,3 +115,52 @@ test:
 
         g++ test.cpp -o test -lpulsar
         ./test
+    # Upstream CMake silently disables a codec when it can't find the
+    # library, so assert the optional compression libraries are linked.
+    - name: Verify zstd and snappy are linked
+      runs: |
+        readelf -d /usr/lib/libpulsar.so | grep -F 'libzstd.so'
+        readelf -d /usr/lib/libpulsar.so | grep -F 'libsnappy.so'
+    - name: Produce and consume compressed messages against a standalone broker
+      uses: test/daemon-check-output
+      with:
+        start: /usr/share/java/pulsar/bin/pulsar-daemon start standalone --no-functions-worker --no-stream-storage
+        timeout: 180
+        expected_output: |
+          starting standalone, logging to
+        post: |
+          wait-for-it -t 180 localhost:6650 || { tail -n 80 /usr/share/java/pulsar/logs/pulsar-standalone-*.log; exit 1; }
+          wait-for-it -t 60 localhost:8080
+          tee compression_test.py <<'EOF'
+          import time
+          import pulsar
+          from pulsar import CompressionType
+
+          payload = ("chainguard " * 1000).encode()
+          client = pulsar.Client("pulsar://localhost:6650")
+          for name in ("ZSTD", "SNAPPY", "LZ4", "ZLib"):
+              topic = f"persistent://public/default/compression-{name.lower()}"
+              # The broker accepts connections before it can serve topics.
+              for attempt in range(30):
+                  try:
+                      consumer = client.subscribe(topic, "test-sub")
+                      break
+                  except Exception:
+                      time.sleep(2)
+              else:
+                  raise SystemExit(f"broker never became ready for {topic}")
+              producer = client.create_producer(
+                  topic,
+                  compression_type=getattr(CompressionType, name),
+                  batching_enabled=False,
+              )
+              producer.send(payload)
+              msg = consumer.receive(timeout_millis=30000)
+              assert msg.data() == payload, f"{name}: payload mismatch"
+              consumer.acknowledge(msg)
+              producer.close()
+              consumer.close()
+              print(f"{name}: produce/consume OK")
+          client.close()
+          EOF
+          python3.13 compression_test.py

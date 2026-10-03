@@ -1,0 +1,384 @@
+package:
+  name: k3s-1.37
+  version: "1.37.1.1"
+  epoch: 0
+  description:
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provides:
+      - k3s=${{package.full-version}}
+    runtime:
+      - busybox
+      - conntrack-tools
+      - containerd-shim-runc-v2
+      - ipset # required for network policy controller
+      - iptables-nft
+      - kmod
+      - libseccomp
+      - merged-bin
+      - mount
+      - nftables
+      - runc
+      - umount
+      # Do not include runtime dependencies already included in the multicall k3s
+      # - ctr
+      # - crictl
+      # - containerd
+      # - kubectl
+      - wolfi-baselayout
+  resources:
+    cpu: "15"
+    memory: 19Gi
+
+environment:
+  contents:
+    packages:
+      # Upstream's scripts/{download,build,version.sh} are all #!/bin/bash;
+      # nothing else in this list pulls bash in transitively any more.
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - crane
+      - curl
+      - glibc-2.44-dev
+      - gnutar
+      - go-1.27
+      - libseccomp-dev
+      - libseccomp-static
+      - sqlite-dev
+      - yq
+      - zlib-dev
+      - zlib-static
+      - zstd
+
+var-transforms:
+  # Transform melange version 1.30.2.2 => 1.30.2+k3s2
+  - from: ${{package.version}}
+    match: \.(\d+)$
+    replace: +k3s$1
+    to: mangled-package-version
+
+# Upstream uses `dapper` to initialize build environments, but since melange
+# already provides a consistent build environment, we adopt upstreams ./scripts
+# as much as possible.
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/k3s-io/k3s
+      tag: v${{vars.mangled-package-version}}
+      expected-commit: 356c025475bbefaa09cf0d7e48e8e2adbbde57db
+
+  # Upstream go.mod points go.etcd.io/etcd/client/v2 at
+  # github.com/k3s-io/etcd/client/v2 v2.306.7-k3s1, a tag that exists but has no
+  # client/v2 subdirectory or go.mod. The broken replace only surfaces when a
+  # dep (e.g. go-ipld-prime v0.22.0 below) pulls etcd/client/v2 in. Pre-patch
+  # the replace before go/bump runs so its `go get` step resolves cleanly.
+  - runs: |
+      go mod edit -replace go.etcd.io/etcd/client/v2=github.com/k3s-io/etcd/client/v2@v2.305.26-k3s1
+
+  # cilium/ebpf is replace-pinned upstream to v0.12.3 (go.mod:8); move the pin to
+  # v0.22.0 to fix CVE-2026-10722 / GHSA-xhgw-qwwf-pg32 (integer overflow in
+  # LoadCollectionSpecFromReader). docker-credential-helpers and
+  # go-containerregistry are raised alongside it: v0.22.0's own go.mod requires
+  # newer minimums for both.
+  - uses: bump
+    with:
+      deps: |-
+        github.com/quic-go/webtransport-go@v0.11.1
+        github.com/pion/stun/v3@v3.1.5
+        github.com/pion/dtls/v3@v3.1.4
+        golang.org/x/mod@v0.40.0
+        github.com/docker/docker-credential-helpers@v0.9.3
+        github.com/google/go-containerregistry@v0.20.6
+        golang.org/x/crypto@v0.56.0
+      replaces: |-
+        golang.org/x/crypto=golang.org/x/crypto@v0.56.0
+        golang.org/x/net=golang.org/x/net@v0.58.0
+        google.golang.org/grpc=google.golang.org/grpc@v1.83.2
+        github.com/cilium/ebpf=github.com/cilium/ebpf@v0.22.0
+
+  # Build things (almost) identical to upstream, with the k3s components
+  # embedded in the "outer" multicall binary.
+  - runs: |
+      # Don't include the k3s-root since it conflicts with wolfi variants (ie: busybox and ip6tables)
+      sed -e '/K3S_ROOT_TAR=/,/sha256sum-/d' -i scripts/download
+      mkdir -p build/static bin/aux etc
+      ./scripts/download
+
+  - runs: |
+      # Override the go version check at runtime to always match the go version at build time
+      # Ref: https://github.com/k3s-io/k3s/pull/9054
+      GOVERSION=$(go env GOVERSION)
+      sed -i "s/\${VERSION_GOLANG}/$GOVERSION/g" scripts/build
+
+      ./scripts/build
+
+  # k3s embedds a lot of useful components (containerd, kubectl, etc...) in a
+  # very efficient manner that can't be replicated with external runtime
+  # components. To ensure we have an optimally packaged k3s, we try to mimic
+  # as much of the upstream k3s space savings while still building all the
+  # components from source. We use some light sed surgery instead of
+  # maintaining patches for every version. Ultimately this means Wolfi's
+  # version of k3s should feel identical to upstream (with containerd,
+  # kubectl, crictl, etc...) all embedded, but with Wolfi variants where
+  # applicable (runc).
+  - runs: |
+      # Remove non-embedded components and replace with Wolfi variants at runtime
+      rm -rf bin/runc
+      rm -rf bin/containerd-shim-runc-v2
+
+      for cni in bandwidth bridge firewall flannel host-local loopback portmap; do
+        ln -s cni bin/$cni
+      done
+
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      cp -r bin/* "${{targets.destdir}}/usr/bin/"
+
+  - uses: strip
+
+subpackages:
+  - name: k3s-multicall-1.37
+    description: "The k3s multicall binary with embedded components"
+    dependencies:
+      provides:
+        - k3s-multicall=${{package.full-version}}
+      runtime:
+        - busybox
+        - conntrack-tools
+        - containerd-shim-runc-v2
+        - ipset
+        - iptables-nft
+        - kmod
+        - libseccomp
+        - merged-bin
+        - mount
+        - nftables
+        - runc
+        - umount
+        - wolfi-baselayout
+    pipeline:
+      - runs: |
+          # Remove the upload portion from the upstream package-cli script
+          sed -e '/scripts\/build-upload/d' -i scripts/package-cli
+
+          ./scripts/package-cli
+
+          # Install the "outer" k3s multicall binary. This should only
+          # contain the go runtime plus the self extracting multicall logic, and
+          # should be a relatively small binary (~<15Mb).
+          install -Dm755 dist/artifacts/k3s* "${{targets.contextdir}}/usr/bin/k3s"
+
+          # Create our own links to the multicall binary, which won't be present until k3s is unpacked
+          for bin in kubectl ctr crictl containerd; do
+            ln -s k3s "${{targets.contextdir}}/usr/bin/$bin"
+          done
+      - uses: strip
+    test:
+      pipeline:
+        - runs: |
+            # Verify that the multicall symlinks were created
+            [ "$(readlink $(which kubectl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+            [ "$(readlink $(which ctr))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+            [ "$(readlink $(which crictl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+            [ "$(readlink $(which containerd))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+            containerd --version
+            containerd --help
+            k3s --help
+
+  - name: k3s-static-1.37
+    description: "k3s built with statically linked components"
+    dependencies:
+      provides:
+        - k3s-static=${{package.full-version}}
+      runtime:
+        - busybox
+        - conntrack-tools
+        - containerd-shim-runc-v2
+        - ipset
+        - iptables-nft
+        - kmod
+        - merged-bin
+        - mount
+        - nftables
+        - runc
+        - umount
+        - wolfi-baselayout
+    options:
+      # Do not provide copies of the statically linked embedded components (like containerd)
+      no-provides: true
+    pipeline:
+      # Pin the containerd tree that containerd-shim-runc-v2 is built from
+      # to upstream v2.3.6 to remediate CVE-2026-53493 (GHSA-pg57-6jwg-q645)
+      # and CVE-2026-53495 (GHSA-7jxh-36q5-gcqv). The k3s-io/containerd
+      # fork has no tag carrying those fixes yet, so clone upstream
+      # containerd instead. The bump step below cannot update containerd/v2
+      # from inside its own cloned tree, so the source must be selected
+      # before ./scripts/download.
+      - uses: sed
+        with:
+          path: ./scripts/version.sh
+          pattern: |-
+            ^PKG_CONTAINERD_K3S=\$\(get-module-path github\.com/containerd/containerd/v2\)$
+          replacement: PKG_CONTAINERD_K3S="github.com/containerd/containerd/v2"
+      - uses: sed
+        with:
+          path: ./scripts/version.sh
+          pattern: |-
+            ^VERSION_CONTAINERD=\$\(get-module-version github\.com/containerd/containerd/v2\)$
+          replacement: VERSION_CONTAINERD="v2.3.6"
+      - runs: |
+          # Override the go version check at runtime to always match the go version at build time
+          # Ref: https://github.com/k3s-io/k3s/pull/9054
+          GOVERSION=$(go env GOVERSION)
+          sed -i "s/\${VERSION_GOLANG}/$GOVERSION/g" scripts/build
+
+          # Clean up the build directory and download again with specified versions
+          rm -rf bin etc build/src
+          ./scripts/download
+      # bump golang.org/x/crypto to v0.56.0 in the embedded containerd source to fix CVE-2026-78662
+      # bump golang.org/x/net to v0.56.0 in the embedded containerd source to fix GO-2026-5942
+      # bump golang.org/x/text to v0.39.0 in the embedded containerd source to fix GO-2026-5970
+      # this is needed to ensure the statically linked containerd-shim-runc-v2 is also patched
+      # bump github.com/cilium/ebpf to v0.22.0 (plain indirect require in containerd's own
+      # go.mod, no replace pin there) to fix CVE-2026-10722 / GHSA-xhgw-qwwf-pg32
+      - uses: bump
+        with:
+          deps: |
+            github.com/cilium/ebpf@v0.22.0
+            golang.org/x/crypto@v0.56.0
+            golang.org/x/net@v0.56.0
+            golang.org/x/text@v0.39.0
+            google.golang.org/grpc@v1.83.2
+          modroot: ./build/src/github.com/containerd/containerd
+      - runs: |
+          STATIC_BUILD=true ./scripts/build
+
+          # Remove non-embedded components and replace with Wolfi variants at runtime
+          rm -rf bin/runc
+          # Use system containerd-shim-runc-v2 to avoid CVE-2026-53495 and
+          # CVE-2026-53493 in the k3s containerd fork
+          rm -rf bin/containerd-shim-runc-v2
+
+          for cni in bandwidth bridge firewall flannel host-local loopback portmap; do ln -s cni bin/$cni; done
+
+          mkdir -p "${{targets.subpkgdir}}/usr/bin"
+          cp -r bin/* "${{targets.subpkgdir}}/usr/bin/"
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils
+            - go
+      pipeline:
+        - runs: |
+            # Verify libseccomp is statically linked against k3s
+            $(go version -m $(which k3s) | grep -q "tags=.*static_build.*seccomp") || { echo "Error: go tags don't include static_build and seccomp" >&2; exit 1; }
+            $(objdump -x $(which k3s) | grep -q -v "DYNAMIC") || { echo "Error: k3s is dynamically linked" >&2; exit 1; }
+
+            # Verify runc is statically linked
+            objdump -x $(which runc) | grep -v "DYNAMIC"
+
+            # Verify containerd is statically linked
+            objdump -x $(which containerd) | grep -v "DYNAMIC"
+            bandwidth --version
+            bandwidth --help
+            bridge --version
+            bridge --help
+            cni --version
+            cni --help
+            containerd-shim-runc-v2 --help
+            ctr --version
+            ctr --help
+            firewall --version
+            firewall --help
+            flannel --version
+            flannel --help
+            host-local --version
+            host-local --help
+            k3s-agent --version
+            k3s-agent --help
+            k3s-certificate --version
+            k3s-certificate --help
+            k3s-completion --version
+            k3s-completion --help
+            k3s-etcd-snapshot --version
+            k3s-etcd-snapshot --help
+            k3s-secrets-encrypt --version
+            k3s-secrets-encrypt --help
+            k3s-server --version
+            k3s-server --help
+            k3s-token --version
+            k3s-token --help
+            kubectl --version
+            kubectl --help
+            loopback --version
+            loopback --help
+            portmap --version
+            portmap --help
+
+update:
+  enabled: true
+  # Ignore any release-candidate tags
+  ignore-regex-patterns:
+    - -rc*
+  # Example: Upstream tag: v1.31.0+k3s1 would become v1.31.0.1
+  version-transform:
+    - match: \+k3s(\d+)$
+      replace: .$1
+  github:
+    identifier: k3s-io/k3s
+    strip-prefix: v
+    tag-filter: v1.37
+    use-tag: true
+
+test:
+  pipeline:
+    - name: Basic version smoketest
+      runs: |
+        k3s --version
+        bandwidth --version
+        bandwidth --help
+        bridge --version
+        bridge --help
+        cni --version
+        cni --help
+        crictl --version
+        crictl --help
+        ctr --version
+        ctr --help
+        firewall --version
+        firewall --help
+        flannel --version
+        flannel --help
+        host-local --version
+        host-local --help
+        k3s-agent --version
+        k3s-agent --help
+        k3s-certificate --version
+        k3s-certificate --help
+        k3s-completion --version
+        k3s-completion --help
+        k3s-etcd-snapshot --version
+        k3s-etcd-snapshot --help
+        k3s-secrets-encrypt --version
+        k3s-secrets-encrypt --help
+        k3s-server --version
+        k3s-server --help
+        k3s-token --version
+        k3s-token --help
+        kubectl --version
+        kubectl --help
+        loopback --version
+        loopback --help
+        portmap --version
+        portmap --help
+    - name: Ensure the various tools are appropriately symlinked
+      runs: |
+        # Ensure the various tools are appropriately symlinked
+        [ "$(readlink $(which kubectl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+        [ "$(readlink $(which ctr))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+        [ "$(readlink $(which crictl))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }
+        [ "$(readlink $(which containerd))" = "k3s" ] || { echo "Error: the multicall symlinks are not set up appropriately" >&2; exit 1; }

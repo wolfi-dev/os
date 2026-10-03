@@ -7,7 +7,7 @@
   -mno-omit-leaf-frame-pointer \
   -Wp,-D_FORTIFY_SOURCE=2 \
   -Wp,-D_GLIBCXX_ASSERTIONS \
-  -mbranch-protection=standard \
+  %{!mbranch-protection=*:-mbranch-protection=standard} \
   -fstack-clash-protection \
   -fstack-protector-strong
 

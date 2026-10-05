@@ -1,0 +1,260 @@
+From c05e24ff1ae8b2ab68bc8680f98229495617f9d9 Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@surgut.co.uk>
+Date: Sat, 3 Oct 2026 15:15:15 +0000
+Subject: [PATCH 9/9] Always provide PROTOCOL_TLSv1* and fix HAS_TLSv1_2 with
+ OpenSSL 4.0
+
+OpenSSL 4.0 removed SSLv3 and the version specific methods
+(TLSv1_method() and friends), but TLS 1.0, 1.1 and 1.2 can still be
+negotiated with TLS_method().  Only define the OPENSSL_NO_*_METHOD
+macros (and OPENSSL_NO_SSL3) for OpenSSL 4.0, so that HAS_TLSv1,
+HAS_TLSv1_1 and HAS_TLSv1_2 follow the OpenSSL configuration again.
+Previously HAS_TLSv1_2 was always false with OpenSSL 4.0.
+
+Always export PROTOCOL_TLSv1, PROTOCOL_TLSv1_1 and PROTOCOL_TLSv1_2.
+When the version specific method is not available, because of OpenSSL
+4.0 or because the protocol version is disabled, they are aliases of
+PROTOCOL_TLS, like PROTOCOL_SSLv23.  Build _PROTOCOL_NAMES from the
+canonical members so that get_protocol_name(PROTOCOL_TLS) is not
+affected by the aliases, and skip the version pinning tests for
+aliased protocols.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Doc/library/ssl.rst  | 18 +++++++++++++++++
+ Lib/ssl.py           |  2 +-
+ Lib/test/test_ssl.py | 48 +++++++++++++++++++++++++++++++++++---------
+ Modules/_ssl.c       | 23 +++++++++++++++------
+ 4 files changed, 74 insertions(+), 17 deletions(-)
+
+diff --git a/Doc/library/ssl.rst b/Doc/library/ssl.rst
+index 0dcbd5e3cdd..bc255a1de4b 100644
+--- a/Doc/library/ssl.rst
++++ b/Doc/library/ssl.rst
+@@ -638,6 +638,12 @@ Constants
+ 
+       OpenSSL has deprecated all version specific protocols.
+ 
++   .. versionchanged:: next
++
++      Always available.  If OpenSSL does not provide the version specific
++      method, for example with OpenSSL 4.0 and newer or when the protocol
++      version is disabled, this is an alias for :data:`PROTOCOL_TLS`.
++
+ .. data:: PROTOCOL_TLSv1_1
+ 
+    Selects TLS version 1.1 as the channel encryption protocol.
+@@ -649,6 +655,12 @@ Constants
+ 
+       OpenSSL has deprecated all version specific protocols.
+ 
++   .. versionchanged:: next
++
++      Always available.  If OpenSSL does not provide the version specific
++      method, for example with OpenSSL 4.0 and newer or when the protocol
++      version is disabled, this is an alias for :data:`PROTOCOL_TLS`.
++
+ .. data:: PROTOCOL_TLSv1_2
+ 
+    Selects TLS version 1.2 as the channel encryption protocol.
+@@ -660,6 +672,12 @@ Constants
+ 
+       OpenSSL has deprecated all version specific protocols.
+ 
++   .. versionchanged:: next
++
++      Always available.  If OpenSSL does not provide the version specific
++      method, for example with OpenSSL 4.0 and newer or when the protocol
++      version is disabled, this is an alias for :data:`PROTOCOL_TLS`.
++
+ .. data:: OP_ALL
+ 
+    Enables workarounds for various bugs present in other SSL implementations.
+diff --git a/Lib/ssl.py b/Lib/ssl.py
+index f243c1c406f..1c57d4abffa 100644
+--- a/Lib/ssl.py
++++ b/Lib/ssl.py
+@@ -151,7 +151,7 @@
+     source=_ssl)
+ 
+ PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_TLS
+-_PROTOCOL_NAMES = {value: name for name, value in _SSLMethod.__members__.items()}
++_PROTOCOL_NAMES = {member: member.name for member in _SSLMethod}
+ 
+ _SSLv2_IF_EXISTS = getattr(_SSLMethod, 'PROTOCOL_SSLv2', None)
+ 
+diff --git a/Lib/test/test_ssl.py b/Lib/test/test_ssl.py
+index f85efa292af..db72ee42eea 100644
+--- a/Lib/test/test_ssl.py
++++ b/Lib/test/test_ssl.py
+@@ -55,11 +55,14 @@
+     ("PROTOCOL_TLSv1_1", "TLSv1_1"),
+ ):
+     try:
+-        proto = getattr(ssl, proto)
++        proto_value = getattr(ssl, proto)
+         ver = getattr(ssl.TLSVersion, ver)
+     except AttributeError:
+         continue
+-    PROTOCOL_TO_TLS_VERSION[proto] = ver
++    if proto_value.name != proto:
++        # alias of PROTOCOL_TLS without a version-specific method
++        continue
++    PROTOCOL_TO_TLS_VERSION[proto_value] = ver
+ 
+ def data_file(*name):
+     return os.path.join(os.path.dirname(__file__), "certdata", *name)
+@@ -191,9 +194,13 @@ def has_tls_protocol(protocol):
+     """
+     if isinstance(protocol, str):
+         assert protocol.startswith('PROTOCOL_')
+-        protocol = getattr(ssl, protocol, None)
++        name = protocol
++        protocol = getattr(ssl, name, None)
+         if protocol is None:
+             return False
++        if protocol.name != name:
++            # alias of PROTOCOL_TLS without a version-specific method
++            return False
+     if protocol in {
+         ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLS_SERVER,
+         ssl.PROTOCOL_TLS_CLIENT
+@@ -384,6 +391,24 @@ def test_constants(self):
+         ssl.OP_NO_TLSv1_2
+         self.assertEqual(ssl.PROTOCOL_TLS, ssl.PROTOCOL_SSLv23)
+ 
++    def test_protocol_tlsv1_constants(self):
++        # Always available, aliases of PROTOCOL_TLS when OpenSSL has no
++        # version specific method (OpenSSL 4.0+ or the version disabled).
++        for name, has_version in (
++            ('PROTOCOL_TLSv1', ssl.HAS_TLSv1),
++            ('PROTOCOL_TLSv1_1', ssl.HAS_TLSv1_1),
++            ('PROTOCOL_TLSv1_2', ssl.HAS_TLSv1_2),
++        ):
++            with self.subTest(name=name):
++                protocol = getattr(ssl, name)
++                self.assertIsInstance(protocol, ssl._SSLMethod)
++                if not has_version or ssl._OPENSSL_API_VERSION >= (4,):
++                    self.assertIs(protocol, ssl.PROTOCOL_TLS)
++                else:
++                    self.assertEqual(protocol.name, name)
++        self.assertEqual(ssl.get_protocol_name(ssl.PROTOCOL_TLS),
++                         'PROTOCOL_TLS')
++
+     def test_options(self):
+         # gh-106687: SSL options values are unsigned integer (uint64_t)
+         for name in dir(ssl):
+@@ -3460,19 +3485,19 @@ def test_PROTOCOL_TLS(self):
+         if has_tls_version('SSLv3'):
+             try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_SSLv3, False)
+         try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLS, True)
+-        if has_tls_version('TLSv1'):
++        if has_tls_protocol('PROTOCOL_TLSv1'):
+             try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLSv1, 'TLSv1')
+ 
+         if has_tls_version('SSLv3'):
+             try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_SSLv3, False, ssl.CERT_OPTIONAL)
+         try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLS, True, ssl.CERT_OPTIONAL)
+-        if has_tls_version('TLSv1'):
++        if has_tls_protocol('PROTOCOL_TLSv1'):
+             try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLSv1, 'TLSv1', ssl.CERT_OPTIONAL)
+ 
+         if has_tls_version('SSLv3'):
+             try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_SSLv3, False, ssl.CERT_REQUIRED)
+         try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLS, True, ssl.CERT_REQUIRED)
+-        if has_tls_version('TLSv1'):
++        if has_tls_protocol('PROTOCOL_TLSv1'):
+             try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLSv1, 'TLSv1', ssl.CERT_REQUIRED)
+ 
+         # Server with specific SSL options
+@@ -3482,7 +3507,7 @@ def test_PROTOCOL_TLS(self):
+         # Will choose TLSv1
+         try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLS, True,
+                            server_options=ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3)
+-        if has_tls_version('TLSv1'):
++        if has_tls_protocol('PROTOCOL_TLSv1'):
+             try_protocol_combo(ssl.PROTOCOL_TLS, ssl.PROTOCOL_TLSv1, False,
+                                server_options=ssl.OP_NO_TLSv1)
+ 
+@@ -3498,7 +3523,8 @@ def test_protocol_sslv3(self):
+                            client_options=ssl.OP_NO_SSLv3)
+         try_protocol_combo(ssl.PROTOCOL_SSLv3, ssl.PROTOCOL_TLSv1, False)
+ 
+-    @requires_tls_version('TLSv1')
++    @unittest.skipUnless(has_tls_protocol('PROTOCOL_TLSv1'),
++                         'PROTOCOL_TLSv1 is not available')
+     def test_protocol_tlsv1(self):
+         """Connecting to a TLSv1 server with various client options"""
+         if support.verbose:
+@@ -3511,7 +3537,8 @@ def test_protocol_tlsv1(self):
+         try_protocol_combo(ssl.PROTOCOL_TLSv1, ssl.PROTOCOL_TLS, False,
+                            client_options=ssl.OP_NO_TLSv1)
+ 
+-    @requires_tls_version('TLSv1_1')
++    @unittest.skipUnless(has_tls_protocol('PROTOCOL_TLSv1_1'),
++                         'PROTOCOL_TLSv1_1 is not available')
+     def test_protocol_tlsv1_1(self):
+         """Connecting to a TLSv1.1 server with various client options.
+            Testing against older TLS versions."""
+@@ -3527,7 +3554,8 @@ def test_protocol_tlsv1_1(self):
+         try_protocol_combo(ssl.PROTOCOL_TLSv1_1, ssl.PROTOCOL_TLSv1_2, False)
+         try_protocol_combo(ssl.PROTOCOL_TLSv1_2, ssl.PROTOCOL_TLSv1_1, False)
+ 
+-    @requires_tls_version('TLSv1_2')
++    @unittest.skipUnless(has_tls_protocol('PROTOCOL_TLSv1_2'),
++                         'PROTOCOL_TLSv1_2 is not available')
+     def test_protocol_tlsv1_2(self):
+         """Connecting to a TLSv1.2 server with various client options.
+            Testing against older TLS versions."""
+diff --git a/Modules/_ssl.c b/Modules/_ssl.c
+index 561400512d7..0922433d9bc 100644
+--- a/Modules/_ssl.c
++++ b/Modules/_ssl.c
+@@ -128,11 +128,10 @@ static void _PySSLFixErrno(void) {
+ #include "_ssl_data.h"
+ #endif
+ 
++/* OpenSSL 4.0 removed SSLv3 and the version-specific methods,
++ * but TLS 1.0-1.2 can still be negotiated with TLS_method(). */
+ #if (OPENSSL_VERSION_NUMBER >= 0x40000000L)
+ #  define OPENSSL_NO_SSL3
+-#  define OPENSSL_NO_TLS1
+-#  define OPENSSL_NO_TLS1_1
+-#  define OPENSSL_NO_TLS1_2
+ #  define OPENSSL_NO_SSL3_METHOD
+ #  define OPENSSL_NO_TLS1_METHOD
+ #  define OPENSSL_NO_TLS1_1_METHOD
+@@ -5975,15 +5974,27 @@ sslmodule_init_constants(PyObject *m)
+                             PY_SSL_VERSION_TLS_CLIENT);
+     PyModule_AddIntConstant(m, "PROTOCOL_TLS_SERVER",
+                             PY_SSL_VERSION_TLS_SERVER);
+-#ifndef OPENSSL_NO_TLS1
++    /* The PROTOCOL_TLSv1* constants are always available.  Without a
++     * version-specific method, they are aliases of PROTOCOL_TLS (like
++     * PROTOCOL_SSLv23). */
++#if defined(OPENSSL_NO_TLS1) || defined(OPENSSL_NO_TLS1_METHOD)
++    PyModule_AddIntConstant(m, "PROTOCOL_TLSv1",
++                            PY_SSL_VERSION_TLS);
++#else
+     PyModule_AddIntConstant(m, "PROTOCOL_TLSv1",
+                             PY_SSL_VERSION_TLS1);
+ #endif
+-#ifndef OPENSSL_NO_TLS1_1
++#if defined(OPENSSL_NO_TLS1_1) || defined(OPENSSL_NO_TLS1_1_METHOD)
++    PyModule_AddIntConstant(m, "PROTOCOL_TLSv1_1",
++                            PY_SSL_VERSION_TLS);
++#else
+     PyModule_AddIntConstant(m, "PROTOCOL_TLSv1_1",
+                             PY_SSL_VERSION_TLS1_1);
+ #endif
+-#ifndef OPENSSL_NO_TLS1_2
++#if defined(OPENSSL_NO_TLS1_2) || defined(OPENSSL_NO_TLS1_2_METHOD)
++    PyModule_AddIntConstant(m, "PROTOCOL_TLSv1_2",
++                            PY_SSL_VERSION_TLS);
++#else
+     PyModule_AddIntConstant(m, "PROTOCOL_TLSv1_2",
+                             PY_SSL_VERSION_TLS1_2);
+ #endif
+-- 
+2.53.0
+

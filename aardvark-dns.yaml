@@ -1,0 +1,112 @@
+package:
+  name: aardvark-dns
+  version: "2.1.0"
+  epoch: 0
+  description: "Authoritative DNS server for container records, used by netavark"
+  copyright:
+    - license: Apache-2.0
+
+vars:
+  glibc-version: "2.44"
+  rust-version: "1.94"
+
+environment:
+  contents:
+    packages:
+      - glibc-${{vars.glibc-version}}-dev
+      - rust-${{vars.rust-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/containers/aardvark-dns
+      tag: v${{package.version}}
+      expected-commit: cd7417681229219059939bdd9f0b3bd9ac9abb08
+
+  # netavark execs aardvark-dns from podman's helper directory, which is
+  # where upstream's `make install` puts it.
+  - uses: cargo/build
+    with:
+      output: aardvark-dns
+      install-dir: libexec/podman
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: containers/aardvark-dns
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - bind-tools
+        - wait-for-it
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/help-check
+      with:
+        bins: /usr/libexec/podman/aardvark-dns
+    - uses: test/tw/ver-check
+      with:
+        bins: /usr/libexec/podman/aardvark-dns
+    - name: Resolve container records
+      runs: |
+        # One network in the config.md format: listen IPs and network-scoped
+        # resolvers, then "<container id> <ipv4> <ipv6> <names>". Serve on
+        # aardvark-dns's default port (5533) at a dedicated loopback address.
+        mkdir -p /tmp/aardvark
+        cat > /tmp/aardvark/podman1 <<'EOF'
+        127.0.0.10 127.0.0.20
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 10.88.0.2 fd00::2 web,web-alias
+        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 127.0.0.2 fd00::3 client
+        EOF
+
+        # run forks and only returns once the server is ready.
+        /usr/libexec/podman/aardvark-dns --config /tmp/aardvark -p 5533 run
+
+        # Query as the client container, the requester-scoped path podman uses.
+        a=$(dig +short -b 127.0.0.2 @127.0.0.10 -p 5533 web A)
+        test "$a" = "10.88.0.2"
+        aaaa=$(dig +short -b 127.0.0.2 @127.0.0.10 -p 5533 web AAAA)
+        test "$aaaa" = "fd00::2"
+        alias=$(dig +short -b 127.0.0.2 @127.0.0.10 -p 5533 web-alias A)
+        test "$alias" = "10.88.0.2"
+        fqdn=$(dig +short -b 127.0.0.2 @127.0.0.10 -p 5533 web.dns.podman A)
+        test "$fqdn" = "10.88.0.2"
+        ptr=$(dig +short -b 127.0.0.2 @127.0.0.10 -p 5533 -x 10.88.0.2)
+        printf '%s\n' "$ptr" | grep -Fx 'web.'
+        printf '%s\n' "$ptr" | grep -Fx 'web-alias.'
+    - name: Reload networks on SIGHUP
+      runs: |
+        # netavark adds networks by rewriting the config dir and sending SIGHUP.
+        cat > /tmp/aardvark/podman2 <<'EOF'
+        127.0.0.11
+        cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 10.89.0.2 fd01::2 db
+        dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd 127.0.0.3 fd01::3 client2
+        EOF
+        kill -HUP "$(cat /tmp/aardvark/aardvark.pid)"
+        wait-for-it 127.0.0.11:5533 -t 30
+
+        db=$(dig +tcp +short -b 127.0.0.3 @127.0.0.11 -p 5533 db A)
+        test "$db" = "10.89.0.2"
+
+        # Names on another network must not resolve; names under the
+        # dns.podman search domain are answered locally, never forwarded.
+        isolated=$(dig -b 127.0.0.2 @127.0.0.10 -p 5533 db.dns.podman A)
+        printf '%s\n' "$isolated" | grep -F 'status: NXDOMAIN'
+    - name: Forward to network-scoped resolvers
+      runs: |
+        # A second aardvark-dns on 127.0.0.20:53 stands in for podman1's
+        # upstream resolver; forwarded queries always go to port 53.
+        mkdir -p /tmp/upstream
+        cat > /tmp/upstream/ext <<'EOF'
+        127.0.0.20
+        eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee 10.90.0.2 fd02::2 external
+        EOF
+        /usr/libexec/podman/aardvark-dns --config /tmp/upstream -p 53 run
+
+        ext=$(dig +short -b 127.0.0.2 @127.0.0.10 -p 5533 external A)
+        test "$ext" = "10.90.0.2"

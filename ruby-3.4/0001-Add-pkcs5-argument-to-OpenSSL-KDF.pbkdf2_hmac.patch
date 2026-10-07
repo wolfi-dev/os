@@ -1,0 +1,204 @@
+From 8a55ce5614cbe75a47243f9ad78ab8ad925df037 Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@surgut.co.uk>
+Date: Sun, 4 Oct 2026 21:04:41 +0000
+Subject: [PATCH] Add pkcs5 argument to OpenSSL::KDF.pbkdf2_hmac
+
+With OpenSSL 3.0 and later, derive the key with EVP_KDF_fetch() and
+EVP_KDF_derive(), passing all arguments as OSSL_PARAMs, including
+OSSL_KDF_PARAM_PKCS5. The new pkcs5: keyword argument controls the
+SP 800-132 lower bound checks: 0 enforces them, and 1 (the default)
+bypasses them.
+
+The default matches the behavior of PKCS5_PBKDF2_HMAC() prior to the
+OpenSSL 4.0 release, and allows existing data to be decrypted, such as
+Active Record encrypted attributes, which use a salt that is too short
+by default (https://github.com/rails/rails/pull/58937).
+
+Other libraries continue to use PKCS5_PBKDF2_HMAC() and ignore the
+argument.
+
+[Backport: maint-4.0 lacks the change releasing the GVL during PBKDF2, so
+call the new helper directly instead of via rb_thread_call_without_gvl().]
+
+(cherry picked from commit e87750e2da92d6abbc9bd1021e7ea3c98cac215b)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ext/openssl/ossl_kdf.c   | 94 ++++++++++++++++++++++++++++++++++++----
+ test/openssl/test_kdf.rb | 21 +++++++++
+ 2 files changed, 106 insertions(+), 9 deletions(-)
+
+diff --git a/ext/openssl/ossl_kdf.c b/ext/openssl/ossl_kdf.c
+index 1f28016..674c932 100644
+--- a/ext/openssl/ossl_kdf.c
++++ b/ext/openssl/ossl_kdf.c
+@@ -4,12 +4,56 @@
+  */
+ #include "ossl.h"
+ #include <openssl/kdf.h>
++#ifdef OSSL_USE_PROVIDER
++# include <openssl/core_names.h>
++#endif
+ 
+ static VALUE mKDF, eKDF;
+ 
++static int
++pbkdf2_hmac(const char *pass, int passlen, const unsigned char *salt,
++            int saltlen, int iters, const EVP_MD *md, int len,
++            unsigned char *out, int pkcs5)
++{
++#ifdef OSSL_USE_PROVIDER
++    static char empty[] = "";
++    int ret = 0;
++    EVP_KDF *kdf;
++    EVP_KDF_CTX *kctx;
++    OSSL_PARAM params[6], *p = params;
++
++    kdf = EVP_KDF_fetch(NULL, OSSL_KDF_NAME_PBKDF2, NULL);
++    if (kdf == NULL)
++        return 0;
++    kctx = EVP_KDF_CTX_new(kdf);
++    EVP_KDF_free(kdf);
++    if (kctx == NULL)
++        return 0;
++    *p++ = OSSL_PARAM_construct_int(OSSL_KDF_PARAM_PKCS5, &pkcs5);
++    *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD,
++                                             passlen ? (char *)pass : empty,
++                                             (size_t)passlen);
++    *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
++                                             saltlen ? (char *)salt : empty,
++                                             (size_t)saltlen);
++    *p++ = OSSL_PARAM_construct_int(OSSL_KDF_PARAM_ITER, &iters);
++    *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
++                                            (char *)EVP_MD_get0_name(md),
++                                            0);
++    *p = OSSL_PARAM_construct_end();
++    if (EVP_KDF_derive(kctx, out, (size_t)len, params) == 1)
++        ret = 1;
++    EVP_KDF_CTX_free(kctx);
++    return ret;
++#else
++    return PKCS5_PBKDF2_HMAC(pass, passlen, salt, saltlen, iters, md, len,
++                             out);
++#endif
++}
++
+ /*
+  * call-seq:
+- *   KDF.pbkdf2_hmac(pass, salt:, iterations:, length:, hash:) -> aString
++ *   KDF.pbkdf2_hmac(pass, salt:, iterations:, length:, hash:, pkcs5: 1) -> aString
+  *
+  * PKCS #5 PBKDF2 (Password-Based Key Derivation Function 2) in combination
+  * with HMAC. Takes _pass_, _salt_ and _iterations_, and then derives a key
+@@ -31,13 +75,39 @@ static VALUE mKDF, eKDF;
+  * hash       :: The hash algorithm used with HMAC for the PRF. May be a String
+  *               representing the algorithm name, or an instance of
+  *               OpenSSL::Digest.
++ * pkcs5      :: Optional. Enforces or bypasses the SP 800-132 lower bound
++ *               checks done by OpenSSL. If 1 (the default) or any other
++ *               non-zero value, the checks are bypassed, for compatibility
++ *               with plain PKCS #5. If 0, OpenSSL 3.0 and later enforce the
++ *               lower bound checks: an iteration count of at least 1000, a
++ *               salt of at least 128 bits, a derived key of at least 112
++ *               bits, and a non-empty password (at least 8 bytes with the
++ *               FIPS provider). With the FIPS provider, bypassing the checks
++ *               might still block the operation, or raise the non-approved
++ *               usage indicator, which allows it for decryption and legacy
++ *               purposes. With other libraries, such as LibreSSL, this
++ *               argument is accepted but has no effect.
++ *
++ *               The default matches the behavior of PKCS5_PBKDF2_HMAC()
++ *               prior to the OpenSSL 4.0 release. It allows existing data
++ *               to be decrypted, such as Active Record encrypted attributes,
++ *               which use a salt that is too short by default
++ *               (https://github.com/rails/rails/pull/58937).
++ *
++ * *NOTE*: The lower bounds enforced by OpenSSL are minimums, not
++ * recommendations. They are far too low to protect stored passwords
++ * against modern brute-force attacks. For security-sensitive uses, choose
++ * parameters as recommended by the OWASP Password Storage Cheat Sheet
++ * (https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html),
++ * for example 600,000 iterations with HMAC-SHA-256 or 210,000 iterations
++ * with HMAC-SHA-512.
+  */
+ static VALUE
+ kdf_pbkdf2_hmac(int argc, VALUE *argv, VALUE self)
+ {
+-    VALUE pass, salt, opts, kwargs[4], str, md_holder;
+-    static ID kwargs_ids[4];
+-    int iters, len;
++    VALUE pass, salt, opts, kwargs[5], str, md_holder;
++    static ID kwargs_ids[5];
++    int iters, len, pkcs5;
+     const EVP_MD *md;
+ 
+     if (!kwargs_ids[0]) {
+@@ -45,22 +115,28 @@ kdf_pbkdf2_hmac(int argc, VALUE *argv, VALUE self)
+         kwargs_ids[1] = rb_intern_const("iterations");
+         kwargs_ids[2] = rb_intern_const("length");
+         kwargs_ids[3] = rb_intern_const("hash");
++        kwargs_ids[4] = rb_intern_const("pkcs5");
+     }
+     rb_scan_args(argc, argv, "1:", &pass, &opts);
+-    rb_get_kwargs(opts, kwargs_ids, 4, 0, kwargs);
++    rb_get_kwargs(opts, kwargs_ids, 4, 1, kwargs);
+ 
+     StringValue(pass);
+     salt = StringValue(kwargs[0]);
+     iters = NUM2INT(kwargs[1]);
+     len = NUM2INT(kwargs[2]);
+     md = ossl_evp_md_fetch(kwargs[3], &md_holder);
++    pkcs5 = kwargs[4] == Qundef ? 1 : NUM2INT(kwargs[4]);
+ 
+     str = rb_str_new(0, len);
+-    if (!PKCS5_PBKDF2_HMAC(RSTRING_PTR(pass), RSTRING_LENINT(pass),
+-                           (unsigned char *)RSTRING_PTR(salt),
+-                           RSTRING_LENINT(salt), iters, md, len,
+-                           (unsigned char *)RSTRING_PTR(str)))
++    if (!pbkdf2_hmac(RSTRING_PTR(pass), RSTRING_LENINT(pass),
++                     (unsigned char *)RSTRING_PTR(salt),
++                     RSTRING_LENINT(salt), iters, md, len,
++                     (unsigned char *)RSTRING_PTR(str), pkcs5))
++#ifdef OSSL_USE_PROVIDER
++        ossl_raise(eKDF, "EVP_KDF_derive");
++#else
+         ossl_raise(eKDF, "PKCS5_PBKDF2_HMAC");
++#endif
+ 
+     return str;
+ }
+diff --git a/test/openssl/test_kdf.rb b/test/openssl/test_kdf.rb
+index 6a12a25..a499360 100644
+--- a/test/openssl/test_kdf.rb
++++ b/test/openssl/test_kdf.rb
+@@ -101,6 +101,27 @@ class OpenSSL::TestKDF < OpenSSL::TestCase
+     assert_equal(value1, value2)
+   end
+ 
++  def test_pbkdf2_hmac_pkcs5
++    # RFC 6070 c=1 parameters are below the SP 800-132 lower bounds
++    p = "password"
++    s = "salt"
++    c = 1
++    dk_len = 20
++    expected = B(%w{ 0c 60 c8 0f 96 1f 0e 71 f3 a9 b5 24 af 60 12 06 2f e0 37 a6 })
++
++    # pkcs5: 0 enforces the lower bound checks
++    if openssl?(3, 0, 0)
++      assert_raise(OpenSSL::KDF::KDFError) {
++        OpenSSL::KDF.pbkdf2_hmac(p, salt: s, iterations: c, length: dk_len, hash: "sha1", pkcs5: 0)
++      }
++    end
++
++    # pkcs5: 1 bypasses the lower bound checks, which is not FIPS approved
++    omit_on_fips
++    value = OpenSSL::KDF.pbkdf2_hmac(p, salt: s, iterations: c, length: dk_len, hash: "sha1", pkcs5: 1)
++    assert_equal(expected, value)
++  end
++
+   def test_scrypt_rfc7914_first
+     pend "scrypt is not implemented" unless OpenSSL::KDF.respond_to?(:scrypt) # OpenSSL >= 1.1.0
+     pass = ""
+-- 
+2.53.0
+

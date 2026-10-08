@@ -1,0 +1,450 @@
+name: Compare the installed fonts against the published release
+
+# Catches a conversion or a toolchain bump that quietly loses something. The
+# package under test is installed; the version currently published in the apk
+# index is fetched and used as the reference, so this compares what this build
+# produces against what users have today.
+#
+# Scope: this compares inventory, coverage, metrics and table presence, not
+# rendered output. It does not shape text or rasterise, so a changed outline
+# whose bounding box and advance are unchanged passes. OS-3340 calls the
+# hb-view raster diff the arbiter; that is a later stage, not this one.
+#
+# Only losses fail: a font file, a drawn glyph, a mapped code point or an
+# OpenType feature that the published package has and this build does not.
+# Gains are reported and pass, because a conversion is allowed to be better
+# than the binary it replaces. Outlines may move by up to max-bbox-delta.
+needs:
+  packages:
+    - apk-tools
+    - py${{inputs.python-version}}-fonttools
+    - python-${{inputs.python-version}}
+
+inputs:
+  package:
+    description: |
+      Package whose published version is the reference. The default resolves
+      to the origin even inside a subpackage test, where a different set of
+      fonts is installed, so a subpackage test must pass ${{subpkg.name}}.
+    default: ${{package.name}}
+  path:
+    description: Directory searched for the installed font files.
+    default: /usr/share/fonts
+  max-bbox-delta:
+    description: |
+      Largest per-glyph bounding box edge difference tolerated, in font units.
+      0 requires the outlines to be identical, which is right for a rebuild;
+      raise it only for a deliberate upstream version bump.
+    default: "0"
+  expected-losses:
+    description: |
+      Losses this build is allowed to have, one substring per line, matched
+      against the reported loss lines. An upstream version bump that drops a
+      glyph, unmaps a code point or removes a feature is a real loss that
+      should still be visible, so it is recorded here and reviewed in the
+      diff rather than silenced by deleting the test.
+
+      Entries ratchet: one that matches nothing fails the test, so a line
+      left behind after the loss is repaired does not quietly accumulate.
+      Lines starting with # are comments.
+    default: ""
+  require-published:
+    description: |
+      Whether to fail when nothing is published yet. Leave false for a new
+      package, whose first build has nothing to compare against.
+    default: "false"
+  python-version:
+    description: Python whose fonttools runs the comparison.
+    default: "3.13"
+
+pipeline:
+  - name: Fetch the published ${{inputs.package}}
+    runs: |
+      set -euo pipefail
+      PKG="${{inputs.package}}"
+      mkdir -p /tmp/fonts-compare/ref
+      cd /tmp/fonts-compare
+
+      installed=$(apk list --installed "$PKG" | head -1 | cut -d' ' -f1)
+      if [ -z "$installed" ]; then
+        echo "FAIL: $PKG is not installed, so there is nothing to compare"
+        exit 1
+      fi
+      echo "installed: $installed"
+
+      # The build under test is reachable as a package too: in CI through the
+      # wolfi-presubmit index this PR's apks are pushed to, and locally
+      # through the mounted build repo. Both carry a higher version than the
+      # published release, so an unconstrained fetch resolves to the build
+      # itself and the comparison becomes a no-op that cannot fail. apk-tools
+      # here rejects "$PKG<version" and "$PKG=version" with "unable to select
+      # package", so the version cannot be pinned; narrow the repositories
+      # instead and drop the two that serve the build under test.
+      if [ ! -f /etc/apk/repositories ]; then
+        echo "FAIL: no /etc/apk/repositories to narrow; refusing to risk a self-comparison"
+        exit 1
+      fi
+      grep -vE '^/|presubmit' /etc/apk/repositories > /tmp/fonts-compare/repos
+      if [ ! -s /tmp/fonts-compare/repos ]; then
+        echo "FAIL: no published repository left after excluding the build under test"
+        exit 1
+      fi
+      echo "reference repositories:"
+      sed 's/^/  /' /tmp/fonts-compare/repos
+
+      # apk warns to stderr and exits 0 with no output when an index cannot be
+      # loaded, and the exit status of a command substitution inside [ is
+      # discarded, so set -e never fires on it. An empty result for $PKG
+      # therefore cannot mean "not published" on its own: a 401 with no
+      # apk.cgr.dev credentials, a network error and a stale repository URL
+      # all look exactly the same. Require the index to list something first.
+      # apk prints progress lines on stdout that are not listings, so they are
+      # discounted; awk is used rather than grep -c because grep exits 1 when
+      # it matches nothing and pipefail would then abort before the message.
+      indexed=$(apk search --no-cache --repositories-file /tmp/fonts-compare/repos \
+                | awk '!/^fetch |^WARNING/ { n++ } END { print n+0 }')
+      echo "published index lists $indexed packages"
+      if [ "$indexed" -eq 0 ]; then
+        echo "FAIL: the narrowed repositories listed no packages at all, so the"
+        echo "published index did not load; 'not published' cannot be told apart"
+        echo "from 'unreachable', and the gate may not pass without comparing"
+        exit 1
+      fi
+
+      # "not published yet" and "the fetch broke" are different outcomes and
+      # only the first may pass. Decide which one this is before fetching, so
+      # a broken fetch can never be mistaken for a first build.
+      if [ -z "$(apk list --no-cache --repositories-file /tmp/fonts-compare/repos "$PKG")" ]; then
+        if [ "${{inputs.require-published}}" = "true" ]; then
+          echo "FAIL: no published $PKG to compare against"
+          exit 1
+        fi
+        echo "no published $PKG; nothing to compare (first build)"
+        touch /tmp/fonts-compare/skip
+        exit 0
+      fi
+
+      apk fetch --no-cache --quiet --repositories-file /tmp/fonts-compare/repos "$PKG"
+      apk_file=$(find /tmp/fonts-compare -maxdepth 1 -name '*.apk' | head -1)
+      if [ -z "$apk_file" ]; then
+        echo "FAIL: apk fetch succeeded but produced no apk"
+        exit 1
+      fi
+      reference=$(basename "$apk_file" .apk)
+
+      # The invariant the whole gate rests on. Narrowing the repositories is
+      # what makes this succeed; this check is what makes it safe, so a repo
+      # layout we did not anticipate fails closed instead of passing vacuously.
+      if [ "$reference" = "$installed" ]; then
+        echo "FAIL: the reference $reference is the build under test, so the"
+        echo "comparison would be against itself and could never fail"
+        exit 1
+      fi
+      echo "reference: $reference.apk"
+
+      # A tar failure is fatal, so reaching this point means the apk was
+      # extracted whole. The whole tree is searched, not just the path input,
+      # so finding no fonts here means the package genuinely ships none (an
+      # X11 alias or metadata package) rather than that extraction or the
+      # path went wrong. Nothing to compare, and nothing lost.
+      tar xzf "$apk_file" -C /tmp/fonts-compare/ref
+      if [ -z "$(find /tmp/fonts-compare/ref -name '*.[ot]t[fc]' -print -quit)" ]; then
+        echo "the published $reference ships no font files; nothing to compare"
+        touch /tmp/fonts-compare/skip
+        exit 0
+      fi
+
+  - name: Compare every font the published package ships
+    runs: |
+      set -euo pipefail
+      if [ -f /tmp/fonts-compare/skip ]; then
+        echo "no published release was fetched; nothing to compare"
+        exit 0
+      fi
+      python${{inputs.python-version}} - <<'EOF'
+      import glob
+      import os
+      import sys
+
+      from fontTools.pens.boundsPen import BoundsPen
+      from fontTools.ttLib import TTCollection, TTFont, TTLibError
+
+      MAX_DELTA = float("${{inputs.max-bbox-delta}}")
+      PACKAGE = "${{inputs.package}}"
+      EXPECTED_LOSSES = """${{inputs.expected-losses}}"""
+      INSTALLED = "${{inputs.path}}"
+      REF_ROOT = "/tmp/fonts-compare/ref"
+
+      # Bitmap-only fonts (CBDT/CBLC colour emoji, EBDT, sbix) have no
+      # outlines at all, so there is nothing to measure a bounding box from.
+      # Their glyphs are still compared for presence, advance and coverage.
+      BITMAP_TABLES = ("CBDT", "EBDT", "sbix")
+
+      # Some shipped fonts hold a contour fontTools declines to draw, e.g. a
+      # cubic with a single off-curve point. That is not a regression and must
+      # not abort the run, but losing the ability to draw a glyph that drew
+      # before is, so the state is recorded and compared rather than ignored.
+      UNDRAWABLE = "undrawable"
+
+      def measure_one(font):
+          try:
+              glyph_set = font.getGlyphSet()
+          except TTLibError:
+              # No 'glyf' and no CFF: a bitmap font. Fall back to hmtx, so a
+              # lost or newly empty bitmap glyph is still caught by name.
+              if not any(t in font for t in BITMAP_TABLES):
+                  raise
+              metrics = font["hmtx"].metrics
+              glyphs = {name: (metrics[name][0], None) for name in font.getGlyphOrder()}
+          else:
+              glyphs = {}
+              for name in glyph_set:
+                  glyph = glyph_set[name]
+                  pen = BoundsPen(glyph_set)
+                  try:
+                      glyph.draw(pen)
+                  except Exception:
+                      glyphs[name] = (glyph.width, UNDRAWABLE)
+                      continue
+                  glyphs[name] = (glyph.width, pen.bounds)
+          features = set()
+          for tag in ("GSUB", "GPOS"):
+              table = font[tag].table if tag in font else None
+              if table is not None and table.FeatureList:
+                  features |= {f"{tag}:{r.FeatureTag}" for r in table.FeatureList.FeatureRecord}
+          # Whole tables can go missing without any glyph changing: hinting
+          # dropped (fpgm, prep, cvt), kerning or GDEF gone, or a variable
+          # font flattened to one static instance, which takes fvar and STAT
+          # and every named instance with it. The axes and instances are
+          # listed individually so losing one of them is caught too.
+          tables = set(font.keys())
+          if "fvar" in font:
+              tables |= {f"fvar:axis:{a.axisTag}" for a in font["fvar"].axes}
+              tables |= {f"fvar:instance:{i.subfamilyNameID}" for i in font["fvar"].instances}
+          return glyphs, set(font.getBestCmap() or {}), features, tables
+
+      def member_count(path):
+          """Number of fonts in a file, without measuring any of them."""
+          if path.lower().endswith((".ttc", ".otc")):
+              return len(TTCollection(path, lazy=True).fonts)
+          return 1
+
+      def measure_members(path):
+          """Yield (suffix, measurement) for each font in a file.
+
+          A .ttc or .otc holds several fonts. They are yielded one at a time
+          rather than merged: uming.ttc is 4 members of 27,123 glyphs, and
+          holding all of them for both sides at once exhausted the test VM's
+          memory. Members also share tables, so merging them measures the
+          same glyphs repeatedly. Each measurement is glyphs mapping name to
+          (advance width, bounds), plus cmap, feature tags and table tags.
+          """
+          if path.lower().endswith((".ttc", ".otc")):
+              # lazy, or every member's glyf table is parsed up front; a CJK
+              # collection does not fit the test VM's memory otherwise.
+              # Members share one file handle, so closing a member after
+              # measuring it breaks the next one. They are left open and
+              # released with the collection.
+              for i, font in enumerate(TTCollection(path, lazy=True).fonts):
+                  yield f"[{i}]", measure_one(font)
+          else:
+              yield "", measure_one(TTFont(path, lazy=True))
+
+      def regressions(built, reference, label):
+          """Return the losses of reference relative to built, as strings."""
+          (b_glyphs, b_cmap, b_feats, b_tables) = built
+          (r_glyphs, r_cmap, r_feats, r_tables) = reference
+          out = []
+          lost_cp = r_cmap - b_cmap
+          if lost_cp:
+              shown = ", ".join(f"U+{c:04X}" for c in sorted(lost_cp)[:10])
+              out.append(f"{label}: {len(lost_cp)} code points no longer mapped: {shown}")
+          lost_feat = r_feats - b_feats
+          if lost_feat:
+              out.append(f"{label}: features lost: {', '.join(sorted(lost_feat))}")
+          lost_tables = r_tables - b_tables
+          if lost_tables:
+              out.append(f"{label}: tables lost: {', '.join(sorted(lost_tables))}")
+          gone, emptied, moved, undrawable, rewidth = [], [], [], [], []
+          for name, (r_width, r_bounds) in r_glyphs.items():
+              if name not in b_glyphs:
+                  gone.append(name)
+                  continue
+              b_width, b_bounds = b_glyphs[name]
+              # An advance width change is invisible to the bounding box but
+              # breaks metric compatibility, which for a font like Caladea is
+              # the whole point of shipping it.
+              if r_width is not None and b_width is not None \
+                      and abs(r_width - b_width) > MAX_DELTA:
+                  rewidth.append((abs(r_width - b_width), name))
+              if r_bounds is UNDRAWABLE or b_bounds is UNDRAWABLE:
+                  # Already undrawable upstream: not this build's doing. Newly
+                  # undrawable here: the outline changed for the worse.
+                  if r_bounds is not UNDRAWABLE:
+                      undrawable.append(name)
+              elif r_bounds is not None and b_bounds is None:
+                  emptied.append(name)
+              elif r_bounds is not None and b_bounds is not None:
+                  delta = max(abs(a - b) for a, b in zip(r_bounds, b_bounds))
+                  if delta > MAX_DELTA:
+                      moved.append((round(delta, 2), name))
+          if gone:
+              out.append(f"{label}: {len(gone)} glyphs removed: {', '.join(sorted(gone)[:10])}")
+          if rewidth:
+              worst = ", ".join(f"{n} by {d}" for d, n in sorted(rewidth, reverse=True)[:10])
+              out.append(f"{label}: {len(rewidth)} advance widths changed by more "
+                         f"than {MAX_DELTA} units: {worst}")
+          if undrawable:
+              out.append(f"{label}: {len(undrawable)} glyphs drew before and cannot be drawn now: "
+                         + ", ".join(sorted(undrawable)[:10]))
+          if emptied:
+              out.append(f"{label}: {len(emptied)} glyphs drawn before and empty now: {', '.join(sorted(emptied)[:10])}")
+          if moved:
+              worst = ", ".join(f"{n} by {d}" for d, n in sorted(moved, reverse=True)[:10])
+              out.append(f"{label}: {len(moved)} outlines moved more than {MAX_DELTA} units: {worst}")
+          return out
+
+      installed = {os.path.basename(p): p
+                   for p in glob.glob(f"{INSTALLED}/**/*.[ot]t[fc]", recursive=True)}
+      published = {os.path.basename(p): p
+                   for p in glob.glob(f"{REF_ROOT}/**/*.[ot]t[fc]", recursive=True)}
+      print(f"installed {len(installed)} fonts, published {len(published)}")
+
+      failures = []
+      # A package that installs its fonts outside the searched path looks
+      # exactly like one that stopped shipping them. Both are failures, but
+      # only one is a regression, so name the likelier cause.
+      if published and not installed:
+          print("FAIL: no font files under " + INSTALLED + " while the published "
+                + repr(PACKAGE) + " ships " + str(len(published)) + "; if this "
+                "package installs its fonts elsewhere, set the `path` input.")
+          sys.exit(1)
+
+      # Nothing in common while both sides ship fonts means the reference is
+      # the wrong package, not that every file was lost. The usual cause is a
+      # subpackage test left on the default origin reference. Say so, rather
+      # than reporting the origin's whole file list as missing.
+      if installed and published and not (set(installed) & set(published)):
+          print("FAIL: no font file is in both the installed set and the published "
+                + repr(PACKAGE) + "; the reference looks like the wrong package. "
+                "A subpackage test must pass the subpackage's own name as the "
+                "`package` input.")
+          sys.exit(1)
+
+      missing_files = sorted(set(published) - set(installed))
+      if missing_files:
+          failures.append(f"{len(missing_files)} font files the published package ships are gone: "
+                          + ", ".join(missing_files[:10]))
+      added_files = sorted(set(installed) - set(published))
+      if added_files:
+          print(f"  new in this build: {len(added_files)} files: {', '.join(added_files[:10])}")
+
+      compared = 0
+      for name in sorted(set(installed) & set(published)):
+          # zip over two generators keeps one member pair in memory at a
+          # time; it also stops at the shorter side, so the member counts are
+          # compared separately or a dropped member would go unnoticed.
+          members = 0
+          for (suffix, built), (_, reference) in zip(measure_members(installed[name]),
+                                                     measure_members(published[name])):
+              label = f"{name}{suffix}"
+              failures += regressions(built, reference, label)
+              members += 1
+              gained = len(built[1] - reference[1])
+              if gained:
+                  print(f"  {label}: {gained} code points gained")
+              # Visible, so a font whose outlines are mostly uncheckable
+              # cannot look like a clean pass.
+              skipped = sum(1 for _, b in built[0].values() if b is UNDRAWABLE)
+              if skipped:
+                  print(f"  {label}: {skipped} of {len(built[0])} glyphs could not be "
+                        "drawn; their outlines were not compared")
+          b_members, r_members = member_count(installed[name]), member_count(published[name])
+          if b_members < r_members:
+              failures.append(f"{name}: collection lost {r_members - b_members} of its "
+                              f"{r_members} members")
+          compared += 1
+      print(f"compared {compared} fonts against the published release")
+
+      # Prove the comparison can fail, one loss class at a time. Each probe
+      # damages a real reference font in exactly one way and must be reported
+      # with the matching phrase: requiring only that *something* was reported
+      # would let a bug in any single branch pass behind the others.
+      if compared:
+          probe = sorted(set(installed) & set(published))[0]
+          # First member only: enough to probe every loss class, and it keeps
+          # the probe off the whole of a large collection.
+          intact = next(iter(measure_members(published[probe])))[1]
+          glyphs, cmap, feats, tables = intact
+
+          def damaged(glyphs=None, cmap=None, feats=None, tables=None):
+              return (glyphs if glyphs is not None else intact[0],
+                      cmap if cmap is not None else intact[1],
+                      feats if feats is not None else intact[2],
+                      tables if tables is not None else intact[3])
+
+          drawn = next((n for n, (_, b) in glyphs.items()
+                        if b is not None and b is not UNDRAWABLE), None)
+          probes = []
+          if glyphs:
+              victim = sorted(glyphs)[0]
+              probes.append(("glyphs removed",
+                             damaged(glyphs={k: v for k, v in glyphs.items() if k != victim})))
+              probes.append(("advance widths changed",
+                             damaged(glyphs=dict(glyphs, **{
+                                 victim: (glyphs[victim][0] + MAX_DELTA + 1, glyphs[victim][1])}))))
+          if drawn is not None:
+              probes.append(("glyphs drawn before and empty now",
+                             damaged(glyphs=dict(glyphs, **{drawn: (glyphs[drawn][0], None)}))))
+              shifted = tuple(v + MAX_DELTA + 1 for v in glyphs[drawn][1])
+              probes.append(("outlines moved",
+                             damaged(glyphs=dict(glyphs, **{drawn: (glyphs[drawn][0], shifted)}))))
+          if cmap:
+              probes.append(("code points no longer mapped", damaged(cmap=cmap - {min(cmap)})))
+          if feats:
+              probes.append(("features lost", damaged(feats=feats - {min(feats)})))
+          if tables:
+              probes.append(("tables lost", damaged(tables=tables - {min(tables)})))
+
+          if not probes:
+              failures.append(f"self-test: nothing measured in {probe} to probe with")
+          for phrase, broken in probes:
+              reported = regressions(broken, intact, "self-test")
+              if not any(phrase in line for line in reported):
+                  failures.append(f"self-test: a {phrase!r} regression was not reported")
+          # An undamaged copy must come back clean, or every probe above
+          # could be passing on noise rather than on the damage.
+          if regressions(intact, intact, "self-test"):
+              failures.append("self-test: an undamaged copy was reported as a regression")
+          print(f"self-test: {len(probes)} damaged copies of {probe} are each "
+                "correctly reported, and an undamaged copy is not")
+
+      # Accepted losses are still reported, just not fatal. An entry that
+      # matches nothing is itself a failure, so the list cannot outlive the
+      # loss it was added for.
+      expected = [line.strip() for line in EXPECTED_LOSSES.splitlines()
+                  if line.strip() and not line.strip().startswith("#")]
+      if expected:
+          remaining, accepted, used = [], [], set()
+          for line in failures:
+              hit = next((e for e in expected if e in line), None)
+              if hit is None:
+                  remaining.append(line)
+              else:
+                  accepted.append(line)
+                  used.add(hit)
+          if accepted:
+              print("\naccepted losses (listed in expected-losses):")
+              for line in accepted:
+                  print(f"  {line}")
+          failures = remaining
+          for stale in sorted(set(expected) - used):
+              failures.append(f"expected-losses entry matched nothing and is stale: {stale!r}")
+
+      if failures:
+          print("\nREGRESSIONS against the published release:")
+          for line in failures:
+              print(f"  {line}")
+          sys.exit(1)
+      print("no regressions against the published release")
+      EOF

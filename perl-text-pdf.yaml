@@ -1,0 +1,220 @@
+package:
+  name: perl-text-pdf
+  version: "0.31"
+  epoch: 0
+  description: 'Text::PDF is a low-level pure-Perl library from SIL International for creating and changing PDF files. Its object model maps directly onto the PDF spec: File, Dict, Array, Name, String, Number, Bool, Null, Objind, Pages, Page, Filter and Utils. It can keep several PDF files open at once, read and write streams compressed with FlateDecode (through Compress::Zlib), and embed the base-14 standard fonts (SFont). With Font::TTF installed it can also embed TrueType fonts, including Type0 glyph-based Unicode fonts with subsetting (TTFont, TTFont0). The distribution also installs three helper scripts: pdfbklt turns documents into booklets, pdfrevert removes one layer of incremental edits, and pdfstamp stamps text on every page. It is packaged as a prerequisite of Font::TTF::Scripts in the SIL font toolchain.'
+  copyright:
+    - license: Artistic-2.0
+  dependencies:
+    runtime:
+      - perl
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - make
+      - perl
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/silnrsi/text-pdf
+      tag: v${{package.version}}
+      expected-commit: 0ac6c78367d66a2bba25fc5e017813d664f50e79
+
+  - uses: perl/make
+
+  - uses: autoconf/make
+
+  - name: Run the upstream test suite
+    runs: make test
+
+  - uses: autoconf/make-install
+
+  - uses: perl/cleanup
+
+subpackages:
+  - name: ${{package.name}}-doc
+    pipeline:
+      - uses: split/manpages
+    description: ${{package.name}} manpages
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+update:
+  enabled: true
+  github:
+    identifier: silnrsi/text-pdf
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        # Text::PDF::TTFont and TTFont0 'use Font::TTF::Font', which is not a runtime dep.
+        - perl-font-ttf
+  pipeline:
+    - name: Load every installed Text::PDF module
+      runs: |
+        for m in Text::PDF Text::PDF::Array Text::PDF::Bool Text::PDF::Dict \
+          Text::PDF::File Text::PDF::Filter Text::PDF::Name Text::PDF::Null \
+          Text::PDF::Number Text::PDF::Objind Text::PDF::Page Text::PDF::Pages \
+          Text::PDF::SFont Text::PDF::String Text::PDF::TTFont \
+          Text::PDF::TTFont0 Text::PDF::Utils; do
+          out=$(perl -M"$m" -e 'print "loaded\n"')
+          echo "$m: $out"
+          [ "$out" = "loaded" ]
+        done
+    - name: Write a Hello World PDF and read it back
+      runs: |
+        perl <<'EOF'
+        use strict;
+        use warnings;
+        use Text::PDF::File;
+        use Text::PDF::Page;
+        use Text::PDF::Pages;
+        use Text::PDF::Utils;
+        use Text::PDF::SFont;
+
+        my $pdf = Text::PDF::File->new;
+        my $root = Text::PDF::Pages->new($pdf);
+        $root->proc_set("PDF", "Text");
+        $root->bbox(0, 0, 595, 840);
+        my $font = Text::PDF::SFont->new($pdf, "Helvetica", "F0");
+        $root->add_font($font);
+        my $page = Text::PDF::Page->new($pdf, $root);
+        $page->add("BT 1 0 0 1 250 600 Tm /F0 48 Tf 48 TL (Hello World!)Tj ET");
+        $pdf->out_file("/tmp/hello.pdf");
+        EOF
+        head -c 5 /tmp/hello.pdf | grep -F "%PDF-"
+        grep -F "%%EOF" /tmp/hello.pdf
+        grep -F "/Helvetica" /tmp/hello.pdf
+
+        count=$(perl -MText::PDF::File -e '
+          my $p = Text::PDF::File->open($ARGV[0]) or die "cannot open";
+          print $p->{"Root"}->realise->{"Pages"}->realise->{"Count"}->val, "\n";
+        ' /tmp/hello.pdf)
+        echo "page count: $count"
+        [ "$count" = "1" ]
+
+        # Page streams may be FlateDecode-compressed, so inflate every stream before searching.
+        cat > /tmp/findtext.pl <<'EOF'
+        use strict;
+        use warnings;
+        use Compress::Zlib;
+        my ($file, $needle) = @ARGV;
+        open my $fh, '<:raw', $file or die "open $file: $!";
+        local $/;
+        my $pdf = <$fh>;
+        my $text = $pdf;
+        while ($pdf =~ /stream\r?\n(.*?)endstream/sg) {
+            my $out = uncompress($1);
+            $text .= $out if defined $out;
+        }
+        print index($text, $needle) >= 0 ? "found\n" : "missing\n";
+        EOF
+        perl /tmp/findtext.pl /tmp/hello.pdf "Hello World!" | grep -Fx found
+    - name: Round-trip data through Text::PDF stream filters
+      runs: |
+        perl <<'EOF'
+        use strict;
+        use warnings;
+        use Text::PDF::Filter;
+        my $data = "Text::PDF filter round trip 0123456789" x 20;
+        for my $class (qw(Text::PDF::ASCIIHexDecode Text::PDF::FlateDecode)) {
+            my $enc = $class->new->outfilt($data, 1);
+            die "$class did not transform the data\n" if $enc eq $data;
+            my $dec = $class->new->infilt($enc, 1);
+            die "$class round trip mismatch\n" unless $dec eq $data;
+            print "$class ok\n";
+        }
+        EOF
+    - name: Scripts compile against the installed modules
+      runs: |
+        for s in pdfbklt pdfrevert pdfstamp; do
+          out=$(perl -c "/usr/bin/$s" 2>&1)
+          echo "$out"
+          echo "$out" | grep -F "syntax OK"
+        done
+    - name: pdfstamp with no arguments prints its usage and fails
+      runs: |
+        if pdfstamp > /tmp/pdfstamp-usage.txt 2>&1; then
+          echo "ERROR: pdfstamp without arguments exited 0"
+          exit 1
+        fi
+        cat /tmp/pdfstamp-usage.txt
+        grep -F "pdfstamp [-f font] [-l locx,locy] [-s size] infile string" /tmp/pdfstamp-usage.txt
+    - name: pdfstamp stamps text onto a PDF
+      runs: |
+        cp /tmp/hello.pdf /tmp/stamp.pdf
+        perl /tmp/findtext.pl /tmp/stamp.pdf "ChainguardStamp42" | grep -Fx missing
+        pdfstamp -s 24 -l 100,100 /tmp/stamp.pdf "ChainguardStamp42"
+        perl /tmp/findtext.pl /tmp/stamp.pdf "ChainguardStamp42" | grep -Fx found
+        perl /tmp/findtext.pl /tmp/stamp.pdf "Hello World!" | grep -Fx found
+        count=$(perl -MText::PDF::File -e '
+          my $p = Text::PDF::File->open($ARGV[0]) or die "cannot open";
+          print $p->{"Root"}->realise->{"Pages"}->realise->{"Count"}->val, "\n";
+        ' /tmp/stamp.pdf)
+        echo "page count after stamp: $count"
+        [ "$count" = "1" ]
+    - name: pdfrevert removes the pdfstamp incremental update
+      runs: |
+        # pdfstamp appended its stamp as an incremental update, so one revert must drop it in place.
+        cp /tmp/stamp.pdf /tmp/revert.pdf
+        perl /tmp/findtext.pl /tmp/revert.pdf "ChainguardStamp42" | grep -Fx found
+        pdfrevert /tmp/revert.pdf
+        perl /tmp/findtext.pl /tmp/revert.pdf "ChainguardStamp42" | grep -Fx missing
+        perl /tmp/findtext.pl /tmp/revert.pdf "Hello World!" | grep -Fx found
+        count=$(perl -MText::PDF::File -e '
+          my $p = Text::PDF::File->open($ARGV[0]) or die "cannot open";
+          print $p->{"Root"}->realise->{"Pages"}->realise->{"Count"}->val, "\n";
+        ' /tmp/revert.pdf)
+        echo "page count after revert: $count"
+        [ "$count" = "1" ]
+    - name: pdfbklt imposes a 4-page PDF as a booklet
+      runs: |
+        perl <<'EOF'
+        use strict;
+        use warnings;
+        use Text::PDF::File;
+        use Text::PDF::Page;
+        use Text::PDF::Pages;
+        use Text::PDF::SFont;
+
+        my $pdf = Text::PDF::File->new;
+        my $root = Text::PDF::Pages->new($pdf);
+        $root->proc_set("PDF", "Text");
+        $root->bbox(0, 0, 420, 595);
+        my $font = Text::PDF::SFont->new($pdf, "Helvetica", "F0");
+        $root->add_font($font);
+        for my $n (1 .. 4) {
+            my $page = Text::PDF::Page->new($pdf, $root);
+            $page->add("BT 1 0 0 1 100 300 Tm /F0 24 Tf (BookletPage$n)Tj ET");
+        }
+        $pdf->out_file("/tmp/booklet.pdf");
+        EOF
+        cat > /tmp/pagecount.pl <<'EOF'
+        use Text::PDF::File;
+        my $p = Text::PDF::File->open($ARGV[0]) or die "cannot open";
+        print $p->{"Root"}->realise->{"Pages"}->realise->{"Count"}->val, "\n";
+        EOF
+        before=$(perl /tmp/pagecount.pl /tmp/booklet.pdf)
+        echo "pages before: $before"
+        [ "$before" = "4" ]
+        size_before=$(wc -c < /tmp/booklet.pdf)
+
+        # pdfbklt rewrites the file in place, placing two source pages on each output page.
+        pdfbklt /tmp/booklet.pdf
+
+        after=$(perl /tmp/pagecount.pl /tmp/booklet.pdf)
+        size_after=$(wc -c < /tmp/booklet.pdf)
+        echo "pages after: $after, size $size_before -> $size_after"
+        [ "$after" -ge 1 ]
+        [ "$after" -lt 4 ]
+        [ "$size_after" -gt "$size_before" ]
+        for n in 1 2 3 4; do
+          perl /tmp/findtext.pl /tmp/booklet.pdf "BookletPage$n" | grep -Fx found
+        done

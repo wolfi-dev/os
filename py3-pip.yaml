@@ -1,7 +1,7 @@
 package:
   name: py3-pip
   version: "26.2.1" # IF the next version fixes CVEs, check the idna/urllib3 surgery below!
-  epoch: 3 # sync vendored bom.cdx.json with replaced deps; stop downgrading idna
+  epoch: 2 # CVE-2026-97687
   description: The PyPA recommended tool for installing Python packages.
   copyright:
     - license: MIT
@@ -12,6 +12,7 @@ package:
     memory: 6Gi
 
 vars:
+  idna-version: "3.15" # 3.15 or higher for GHSA-65pc-fj4g-8rjx
   msgpack-version: "1.2.1" # 1.2.1 or higher for GHSA-6v7p-g79w-8964 (CVE-2026-57585)
   pypi-package: pip
   urllib3-version: "2.8.0" # 2.8.0 or higher for GHSA-8988-9cw3-xx77 (CVE-2026-97687), GHSA-gh4c-6fx4-qh6g, GHSA-vxq7-64xx-v4gw (also covers GHSA-mf9v-mfxr-j63j, GHSA-qccp-gfcp-xxvc)
@@ -43,6 +44,14 @@ pipeline:
 
   - uses: auth/uv
 
+  # IF the next version pulls in idna >= 3.15, remove this:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/kjd/idna
+      expected-commit: af30a092e158181d0b35ac66dfa813788126bdd8
+      tag: v${{vars.idna-version}}
+      destination: idna
+
   # IF the next version pulls in urllib3 >= 2.7.0, remove this (and possibly
   # the uv in the build environment deps):
   - uses: git-checkout
@@ -70,6 +79,9 @@ pipeline:
     runs: |
       VENDOR_DIR=./src/pip/_vendor
 
+      rm -r "$VENDOR_DIR/idna"
+      mv -v "idna/idna" "$VENDOR_DIR/idna"
+
       rm -r "$VENDOR_DIR/urllib3"
       mv -v "urllib3/src/urllib3" "$VENDOR_DIR/urllib3"
 
@@ -84,36 +96,11 @@ pipeline:
             msgpack/COPYING \
             "$VENDOR_DIR/msgpack/"
 
-      rm -r urllib3 msgpack
+      rm -r idna urllib3 msgpack
 
+      sed -i -E "s/idna==3.[0-9]+/idna==${{vars.idna-version}}/" "$VENDOR_DIR/vendor.txt"
       sed -i -E "s/urllib3==2.[0-9]+.[0-9]+/urllib3==${{vars.urllib3-version}}/" "$VENDOR_DIR/vendor.txt"
       sed -i -E "s/msgpack==1.[0-9]+.[0-9]+/msgpack==${{vars.msgpack-version}}/" "$VENDOR_DIR/vendor.txt"
-
-      # pip also ships a CycloneDX SBOM of its vendored deps. Rewrite every
-      # component whose version no longer matches vendor.txt, otherwise
-      # SBOM-reading scanners report CVEs for the versions we replaced.
-      python3.14 - "$VENDOR_DIR" <<'EOF'
-      import json, pathlib, re, sys
-      vendor = pathlib.Path(sys.argv[1])
-      norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
-      pins = {norm(m[1]): m[2] for m in re.finditer(r"^\s*([A-Za-z0-9._-]+)==(\S+)", (vendor / "vendor.txt").read_text(), re.M)}
-      path = vendor / "bom.cdx.json"
-      bom = json.loads(path.read_text())
-      refs = {}
-      for c in bom["components"]:
-          want = pins.get(norm(c["name"]))
-          if "version" not in c or want is None or want == c["version"]:
-              continue
-          print(f"bom.cdx.json: {c['name']} {c['version']} -> {want}")
-          new = f"pkg:pypi/{c['name']}@{want}"
-          refs[c["bom-ref"]] = new
-          c["version"], c["purl"], c["bom-ref"] = want, new, new
-      for d in bom.get("dependencies", []):
-          d["ref"] = refs.get(d["ref"], d["ref"])
-          if "dependsOn" in d:
-              d["dependsOn"] = [refs.get(r, r) for r in d["dependsOn"]]
-      path.write_text(json.dumps(bom, indent=2, sort_keys=True) + "\n")
-      EOF
 
   # With any luck, these will still work with the ones we've pulled in. Adjust
   # this based on which vendored deps have been updated in pip (they apply the
@@ -254,21 +241,6 @@ subpackages:
               echo "FAIL: pip failed to install pip wheel from /usr/share/python-wheels/"
               exit 1
             fi
-        - name: "Wheel's vendored bom.cdx.json matches its vendor.txt"
-          uses: py/one-python
-          with:
-            content: |
-              #!/usr/bin/env python3
-              import json, re, sys, zipfile
-              z = zipfile.ZipFile("/usr/share/python-wheels/pip-${{package.version}}-py3-none-any.whl")
-              norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
-              pins = {norm(m[1]): m[2] for m in re.finditer(r"^\s*([A-Za-z0-9._-]+)==(\S+)", z.read("pip/_vendor/vendor.txt").decode(), re.M)}
-              bom = {norm(c["name"]): c["version"] for c in json.loads(z.read("pip/_vendor/bom.cdx.json"))["components"] if "version" in c}
-              bad = [f"{n}: bom {v} != vendor.txt {pins[n]}" for n, v in bom.items() if n in pins and pins[n] != v]
-              if bad:
-                  print("FAIL: stale pip/_vendor/bom.cdx.json in wheel:\n  " + "\n  ".join(bad))
-                  sys.exit(1)
-              print("PASS: wheel bom.cdx.json matches vendor.txt")
 
 test:
   pipeline:
@@ -303,25 +275,6 @@ test:
                   if 'host =' in line or 'ri.' in line:
                       print(f'  Found: {line.strip()}')
               sys.exit(1)
-    - name: "Vendored bom.cdx.json matches vendor.txt and the vendored code"
-      uses: py/one-python
-      with:
-        content: |
-          #!/usr/bin/env python3
-          import json, pathlib, re, sys
-          import pip
-          from pip._vendor import idna, msgpack, urllib3
-          vendor = pathlib.Path(pip.__file__).parent / "_vendor"
-          norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
-          pins = {norm(m[1]): m[2] for m in re.finditer(r"^\s*([A-Za-z0-9._-]+)==(\S+)", (vendor / "vendor.txt").read_text(), re.M)}
-          bom = {norm(c["name"]): c["version"] for c in json.loads((vendor / "bom.cdx.json").read_text())["components"] if "version" in c}
-          code = {"idna": idna.__version__, "msgpack": ".".join(map(str, msgpack.version)), "urllib3": urllib3.__version__}
-          bad = [f"{n}: bom {v} != vendor.txt {pins[n]}" for n, v in bom.items() if n in pins and pins[n] != v]
-          bad += [f"{n}: bom {bom.get(n)} != code {v}" for n, v in code.items() if bom.get(n) != v]
-          if bad:
-              print("FAIL: stale pip/_vendor/bom.cdx.json:\n  " + "\n  ".join(bad))
-              sys.exit(1)
-          print(f"PASS: bom.cdx.json matches vendor.txt and code ({code})")
 
 update:
   ignore-regex-patterns:

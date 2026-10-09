@@ -1,7 +1,7 @@
 package:
   name: pkcs11-helper
   version: "1.31.0"
-  epoch: 5 # openssl: 3.6->4.0, backport OpenSSL 4 support
+  epoch: 4
   description: PKCS#11 Helper library that simplifies the interaction with PKCS#11 providers for end-user applications
   copyright:
     - license: GPL-2.0-or-later
@@ -10,7 +10,7 @@ package:
     memory: 5Gi
 
 vars:
-  openssl-version: "4.0"
+  openssl-version: "3.6"
 
 environment:
   contents:
@@ -36,10 +36,6 @@ pipeline:
       repository: https://github.com/OpenSC/pkcs11-helper
       tag: pkcs11-helper-${{package.version}}
       expected-commit: 286b4415b95f298ab35d62508a37c2aefc055037
-
-  - uses: patch
-    with:
-      patches: 0001-crypto-openssl-use-ASN1_TIME_to_tm.patch
 
   - runs: aclocal && autoreconf -vfi -I/usr/share/aclocal
 
@@ -84,9 +80,7 @@ test:
       packages:
         - pkcs11-helper-dev
         - build-base
-        - openssl-${{vars.openssl-version}}
         - openssl-${{vars.openssl-version}}-dev
-        - p11-kit-trust
         - pkgconf
   pipeline:
     - uses: test/tw/ldd-check
@@ -111,65 +105,3 @@ test:
         EOF
         gcc $(pkg-config --cflags libpkcs11-helper-1) test_pkcs11h.c -o test_pkcs11h $(pkg-config --libs libpkcs11-helper-1)
         ./test_pkcs11h
-    - name: Pick the certificate with the latest expiration from a token
-      runs: |
-        # Two certificates for the same key share a CKA_ID in p11-kit-trust.
-        # Loading that id makes pkcs11-helper compare their notAfter dates
-        # in the OpenSSL crypto engine and keep the later one. The token
-        # lists them in file name order, so the 2099 certificate only
-        # replaces the 2049 one if both dates were parsed. 2049 is the last
-        # year encoded as UTCTime, 2099 uses GeneralizedTime. Both are in
-        # the future because pkcs11-helper reports no expiration date for an
-        # expired certificate.
-        cd "$(mktemp -d)"
-        mkdir anchors
-        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out key.pem
-        openssl req -x509 -key key.pem -subj "/CN=pkcs11-helper test" \
-          -not_after 20491231235959Z -out anchors/1.pem
-        openssl req -x509 -key key.pem -subj "/CN=pkcs11-helper test" \
-          -not_after 20991231235959Z -out anchors/2.pem
-        openssl x509 -in anchors/2.pem -outform DER -out expected.der
-
-        cat > pick_cert.c << 'EOF'
-        #include <pkcs11-helper-1.0/pkcs11h-certificate.h>
-        #include <stdio.h>
-        #include <string.h>
-
-        #define CHECK(call) do { CK_RV rv = (call); if (rv != CKR_OK) { \
-            fprintf(stderr, "%s: %s\n", #call, pkcs11h_getMessage(rv)); return 1; } } while (0)
-
-        int main(int argc, char **argv) {
-            /* p11-kit-trust reads its anchor directory from pReserved */
-            CK_C_INITIALIZE_ARGS args = { .flags = CKF_OS_LOCKING_OK, .pReserved = argv[2] };
-            CK_C_INITIALIZE_ARGS_PTR p_args = &args;
-            pkcs11h_certificate_id_list_t issuers, ends;
-            pkcs11h_certificate_id_t id;
-            pkcs11h_certificate_t cert;
-            char serialized[4096];
-            unsigned char blob[8192];
-            size_t serialized_size = sizeof(serialized), blob_size = sizeof(blob);
-
-            CHECK(pkcs11h_initialize());
-            CHECK(pkcs11h_registerProvider("trust"));
-            CHECK(pkcs11h_setProviderProperty("trust", PKCS11H_PROVIDER_PROPERTY_LOCATION, argv[1], strlen(argv[1]) + 1));
-            CHECK(pkcs11h_setProviderProperty("trust", PKCS11H_PROVIDER_PROPERTY_INIT_ARGS, &p_args, sizeof(p_args)));
-            CHECK(pkcs11h_initializeProvider("trust"));
-            CHECK(pkcs11h_certificate_enumCertificateIds(PKCS11H_ENUM_METHOD_CACHE_EXIST, NULL,
-                PKCS11H_PROMPT_MASK_ALLOW_ALL, &issuers, &ends));
-            /* Round-trip the id to drop its cached blob, so the token is searched again */
-            CHECK(pkcs11h_certificate_serializeCertificateId(serialized, &serialized_size,
-                (ends != NULL ? ends : issuers)->certificate_id));
-            CHECK(pkcs11h_certificate_deserializeCertificateId(&id, serialized));
-            CHECK(pkcs11h_certificate_create(id, NULL, PKCS11H_PROMPT_MASK_ALLOW_ALL, PKCS11H_PIN_CACHE_INFINITE, &cert));
-            CHECK(pkcs11h_certificate_getCertificateBlob(cert, blob, &blob_size));
-            fwrite(blob, 1, blob_size, stdout);
-            return 0;
-        }
-        EOF
-        gcc $(pkg-config --cflags libpkcs11-helper-1) pick_cert.c -o pick_cert $(pkg-config --libs libpkcs11-helper-1)
-
-        ./pick_cert /usr/lib/pkcs11/p11-kit-trust.so "paths=$PWD/anchors" > chosen.der
-        if ! cmp chosen.der expected.der; then
-          echo "pkcs11-helper did not pick the certificate that expires last"
-          exit 1
-        fi

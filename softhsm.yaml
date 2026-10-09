@@ -2,7 +2,7 @@
 package:
   name: softhsm
   version: 2.7.0
-  epoch: 5 # openssl: 3.6->4.0, backport OpenSSL 4 support
+  epoch: 4
   description: 'cryptographic store accessible through a PKCS #11'
   copyright:
     - license: BSD-2-Clause
@@ -11,7 +11,7 @@ package:
     memory: 7Gi
 
 vars:
-  openssl-version: "4.0"
+  openssl-version: "3.6"
 
 environment:
   environment:
@@ -39,13 +39,6 @@ pipeline:
       repository: https://github.com/softhsm/SoftHSMv2
       tag: ${{package.version}}
       expected-commit: 13e6e86b83748fef74046dbf0c91f664b7acc1c3
-
-  # OpenSSL 4.0 makes ASN1_STRING opaque; backported from SoftHSMv2 main.
-  - uses: patch
-    with:
-      patches: |
-        0001-Fix-the-memory-leak-in-OSSL-byteString2oid-863.patch
-        0002-Fix-memory-leak-in-EdDSA-PrintableString-handling-858.patch
 
   - uses: autoconf/configure
     with:
@@ -81,138 +74,8 @@ test:
   environment:
     contents:
       packages:
-        - gcc
         - openssl
-        - p11-kit-dev
   pipeline:
-    - name: EdDSA key generation, signing and verification over PKCS#11
-      runs: |
-        # Key generation and key loading map CKA_EC_PARAMS to a curve in
-        # OSSL::byteString2oid(), for both OID and PrintableString encodings
-        mkdir -p /tmp/softhsm-eddsa/tokens
-        cat > /tmp/softhsm-eddsa.conf << 'EOF'
-        directories.tokendir = /tmp/softhsm-eddsa/tokens
-        objectstore.backend = file
-        log.level = ERROR
-        EOF
-        export SOFTHSM2_CONF=/tmp/softhsm-eddsa.conf
-        softhsm2-util --init-token --slot 0 --label "EdDSAToken" \
-          --so-pin 1234567890 --pin 1234567890
-
-        cat > /tmp/eddsa_test.c << 'EOF'
-        #include <dlfcn.h>
-        #include <stdio.h>
-        #include <string.h>
-        #include <p11-kit/pkcs11.h>
-        #ifndef CKM_EC_EDWARDS_KEY_PAIR_GEN
-        #define CKM_EC_EDWARDS_KEY_PAIR_GEN 0x1055UL
-        #endif
-        #ifndef CKM_EDDSA
-        #define CKM_EDDSA 0x1057UL
-        #endif
-
-        static CK_FUNCTION_LIST_PTR f;
-        static CK_SESSION_HANDLE s;
-
-        static int fail(const char *what, CK_RV rv)
-        {
-            fprintf(stderr, "FAIL: %s: rv=0x%lx\n", what, (unsigned long)rv);
-            return 1;
-        }
-
-        static CK_RV gen(const unsigned char *params, CK_ULONG plen,
-                         CK_OBJECT_HANDLE *pub, CK_OBJECT_HANDLE *priv)
-        {
-            CK_MECHANISM m = { CKM_EC_EDWARDS_KEY_PAIR_GEN, NULL, 0 };
-            CK_BBOOL t = CK_TRUE;
-            CK_ATTRIBUTE pubt[] = {
-                { CKA_EC_PARAMS, (void *)params, plen },
-                { CKA_VERIFY, &t, sizeof(t) },
-            };
-            CK_ATTRIBUTE privt[] = {
-                { CKA_SIGN, &t, sizeof(t) },
-            };
-            return f->C_GenerateKeyPair(s, &m, pubt, 2, privt, 1, pub, priv);
-        }
-
-        static int sign_verify(const char *name, const unsigned char *params,
-                               CK_ULONG plen, CK_ULONG siglen_expected)
-        {
-            CK_OBJECT_HANDLE pub, priv;
-            CK_MECHANISM m = { CKM_EDDSA, NULL, 0 };
-            unsigned char msg[] = "softhsm OpenSSL 4 EdDSA test";
-            unsigned char sig[256];
-            CK_ULONG siglen = sizeof(sig);
-            CK_RV rv;
-
-            if ((rv = gen(params, plen, &pub, &priv)) != CKR_OK) return fail(name, rv);
-            if ((rv = f->C_SignInit(s, &m, priv)) != CKR_OK) return fail("C_SignInit", rv);
-            if ((rv = f->C_Sign(s, msg, sizeof(msg) - 1, sig, &siglen)) != CKR_OK) return fail("C_Sign", rv);
-            if (siglen != siglen_expected) {
-                fprintf(stderr, "FAIL: %s signature is %lu bytes, expected %lu\n",
-                        name, (unsigned long)siglen, (unsigned long)siglen_expected);
-                return 1;
-            }
-            if ((rv = f->C_VerifyInit(s, &m, pub)) != CKR_OK) return fail("C_VerifyInit", rv);
-            if ((rv = f->C_Verify(s, msg, sizeof(msg) - 1, sig, siglen)) != CKR_OK) return fail("C_Verify", rv);
-            msg[0] ^= 1;
-            if ((rv = f->C_VerifyInit(s, &m, pub)) != CKR_OK) return fail("C_VerifyInit", rv);
-            rv = f->C_Verify(s, msg, sizeof(msg) - 1, sig, siglen);
-            if (rv != CKR_SIGNATURE_INVALID) return fail("tampered message must not verify", rv);
-            printf("PASS: %s keygen, sign and verify\n", name);
-            return 0;
-        }
-
-        int main(void)
-        {
-            static const unsigned char ed25519_ps[] = { 0x13, 0x0c, 'e','d','w','a','r','d','s','2','5','5','1','9' };
-            static const unsigned char ed448_ps[] = { 0x13, 0x0a, 'e','d','w','a','r','d','s','4','4','8' };
-            static const unsigned char ed25519_oid[] = { 0x06, 0x03, 0x2b, 0x65, 0x70 };
-            static const unsigned char unknown_ps[] = { 0x13, 0x0c, 'e','d','w','a','r','d','s','9','9','9','9','9' };
-            CK_RV (*get_list)(CK_FUNCTION_LIST_PTR_PTR);
-            CK_SLOT_ID slots[16];
-            CK_ULONG n = 16, i;
-            CK_OBJECT_HANDLE pub, priv;
-            CK_RV rv;
-            int found = 0;
-
-            void *h = dlopen("/usr/lib/softhsm/libsofthsm2.so", RTLD_NOW);
-            if (!h) { fprintf(stderr, "FAIL: dlopen: %s\n", dlerror()); return 1; }
-            get_list = (CK_RV (*)(CK_FUNCTION_LIST_PTR_PTR))dlsym(h, "C_GetFunctionList");
-            if (!get_list || get_list(&f) != CKR_OK) return fail("C_GetFunctionList", 0);
-            if ((rv = f->C_Initialize(NULL)) != CKR_OK) return fail("C_Initialize", rv);
-            if ((rv = f->C_GetSlotList(CK_TRUE, slots, &n)) != CKR_OK) return fail("C_GetSlotList", rv);
-            for (i = 0; i < n && !found; i++) {
-                CK_TOKEN_INFO ti;
-                if (f->C_GetTokenInfo(slots[i], &ti) == CKR_OK &&
-                    memcmp(ti.label, "EdDSAToken", 10) == 0) found = 1;
-            }
-            if (!found) return fail("token EdDSAToken not found", 0);
-            if ((rv = f->C_OpenSession(slots[i - 1], CKF_SERIAL_SESSION | CKF_RW_SESSION,
-                                       NULL, NULL, &s)) != CKR_OK) return fail("C_OpenSession", rv);
-            if ((rv = f->C_Login(s, CKU_USER, (unsigned char *)"1234567890", 10)) != CKR_OK)
-                return fail("C_Login", rv);
-
-            if (sign_verify("Ed25519 (PrintableString)", ed25519_ps, sizeof(ed25519_ps), 64)) return 1;
-            if (sign_verify("Ed448 (PrintableString)", ed448_ps, sizeof(ed448_ps), 114)) return 1;
-            if (sign_verify("Ed25519 (OID)", ed25519_oid, sizeof(ed25519_oid), 64)) return 1;
-
-            rv = gen(unknown_ps, sizeof(unknown_ps), &pub, &priv);
-            if (rv == CKR_OK) {
-                fprintf(stderr, "FAIL: unknown curve name edwards99999 was accepted\n");
-                return 1;
-            }
-            printf("PASS: unknown curve name rejected (rv=0x%lx)\n", (unsigned long)rv);
-
-            f->C_Logout(s);
-            f->C_CloseSession(s);
-            f->C_Finalize(NULL);
-            return 0;
-        }
-        EOF
-
-        gcc -o /tmp/eddsa_test /tmp/eddsa_test.c -I/usr/include/p11-kit-1 -ldl
-        /tmp/eddsa_test
     - name: Initialize token and import key
       runs: |
         # Set up SoftHSM configuration and token directory

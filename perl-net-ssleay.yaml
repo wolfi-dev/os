@@ -1,7 +1,7 @@
 package:
   name: perl-net-ssleay
   version: "1.96"
-  epoch: 4
+  epoch: 5 # openssl-hardened: 3.6->4.0
   description: Perl extension for using OpenSSL
   copyright:
     - license: Artistic-2.0
@@ -10,7 +10,7 @@ package:
     memory: 2Gi
 
 vars:
-  openssl-version: "3.6"
+  openssl-version: "4.0"
 
 environment:
   contents:
@@ -21,7 +21,7 @@ environment:
       - ca-certificates-bundle
       - glibc-2.44-dev
       - openssl
-      - openssl-hardened-${{vars.openssl-version}}-dev
+      - openssl-${{vars.openssl-version}}-dev # Net::SSLeay 1.96 calls RIPEMD160() unconditionally, which openssl-hardened 4.0 (no-rmd160) does not declare
       - perl-dev
       - zlib-dev
 
@@ -31,6 +31,14 @@ pipeline:
       expected-commit: 006e139250692a04e2c66c122b572d3833199444
       repository: https://github.com/radiator-software/p5-net-ssleay
       tag: ${{package.version}}
+
+  - uses: patch
+    with:
+      patches: |
+        0001-Fix-SSLv3-in-OpenSSL-4.0.0.patch
+        0002-OpenSSL-4.0.0-remove-support-for-some-TLS-functions.patch
+        0003-Fix-Net-SSLeay-to-support-opaque-ASN1_STRING.patch
+        0004-Do-not-use-elif-but-if-with-else-to-avoid-duplicate-.patch
 
   - uses: perl/make
 
@@ -55,26 +63,215 @@ test:
   environment:
     contents:
       packages:
+        - openssl
         - perl
   pipeline:
     - uses: test/tw/ldd-check
-    - name: Test
+    - name: Load module
       runs: |
-        cat <<EOF > net-ssleay.pl
+        perl -MNet::SSLeay -e 'print "Net::SSLeay $Net::SSLeay::VERSION\n"'
+    - name: Digests
+      runs: |
+        cat <<'EOF' > digest.pl
         use strict;
         use warnings;
-
-        eval {
-            require Net::SSLeay;
-            Net::SSLeay->import();
-        };
-        if (\$@) {
-            print "Failed to load Net::SSLeay\n";
-            exit 1;
+        use Net::SSLeay;
+        my %want = (
+            MD5       => ['MD5',       '900150983cd24fb0d6963f7d28e17f72'],
+            SHA1      => ['SHA1',      'a9993e364706816aba3e25717850c26c9cd0d89d'],
+        );
+        for my $n (sort keys %want) {
+            no strict 'refs';
+            my $got = unpack('H*', &{"Net::SSLeay::$n"}('abc'));
+            die "$n mismatch: $got\n" unless $got eq $want{$n}[1];
         }
+        my $sha = Net::SSLeay::EVP_get_digestbyname('sha256');
+        die "sha256 not found\n" unless $sha;
+        my $ctx = Net::SSLeay::EVP_MD_CTX_create();
+        Net::SSLeay::EVP_DigestInit($ctx, $sha);
+        Net::SSLeay::EVP_DigestUpdate($ctx, 'abc');
+        my $d = unpack('H*', Net::SSLeay::EVP_DigestFinal($ctx));
+        die "sha256 mismatch: $d\n" unless $d eq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
+        die "RIPEMD160 function missing\n" unless defined &Net::SSLeay::RIPEMD160;
+        my $r = unpack('H*', Net::SSLeay::RIPEMD160('abc'));
+        die "RIPEMD160 mismatch: $r\n" unless $r eq '8eb208f7e05d987a9b044a8e98c6b087f15a0bfc';
+        print "digests ok\n";
         EOF
+        perl digest.pl
+    - name: Verified TLS handshake and certificate accessors
+      runs: |
+        set -e
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
+          -days 2 -subj "/CN=localhost" \
+          -addext "subjectAltName=DNS:localhost,DNS:alt.example.test,IP:127.0.0.1"
+        openssl s_server -accept 127.0.0.1:14433 -cert cert.pem -key key.pem -www -quiet >server.log 2>&1 &
+        SERVER_PID=$!
+        trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+        cat <<'EOF' > tlslib.pl
+        use strict;
+        use warnings;
+        use Net::SSLeay;
+        use Socket;
+        $| = 1;
+        Net::SSLeay::initialize();
 
-        perl net-ssleay.pl
+        sub tcp_connect {
+            my ($port) = @_;
+            for (1 .. 30) {
+                socket(my $s, PF_INET, SOCK_STREAM, 0) or die "socket: $!";
+                return $s if connect($s, sockaddr_in($port, inet_aton('127.0.0.1')));
+                select(undef, undef, undef, 0.5);
+            }
+            die "connect to $port failed\n";
+        }
+
+        # Returns ($rc, $verify_result, $ssl, $ctx, $socket, $errors) after a handshake that trusts
+        # cert.pem only when $trust is set and checks $host against the peer cert.
+        sub handshake {
+            my (%a) = @_;
+            my $ctx = $a{ctx} || Net::SSLeay::CTX_new() or die "CTX_new\n";
+            if ($a{trust}) {
+                Net::SSLeay::CTX_load_verify_locations($ctx, 'cert.pem', '') or die "load_verify_locations\n";
+            }
+            Net::SSLeay::CTX_set_verify($ctx, Net::SSLeay::VERIFY_PEER(), undef);
+            my $s = tcp_connect($a{port});
+            my $ssl = Net::SSLeay::new($ctx) or die "new\n";
+            Net::SSLeay::set_fd($ssl, fileno($s));
+            Net::SSLeay::X509_VERIFY_PARAM_set1_host(Net::SSLeay::get0_param($ssl), $a{host}) == 1
+                or die "set1_host failed\n";
+            my $rc = Net::SSLeay::connect($ssl);
+            my @errs;
+            while (my $e = Net::SSLeay::ERR_get_error()) { push @errs, Net::SSLeay::ERR_error_string($e) }
+            return ($rc, Net::SSLeay::get_verify_result($ssl), $ssl, $ctx, $s, join('; ', @errs));
+        }
+        1;
+        EOF
+        cat <<'EOF' > tls.pl
+        use strict;
+        use warnings;
+        use Socket;
+        require './tlslib.pl';
+
+        # s_server serves one connection at a time, so the failing cases run before
+        # the positive handshake that stays open.
+        # Wrong hostname against a trusted cert must fail verification.
+        my ($rc2, $vr2) = handshake(port => 14433, host => 'wrong.example.test', trust => 1);
+        if ($rc2 == 1 || $vr2 != Net::SSLeay::X509_V_ERR_HOSTNAME_MISMATCH()) {
+            die "wrong hostname: rc=$rc2 verify_result=$vr2, want X509_V_ERR_HOSTNAME_MISMATCH\n";
+        }
+        print "negative hostname rejected verify_result=$vr2 ("
+            . Net::SSLeay::X509_verify_cert_error_string($vr2) . ")\n";
+
+        # Untrusted self-signed cert must fail verification.
+        my ($rc3, $vr3) = handshake(port => 14433, host => 'localhost', trust => 0);
+        if ($rc3 == 1 || $vr3 != Net::SSLeay::X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT()) {
+            die "untrusted cert: rc=$rc3 verify_result=$vr3, want X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT\n";
+        }
+        print "negative untrusted rejected verify_result=$vr3 ("
+            . Net::SSLeay::X509_verify_cert_error_string($vr3) . ")\n";
+
+        # Trusted cert and matching hostname: handshake and verification must succeed.
+        my ($rc, $vr, $ssl, $ctx, $sock) = handshake(port => 14433, host => 'localhost', trust => 1);
+        die "verified handshake failed rc=$rc verify_result=$vr\n" unless $rc == 1;
+        die "verify_result $vr, want X509_V_OK\n" unless $vr == Net::SSLeay::X509_V_OK();
+        my $ver = Net::SSLeay::get_version($ssl);
+        die "unexpected protocol $ver\n" unless $ver =~ /^TLSv1\.[23]$/;
+        print "protocol $ver cipher ", Net::SSLeay::get_cipher($ssl), "\n";
+
+        my $cert = Net::SSLeay::get_peer_certificate($ssl) or die "no peer cert\n";
+
+        # GEN_IPADD (7) entries carry the raw 4 byte address.
+        my @san = Net::SSLeay::X509_get_subjectAltNames($cert);
+        my (%dns, @ip);
+        while (my ($type, $val) = splice(@san, 0, 2)) {
+            $dns{$val} = 1 if $type == 2;
+            push @ip, $val if $type == 7;
+        }
+        die "DNS SANs missing\n" unless $dns{localhost} && $dns{'alt.example.test'};
+        die "IP SAN missing or not 4 bytes\n" unless @ip == 1 && length($ip[0]) == 4;
+        die "IP SAN value wrong\n" unless $ip[0] eq inet_aton('127.0.0.1');
+
+        my $nb = Net::SSLeay::X509_get_notBefore($cert);
+        my $na = Net::SSLeay::X509_get_notAfter($cert);
+        my $nbs = Net::SSLeay::P_ASN1_TIME_get_isotime($nb);
+        my $nas = Net::SSLeay::P_ASN1_TIME_get_isotime($na);
+        die "bad notBefore $nbs\n" unless $nbs =~ /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+        die "bad notAfter $nas\n" unless $nas =~ /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+        die "notAfter not after notBefore\n" unless $nas gt $nbs;
+
+        # The cert is valid for 2 days, so ASN1_TIME_timet must agree.
+        my $nbt = Net::SSLeay::ASN1_TIME_timet($nb);
+        my $nat = Net::SSLeay::ASN1_TIME_timet($na);
+        die "ASN1_TIME_timet span $nbt..$nat\n" unless $nat - $nbt == 2 * 86400;
+        die "ASN1_TIME_timet not near now\n" unless abs($nbt - time) < 3600;
+
+        my $t = Net::SSLeay::ASN1_TIME_new() or die "ASN1_TIME_new\n";
+        Net::SSLeay::P_ASN1_TIME_set_isotime($t, '2030-01-02T03:04:05Z') or die "set_isotime\n";
+        my $back = Net::SSLeay::P_ASN1_TIME_get_isotime($t);
+        die "isotime roundtrip: $back\n" unless $back eq '2030-01-02T03:04:05Z';
+        my $epoch = Net::SSLeay::ASN1_TIME_timet($t);
+        die "ASN1_TIME_timet of set time: $epoch\n" unless $epoch == 1893553445;
+        Net::SSLeay::ASN1_TIME_free($t);
+
+        my $dump = Net::SSLeay::dump_peer_certificate($ssl);
+        die "dump_peer_certificate: $dump\n" unless $dump =~ /CN=localhost/;
+
+        my $fp = Net::SSLeay::X509_get_fingerprint($cert, 'sha256');
+        die "fingerprint: $fp\n" unless $fp =~ /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/;
+
+        Net::SSLeay::write($ssl, "GET / HTTP/1.0\r\n\r\n");
+        my $resp = '';
+        while (defined(my $chunk = Net::SSLeay::read($ssl))) { last if $chunk eq ''; $resp .= $chunk; }
+        die "no HTTP response\n" unless $resp =~ /^HTTP\/1\.0 200/;
+        Net::SSLeay::free($ssl);
+        Net::SSLeay::CTX_free($ctx);
+        print "tls ok\n";
+        EOF
+        timeout 60 perl tls.pl
+    - name: Fixed-version TLS contexts
+      runs: |
+        set -e
+        openssl s_server -accept 127.0.0.1:14434 -cert cert.pem -key key.pem -www -quiet >server12.log 2>&1 &
+        SERVER_PID=$!
+        trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+        cat <<'EOF' > fixed.pl
+        use strict;
+        use warnings;
+        require './tlslib.pl';
+
+        my %want = (tlsv1 => Net::SSLeay::TLS1_VERSION(), tlsv1_1 => Net::SSLeay::TLS1_1_VERSION(),
+                    tlsv1_2 => Net::SSLeay::TLS1_2_VERSION());
+        for my $v (sort keys %want) {
+            no strict 'refs';
+            my $ctx = &{"Net::SSLeay::CTX_${v}_new"}() or die "CTX_${v}_new failed\n";
+            my ($min, $max) = (Net::SSLeay::CTX_get_min_proto_version($ctx), Net::SSLeay::CTX_get_max_proto_version($ctx));
+            printf "%s min=0x%x max=0x%x\n", $v, $min, $max;
+            die "$v bounds not pinned to $want{$v}\n" unless $min == $want{$v} && $max == $want{$v};
+        }
+
+        # The OpenSSL in this config is built with no-tls1 and no-tls1_1, so the
+        # bounds read back as set but the handshake must fail.
+        for my $v ('tlsv1', 'tlsv1_1') {
+            no strict 'refs';
+            my $old = &{"Net::SSLeay::CTX_${v}_new"}() or die "CTX_${v}_new failed\n";
+            my ($orc, $ovr, $ossl, $oc, $osock, $oerr) = handshake(ctx => $old, port => 14434, host => 'localhost', trust => 1);
+            die "$v handshake succeeded with " . Net::SSLeay::get_version($ossl) . "\n" if $orc == 1;
+            # A clean verify result rules out a certificate failure.
+            die "$v verify_result $ovr, want X509_V_OK\n" unless $ovr == Net::SSLeay::X509_V_OK();
+            print "$v handshake rejected: $oerr\n";
+            die "$v failure is not a protocol error: $oerr\n" unless $oerr =~ /SSL routines::no protocols available/;
+        }
+
+        my $ctx = Net::SSLeay::CTX_tlsv1_2_new() or die "CTX_tlsv1_2_new\n";
+        die "tlsv1_2 min bound\n" unless Net::SSLeay::CTX_get_min_proto_version($ctx) == Net::SSLeay::TLS1_2_VERSION();
+        die "tlsv1_2 max bound\n" unless Net::SSLeay::CTX_get_max_proto_version($ctx) == Net::SSLeay::TLS1_2_VERSION();
+        my ($rc, $vr, $ssl, $c, $sock) = handshake(ctx => $ctx, port => 14434, host => 'localhost', trust => 1);
+        die "TLS 1.2 handshake failed rc=$rc verify_result=$vr\n" unless $rc == 1 && $vr == Net::SSLeay::X509_V_OK();
+        my $ver = Net::SSLeay::get_version($ssl);
+        die "expected TLSv1.2, got $ver\n" unless $ver eq 'TLSv1.2';
+        print "tls1.2 ok\n";
+        EOF
+        timeout 60 perl fixed.pl
 
 update:
   enabled: true

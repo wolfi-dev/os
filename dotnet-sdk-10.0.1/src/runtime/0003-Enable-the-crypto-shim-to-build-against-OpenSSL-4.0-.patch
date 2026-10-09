@@ -1,0 +1,515 @@
+From a84f12301383bf905187cc2fc93943b55961c8e3 Mon Sep 17 00:00:00 2001
+From: Jeremy Barton <jbarton@microsoft.com>
+Date: Fri, 13 Mar 2026 15:36:14 -0700
+Subject: [PATCH 3/9] Enable the crypto shim to build against OpenSSL
+ 4.0-alpha1 headers
+
+Largely the issues are around the ASN1_STRING type now being opaque, but
+the accessors have been present since 1.0.2.
+
+The next source of strife is that many functions now return const
+pointers, so we need to type the locals they get assigned to as const.
+This generally works because const inputs were marked in previous
+versions, but one or two were missed until 4, so this adds an OSSL4CONST
+optional keyword to deal with the header variance.
+
+The change in `sk_XXX_new_null()` to use OPENSSL_sk_set_thunks requires
+some thought for making portable-3 run on 4.
+
+This change does not put "4" in the shim loader list, so portable builds will
+not load libcrypto.so.4 yet.
+
+(cherry picked from commit 53c6c4e7d3ddc60cb554350308419865b1dba828)
+---
+ .../openssl.c                                 | 56 +++++++++++--------
+ .../opensslshim.h                             | 35 +++++++++++-
+ .../osslcompat_40.h                           | 12 ++++
+ .../pal_ssl.c                                 | 28 +++++++---
+ .../pal_x509.c                                | 14 ++---
+ .../pal_x509.h                                | 14 ++---
+ src/native/libs/verify-so.sh                  | 19 +++++--
+ 7 files changed, 126 insertions(+), 52 deletions(-)
+ create mode 100644 src/native/libs/System.Security.Cryptography.Native/osslcompat_40.h
+
+diff --git a/src/native/libs/System.Security.Cryptography.Native/openssl.c b/src/native/libs/System.Security.Cryptography.Native/openssl.c
+index 1036621f7cb..9999fb48213 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/openssl.c
++++ b/src/native/libs/System.Security.Cryptography.Native/openssl.c
+@@ -388,7 +388,7 @@ int32_t CryptoNative_GetAsn1StringBytes(ASN1_STRING* asn1, uint8_t* pBuf, int32_
+         return 0;
+     }
+ 
+-    int length = asn1->length;
++    int length = ASN1_STRING_length(asn1);
+     assert(length >= 0);
+     if (length < 0)
+     {
+@@ -400,7 +400,7 @@ int32_t CryptoNative_GetAsn1StringBytes(ASN1_STRING* asn1, uint8_t* pBuf, int32_
+         return -length;
+     }
+ 
+-    memcpy_s(pBuf, Int32ToSizeT(cBuf), asn1->data, Int32ToSizeT(length));
++    memcpy_s(pBuf, Int32ToSizeT(cBuf), ASN1_STRING_get0_data(asn1), Int32ToSizeT(length));
+     return 1;
+ }
+ 
+@@ -494,28 +494,28 @@ BIO* CryptoNative_GetX509NameInfo(X509* x509, int32_t nameType, int32_t forIssue
+     // UrlName: SAN.Entries.FirstOrDefault(type == GEN_URI);
+     if (nameType == NAME_TYPE_SIMPLE)
+     {
+-        X509_NAME* name = forIssuer ? X509_get_issuer_name(x509) : X509_get_subject_name(x509);
++        const X509_NAME* name = forIssuer ? X509_get_issuer_name(x509) : X509_get_subject_name(x509);
+ 
+         if (name)
+         {
+-            ASN1_STRING* cn = NULL;
+-            ASN1_STRING* ou = NULL;
+-            ASN1_STRING* o = NULL;
+-            ASN1_STRING* e = NULL;
+-            ASN1_STRING* firstRdn = NULL;
++            const ASN1_STRING* cn = NULL;
++            const ASN1_STRING* ou = NULL;
++            const ASN1_STRING* o = NULL;
++            const ASN1_STRING* e = NULL;
++            const ASN1_STRING* firstRdn = NULL;
+ 
+             // Walk the list backwards because it is stored in stack order
+             for (int i = X509_NAME_entry_count(name) - 1; i >= 0; --i)
+             {
+-                X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, i);
++                const X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, i);
+ 
+                 if (!entry)
+                 {
+                     continue;
+                 }
+ 
+-                ASN1_OBJECT* oid = X509_NAME_ENTRY_get_object(entry);
+-                ASN1_STRING* str = X509_NAME_ENTRY_get_data(entry);
++                const ASN1_OBJECT* oid = X509_NAME_ENTRY_get_object(entry);
++                const ASN1_STRING* str = X509_NAME_ENTRY_get_data(entry);
+ 
+                 if (!oid || !str)
+                 {
+@@ -548,7 +548,7 @@ BIO* CryptoNative_GetX509NameInfo(X509* x509, int32_t nameType, int32_t forIssue
+                 }
+             }
+ 
+-            ASN1_STRING* answer = cn;
++            const ASN1_STRING* answer = cn;
+ 
+             // If there was no CN, but there was something, then perform fallbacks.
+             if (!answer && firstRdn)
+@@ -672,7 +672,7 @@ BIO* CryptoNative_GetX509NameInfo(X509* x509, int32_t nameType, int32_t forIssue
+ 
+     if (nameType == NAME_TYPE_EMAIL || nameType == NAME_TYPE_DNS)
+     {
+-        X509_NAME* name = forIssuer ? X509_get_issuer_name(x509) : X509_get_subject_name(x509);
++        const X509_NAME* name = forIssuer ? X509_get_issuer_name(x509) : X509_get_subject_name(x509);
+         int expectedNid = NID_undef;
+ 
+         switch (nameType)
+@@ -690,15 +690,15 @@ BIO* CryptoNative_GetX509NameInfo(X509* x509, int32_t nameType, int32_t forIssue
+             // Walk the list backwards because it is stored in stack order
+             for (int i = X509_NAME_entry_count(name) - 1; i >= 0; --i)
+             {
+-                X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, i);
++                const X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, i);
+ 
+                 if (!entry)
+                 {
+                     continue;
+                 }
+ 
+-                ASN1_OBJECT* oid = X509_NAME_ENTRY_get_object(entry);
+-                ASN1_STRING* str = X509_NAME_ENTRY_get_data(entry);
++                const ASN1_OBJECT* oid = X509_NAME_ENTRY_get_object(entry);
++                const ASN1_STRING* str = X509_NAME_ENTRY_get_data(entry);
+ 
+                 if (!oid || !str)
+                 {
+@@ -810,12 +810,19 @@ int32_t CryptoNative_CheckX509IpAddress(
+ 
+             ipAddr = sanEntry->d.iPAddress;
+ 
+-            if (!ipAddr || !ipAddr->data || ipAddr->length != addressBytesLen)
++            if (!ipAddr || ASN1_STRING_length(ipAddr) != addressBytesLen)
+             {
+                 continue;
+             }
+ 
+-            if (!memcmp(addressBytes, ipAddr->data, (size_t)addressBytesLen))
++            const uint8_t* ipAddrData = ASN1_STRING_get0_data(ipAddr);
++
++            if (!ipAddrData)
++            {
++                continue;
++            }
++
++            if (!memcmp(addressBytes, ipAddrData, (size_t)addressBytesLen))
+             {
+                 success = 1;
+                 break;
+@@ -828,7 +835,7 @@ int32_t CryptoNative_CheckX509IpAddress(
+     if (!success)
+     {
+         // This is a shared/interor pointer, do not free!
+-        X509_NAME* subject = X509_get_subject_name(x509);
++        OSSL4CONST X509_NAME* subject = X509_get_subject_name(x509);
+ 
+         if (subject)
+         {
+@@ -837,11 +844,14 @@ int32_t CryptoNative_CheckX509IpAddress(
+             while ((i = X509_NAME_get_index_by_NID(subject, subjectNid, i)) >= 0)
+             {
+                 // Shared/interior pointers, do not free!
+-                X509_NAME_ENTRY* nameEnt = X509_NAME_get_entry(subject, i);
+-                ASN1_STRING* cn = X509_NAME_ENTRY_get_data(nameEnt);
++                const X509_NAME_ENTRY* nameEnt = X509_NAME_get_entry(subject, i);
++                const ASN1_STRING* cn = X509_NAME_ENTRY_get_data(nameEnt);
++
++                const char* data = (const char*)ASN1_STRING_get0_data(cn);
+ 
+-                if (cn->length == cchHostname &&
+-                    !strncasecmp((const char*)cn->data, hostname, (size_t)cchHostname))
++                if (ASN1_STRING_length(cn) == cchHostname &&
++                    data != NULL &&
++                    !strncasecmp(data, hostname, (size_t)cchHostname))
+                 {
+                     success = 1;
+                     break;
+diff --git a/src/native/libs/System.Security.Cryptography.Native/opensslshim.h b/src/native/libs/System.Security.Cryptography.Native/opensslshim.h
+index 47dbec2f9da..eaed572e7e8 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/opensslshim.h
++++ b/src/native/libs/System.Security.Cryptography.Native/opensslshim.h
+@@ -38,10 +38,17 @@
+ 
+ #include "pal_crypto_config.h"
+ #include "pal_compiler.h"
++#define OPENSSL_VERSION_4_0_RTM 0x40000000L
+ #define OPENSSL_VERSION_3_0_RTM 0x30000000L
+ #define OPENSSL_VERSION_1_1_1_RTM 0x10101000L
+ #define OPENSSL_VERSION_1_1_0_RTM 0x10100000L
+ 
++#if OPENSSL_VERSION_NUMBER >= OPENSSL_VERSION_4_0_RTM
++#define OSSL4CONST const
++#else
++#define OSSL4CONST
++#endif
++
+ #if OPENSSL_VERSION_NUMBER >= OPENSSL_VERSION_3_0_RTM
+ #include <openssl/provider.h>
+ #include <openssl/store.h>
+@@ -50,9 +57,19 @@
+ #include <openssl/kdf.h>
+ #endif
+ 
+-#if HAVE_OPENSSL_ENGINE
+ // Some Linux distributions build without engine support.
++#if HAVE_OPENSSL_ENGINE
++// HAVE_OPENSSL_ENGINE might be true with OSSL4 headers, because there's
++// no good state to be in where 3.x says yes (deprecated since 1.1) and 4.0 says no
++// (in 4.0 it's deprecated without regard to OPENSSL_API_COMPAT).
++//
++// So, if it's on, and we're 4, turn it off.  (Portable will turn it back on, later).
++#if OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_4_0_RTM
+ #include <openssl/engine.h>
++#else
++#undef HAVE_OPENSSL_ENGINE
++#define HAVE_OPENSSL_ENGINE 0
++#endif
+ #endif
+ 
+ #if OPENSSL_VERSION_NUMBER >= OPENSSL_VERSION_1_1_1_RTM
+@@ -185,6 +202,10 @@ int SSL_set_ciphersuites(SSL *s, const char *str);
+ const SSL_CIPHER* SSL_CIPHER_find(SSL *ssl, const unsigned char *ptr);
+ #endif
+ 
++#if OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_4_0_RTM
++#include "osslcompat_40.h"
++#endif
++
+ #if OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_3_0_RTM
+ #include "osslcompat_30.h"
+ #endif
+@@ -287,6 +308,8 @@ extern bool g_libSslUses32BitTime;
+     REQUIRED_FUNCTION(ASN1_OCTET_STRING_set) \
+     REQUIRED_FUNCTION(ASN1_STRING_dup) \
+     REQUIRED_FUNCTION(ASN1_STRING_free) \
++    REQUIRED_FUNCTION(ASN1_STRING_get0_data) \
++    REQUIRED_FUNCTION(ASN1_STRING_length) \
+     REQUIRED_FUNCTION(ASN1_STRING_print_ex) \
+     REQUIRED_FUNCTION(ASN1_TIME_new) \
+     REQUIRED_FUNCTION(ASN1_TIME_set) \
+@@ -594,6 +617,7 @@ extern bool g_libSslUses32BitTime;
+     REQUIRED_FUNCTION(OPENSSL_sk_pop) \
+     REQUIRED_FUNCTION(OPENSSL_sk_pop_free) \
+     REQUIRED_FUNCTION(OPENSSL_sk_push) \
++    LIGHTUP_FUNCTION(OPENSSL_sk_set_thunks) \
+     REQUIRED_FUNCTION(OPENSSL_sk_value) \
+     REQUIRED_FUNCTION(OpenSSL_version_num) \
+     LIGHTUP_FUNCTION(OSSL_LIB_CTX_free) \
+@@ -768,6 +792,7 @@ extern bool g_libSslUses32BitTime;
+     REQUIRED_FUNCTION(X509_NAME_entry_count) \
+     REQUIRED_FUNCTION(X509_NAME_ENTRY_get_data) \
+     REQUIRED_FUNCTION(X509_NAME_ENTRY_get_object) \
++    REQUIRED_FUNCTION(X509_NAME_dup) \
+     REQUIRED_FUNCTION(X509_NAME_free) \
+     REQUIRED_FUNCTION(X509_NAME_get_entry) \
+     REQUIRED_FUNCTION(X509_NAME_get_index_by_NID) \
+@@ -776,7 +801,9 @@ extern bool g_libSslUses32BitTime;
+     REQUIRED_FUNCTION(X509_PUBKEY_get) \
+     REQUIRED_FUNCTION(X509_PUBKEY_get0_param) \
+     REQUIRED_FUNCTION(X509_set_ex_data) \
++    REQUIRED_FUNCTION(X509_set_issuer_name) \
+     REQUIRED_FUNCTION(X509_set_pubkey) \
++    REQUIRED_FUNCTION(X509_set_subject_name) \
+     REQUIRED_FUNCTION(X509_sign) \
+     REQUIRED_FUNCTION(X509_subject_name_hash) \
+     REQUIRED_FUNCTION(X509_STORE_add_cert) \
+@@ -842,6 +869,8 @@ extern TYPEOF(OPENSSL_gmtime)* OPENSSL_gmtime_ptr;
+ #define ASN1_OCTET_STRING_set ASN1_OCTET_STRING_set_ptr
+ #define ASN1_STRING_dup ASN1_STRING_dup_ptr
+ #define ASN1_STRING_free ASN1_STRING_free_ptr
++#define ASN1_STRING_get0_data ASN1_STRING_get0_data_ptr
++#define ASN1_STRING_length ASN1_STRING_length_ptr
+ #define ASN1_STRING_print_ex ASN1_STRING_print_ex_ptr
+ #define ASN1_TIME_free ASN1_TIME_free_ptr
+ #define ASN1_TIME_new ASN1_TIME_new_ptr
+@@ -1152,6 +1181,7 @@ extern TYPEOF(OPENSSL_gmtime)* OPENSSL_gmtime_ptr;
+ #define OPENSSL_sk_pop OPENSSL_sk_pop_ptr
+ #define OPENSSL_sk_pop_free OPENSSL_sk_pop_free_ptr
+ #define OPENSSL_sk_push OPENSSL_sk_push_ptr
++#define OPENSSL_sk_set_thunks OPENSSL_sk_set_thunks_ptr
+ #define OPENSSL_sk_value OPENSSL_sk_value_ptr
+ #define OpenSSL_version_num OpenSSL_version_num_ptr
+ #define OSSL_LIB_CTX_free OSSL_LIB_CTX_free_ptr
+@@ -1329,6 +1359,7 @@ extern TYPEOF(OPENSSL_gmtime)* OPENSSL_gmtime_ptr;
+ #define X509_NAME_entry_count X509_NAME_entry_count_ptr
+ #define X509_NAME_ENTRY_get_data X509_NAME_ENTRY_get_data_ptr
+ #define X509_NAME_ENTRY_get_object X509_NAME_ENTRY_get_object_ptr
++#define X509_NAME_dup X509_NAME_dup_ptr
+ #define X509_NAME_free X509_NAME_free_ptr
+ #define X509_NAME_get0_der X509_NAME_get0_der_ptr
+ #define X509_NAME_get_entry X509_NAME_get_entry_ptr
+@@ -1337,7 +1368,9 @@ extern TYPEOF(OPENSSL_gmtime)* OPENSSL_gmtime_ptr;
+ #define X509_PUBKEY_get0_param X509_PUBKEY_get0_param_ptr
+ #define X509_PUBKEY_get X509_PUBKEY_get_ptr
+ #define X509_set_ex_data X509_set_ex_data_ptr
++#define X509_set_issuer_name X509_set_issuer_name_ptr
+ #define X509_set_pubkey X509_set_pubkey_ptr
++#define X509_set_subject_name X509_set_subject_name_ptr
+ #define X509_subject_name_hash X509_subject_name_hash_ptr
+ #define X509_sign X509_sign_ptr
+ #define X509_STORE_add_cert X509_STORE_add_cert_ptr
+diff --git a/src/native/libs/System.Security.Cryptography.Native/osslcompat_40.h b/src/native/libs/System.Security.Cryptography.Native/osslcompat_40.h
+new file mode 100644
+index 00000000000..43e0b4f4c35
+--- /dev/null
++++ b/src/native/libs/System.Security.Cryptography.Native/osslcompat_40.h
+@@ -0,0 +1,12 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++// Function prototypes unique to OpenSSL 4.0
++
++#pragma once
++#include "pal_types.h"
++
++typedef void (*OPENSSL_sk_freefunc)(void *);
++typedef void (*OPENSSL_sk_freefunc_thunk)(OPENSSL_sk_freefunc, void *);
++
++OPENSSL_STACK *OPENSSL_sk_set_thunks(OPENSSL_STACK *st, OPENSSL_sk_freefunc_thunk f_thunk);
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c b/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c
+index 4f935e691ef..dfbd61491a6 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c
+@@ -1030,17 +1030,29 @@ static int MakeSelfSignedCertificate(X509* cert, EVP_PKEY* evp)
+ 
+         X509_set_pubkey(cert, evp);
+ 
+-        asnName = X509_get_subject_name(cert);
+-        X509_NAME_add_entry_by_txt(asnName, "CN", MBSTRING_ASC, name, -1, -1, 0);
++        asnName = X509_NAME_dup(X509_get_subject_name(cert));
+ 
+-        asnName =  X509_get_issuer_name(cert);
+-        X509_NAME_add_entry_by_txt(asnName, "CN", MBSTRING_ASC, name, -1, -1, 0);
++        if (asnName != NULL)
++        {
++            X509_NAME_add_entry_by_txt(asnName, "CN", MBSTRING_ASC, name, -1, -1, 0);
++            X509_set_subject_name(cert, asnName);
++            X509_NAME_free(asnName);
++
++            asnName =  X509_NAME_dup(X509_get_issuer_name(cert));
++
++            if (asnName != NULL)
++            {
++                X509_NAME_add_entry_by_txt(asnName, "CN", MBSTRING_ASC, name, -1, -1, 0);
++                X509_set_issuer_name(cert, asnName);
++                X509_NAME_free(asnName);
+ 
+-        ASN1_TIME_set(time, 0);
+-        X509_set1_notBefore(cert, time);
+-        X509_set1_notAfter(cert, time);
++                ASN1_TIME_set(time, 0);
++                X509_set1_notBefore(cert, time);
++                X509_set1_notAfter(cert, time);
+ 
+-        ret = X509_sign(cert, evp, EVP_sha256());
++                ret = X509_sign(cert, evp, EVP_sha256());
++            }
++        }
+     }
+ 
+     if (rsa != NULL)
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_x509.c b/src/native/libs/System.Security.Cryptography.Native/pal_x509.c
+index 2f07a3cd2da..617b83b6040 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_x509.c
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_x509.c
+@@ -145,13 +145,13 @@ ASN1_INTEGER* CryptoNative_X509GetSerialNumber(X509* x509)
+     return X509_get_serialNumber(x509);
+ }
+ 
+-X509_NAME* CryptoNative_X509GetIssuerName(X509* x509)
++const X509_NAME* CryptoNative_X509GetIssuerName(X509* x509)
+ {
+     // Just a field accessor, no error queue interactions apply.
+     return X509_get_issuer_name(x509);
+ }
+ 
+-X509_NAME* CryptoNative_X509GetSubjectName(X509* x509)
++const X509_NAME* CryptoNative_X509GetSubjectName(X509* x509)
+ {
+     // Just a field accessor, no error queue interactions apply.
+     return X509_get_subject_name(x509);
+@@ -175,19 +175,19 @@ int32_t CryptoNative_X509GetExtCount(X509* x)
+     return X509_get_ext_count(x);
+ }
+ 
+-X509_EXTENSION* CryptoNative_X509GetExt(X509* x, int32_t loc)
++const X509_EXTENSION* CryptoNative_X509GetExt(X509* x, int32_t loc)
+ {
+     // Just a field accessor, no error queue interactions apply.
+     return X509_get_ext(x, loc);
+ }
+ 
+-ASN1_OBJECT* CryptoNative_X509ExtensionGetOid(X509_EXTENSION* x)
++const ASN1_OBJECT* CryptoNative_X509ExtensionGetOid(X509_EXTENSION* x)
+ {
+     // Just a field accessor, no error queue interactions apply.
+     return X509_EXTENSION_get_object(x);
+ }
+ 
+-ASN1_OCTET_STRING* CryptoNative_X509ExtensionGetData(X509_EXTENSION* x)
++const ASN1_OCTET_STRING* CryptoNative_X509ExtensionGetData(X509_EXTENSION* x)
+ {
+     // Just a field accessor, no error queue interactions apply.
+     return X509_EXTENSION_get_data(x);
+@@ -199,7 +199,7 @@ int32_t CryptoNative_X509ExtensionGetCritical(X509_EXTENSION* x)
+     return X509_EXTENSION_get_critical(x);
+ }
+ 
+-ASN1_OCTET_STRING* CryptoNative_X509FindExtensionData(X509* x, int32_t nid)
++const ASN1_OCTET_STRING* CryptoNative_X509FindExtensionData(X509* x, int32_t nid)
+ {
+     ERR_clear_error();
+ 
+@@ -215,7 +215,7 @@ ASN1_OCTET_STRING* CryptoNative_X509FindExtensionData(X509* x, int32_t nid)
+         return NULL;
+     }
+ 
+-    X509_EXTENSION* ext = X509_get_ext(x, idx);
++    OSSL4CONST X509_EXTENSION* ext = X509_get_ext(x, idx);
+ 
+     if (ext == NULL)
+     {
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_x509.h b/src/native/libs/System.Security.Cryptography.Native/pal_x509.h
+index bf76a1c2345..ceeb38ad7ee 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_x509.h
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_x509.h
+@@ -161,16 +161,16 @@ PALEXPORT ASN1_INTEGER* CryptoNative_X509GetSerialNumber(X509* x509);
+ /*
+ Shims the X509_get_issuer_name method.
+ 
+-Returns the ASN1_INTEGER for the issuer name.
++Returns the X509_NAME for the issuer name.
+ */
+-PALEXPORT X509_NAME* CryptoNative_X509GetIssuerName(X509* x509);
++PALEXPORT const X509_NAME* CryptoNative_X509GetIssuerName(X509* x509);
+ 
+ /*
+ Shims the X509_get_subject_name method.
+ 
+ Returns the X509_NAME for the subject name.
+ */
+-PALEXPORT X509_NAME* CryptoNative_X509GetSubjectName(X509* x509);
++PALEXPORT const X509_NAME* CryptoNative_X509GetSubjectName(X509* x509);
+ 
+ /*
+ Shims the X509_check_purpose method.
+@@ -190,17 +190,17 @@ PALEXPORT int32_t CryptoNative_X509GetExtCount(X509* x);
+ /*
+ Shims the X509_get_ext method.
+ */
+-PALEXPORT X509_EXTENSION* CryptoNative_X509GetExt(X509* x, int32_t loc);
++PALEXPORT const X509_EXTENSION* CryptoNative_X509GetExt(X509* x, int32_t loc);
+ 
+ /*
+ Shims the X509_EXTENSION_get_object method.
+ */
+-PALEXPORT ASN1_OBJECT* CryptoNative_X509ExtensionGetOid(X509_EXTENSION* x);
++PALEXPORT const ASN1_OBJECT* CryptoNative_X509ExtensionGetOid(X509_EXTENSION* x);
+ 
+ /*
+ Shims the X509_EXTENSION_get_data method.
+ */
+-PALEXPORT ASN1_OCTET_STRING* CryptoNative_X509ExtensionGetData(X509_EXTENSION* x);
++PALEXPORT const ASN1_OCTET_STRING* CryptoNative_X509ExtensionGetData(X509_EXTENSION* x);
+ 
+ /*
+ Shims the X509_EXTENSION_get_critical method.
+@@ -210,7 +210,7 @@ PALEXPORT int32_t CryptoNative_X509ExtensionGetCritical(X509_EXTENSION* x);
+ /*
+ Returns the data portion of the first matched extension.
+ */
+-PALEXPORT ASN1_OCTET_STRING* CryptoNative_X509FindExtensionData(X509* x, int32_t nid);
++PALEXPORT const ASN1_OCTET_STRING* CryptoNative_X509FindExtensionData(X509* x, int32_t nid);
+ 
+ /*
+ Shims the X509_STORE_free method.
+diff --git a/src/native/libs/verify-so.sh b/src/native/libs/verify-so.sh
+index dc117b22550..ef9b0703091 100755
+--- a/src/native/libs/verify-so.sh
++++ b/src/native/libs/verify-so.sh
+@@ -4,15 +4,22 @@
+ 
+ count=0
+ while read -r line; do
+-  # AddressSanitizer-instrumented shared libraries don't define the
+-  # symbols from the ASAN runtime. They are provided by the entry executable.
+-  # Therefore, we ignore them here as they're expected to not be present.
+-  if [[ "$line" =~ ^.*"undefined symbol: (?!__asan)" ]]; then
++  if [[ "$line" =~ ^.*"undefined symbol:" ]]; then
++    array=($line)
++    sym=${array[2]}
++
++    # AddressSanitizer-instrumented shared libraries don't define the
++    # symbols from the ASAN runtime. They are provided by the entry executable.
++    # Therefore, we ignore them here as they're expected to not be present.
++    if [[ "$sym" =~ ^"__asan" ]]; then
++      continue
++    fi
++
+     if [[ "$count" -eq 0 ]]; then
+       printf "Undefined symbol(s) found:\n"
+     fi
+-    array=($line)
+-    printf " %s\n" "${array[2]}"
++
++    printf " %s\n" "${sym}"
+     ((count++))
+   fi
+ done < <(ldd -r $1 2>&1)
+-- 
+2.53.0
+

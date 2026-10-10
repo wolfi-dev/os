@@ -1,7 +1,7 @@
 package:
   name: zellij
   version: "0.45.1"
-  epoch: 2
+  epoch: 3 # openssl-hardened: 3.6->4.0, update openssl-sys and curl-sys for OpenSSL 4, GHSA-2mjx-qc3c-rqvc
   description: A terminal workspace with batteries included
   copyright:
     - license: MIT
@@ -13,7 +13,7 @@ package:
     memory: 1Gi
 
 vars:
-  openssl-version: "3.6"
+  openssl-version: "4.0"
   rust-version: "1.95"
 
 environment:
@@ -36,6 +36,19 @@ pipeline:
       expected-commit: efd8fd5a89a20c07a111d248ad7fce53848d2c18
 
   - uses: bump
+
+  # openssl-sys 0.9.111 in the upstream Cargo.lock rejects OpenSSL 4, and
+  # curl-sys 0.4.68 bundles curl 8.4.0, which predates curl's OpenSSL 4 support.
+  # omnibump can't bump either here (cargo add rejects their features), so
+  # update the lock directly, as py3-hf-transfer does.
+  #
+  # GHSA-2mjx-qc3c-rqvc: rustls needs 0.23.45. That pulls aws-lc-sys 0.45,
+  # which requires pkg-config >= 0.3.31, so raise pkg-config first.
+  - runs: |
+      cargo update -p openssl-sys --precise 0.9.117
+      cargo update -p curl-sys --precise 0.4.91+curl-8.22.0
+      cargo update -p pkg-config --precise 0.3.32
+      cargo update -p rustls --precise 0.23.45
 
   - runs: |
       # use system openssl
@@ -109,6 +122,11 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - openssl-${{vars.openssl-version}}
+        - wait-for-port
   pipeline:
     - uses: test/tw/ver-check
       with:
@@ -116,3 +134,26 @@ test:
     - uses: test/tw/help-check
       with:
         bins: zellij
+    - name: HTTPS through the bundled curl on the OpenSSL ${{vars.openssl-version}} ABI
+      runs: |
+        set -euo pipefail
+        cd "$(mktemp -d)"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
+          -addext subjectAltName=IP:127.0.0.1 -keyout server.key -out server.crt 2>/dev/null
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=other \
+          -keyout other.key -out other.crt 2>/dev/null
+        mkdir info
+        printf '%s' "${{package.version}}" > info/version
+        openssl s_server -accept 127.0.0.1:8082 -cert server.crt -key server.key -WWW >/dev/null 2>&1 &
+        wait-for-port 8082 -t 10
+
+        # web --status fetches /info/version over HTTPS with isahc and the
+        # statically linked libcurl. The curl crate takes its CA file from
+        # SSL_CERT_FILE, so trusting the server certificate must succeed.
+        echo 'enforce_https_for_localhost true' > config.kdl
+        SSL_CERT_FILE=server.crt zellij --config config.kdl web --status | tee trusted.out
+        grep -F "Web server online with version: ${{package.version}}" trusted.out
+
+        # Trusting an unrelated certificate must fail verification.
+        SSL_CERT_FILE=other.crt zellij --config config.kdl web --status | tee untrusted.out
+        grep -F "Web server is offline" untrusted.out

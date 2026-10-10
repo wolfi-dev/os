@@ -3,7 +3,7 @@ package:
   name: ingress-nginx-controller-1.15
   version: "1.15.10"
   # There are manual changes to review between each package update. See 'vars:' section.
-  epoch: 6 # pin openssl-version
+  epoch: 7 # openssl: 3.6->4.0
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -121,8 +121,8 @@ environment:
       - pcre-dev
       - perl-dev
       - pkgconf
-      - protobuf-dev=36.1-r0
-      - protobuf-static=36.1-r0
+      - protobuf-dev=36.2-r0
+      - protobuf-static=36.2-r0
       - python3
       - re2-dev
       - scanelf
@@ -140,7 +140,7 @@ vars:
   llvm-version: "22"
   go-version: "1.27"
   grpc-version: "1.84"
-  openssl-version: "3.6"
+  openssl-version: "4.0"
   # These environment variables need updated for each new release. Retrieve their
   # correct values from here, replacing <package-version> with the package version.
   #   - https://github.com/chainguard-forks/ingress-nginx/blob/controller-v<package-version>/images/nginx/rootfs/build.sh
@@ -322,6 +322,11 @@ pipeline:
       tag: release-${{vars.NGINX_VERSION}}
       expected-commit: e06bdbd4a20912c5223d7c6c6e2b3f0d6086c928
       destination: nginx-${{vars.NGINX_VERSION}}
+
+  - uses: patch
+    working-directory: nginx-${{vars.NGINX_VERSION}}
+    with:
+      patches: ../0001-SSL-compatibility-with-OpenSSL-4.0.patch
 
   - runs: ln -s auto/configure nginx-${{vars.NGINX_VERSION}}/configure
 
@@ -936,8 +941,11 @@ test:
     contents:
       packages:
         - ingress-nginx-controller-compat-${{vars.nginx-ingress-major-minor}}
-        - libcap-utils
+        - curl
         - file
+        - libcap-utils
+        - openssl-${{vars.openssl-version}}
+        - wait-for-port
   pipeline:
     - runs: |
         /usr/bin/nginx -v
@@ -989,6 +997,59 @@ test:
         EOF
         output=$(nginx -T 2>&1 || true)
         echo "$output" | grep -F "Missing required exporter field"
+    - name: Client certificate DN and OCSP validation on the OpenSSL ${{vars.openssl-version}} ABI
+      runs: |
+        set -euo pipefail
+        cd "$(mktemp -d)"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=test-ca \
+          -keyout ca.key -out ca.pem 2>/dev/null
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
+          -addext subjectAltName=DNS:localhost -CA ca.pem -CAkey ca.key \
+          -keyout server.key -out server.pem 2>/dev/null
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/O=Test/CN=client" \
+          -CA ca.pem -CAkey ca.key -keyout client.key -out client.pem 2>/dev/null
+        # OCSP responder that knows the client certificate. The index expiry
+        # is the certificate notAfter in its ASN.1 UTCTIME form.
+        printf 'V\t%s\t\t%s\tunknown\t/O=Test/CN=client\n' \
+          "$(openssl asn1parse -in client.pem | awk -F: '/UTCTIME/ {print $NF}' | tail -1)" \
+          "$(openssl x509 -in client.pem -noout -serial | cut -d= -f2)" > index.txt
+        openssl ocsp -index index.txt -CA ca.pem -rsigner ca.pem -rkey ca.key -ndays 1 \
+          -port 8888 > ocsp.log 2>&1 &
+        # Readiness through a real query: a bare TCP probe wedges the responder.
+        for try in $(seq 10); do
+          openssl ocsp -issuer ca.pem -cert client.pem -url http://127.0.0.1:8888 -CAfile ca.pem -no_nonce 2>/dev/null \
+            | grep -q "client.pem: good" && break
+          sleep 1
+        done
+        # ssl_ocsp_cache makes nginx key the response with ngx_ssl_ocsp_create_key(),
+        # which reads the certificate serial through the ASN1_STRING accessors.
+        cat > nginx.conf <<EOF
+        pid $PWD/nginx.pid;
+        error_log $PWD/error.log;
+        events {}
+        http {
+          access_log off;
+          # The lua module is built in and loads resty.core from lua-resty-core at init.
+          lua_package_path "/usr/lib/lua/?.lua;;";
+          ssl_ocsp_cache shared:ocsp:1m;
+          server {
+            listen 127.0.0.1:8443 ssl;
+            ssl_certificate $PWD/server.pem;
+            ssl_certificate_key $PWD/server.key;
+            ssl_client_certificate $PWD/ca.pem;
+            ssl_verify_client on;
+            ssl_ocsp on;
+            ssl_ocsp_responder http://127.0.0.1:8888;
+            return 200 "\$ssl_client_verify \$ssl_client_s_dn \$ssl_client_i_dn\n";
+          }
+        }
+        EOF
+        nginx -p "$PWD" -c "$PWD/nginx.conf"
+        wait-for-port 8443 -t 10
+        curl -s --cacert ca.pem --cert client.pem --key client.key https://localhost:8443/ > out || { cat error.log ocsp.log; exit 1; }
+        cat out
+        grep -x "SUCCESS CN=client,O=Test CN=test-ca" out
+        nginx -p "$PWD" -c "$PWD/nginx.conf" -s quit
     - uses: test/tw/ldd-check
     - name: Test file capabilities
       runs: |

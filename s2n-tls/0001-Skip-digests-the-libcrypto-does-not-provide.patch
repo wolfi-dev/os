@@ -1,0 +1,129 @@
+From d2cf0ad6558289bcc28cb3e4b0fed6af11435a5d Mon Sep 17 00:00:00 2001
+From: Mritunjay Sharma <mritunjay.sharma@chainguard.dev>
+Date: Fri, 9 Oct 2026 23:43:33 +0530
+Subject: [PATCH] Skip digests the libcrypto does not provide
+
+s2n fetches every handshake digest when a connection is created. With
+a provider-based libcrypto whose default provider omits MD5-SHA1 and
+SHA224 (for example Chainguard's hardened OpenSSL 4.0 build),
+EVP_MD_fetch() returns NULL for them and s2n_connection_new() fails
+with "invalid hash algorithm", so no TLS connection can be created at
+all.
+
+Report MD5-SHA1 and SHA224 as unavailable when they could not be
+fetched, and:
+- do not initialize their handshake hash states
+- do not require them in s2n_handshake_require_all_hashes()
+- skip the MD5-SHA1 transcript update when the digest is unavailable
+- never offer or accept a signature scheme whose digest is unavailable
+
+TLS 1.2 and TLS 1.3 with SHA-256/384/512 are unaffected. Handshakes
+that need MD5-SHA1 (TLS 1.0/1.1) or a SHA224 signature fail cleanly
+instead of every connection failing up front.
+
+Upstream: not submitted. Chainguard-authored.
+---
+ crypto/s2n_hash.c              | 16 ++++++++++++++--
+ tls/s2n_handshake.c            |  4 +++-
+ tls/s2n_handshake_hashes.c     |  8 ++++++--
+ tls/s2n_handshake_transcript.c |  3 ++-
+ tls/s2n_signature_algorithms.c |  2 ++
+ 5 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/crypto/s2n_hash.c b/crypto/s2n_hash.c
+index 21523681..4462cabe 100644
+--- a/crypto/s2n_hash.c
++++ b/crypto/s2n_hash.c
+@@ -138,14 +138,26 @@ bool s2n_hash_is_available(s2n_hash_algorithm alg)
+ {
+     switch (alg) {
+         case S2N_HASH_MD5:
+-        case S2N_HASH_MD5_SHA1:
+         case S2N_HASH_NONE:
+         case S2N_HASH_SHA1:
+-        case S2N_HASH_SHA224:
+         case S2N_HASH_SHA256:
+         case S2N_HASH_SHA384:
+         case S2N_HASH_SHA512:
+             return true;
++        case S2N_HASH_MD5_SHA1:
++            if (s2n_hash_use_custom_md5_sha1()) {
++                return true;
++            }
++            /* fall through */
++        case S2N_HASH_SHA224:
++#if S2N_LIBCRYPTO_SUPPORTS_PROVIDERS
++            /* A provider-based libcrypto may not offer every digest: a hardened
++             * default provider can omit MD5-SHA1 and SHA224. Report them as
++             * unavailable instead of failing every connection. */
++            return s2n_evp_mds[alg] != NULL;
++#else
++            return true;
++#endif
+         case S2N_HASH_SHAKE256_64:
+             return s2n_hash_supports_shake();
+         case S2N_HASH_ALGS_COUNT:
+diff --git a/tls/s2n_handshake.c b/tls/s2n_handshake.c
+index 77328584..b6f23fa8 100644
+--- a/tls/s2n_handshake.c
++++ b/tls/s2n_handshake.c
+@@ -118,7 +118,9 @@ S2N_RESULT s2n_handshake_copy_hash_state(struct s2n_connection *conn, s2n_hash_a
+ 
+ int s2n_handshake_require_all_hashes(struct s2n_handshake *handshake)
+ {
+-    memset(handshake->required_hash_algs, 1, sizeof(handshake->required_hash_algs));
++    for (size_t i = 0; i < S2N_HASH_ALGS_COUNT; i++) {
++        handshake->required_hash_algs[i] = s2n_hash_is_available((s2n_hash_algorithm) i);
++    }
+     return S2N_SUCCESS;
+ }
+ 
+diff --git a/tls/s2n_handshake_hashes.c b/tls/s2n_handshake_hashes.c
+index 29c1d156..a85eeb7d 100644
+--- a/tls/s2n_handshake_hashes.c
++++ b/tls/s2n_handshake_hashes.c
+@@ -69,11 +69,15 @@ static S2N_RESULT s2n_handshake_hashes_init_hashes(struct s2n_handshake_hashes *
+ {
+     RESULT_GUARD_POSIX(s2n_hash_init(&hashes->md5, S2N_HASH_MD5));
+     RESULT_GUARD_POSIX(s2n_hash_init(&hashes->sha1, S2N_HASH_SHA1));
+-    RESULT_GUARD_POSIX(s2n_hash_init(&hashes->sha224, S2N_HASH_SHA224));
++    if (s2n_hash_is_available(S2N_HASH_SHA224)) {
++        RESULT_GUARD_POSIX(s2n_hash_init(&hashes->sha224, S2N_HASH_SHA224));
++    }
+     RESULT_GUARD_POSIX(s2n_hash_init(&hashes->sha256, S2N_HASH_SHA256));
+     RESULT_GUARD_POSIX(s2n_hash_init(&hashes->sha384, S2N_HASH_SHA384));
+     RESULT_GUARD_POSIX(s2n_hash_init(&hashes->sha512, S2N_HASH_SHA512));
+-    RESULT_GUARD_POSIX(s2n_hash_init(&hashes->md5_sha1, S2N_HASH_MD5_SHA1));
++    if (s2n_hash_is_available(S2N_HASH_MD5_SHA1)) {
++        RESULT_GUARD_POSIX(s2n_hash_init(&hashes->md5_sha1, S2N_HASH_MD5_SHA1));
++    }
+     RESULT_GUARD_POSIX(s2n_hash_init(&hashes->hash_workspace, S2N_HASH_NONE));
+ 
+     return S2N_RESULT_OK;
+diff --git a/tls/s2n_handshake_transcript.c b/tls/s2n_handshake_transcript.c
+index 3a23ff85..ca2a3863 100644
+--- a/tls/s2n_handshake_transcript.c
++++ b/tls/s2n_handshake_transcript.c
+@@ -63,7 +63,8 @@ int s2n_conn_update_handshake_hashes(struct s2n_connection *conn, struct s2n_blo
+ 
+     const uint8_t md5_sha1_required =
+             (s2n_handshake_is_hash_required(&conn->handshake, S2N_HASH_MD5)
+-                    && s2n_handshake_is_hash_required(&conn->handshake, S2N_HASH_SHA1));
++                    && s2n_handshake_is_hash_required(&conn->handshake, S2N_HASH_SHA1)
++                    && s2n_hash_is_available(S2N_HASH_MD5_SHA1));
+ 
+     if (md5_sha1_required) {
+         POSIX_GUARD(s2n_hash_update(&hashes->md5_sha1, data->data, data->size));
+diff --git a/tls/s2n_signature_algorithms.c b/tls/s2n_signature_algorithms.c
+index 2304ebb8..48a3daeb 100644
+--- a/tls/s2n_signature_algorithms.c
++++ b/tls/s2n_signature_algorithms.c
+@@ -50,6 +50,8 @@ static S2N_RESULT s2n_signature_scheme_validate_for_send(struct s2n_connection *
+         RESULT_ENSURE_NE(scheme->sig_alg, S2N_SIGNATURE_RSA_PSS_PSS);
+     }
+ 
++    RESULT_ENSURE(s2n_hash_is_available(scheme->hash_alg), S2N_ERR_HASH_INVALID_ALGORITHM);
++
+     return S2N_RESULT_OK;
+ }
+ 

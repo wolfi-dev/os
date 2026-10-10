@@ -1,0 +1,603 @@
+#nolint:unused-var-transform,depends-on-unversioned-py-provides,unversioned-py3-dep
+package:
+  name: python-3.15
+  version: "3.15.0"
+  epoch: 0
+  description: "the Python programming language"
+  copyright:
+    - license: PSF-2.0
+  resources:
+    cpu: 8
+    memory: 8Gi
+  dependencies:
+    provides:
+      - python3=0
+      - python-3=0
+    runtime:
+      - ${{package.name}}-base=${{package.full-version}}
+  annotations:
+    # Upstream requires llvm 21 for experimental JIT.
+    toolchain-stream-reconcile-optout: true
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - bzip2-dev
+      - ca-certificates-bundle
+      # clang, llvm and python-3.13 are required for the JIT subpackage build
+      - clang-${{vars.llvm-version}}
+      - expat-dev
+      - gdbm-dev
+      - glibc-2.44-dev
+      - libcap-utils
+      - libffi-dev
+      - libx11-dev
+      - linux-headers
+      - llvm-${{vars.llvm-version}}
+      - mpdecimal-dev
+      - ncurses-dev
+      - openssl-hardened-${{vars.openssl-version}}-dev
+      - python-3.13
+      - readline-dev
+      - sqlite-dev
+      - tcl-dev
+      - tk-dev
+      - xz-dev
+      - zlib-dev
+      - zstd-dev
+
+vars:
+  llvm-version: 21
+  openssl-version: "4.0"
+  python-config: |
+    --host=__host_triplet_gnu__ \
+    --build=__host_triplet_gnu__ \
+    --target=__host_triplet_gnu__ \
+    --prefix=/usr \
+    --enable-ipv6 \
+    --enable-loadable-sqlite-extensions \
+    --enable-shared \
+    --with-lto \
+    --with-computed-gotos \
+    --with-dbmliborder=gdbm:ndbm \
+    --with-system-expat \
+    --with-system-libmpdec \
+    --without-ensurepip \
+    --with-builtin-hashlib-hashes=blake2 \
+    --with-wheel-pkg-dir=/usr/share/python-wheels
+
+# creates helpful python3.M and 3.M variables
+var-transforms:
+  - from: ${{vars.python-config}}
+    match: '__host_triplet_gnu__'
+    replace: ${{host.triplet.gnu}}
+    to: python-config
+  - from: ${{package.name}}
+    match: '-'
+    replace: ''
+    to: python
+  - from: ${{vars.python}}
+    match: (.*)
+    replace: '${1}t'
+    to: python-t
+  - from: ${{package.name}}
+    match: python-(.*)
+    replace: '$1'
+    to: pyversion
+  - from: ${{vars.pyversion}}
+    match: (.*)
+    replace: '${1}t'
+    to: pyversion-t
+  - from: ${{package.version}}
+    match: (.*)_git.*
+    replace: '$1'
+    to: upstreamversion
+
+pipeline:
+  - uses: git-checkout
+    with:
+      branch: ${{vars.pyversion}}
+      expected-commit: d220409a13b77de7a6c30abe16ea90db01528edc
+      repository: https://github.com/python/cpython
+
+  - name: Drop the branch development marker from the version string
+    runs: |
+      # Upstream sets PY_VERSION to "X.Y.Z+" on the maintenance branch as soon
+      # as X.Y.Z is tagged, and "X.Y.Z+" is not a valid PEP 440 version.
+      sed -i 's/^\(#define PY_VERSION[[:space:]]*"${{vars.upstreamversion}}\)+"/\1"/' Include/patchlevel.h
+      grep -q '^#define PY_VERSION[[:space:]]*"${{vars.upstreamversion}}"' Include/patchlevel.h
+
+  - name: Support OpenSSL 4 ABI
+    uses: patch
+    with:
+      patches: |
+        0006-Allow-HelloRetryRequest-in-test_ssl-servername-callb.patch
+        0007-Always-provide-PROTOCOL_TLSv1-and-fix-HAS_TLSv1_2-wi.patch
+
+  - name: Force use of system libraries
+    runs: |
+      rm -rf Modules/expat \
+        Modules/_ctypes/darwin* \
+        Modules/_ctypes/libffi*
+
+  - name: Block blake and hmac usage in FIPS mode
+    uses: patch
+    with:
+      patches: |
+        gh-127301.patch
+        0010-hashlib-do-not-fail-import-without-EVP_MAC-HMAC.patch
+
+  - name: Clone patched source for no-GIL and JIT builds
+    runs: |
+      mkdir no-gil build-jit
+      tar -cf - --exclude=no-gil --exclude=build-jit . | tar -xC no-gil
+      tar -cf - --exclude=no-gil --exclude=build-jit . | tar -xC build-jit
+
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --enable-optimizations \
+        ${{vars.python-config}}
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - runs: |
+      find ${{targets.destdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'tests' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+
+      cd ${{targets.destdir}}/usr/bin
+      rm -f idle3* 2to3*
+      rm ${{targets.destdir}}/usr/lib/libpython3.so
+
+      # add dubious python -> python3 link
+      ln -s python3 ${{targets.destdir}}/usr/bin/python
+
+      # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+      cd ${{targets.destdir}}/usr/lib/${{vars.python}}
+      rm site-packages/README.txt
+      rmdir site-packages
+
+  - runs: |
+      rm -R "${{targets.destdir}}/usr/lib/${{vars.python}}/idlelib"
+
+      rm -R ${{targets.destdir}}/usr/lib/${{vars.python}}/ensurepip/_bundled/
+
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+      find ${{targets.destdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+      export LD_LIBRARY_PATH="${{targets.destdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      ${{targets.destdir}}/usr/bin/${{vars.python}} -B -m compileall -f --invalidation-mode=unchecked-hash \
+          -r100 ${{targets.destdir}}/usr/lib/
+
+  - uses: strip
+
+subpackages:
+  - name: "${{package.name}}t"
+    description: "Python with the GIL disabled (free threading)"
+    dependencies:
+      provides:
+        - python3t=${{package.full-version}}
+        - python-3t=${{package.full-version}}
+      runtime:
+        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
+        # which is provided by tk.  melange SCA does not find this dependency.
+        - tk
+    pipeline:
+      - working-directory: no-gil
+        pipeline:
+          - uses: autoconf/configure
+            with:
+              opts: |
+                --disable-gil \
+                --enable-optimizations \
+                ${{vars.python-config}}
+          - uses: autoconf/make
+          - uses: autoconf/make-install
+          - name: "Clean out base items"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+
+              cd ${{targets.subpkgdir}}/usr/bin
+              rm idle3*
+              rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
+
+              # add dubious python -> python3 link
+              ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
+
+              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/site-packages
+
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/idlelib
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/ensurepip/_bundled/
+
+              rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
+              rm -R ${{targets.subpkgdir}}/usr/include
+              rm -R ${{targets.subpkgdir}}/usr/share
+              rm ${{targets.subpkgdir}}/usr/lib/pkgconfig/python-${{vars.pyversion}}-*.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/python3-*.pc
+          # AFAIK the .pyc/.pyo files are compatible between GIL/no-GIL builds, but
+          # the .so files are not, so we include everything in here out of an
+          # abundance of caution.
+          - name: "Precompile .py files"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+              export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+              ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -B -m compileall -f --invalidation-mode=unchecked-hash \
+                  -r100 ${{targets.subpkgdir}}/usr/lib/
+          - uses: strip
+    test:
+      pipeline:
+        - working-directory: no-gil
+          pipeline:
+            - uses: test/tw/ldd-check
+            - uses: test/tw/symlink-check
+            - uses: test/tw/ver-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+                version: ${{vars.upstreamversion}}
+            - uses: test/tw/help-check
+              with:
+                bins: python ${{vars.python}} ${{vars.python-t}}
+            - name: Verify no-GIL build
+              runs: |
+                ${{vars.python-t}} -c 'import sysconfig; assert(sysconfig.get_config_var("Py_GIL_DISABLED"))'
+
+  - name: "${{package.name}}-jit"
+    description: "Python with experimental JIT support"
+    dependencies:
+      provides:
+        - python3-jit=${{package.full-version}}
+        - python-3-jit=${{package.full-version}}
+      runtime:
+        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
+        # which is provided by tk.  melange SCA does not find this dependency.
+        - tk
+    pipeline:
+      - working-directory: build-jit
+        pipeline:
+          # Experimental JIT support
+          #
+          # --enable-optimizations with clang requires PGO support (in particular,
+          # we're missing libclang_rt.profile). This build configuration won't be
+          # optimal and might not produce any performance gains.
+          - runs: |
+              export PATH="/usr/lib/llvm-${{vars.llvm-version}}/bin:$PATH"
+          # clang-21 on aarch64 enables branch protection by default, which makes
+          # the JIT stencil objects carry an SHT_AARCH64_ATTRIBUTES section that
+          # Tools/jit/_targets.py does not handle. Only aarch64 accepts the flag,
+          # so other architectures get -Os, which the JIT already uses by default.
+          - uses: autoconf/configure
+            with:
+              opts: |
+                CC=clang-${{vars.llvm-version}} \
+                CFLAGS_JIT="$(if [ "$(uname -m)" = aarch64 ]; then echo -mbranch-protection=none; else echo -Os; fi)" \
+                --enable-experimental-jit=yes \
+                --with-tail-call-interp \
+                ${{vars.python-config}}
+          - uses: autoconf/make
+          - uses: autoconf/make-install
+          - name: "Clean out base items"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+
+              cd ${{targets.subpkgdir}}/usr/bin
+              rm idle3*
+              rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
+
+              # add dubious python -> python3 link
+              ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
+
+              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python}}/site-packages
+
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python}}/idlelib
+              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python}}/ensurepip/_bundled/
+
+              rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
+              rm -R ${{targets.subpkgdir}}/usr/include
+              rm -R ${{targets.subpkgdir}}/usr/share
+              rm ${{targets.subpkgdir}}/usr/lib/pkgconfig/python-${{vars.pyversion}}-*.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/python3-*.pc
+          - name: "Precompile .py files"
+            runs: |
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+              export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+              ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -B -m compileall -f --invalidation-mode=unchecked-hash \
+                  -r100 ${{targets.subpkgdir}}/usr/lib/
+          - uses: strip
+    test:
+      pipeline:
+        - working-directory: build-jit
+          pipeline:
+            - uses: test/tw/ldd-check
+            - uses: test/tw/symlink-check
+            - uses: test/tw/ver-check
+              with:
+                bins: python ${{vars.python}}
+                version: ${{vars.upstreamversion}}
+            - uses: test/tw/help-check
+              with:
+                bins: python ${{vars.python}}
+            - name: Verify functioning JIT
+              runs: |
+                ${{vars.python}} -c "
+                import sys
+                def fib(n):
+                    if n < 2:
+                        return n
+                    return fib(n-1) + fib(n-2)
+                result = fib(20)
+                print(f'JIT test: fib(20) = {result}')
+                assert result == 6765, f'Expected 6765, got {result}'
+                print('JIT test passed!')
+                "
+
+  - name: "${{package.name}}-base"
+    description: "${{package.name}} without /usr/bin/python3"
+    dependencies:
+      runtime:
+        - py3-pip-wheel
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin ${{targets.subpkgdir}}/usr/lib
+          mv ${{targets.destdir}}/usr/bin/${{vars.python}} \
+              ${{targets.destdir}}/usr/bin/pydoc${{vars.pyversion}} \
+              ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/lib/${{vars.python}} \
+             ${{targets.subpkgdir}}/usr/lib
+          mv -v ${{targets.destdir}}/usr/lib/libpython${{vars.pyversion}}.so.* \
+             ${{targets.subpkgdir}}/usr/lib
+
+          # pyconfig.h is needed at runtime... ugh.
+          d=usr/include/${{vars.python}}
+          mkdir -p "${{targets.subpkgdir}}"/$d
+          mv "${{targets.destdir}}"/$d/pyconfig.h "${{targets.subpkgdir}}"/$d/
+
+          # move usr/lib/python3.X/config-3.X-x86_64-linux-gnu
+          # back into main package so the -base-dev can take it below.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.destdir}}/$d"
+          mv -v "${{targets.subpkgdir}}/$d"/config-${{vars.pyversion}}* \
+              "${{targets.destdir}}/$d"
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: ${{vars.python}}
+            version: ${{vars.upstreamversion}}
+        - name: Verify venv installs expected packages
+          runs: |
+            set +x
+            d=$(mktemp -d)
+            echo "$ ${{vars.python}} -m venv $d"
+            ${{vars.python}} -m venv "$d"
+            echo "$ $d/bin/pip list"
+            $d/bin/pip list | tee "$d/list.txt"
+            wd=/usr/share/python-wheels
+            for pkg in pip ; do
+              set -- "$wd"/$pkg-*.whl
+              [ $# -eq 1 ] || {
+                echo "ERROR: found $# wheels in $wd matching $pkg-*.whl";
+                exit 1;
+              }
+              [ -f "$1" ] || {
+                echo "ERROR: $wd/$pkg-*.whl ('$1') was not a file"
+                exit 1
+              }
+              # name is like pip-24.2-py3-none-any.whl. second token is version.
+              wheel=${1}
+              tmp=${wheel##*/}
+              tmp=${tmp#*-}
+              ver=${tmp%%-*}
+              if ! grep -q "${pkg}[ ]\+${ver}$" "$d/list.txt"; then
+                  echo "FAIL: did not find '$pkg==$ver' in venv"
+                  echo "pip list had:"
+                  sed 's,^,>,' "$d/list.txt"
+                  exit 1
+              fi
+              echo "PASS: venv installed '$pkg==$ver'"
+            done
+
+            rm -Rf "$d"
+
+  - name: "${{package.name}}-privileged-netbindservice"
+    description: "Allows Python to bind to ports less than 1024"
+    options:
+      # This replaces the Python binary and depends on base. We don't want
+      # to generate any dependencies or provide anything that would clash
+      # with the rest of Python
+      no-depends: true
+      no-provides: true
+    dependencies:
+      replaces:
+        - ${{package.name}}-base
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/usr/bin"
+          cp "${{targets.outdir}}/${{package.name}}-base/usr/bin/${{vars.python}}" "${{targets.contextdir}}/usr/bin/"
+          # Note this sets the capability the test using getcap fails but the
+          # capability is set in images with this package.
+          setcap cap_net_bind_service=+eip "${{targets.contextdir}}/usr/bin/${{vars.python}}"
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+
+  - name: "${{package.name}}-tk"
+    dependencies:
+      provides:
+        - py${{vars.pyversion}}-tkinter=${{package.full-version}}
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
+        # which is provided by tk.  melange SCA does not find this dependency.
+        - tk
+    pipeline:
+      - runs: |
+          # these got moved by python-3.xx-base from ${{targets.destdir}}
+          fromd="${{targets.destdir}}-base"
+          tod=${{targets.contextdir}}
+          d=usr/lib/${{vars.python}}
+
+          mkdir -p "$tod/$d/lib-dynload"
+          mv "$fromd/$d/lib-dynload"/_tkinter.*.so "$tod/$d/lib-dynload/"
+          mv "$fromd/$d/tkinter" "$tod/$d/"
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: python/import
+          with:
+            python: python${{vars.pyversion}}
+            import: tkinter
+
+  - name: "${{package.name}}-doc"
+    description: "${{package.name}} documentation"
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/docs
+
+  - name: "${{package.name}}-dev"
+    description: "${{package.name}} development headers"
+    dependencies:
+      provides:
+        - python3-dev=0
+        - python-3-dev=0
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+        - ${{package.name}}-base-dev=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.subpkgdir}}/usr/bin
+          mv -v ${{targets.destdir}}/usr/bin/python3-config ${{targets.subpkgdir}}/usr/bin
+
+          d="usr/lib/pkgconfig"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v \
+             "${{targets.destdir}}"/$d/python3-embed.pc \
+             "${{targets.destdir}}"/$d/python3.pc \
+             "${{targets.subpkgdir}}/$d/"
+    test:
+      pipeline:
+        - uses: test/pkgconf
+
+  - name: "${{package.name}}-base-dev"
+    description: "python3 development headers"
+    dependencies:
+      runtime:
+        - ${{package.name}}-base=${{package.full-version}}
+    pipeline:
+      - runs: |
+          # usr/lib/python3.X/config-3.X-x86_64-linux-gnu
+          # split/dev will only move 2 files from it, but we want all of it.
+          d="usr/lib/${{vars.python}}"
+          mkdir -p "${{targets.subpkgdir}}/$d"
+          mv -v "${{targets.destdir}}"/$d/config-${{vars.pyversion}}* \
+             "${{targets.subpkgdir}}"/$d
+      - uses: split/dev
+    test:
+      pipeline:
+        - uses: test/tw/devpackage
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/symlink-check
+    - uses: test/tw/ver-check
+      with:
+        bins: python python3 ${{vars.python}}
+        version: ${{vars.upstreamversion}}
+    - uses: test/tw/help-check
+      with:
+        bins: pydoc3 python ${{vars.python}}
+    - name: Verify the reported version carries no branch build marker
+      runs: |
+        expected="Python ${{vars.upstreamversion}}"
+        for bin in python python3 ${{vars.python}}; do
+          found=$($bin --version)
+          [ "$found" = "$expected" ] || { echo "FAIL: $bin --version printed '$found', expected '$expected'"; exit 1; }
+        done
+        ${{vars.python}} -c 'import platform, sys; sys.exit(platform.python_version() != sys.argv[1])' ${{vars.upstreamversion}}
+    - name: Verify working python3 -m venv
+      runs: |
+        d=$(mktemp -d)
+        python3 -m venv "$d"
+        $d/bin/pip list
+        $d/bin/pip check
+        rm -Rf "$d"
+    - name: hashlib and hmac refuse unapproved digests in FIPS mode
+      runs: |
+        # Mock FIPS mode the way CPython's own Lib/test/_test_hashlib_fips.py
+        # does: activate the base provider only, so no digest implementation is
+        # reachable and every usedforsecurity=True construction must be refused.
+        # Needs no FIPS provider, so this runs in any environment.
+        cat > /tmp/fips.cnf <<'CNF'
+        config_diagnostics = 1
+        openssl_conf = openssl_init
+        [openssl_init]
+        providers = provider_sect
+        alg_section = algorithm_sect
+        [provider_sect]
+        base = base_sect
+        default = default_sect
+        [base_sect]
+        activate = 1
+        [default_sect]
+        activate = 1
+        [algorithm_sect]
+        default_properties = fips=yes
+        CNF
+        OPENSSL_CONF=/tmp/fips.cnf python3 - <<'PY'
+        import hashlib
+        import hmac
+        from _hashlib import get_fips_mode
+
+        if get_fips_mode() != 1:
+            raise SystemExit("FAIL: could not mock FIPS mode")
+
+        names = sorted(hashlib.algorithms_available)
+
+        # Positive control: the unapproved-service indicator still works, so a
+        # blanket hashlib breakage cannot pass for FIPS enforcement.
+        for name in names:
+            hashlib.new(name, usedforsecurity=False)
+
+        # hmac has no usedforsecurity escape hatch, and 3.14 added a builtin
+        # HACL* HMAC that would otherwise answer for every digest OpenSSL has
+        # just refused -- through two separate fallbacks.
+        for name in names:
+            for label, call in (
+                ("hashlib.new", lambda n=name: hashlib.new(n, usedforsecurity=True)),
+                ("hmac.new", lambda n=name: hmac.new(b"key", b"msg", digestmod=n)),
+                ("hmac.digest", lambda n=name: hmac.digest(b"key", b"msg", n)),
+            ):
+                try:
+                    call()
+                except ValueError:
+                    continue
+                raise SystemExit(f"FAIL: {label}({name!r}) was not refused in FIPS mode")
+
+        print("OK:", len(names), "algorithms refused via hashlib.new, hmac.new and hmac.digest")
+        PY
+
+update:
+  enabled: true
+  git: {}
+  schedule:
+    period: weekly
+    reason: We are building from the release branch as security fixes are not tagged

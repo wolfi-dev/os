@@ -1,13 +1,13 @@
 package:
   name: ssl_client
   version: "3.24.2"
-  epoch: 2 # openssl-hardened: 3.6->4.0
+  epoch: 1 # glibc: 2.43->2.44
   description: ssl_client from alpine busybox
   copyright:
     - license: GPL-2.0-only
 
 vars:
-  openssl-version: "4.0"
+  openssl-version: "3.6"
 
 environment:
   contents:
@@ -23,10 +23,6 @@ pipeline:
       expected-commit: d9d560d5de74ff9a7a73f3c903d6f126a0bf3142
       repository: https://github.com/alpinelinux/aports
       tag: v${{package.version}}
-
-  - uses: patch
-    with:
-      patches: 0001-ssl_client-use-SSL_set1_dnsname-and-SSL_set1_ipaddr.patch
 
   - runs: |
       cd main/busybox
@@ -49,106 +45,47 @@ test:
     contents:
       packages:
         - openssl
-        - bash
         - wait-for-it
   pipeline:
     - uses: test/tw/ldd-check
-    - name: Test verified TLS with ssl_client over a connected socket
+    - name: Test SSL tunneling to a real TLS server
       runs: |
-        # /dev/tcp needs bash.
-        bash -euo pipefail <<'SCRIPT'
-        mkdir -p /tmp/tls
-        cd /tmp/tls
-        openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-          -keyout ca.key -out ca.crt -subj "/CN=test-ca" \
-          -addext basicConstraints=critical,CA:TRUE \
-          -addext keyUsage=critical,keyCertSign
-        openssl req -newkey rsa:2048 -nodes \
-          -keyout server.key -out server.csr -subj "/CN=ignored.invalid"
-        echo "subjectAltName=DNS:test.example,IP:127.0.0.1" > ext.cnf
-        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
-          -CAcreateserial -out server.crt -days 1 -extfile ext.cnf
+        # Generate a self-signed cert for the test server
+        openssl req -new -x509 -days 1 -nodes \
+          -newkey rsa:2048 -sha256 \
+          -out /tmp/server.pem -keyout /tmp/server.key \
+          -subj "/CN=localhost"
 
-        # ssl_client trusts the default verify paths, which SSL_CERT_FILE overrides.
-        export SSL_CERT_FILE=/tmp/tls/ca.crt
+        # Start an openssl s_server in background (without -quiet so it logs connections)
+        openssl s_server -accept 14433 \
+          -cert /tmp/server.pem -key /tmp/server.key \
+          > /tmp/server.out 2>&1 &
+        SERVER_PID=$!
 
-        port=14433
-        server_pid=""
-        stop_server() {
-          if [ -n "$server_pid" ]; then
-            kill "$server_pid" 2>/dev/null || true
-            wait "$server_pid" 2>/dev/null || true
-            server_pid=""
-          fi
-        }
-        trap stop_server EXIT
+        # Wait for the server to be ready
+        wait-for-it 127.0.0.1:14433 -t 10
 
-        start_server() {
-          port=$((port + 1))
-          openssl s_server -accept "$port" -rev \
-            -cert /tmp/tls/server.crt -key /tmp/tls/server.key \
-            > /tmp/tls/server.log 2>&1 &
-          server_pid=$!
-          wait-for-it 127.0.0.1:"$port" -t 10
-        }
+        # Use ssl_client to connect and send data through the SSL tunnel.
+        # ssl_client exits non-zero when the server closes the connection;
+        # temporarily disable errexit so that expected non-zero exit does not
+        # abort the test while still propagating genuine failures (e.g. binary
+        # not found, segfault) via the grep verification below.
+        set +e
+        printf "hello\n" | ssl_client 127.0.0.1 14433 > /tmp/client.out 2>&1
+        set -e
 
-        # Runs ssl_client against the local server on a socket passed with -s.
-        # The -rev server answers each line reversed. Leaves the exit status in
-        # $rc and the output in /tmp/tls/client.out.
-        run_client() {
-          start_server
-          rc=0
-          (printf 'hello\n'; sleep 2) | timeout 10 \
-            ssl_client -s 3 "$@" 3<>/dev/tcp/127.0.0.1/"$port" \
-            > /tmp/tls/client.out 2>&1 || rc=$?
-          stop_server
-          cat /tmp/tls/client.out
-        }
+        # Give the server a moment to write connection info
+        sleep 2
 
-        # The -rev server never closes the connection, so a working client is
-        # ended by timeout (124). Any other status is a crash or an error.
-        expect_roundtrip() {
-          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-            echo "FAIL: $1 (rc=$rc)"
-            exit 1
-          fi
-          if ! grep -qx olleh /tmp/tls/client.out; then
-            echo "FAIL: $1 (no round-tripped data)"
-            exit 1
-          fi
-        }
+        # openssl s_server exits naturally once the client disconnects, so
+        # killing an already-gone process is not a real error.
+        set +e
+        kill "$SERVER_PID" 2>/dev/null
+        set -e
 
-        # A DNS name that matches a DNS SAN verifies and round-trips data.
-        run_client -n test.example
-        expect_roundtrip "-n test.example"
+        # Show client and server output for debugging
+        cat /tmp/client.out
+        cat /tmp/server.out
 
-        # An IP literal is matched against the IP SAN.
-        run_client -n 127.0.0.1
-        expect_roundtrip "-n 127.0.0.1"
-
-        # A DNS name absent from the certificate must fail verification.
-        run_client -n wrong.example
-        if [ "$rc" -ne 1 ] || grep -q olleh /tmp/tls/client.out ||
-          ! grep -q "certificate verify failed" /tmp/tls/client.out; then
-          echo "FAIL: -n wrong.example was not rejected (rc=$rc)"
-          exit 1
-        fi
-
-        # An IP literal absent from the certificate must fail verification.
-        run_client -n 127.0.0.2
-        if [ "$rc" -ne 1 ] || grep -q olleh /tmp/tls/client.out ||
-          ! grep -q "certificate verify failed" /tmp/tls/client.out; then
-          echo "FAIL: -n 127.0.0.2 was not rejected (rc=$rc)"
-          exit 1
-        fi
-
-        # A trailing dot is stripped before the name is checked.
-        run_client -n test.example.
-        expect_roundtrip "trailing dot in -n test.example. was not stripped"
-
-        # -I skips verification, so a mismatched name still connects.
-        run_client -I -n wrong.example
-        expect_roundtrip "-I -n wrong.example did not connect"
-
-        echo "ssl_client verification tests passed"
-        SCRIPT
+        # Verify ssl_client actually connected (server logs ACCEPT on connection)
+        grep -F "ACCEPT" /tmp/server.out

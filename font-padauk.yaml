@@ -1,26 +1,32 @@
-#nolint:unused-var-transform
 package:
   name: font-padauk
   version: "6.000"
-  epoch: 0
+  epoch: 1
   description: Padauk pan Myanmar font
   copyright:
     - license: OFL-1.0
-
-var-transforms:
-  - from: ${{package.version}}
-    match: (\d+)\.\d+
-    replace: $1
-    to: mangled-package-version
+  resources:
+    cpu: "2"
+    memory: 4Gi
 
 environment:
   contents:
     packages:
-      - autoconf
-      - automake
-      - build-base
       - busybox
       - ca-certificates-bundle
+      # SIL's own build toolchain. smith drives the whole build and resolves
+      # the rest from PATH: psf* from pysilfont, makefea from feaxlib,
+      # ttftable, make_gdl, ttfsetver and fret from perl-font-ttf-scripts,
+      # the fonttools CLI from py3.13-fonttools-bin, and grcompiler through
+      # smith's own dependency.
+      - feaxlib
+      - fontmake
+      - gftools
+      - perl-font-ttf-scripts
+      - py3.13-fonttools-bin
+      - pysilfont
+      - smith
+      - ttfautohint
 
 pipeline:
   - uses: git-checkout
@@ -29,12 +35,52 @@ pipeline:
       expected-commit: 1c709d29419fcfacb4887f8441468b0788dfcfea
       tag: v${{package.version}}
 
-  # SIL publishes the UFO/designspace masters and Graphite (.gdl) sources under source/, but they build with SIL's smith + grcompiler toolchain, which we do not package.
-  # blocked-font-toolchain: needs SIL smith/grcompiler (OS-3339).
-  - runs: |
-      pkgname=${{package.name}}
-      mkdir -p "${{targets.destdir}}"/usr/share/fonts/${pkgname#font-}
-      install -D -m644 ./references/*.ttf "${{targets.destdir}}"/usr/share/fonts/${pkgname#font-}
+  # Built from the UFO masters under source/ rather than installing the
+  # prebuilt references/*.ttf the repository carries. Those references are
+  # Padauk 5.100, so until now this package declared 6.000 and shipped 5.100.
+  #
+  # --release, not -r. smith's getversion() treats both as a release build and
+  # returns an empty build label for either, but this wscript also claims -r
+  # through preprocess_args and uses it to set `instances = []`, so -r builds
+  # one font instead of twenty-seven. --release is never consumed there.
+  # Without one of them the name table reads "Version 6.000; dev-1c709d", and
+  # ttfsetver additionally warns, because smith passes it a -n flag that only
+  # exists on Font::TTF::Scripts master.
+  #
+  # Every weight matches the artefacts SIL publishes for this tag: identical
+  # glyph set, cmap, outlines, advances and OpenType feature set. GPOS and
+  # GSUB pack a little smaller because current fontTools compacts lookups
+  # better; ~440k HarfBuzz shaping cases over the Myanmar blocks, with each
+  # feature forced on in turn, come back identical.
+  #
+  # No Graphite tables, and none are available to build. The wscript's
+  # graphite stanza is opt-in behind --gr, and it cannot compile at this tag:
+  # source/myanmar5.gdl references g100b_alt, g1020_long and g101c_med_103d,
+  # whose glyphs (u100B.alt, u1020.long, u101C.med_u103D) are listed in the
+  # UFO's public.skipExportGlyphs and so are absent from the compiled font.
+  # SIL's own Padauk-6.000 release carries no Silf/Glat/Gloc/Feat/Sill either.
+  # The references/*.ttf do, being 5.100.
+  - name: Build the fonts from source with smith
+    runs: |
+      smith configure --release
+      smith build --release
+
+  # The build also produces the Namkio Khamti and Deemawso families from the
+  # same sources. Those are separate upstream products with their own release
+  # archives and their own names, so they are deliberately not installed here;
+  # this package stays the Padauk and Padauk Book families. It previously
+  # shipped only Regular and Bold of each, because that is all the stale
+  # references/ directory held.
+  - name: Install the Padauk and Padauk Book families
+    runs: |
+      for ttf in results/Padauk-*.ttf results/PadaukBook-*.ttf; do
+        install -D -m644 "$ttf" \
+          "${{targets.destdir}}"/usr/share/fonts/padauk/"$(basename "$ttf")"
+      done
+
+      installed=$(find "${{targets.destdir}}"/usr/share/fonts/padauk -name '*.ttf' | wc -l)
+      echo "installed $installed fonts"
+      test "$installed" -eq 9
 
 update:
   enabled: true
@@ -43,5 +89,81 @@ update:
     strip-prefix: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - harfbuzz-utils
+        - py3.13-fonttools-bin
+        - python-3.13
   pipeline:
     - uses: test/fonts
+    - name: The installed fonts are the ones we built, not reference binaries
+      runs: |
+        dir=/usr/share/fonts/padauk
+        python3.13 - "$dir" <<'EOF'
+        import glob, os, sys
+        from fontTools.ttLib import TTFont
+
+        expected = sorted(
+            ["Padauk-%s.ttf" % w for w in
+             ("Regular", "Medium", "SemiBold", "Bold", "ExtraBold")]
+            + ["PadaukBook-%s.ttf" % w for w in
+               ("Regular", "Medium", "SemiBold", "Bold")]
+        )
+        found = sorted(os.path.basename(p) for p in glob.glob(sys.argv[1] + "/*.ttf"))
+        assert found == expected, (found, expected)
+
+        for path in sorted(glob.glob(sys.argv[1] + "/*.ttf")):
+            font = TTFont(path)
+            name = font["name"].getDebugName(5)
+            # A build label here means the recipe lost --release and the font
+            # no longer matches what SIL publishes for this tag.
+            assert name == "Version 6.000", (path, name)
+
+            # The 5.100 references/ binaries carry Graphite and 838 glyphs;
+            # the 6.000 sources produce 827 and no Graphite. Both halves have
+            # to hold or we are installing the wrong file.
+            assert font["maxp"].numGlyphs == 827, (path, font["maxp"].numGlyphs)
+            graphite = [t for t in ("Silf", "Glat", "Gloc", "Feat", "Sill") if t in font]
+            assert graphite == [], (path, graphite)
+
+            cmap = font.getBestCmap()
+            assert len(cmap) == 549, (path, len(cmap))
+            # Myanmar, plus the Extended-A and Extended-B ranges this font is
+            # unusual in covering.
+            for codepoint in (0x1000, 0x1040, 0x1075, 0xA9E0, 0xAA60):
+                assert codepoint in cmap, (path, hex(codepoint))
+
+            gsub = {r.FeatureTag for r in font["GSUB"].table.FeatureList.FeatureRecord}
+            gpos = {r.FeatureTag for r in font["GPOS"].table.FeatureList.FeatureRecord}
+            # The Myanmar shaper needs these; a font that lost its feature
+            # file would still load and still have a cmap.
+            assert {"blwf", "pref", "pres", "psts", "rphf"} <= gsub, (path, sorted(gsub))
+            assert {"mark", "mkmk"} <= gpos, (path, sorted(gpos))
+            print(os.path.basename(path), name, len(cmap), "GSUB", len(gsub))
+        EOF
+    # Codepoints rather than literal text: the shell mangles Burmese in a
+    # $'...' literal, which silently turns these into tests of U+0024.
+    - name: HarfBuzz applies Myanmar reordering, stacking and mark positioning
+      runs: |
+        ttf=/usr/share/fonts/padauk/Padauk-Regular.ttf
+
+        # U+1000 U+103C. The medial ra is stored after its base and the
+        # Myanmar shaper has to move it in front, picking the contextual
+        # .wide variant through GSUB. Without the feature file this comes
+        # back as "uni1000|uni103C" in logical order.
+        out=$(hb-shape --unicodes 1000,103C "$ttf")
+        echo "ka + medial ra: $out"
+        test "$out" = "[uni103C.wide=0+172|uni1000=0+1002]"
+
+        # U+1000 U+1039 U+1000. The virama stacks the second consonant below
+        # the first: blwf must substitute the subjoined form and GPOS must
+        # shift it.
+        out=$(hb-shape --unicodes 1000,1039,1000 "$ttf")
+        echo "stacked ka: $out"
+        test "$out" = "[uni1000=0+1002|uni1000.med=0@-101,0+0]"
+
+        # U+1000 U+102D. A zero-advance mark that GPOS has to place.
+        out=$(hb-shape --unicodes 1000,102D "$ttf")
+        echo "ka + vowel i: $out"
+        test "$out" = "[uni1000=0+1002|uni102D=0@-54,0+0]"

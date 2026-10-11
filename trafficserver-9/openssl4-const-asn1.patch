@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Masakazu Kitajo <maskit@apache.org>
+Date: Wed, 5 Aug 2026 16:26:21 +0000
+Subject: [PATCH 1/3] Resolve OpenSSL 4.0 build issues
+
+OpenSSL 4.0 makes ASN1_STRING opaque, and X509_get_subject_name(),
+X509_NAME_get_entry(), X509_NAME_ENTRY_get_data() and
+X509_REQ_get_subject_name() now return const pointers.
+
+Backport of upstream commit bdefaf97b6 (released in 10.2.0) to 9.2.15.
+Differences from the upstream commit:
+
+- Paths: iocore/net/ and src/traffic_server/InkAPI.cc instead of
+  src/iocore/net/ and src/api/InkAPI.cc.
+- Explicit const types where upstream uses auto. Upstream uses auto to
+  keep building against OpenSSL 1.1.1.
+- plugins/certifier: mkcsr() exists only in 9.2.x. It added the CN to
+  the name that X509_REQ_get_subject_name() returns, which is const in
+  OpenSSL 4. It now builds the name with X509_NAME_new() and sets it
+  with X509_REQ_set_subject_name(). mkcrt() keeps the CSR subject const.
+  This mkcsr() hunk is Chainguard-written, not upstream code. Upstream's
+  matching fix is in mkcrt() and uses X509_NAME_dup() with a
+  scoped_X509_NAME.
+- Smaller differences: the InkAPI.cc hunk does not carry upstream's
+  "const int pos", and the changed lines were not re-run through
+  clang-format.
+- Left out: hunks for code that 9.2.15 does not have (cripts, txn_box,
+  the lua certificate helpers, the OCSP certificate-ID functions,
+  test_SSLDHParams) or does not build by default (experimental and
+  example plugins).
+
+Upstream: https://github.com/apache/trafficserver/pull/13476
+Co-authored-by: Jered Floyd <jered@redhat.com>
+---
+ iocore/net/SSLNetVConnection.cc               |  2 +-
+ iocore/net/SSLUtils.cc                        |  8 ++++----
+ plugins/certifier/certifier.cc                | 18 +++++++++++++++---
+ src/traffic_server/InkAPI.cc                  |  4 ++--
+ src/tscore/X509HostnameValidator.cc           | 10 +++++-----
+ tests/tools/plugins/ssl_client_verify_test.cc |  6 +++---
+ 6 files changed, 30 insertions(+), 18 deletions(-)
+
+diff --git a/iocore/net/SSLNetVConnection.cc b/iocore/net/SSLNetVConnection.cc
+index c472b46..6a24178 100644
+--- a/iocore/net/SSLNetVConnection.cc
++++ b/iocore/net/SSLNetVConnection.cc
+@@ -230,7 +230,7 @@ SSLNetVConnection::_unbindSSLObject()
+ }
+ 
+ static void
+-debug_certificate_name(const char *msg, X509_NAME *name)
++debug_certificate_name(const char *msg, const X509_NAME *name)
+ {
+   BIO *bio;
+ 
+diff --git a/iocore/net/SSLUtils.cc b/iocore/net/SSLUtils.cc
+index 6a410fb..f544aa1 100644
+--- a/iocore/net/SSLUtils.cc
++++ b/iocore/net/SSLUtils.cc
+@@ -1089,7 +1089,7 @@ SSLMultiCertConfigLoader::check_server_cert_now(X509 *cert, const char *certname
+ } /* CheckServerCertNow() */
+ 
+ static char *
+-asn1_strdup(ASN1_STRING *s)
++asn1_strdup(const ASN1_STRING *s)
+ {
+   // Make sure we have an 8-bit encoding.
+   ink_assert(ASN1_STRING_type(s) == V_ASN1_IA5STRING || ASN1_STRING_type(s) == V_ASN1_UTF8STRING ||
+@@ -2282,7 +2282,7 @@ SSLMultiCertConfigLoader::load_certs_and_cross_reference_names(
+ 
+     std::set<std::string> name_set;
+     // Grub through the names in the certs
+-    X509_NAME *subject = nullptr;
++    const X509_NAME *subject = nullptr;
+ 
+     // Insert a key for the subject CN.
+     subject = X509_get_subject_name(cert);
+@@ -2295,8 +2295,8 @@ SSLMultiCertConfigLoader::load_certs_and_cross_reference_names(
+           break;
+         }
+ 
+-        X509_NAME_ENTRY *e = X509_NAME_get_entry(subject, pos);
+-        ASN1_STRING *cn    = X509_NAME_ENTRY_get_data(e);
++        const X509_NAME_ENTRY *e = X509_NAME_get_entry(subject, pos);
++        const ASN1_STRING *cn    = X509_NAME_ENTRY_get_data(e);
+         subj_name          = asn1_strdup(cn);
+ 
+         Debug("ssl_load", "subj '%s' in certificate %s %p", subj_name.get(), data.cert_names_list[i].c_str(), cert);
+diff --git a/plugins/certifier/certifier.cc b/plugins/certifier/certifier.cc
+index b2d4c28..5661a0d 100644
+--- a/plugins/certifier/certifier.cc
++++ b/plugins/certifier/certifier.cc
+@@ -362,14 +362,25 @@ mkcsr(const char *cn)
+   /// Set X509 version
+   X509_REQ_set_version(req.get(), 1);
+ 
+-  /// Get handle to subject name
+-  n = X509_REQ_get_subject_name(req.get());
++  /// Build the subject name (X509_REQ_get_subject_name() returns a const name in OpenSSL 4)
++  n = X509_NAME_new();
++  if (n == nullptr) {
++    TSError("[%s] mkcsr(): Failed to allocate subject name.", PLUGIN_NAME);
++    return nullptr;
++  }
+ 
+   /// Set common name field
+   if (X509_NAME_add_entry_by_txt(n, "CN", MBSTRING_ASC, (unsigned char *)cn, -1, -1, 0) != 1) {
+     TSError("[%s] mkcsr(): Failed to add entry.", PLUGIN_NAME);
++    X509_NAME_free(n);
++    return nullptr;
++  }
++  if (X509_REQ_set_subject_name(req.get(), n) != 1) {
++    TSError("[%s] mkcsr(): Failed to set subject name.", PLUGIN_NAME);
++    X509_NAME_free(n);
+     return nullptr;
+   }
++  X509_NAME_free(n);
+   /// Set Traffic Server public key
+   if (X509_REQ_set_pubkey(req.get(), ca_pkey_scoped.get()) != 1) {
+     TSError("[%s] mkcsr(): Failed to set pubkey.", PLUGIN_NAME);
+@@ -388,7 +399,8 @@ static scoped_X509
+ mkcrt(X509_REQ *req, int serial)
+ {
+   TSDebug(PLUGIN_NAME, "Entering mkcrt()...");
+-  X509_NAME *subj, *tmpsubj;
++  const X509_NAME *subj;
++  X509_NAME *tmpsubj;
+   scoped_EVP_PKEY pktmp;
+   scoped_X509 cert;
+ 
+diff --git a/src/traffic_server/InkAPI.cc b/src/traffic_server/InkAPI.cc
+index 41e3146..85c07eb 100644
+--- a/src/traffic_server/InkAPI.cc
++++ b/src/traffic_server/InkAPI.cc
+@@ -9918,8 +9918,8 @@ TSSslServerCertUpdate(const char *cert_path, const char *key_path)
+ 
+     // Extract common name
+     int pos                       = X509_NAME_get_index_by_NID(X509_get_subject_name(cert.get()), NID_commonName, -1);
+-    X509_NAME_ENTRY *common_name  = X509_NAME_get_entry(X509_get_subject_name(cert.get()), pos);
+-    ASN1_STRING *common_name_asn1 = X509_NAME_ENTRY_get_data(common_name);
++    const X509_NAME_ENTRY *common_name  = X509_NAME_get_entry(X509_get_subject_name(cert.get()), pos);
++    const ASN1_STRING *common_name_asn1 = X509_NAME_ENTRY_get_data(common_name);
+     char *common_name_str         = reinterpret_cast<char *>(const_cast<unsigned char *>(ASN1_STRING_get0_data(common_name_asn1)));
+     if (ASN1_STRING_length(common_name_asn1) != static_cast<int>(strlen(common_name_str))) {
+       // Embedded NULL char
+diff --git a/src/tscore/X509HostnameValidator.cc b/src/tscore/X509HostnameValidator.cc
+index 374a89a..0805f39 100644
+--- a/src/tscore/X509HostnameValidator.cc
++++ b/src/tscore/X509HostnameValidator.cc
+@@ -206,12 +206,12 @@ do_check_string(ASN1_STRING *a, int cmp_type, equal_fn equal, const unsigned cha
+ {
+   bool retval = false;
+ 
+-  if (!a->data || !a->length || cmp_type != a->type) {
++  if (!ASN1_STRING_get0_data(a) || !ASN1_STRING_length(a) || cmp_type != ASN1_STRING_type(a)) {
+     return false;
+   }
+-  retval = equal(a->data, a->length, b, blen);
++  retval = equal(ASN1_STRING_get0_data(a), ASN1_STRING_length(a), b, blen);
+   if (retval && peername) {
+-    *peername = ats_strndup((char *)a->data, a->length);
++    *peername = ats_strndup(reinterpret_cast<const char *>(ASN1_STRING_get0_data(a)), ASN1_STRING_length(a));
+   }
+   return retval;
+ }
+@@ -220,7 +220,7 @@ bool
+ validate_hostname(X509 *x, std::string_view hostname, bool is_ip, char **peername)
+ {
+   GENERAL_NAMES *gens = nullptr;
+-  X509_NAME *name     = nullptr;
++  const X509_NAME *name = nullptr;
+   int i;
+   int alt_type;
+   bool retval = false;
+@@ -272,7 +272,7 @@ validate_hostname(X509 *x, std::string_view hostname, bool is_ip, char **peernam
+   name = X509_get_subject_name(x);
+ 
+   while ((i = X509_NAME_get_index_by_NID(name, NID_commonName, i)) >= 0) {
+-    ASN1_STRING *str;
++    const ASN1_STRING *str;
+     int astrlen;
+     unsigned char *astr;
+     str = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, i));
+diff --git a/tests/tools/plugins/ssl_client_verify_test.cc b/tests/tools/plugins/ssl_client_verify_test.cc
+index e48dae8..3ce703f 100644
+--- a/tests/tools/plugins/ssl_client_verify_test.cc
++++ b/tests/tools/plugins/ssl_client_verify_test.cc
+@@ -53,7 +53,7 @@ check_names(X509 *cert)
+   bool retval = false;
+ 
+   // Check the common name
+-  X509_NAME *subject = X509_get_subject_name(cert);
++  const X509_NAME *subject = X509_get_subject_name(cert);
+   if (subject) {
+     int pos = -1;
+     for (; !retval;) {
+@@ -62,8 +62,8 @@ check_names(X509 *cert)
+         break;
+       }
+ 
+-      X509_NAME_ENTRY *e = X509_NAME_get_entry(subject, pos);
+-      ASN1_STRING *cn    = X509_NAME_ENTRY_get_data(e);
++      const X509_NAME_ENTRY *e = X509_NAME_get_entry(subject, pos);
++      const ASN1_STRING *cn    = X509_NAME_ENTRY_get_data(e);
+ #if OPENSSL_VERSION_NUMBER >= 0x010100000
+       char *subj_name = strndup(reinterpret_cast<const char *>(ASN1_STRING_get0_data(cn)), ASN1_STRING_length(cn));
+ #else

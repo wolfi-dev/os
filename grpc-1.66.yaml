@@ -2,7 +2,7 @@
 package:
   name: grpc-1.66
   version: 1.66.2
-  epoch: 17
+  epoch: 18 # openssl: 3.6->4.0, backport OpenSSL 4 support and ssl ctx null check
   description: The C based gRPC
   copyright:
     - license: Apache-2.0 AND BSD-3-Clause AND MIT
@@ -12,6 +12,9 @@ package:
   dependencies:
     provides:
       - grpc=${{package.full-version}}
+
+vars:
+  openssl-version: "4.0"
 
 var-transforms:
   - from: ${{package.version}}
@@ -41,7 +44,7 @@ environment:
       - libsystemd
       - libtool
       - linux-headers
-      - openssl-hardened-dev
+      - openssl-${{vars.openssl-version}}-dev # FTBFS with openssl-hardened-4.0-dev: OPENSSL_NO_DEPRECATED removes the SSL_get_peer_certificate macro used in src/core/tsi/ssl_transport_security.cc
       - protobuf-29.5-dev
       - py3-setuptools
       - python3
@@ -63,6 +66,10 @@ pipeline:
       repository: https://github.com/grpc/grpc
       tag: v${{package.version}}
       expected-commit: f686ffe7e703fb1440dabea419579e566a8becc3
+
+  - uses: patch
+    with:
+      patches: openssl4.patch ssl-ctx-null-check.patch
 
   - runs: |
       cd third_party
@@ -102,6 +109,9 @@ pipeline:
 
   - runs: |
       DESTDIR="${{targets.destdir}}" cmake --install _build
+      # Upstream installs this .pc even with gRPC_BUILD_GRPCPP_OTEL_PLUGIN off,
+      # so it names a library that is never built and requires opentelemetry_api.
+      rm "${{targets.destdir}}"/usr/lib/pkgconfig/grpcpp_otel_plugin.pc
       python3 setup.py install --skip-build --root="${{targets.destdir}}"
       cd doc
       find ./ -type f -print -exec install -Dm644 {} "${{targets.destdir}}"/usr/share/doc/grpc/{} \;
@@ -135,6 +145,7 @@ subpackages:
       - uses: split/dev
     test:
       pipeline:
+        - uses: test/tw/devpackage
         - uses: test/pkgconf
         - uses: test/tw/ldd-check
           with:
@@ -142,8 +153,8 @@ subpackages:
     dependencies:
       runtime:
         - abseil-cpp-20250127-dev
+        - openssl-${{vars.openssl-version}}-dev
         - ${{package.name}}
-        - opentelemetry-cpp-dev
         - re2-dev
       provides:
         - grpc-dev=${{package.full-version}}
@@ -158,11 +169,24 @@ update:
     tag-filter-prefix: v1.66.
 
 test:
+  environment:
+    contents:
+      packages:
+        - protobuf-29.5-protoc
   pipeline:
     - uses: test/tw/ldd-check
-    - name: Verify grpc_cpp_plugin is functional
+    - name: Generate C++ gRPC stubs with grpc_cpp_plugin
       runs: |
-        grpc_cpp_plugin --version 2>&1 | grep -i grpc
-    - name: Verify grpc_cli can list commands
-      runs: |
-        grpc_cli help 2>&1 | grep -iE 'usage|command|list'
+        # grpc_cpp_plugin has no --version flag; drive it through protoc instead.
+        cat > greeter.proto <<'EOF'
+        syntax = "proto3";
+        package greeter;
+        service Greeter {
+          rpc SayHello (HelloRequest) returns (HelloReply);
+        }
+        message HelloRequest { string name = 1; }
+        message HelloReply { string message = 1; }
+        EOF
+        protoc --plugin=protoc-gen-grpc="$(command -v grpc_cpp_plugin)" --grpc_out=. greeter.proto
+        grep -q 'class Greeter' greeter.grpc.pb.h
+        test -s greeter.grpc.pb.cc

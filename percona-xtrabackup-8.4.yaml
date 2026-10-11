@@ -6,7 +6,7 @@
 package:
   name: percona-xtrabackup-8.4
   version: "8.4.0.5"
-  epoch: 8 # go/wolfi-rsc/percona-xtrabackup-8.4
+  epoch: 11 # glibc: 2.43->2.44, llvm: 15->22, llvm: 15->23
   description: Open source hot backup tool for InnoDB and XtraDB databases
   copyright:
     - license: Apache-2.0
@@ -24,6 +24,9 @@ package:
     memory: 2Gi
 
 vars:
+  openssl-version: "4.0"
+  # Major of the libssl/libcrypto soname the binaries must link; keep in step with openssl-version.
+  openssl-soversion: "4"
   python-version: "3.13"
 
 # Replace the last `.` with `-` to fetch the correct tag.
@@ -45,11 +48,11 @@ environment:
       - build-base
       - busybox
       - ca-certificates
-      - clang-15-extras
+      - clang-23-extras
       - cmake
       - curl-dev
-      - glibc-2.43-dev
       - glibc-2.44
+      - glibc-2.44-dev
       - hardening-check
       - icu-dev
       - libaio-dev
@@ -59,6 +62,7 @@ environment:
       - libgcrypt-dev
       - lz4-dev
       - numactl-dev
+      - openssl-${{vars.openssl-version}}-dev
       - procps-dev
       - protobuf-dev
       - py${{vars.python-version}}-sphinx
@@ -66,6 +70,9 @@ environment:
       - vim # xxd
       - zlib-dev
       - zstd-dev
+  environment:
+    # libs/mysql/gtid/gtid_format.h lacks <cstdint> (fixed upstream in MySQL 8.4.11)
+    CXXFLAGS: -include cstdint
 
 pipeline:
   - uses: git-checkout
@@ -74,6 +81,10 @@ pipeline:
       tag: percona-xtrabackup-${{vars.mangled-package-version}}
       expected-commit: c6054e179b5dc39d9735536ce136dc1c91834d73
       recurse-submodules: true
+
+  - uses: patch
+    with:
+      patches: 0001-Bug-39102340-build-with-OpenSSL-4.x.patch
 
   - runs: |
       mkdir build && cd build
@@ -182,6 +193,10 @@ test:
     contents:
       packages:
         - ${{package.name}}-compat
+        - mariadb-13.1
+        - mariadb-13.1-client
+        - openssl-${{vars.openssl-version}}
+        - wait-for-port
   pipeline:
     - uses: test/tw/ver-check
       with:
@@ -207,4 +222,73 @@ test:
         cat stream_output.xbstream | xbstream -x -C extract_dir
         test -f extract_dir/file1.txt
         test -f extract_dir/file2.txt
+    - name: Binaries and plugins link only the expected OpenSSL
+      runs: |
+        # xtrabackup does TLS itself, so it must link both libraries.
+        deps=$(ldd /usr/bin/xtrabackup)
+        for lib in libssl.so.${{vars.openssl-soversion}} libcrypto.so.${{vars.openssl-soversion}}; do
+          case "$deps" in
+            *"$lib"*) ;;
+            *) echo "xtrabackup does not link $lib"; echo "$deps"; exit 1 ;;
+          esac
+        done
+        # The rest link libcrypto directly or libssl through libcurl.
+        for f in /usr/bin/xbcloud /usr/bin/xbcrypt /usr/bin/xbstream /usr/bin/xtrabackup /usr/lib/plugin/component_keyring_*.so; do
+          other=$(ldd "$f" | grep -oE 'lib(ssl|crypto)\.so\.[0-9]+' | grep -vxE 'lib(ssl|crypto)\.so\.${{vars.openssl-soversion}}' || true)
+          if [ -n "$other" ]; then
+            echo "$f resolves another OpenSSL soname: $other"
+            exit 1
+          fi
+        done
+    - name: TLS connection through the patched MySQL client code
+      runs: |
+        # xtrabackup only uses OpenSSL as a MySQL client. Point it at a
+        # TLS-only server with full certificate verification: it has to
+        # finish the handshake and read the server version over TLS before
+        # it rejects MariaDB as an unsupported server.
+        mkdir -p /tmp/tls /var/lib/mysql /run/mysqld /var/tmp
+        cd /tmp/tls
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 1 -subj "/CN=test-ca"
+        openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=localhost"
+        printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > ext.cnf
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 1 -extfile ext.cnf
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout other-ca.key -out other-ca.crt -days 1 -subj "/CN=other-ca"
+
+        mariadb-install-db --user=root --datadir=/var/lib/mysql --auth-root-authentication-method=normal > /dev/null
+        mariadbd --user=root --datadir=/var/lib/mysql --skip-networking=0 --bind-address=127.0.0.1 --port=3306 \
+          --ssl-ca=/tmp/tls/ca.crt --ssl-cert=/tmp/tls/server.crt --ssl-key=/tmp/tls/server.key \
+          --require-secure-transport=ON > /tmp/mariadbd.log 2>&1 &
+        wait-for-port 3306 -t 60 || { cat /tmp/mariadbd.log; exit 1; }
+        for h in localhost 127.0.0.1; do
+          mariadb -u root -e "CREATE USER 'bk'@'$h' IDENTIFIED VIA mysql_native_password USING PASSWORD('bkpass') REQUIRE SSL;"
+        done
+        xb() {
+          name=$1
+          shift
+          xtrabackup --backup --target-dir="/tmp/bk-$name" --host=127.0.0.1 --port=3306 --user=bk --password=bkpass "$@" > "/tmp/xb-$name.log" 2>&1
+        }
+
+        if xb verified --ssl-mode=VERIFY_IDENTITY --ssl-ca=/tmp/tls/ca.crt; then
+          echo "xtrabackup unexpectedly backed up MariaDB"
+          exit 1
+        fi
+        cat /tmp/xb-verified.log
+        grep -F 'does not support MariaDB' /tmp/xb-verified.log
+
+        if xb untrusted-ca --ssl-mode=VERIFY_CA --ssl-ca=/tmp/tls/other-ca.crt; then
+          echo "connection with an untrusted CA unexpectedly succeeded"
+          exit 1
+        fi
+        cat /tmp/xb-untrusted-ca.log
+        grep -F 'certificate verify failed' /tmp/xb-untrusted-ca.log
+
+        # The server refuses plaintext, so the verified connection was TLS.
+        if xb plaintext --ssl-mode=DISABLED; then
+          echo "plaintext connection unexpectedly succeeded"
+          exit 1
+        fi
+        cat /tmp/xb-plaintext.log
+        grep -F 'insecure transport' /tmp/xb-plaintext.log
+
+        mariadb-admin -u root shutdown
     - uses: test/tw/ldd-check

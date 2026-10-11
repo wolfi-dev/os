@@ -1,7 +1,7 @@
 package:
   name: keydb
   version: 6.3.4
-  epoch: 9 # go/wolfi-rsc/keydb
+  epoch: 10 # openssl: 3.6->4.0, port tls.cpp to OpenSSL 4 const X509 API
   description: A Multithreaded Fork of Redis
   copyright:
     - license: BSD-3-Clause
@@ -13,7 +13,7 @@ package:
     memory: 1Gi
 
 vars:
-  openssl-version: "3.6"
+  openssl-version: "4.0"
 
 environment:
   contents:
@@ -52,6 +52,10 @@ pipeline:
     working-directory: ./deps/rocksdb
     with:
       patches: ../../cstdint.patch
+
+  - uses: patch
+    with:
+      patches: 0001-tls-use-const-X509_NAME_ENTRY-pointer-for-OpenSSL-4.0.patch
 
   - runs: |
       # From here: https://github.com/Snapchat/KeyDB/blob/main/pkg/docker/Dockerfile#L52C9-L55C92
@@ -105,9 +109,61 @@ test:
     contents:
       packages:
         - keydb-cli
+        - openssl-${{vars.openssl-version}}
         - wait-for-it
   pipeline:
     - uses: test/tw/ldd-check
+    - name: TLS client certificate allowlist on the OpenSSL ${{vars.openssl-version}} ABI
+      runs: |
+        set -euo pipefail
+        mkdir -p /tmp/tls && cd /tmp/tls
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=keydb-test-ca" \
+          -keyout ca.key -out ca.crt 2>/dev/null
+        printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > server.ext
+        : > client.ext
+        for name in server allowed-client denied-client; do
+          cn=$name
+          [ "$name" = server ] && cn=localhost
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=$cn" \
+            -keyout $name.key -out $name.csr 2>/dev/null
+          ext=client.ext
+          [ "$name" = server ] && ext=server.ext
+          openssl x509 -req -in $name.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+            -days 1 -extfile $ext -out $name.crt 2>/dev/null
+        done
+        # TLS only with mutual auth. tls-allowlist makes keydb read the client
+        # certificate CN in tlsCheckCertificateAgainstAllowlist() (src/tls.cpp),
+        # the code patched for OpenSSL 4.
+        cat > keydb.conf <<EOF
+        port 0
+        tls-port 6380
+        tls-cert-file /tmp/tls/server.crt
+        tls-key-file /tmp/tls/server.key
+        tls-ca-cert-file /tmp/tls/ca.crt
+        tls-auth-clients yes
+        tls-allowlist allowed-client
+        dir /tmp/tls
+        logfile /tmp/tls/keydb.log
+        pidfile /tmp/tls/keydb.pid
+        daemonize yes
+        EOF
+        keydb-server /tmp/tls/keydb.conf
+        wait-for-it localhost:6380 -t 30
+        cli() { keydb-cli --tls -p 6380 --cacert ca.crt "$@"; }
+        cli --cert allowed-client.crt --key allowed-client.key PING | grep -x PONG
+        cli --cert allowed-client.crt --key allowed-client.key SET tls:1 ok
+        cli --cert allowed-client.crt --key allowed-client.key GET tls:1 | grep -x ok
+        if cli --cert denied-client.crt --key denied-client.key PING 2>/dev/null | grep -q PONG; then
+          echo "client whose CN is not in tls-allowlist was accepted" >&2
+          exit 1
+        fi
+        if cli PING 2>/dev/null | grep -q PONG; then
+          echo "client without a certificate was accepted" >&2
+          exit 1
+        fi
+        # The rejection message carries the CN read from the certificate.
+        grep -F 'Client CN (denied-client) and SANs not found in allowlist' keydb.log
+        cli --cert allowed-client.crt --key allowed-client.key SHUTDOWN NOSAVE || true
     - runs: |
         keydb-server > /dev/null 2>&1 &
         wait-for-it localhost:6379 -t 30

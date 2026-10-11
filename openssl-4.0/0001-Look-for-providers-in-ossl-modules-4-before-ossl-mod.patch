@@ -1,0 +1,109 @@
+From 9cf6b057a73faab2e63272844bf3d17a952e235e Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@chainguard.dev>
+Date: Fri, 9 Oct 2026 14:53:02 +0100
+Subject: [PATCH] Look for providers in ossl-modules-4 before ossl-modules
+
+When no OPENSSL_MODULES or default search path is set, first try to
+load a provider module from the built-in MODULESDIR with "-4"
+appended, and fall back to MODULESDIR itself if that fails.
+
+This lets distributions ship providers in a per-soversion directory,
+in line with the upcoming MODULESDIR rename to ossl-modules-<soversion>
+(see https://github.com/openssl/openssl/pull/29759), while modules
+installed in the existing location keep working. Errors from the
+versioned attempt are discarded so a miss there does not pollute the
+error queue.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Assisted-by: Claude:claude-opus-5-5
+---
+ crypto/provider_core.c | 52 ++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index 08d4de1c7c6..142a19d12ff 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -980,6 +980,9 @@ static int provider_init(OSSL_PROVIDER *prov)
+             char *merged_path = NULL;
+             const char *load_dir = NULL;
+             char *allocated_load_dir = NULL;
++            char *versioned_load_dir = NULL;
++            size_t versioned_len;
++            int loaded = 0;
+             struct provider_store_st *store;
+ 
+             if ((prov->module = DSO_new()) == NULL) {
+@@ -1003,8 +1006,20 @@ static int provider_init(OSSL_PROVIDER *prov)
+ 
+             if (load_dir == NULL) {
+                 load_dir = ossl_safe_getenv("OPENSSL_MODULES");
+-                if (load_dir == NULL)
++                if (load_dir == NULL) {
+                     load_dir = ossl_get_modulesdir();
++                    /* Prefer <modulesdir>-4, fall back to <modulesdir> */
++                    if (load_dir != NULL) {
++                        versioned_len = strlen(load_dir) + sizeof("-4");
++                        versioned_load_dir = OPENSSL_malloc(versioned_len);
++                        if (versioned_load_dir != NULL) {
++                            OPENSSL_strlcpy(versioned_load_dir, load_dir,
++                                versioned_len);
++                            OPENSSL_strlcat(versioned_load_dir, "-4",
++                                versioned_len);
++                        }
++                    }
++                }
+             }
+ 
+             DSO_ctrl(prov->module, DSO_CTRL_SET_FLAGS,
+@@ -1013,18 +1028,41 @@ static int provider_init(OSSL_PROVIDER *prov)
+             module_path = prov->path;
+             if (module_path == NULL)
+                 module_path = allocated_path = DSO_convert_filename(prov->module, prov->name);
+-            if (module_path != NULL)
+-                merged_path = DSO_merge(prov->module, module_path, load_dir);
+ 
+-            if (merged_path == NULL
+-                || (DSO_load(prov->module, merged_path, NULL, 0)) == NULL) {
+-                DSO_free(prov->module);
+-                prov->module = NULL;
++            if (module_path != NULL && versioned_load_dir != NULL) {
++                ERR_set_mark();
++                merged_path = DSO_merge(prov->module, module_path,
++                    versioned_load_dir);
++                if (merged_path != NULL
++                    && DSO_load(prov->module, merged_path, NULL, 0) != NULL) {
++                    loaded = 1;
++                } else {
++                    /* A failed DSO_load() leaves the DSO unusable, start over */
++                    DSO_free(prov->module);
++                    if ((prov->module = DSO_new()) != NULL)
++                        DSO_ctrl(prov->module, DSO_CTRL_SET_FLAGS,
++                            DSO_FLAG_NAME_TRANSLATION_EXT_ONLY, NULL);
++                }
++                ERR_pop_to_mark();
++                OPENSSL_free(merged_path);
++                merged_path = NULL;
++            }
++
++            if (!loaded) {
++                if (module_path != NULL && prov->module != NULL)
++                    merged_path = DSO_merge(prov->module, module_path, load_dir);
++
++                if (merged_path == NULL
++                    || (DSO_load(prov->module, merged_path, NULL, 0)) == NULL) {
++                    DSO_free(prov->module);
++                    prov->module = NULL;
++                }
+             }
+ 
+             OPENSSL_free(merged_path);
+             OPENSSL_free(allocated_path);
+             OPENSSL_free(allocated_load_dir);
++            OPENSSL_free(versioned_load_dir);
+         }
+ 
+         if (prov->module == NULL) {
+-- 
+2.53.0
+

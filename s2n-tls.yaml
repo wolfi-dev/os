@@ -1,7 +1,7 @@
 package:
   name: s2n-tls
   version: "1.7.11"
-  epoch: 1 # openssl: 3.6->4.0
+  epoch: 2 # skip digests the OpenSSL 4.0 provider does not offer (INC-377)
   description: AWS C99 implementation of the TLS/SSL protocols
   copyright:
     - license: Apache-2.0
@@ -28,6 +28,10 @@ pipeline:
       expected-commit: b170000016fb44fa4dfdd86ed0b75bd28241e707
       repository: https://github.com/aws/s2n-tls
       tag: v${{package.version}}
+
+  - uses: patch
+    with:
+      patches: 0001-Skip-digests-the-libcrypto-does-not-provide.patch
 
   - runs: |
       if [ "$CBUILD" != "$CHOST" ]; then
@@ -72,6 +76,7 @@ test:
     contents:
       packages:
         - build-base
+        - openssl-${{vars.openssl-version}}
         - posix-libc-utils
         - s2n-tls-dev
   pipeline:
@@ -100,6 +105,75 @@ test:
         EOF
         cc /tmp/test_s2n.c -o /tmp/test_s2n -ls2n
         /tmp/test_s2n
+    - name: TLS handshake against openssl s_server on the OpenSSL ${{vars.openssl-version}} ABI
+      runs: |
+        set -eu
+        mkdir -p /tmp/tls && cd /tmp/tls
+        for name in ca other-ca; do
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=s2n-test-$name" \
+            -keyout $name.key -out $name.crt 2>/dev/null
+        done
+        openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+          -keyout server.key -out server.csr 2>/dev/null
+        printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > server.ext
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+          -days 1 -extfile server.ext -out server.crt 2>/dev/null
+        # Client that creates a connection and negotiates TLS with certificate
+        # validation. s2n_connection_new() used to fail on OpenSSL 4.0 because
+        # the default provider does not offer MD5-SHA1 and SHA224.
+        cat > client.c << 'EOF'
+        #include <arpa/inet.h>
+        #include <s2n.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <sys/socket.h>
+        #include <unistd.h>
+
+        #define FAIL(what) do { fprintf(stderr, "%s: %s (%s)\n", what, \
+            s2n_strerror(s2n_errno, "EN"), s2n_strerror_debug(s2n_errno, "EN")); return 1; } while (0)
+
+        int main(int argc, char **argv) {
+            if (argc != 4) return 2;
+            if (s2n_init() != S2N_SUCCESS) FAIL("s2n_init");
+            struct s2n_config *config = s2n_config_new();
+            if (!config) FAIL("s2n_config_new");
+            if (s2n_config_set_cipher_preferences(config, argv[3]) != S2N_SUCCESS) FAIL("cipher preferences");
+            if (s2n_config_set_verification_ca_location(config, argv[1], NULL) != S2N_SUCCESS) FAIL("CA");
+            struct s2n_connection *conn = s2n_connection_new(S2N_CLIENT);
+            if (!conn) FAIL("s2n_connection_new");
+            if (s2n_connection_set_config(conn, config) != S2N_SUCCESS) FAIL("set_config");
+            if (s2n_set_server_name(conn, "localhost") != S2N_SUCCESS) FAIL("server name");
+
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[2])) };
+            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+            if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) { perror("connect"); return 1; }
+            if (s2n_connection_set_fd(conn, fd) != S2N_SUCCESS) FAIL("set_fd");
+
+            s2n_blocked_status blocked = S2N_NOT_BLOCKED;
+            if (s2n_negotiate(conn, &blocked) != S2N_SUCCESS) FAIL("s2n_negotiate");
+            printf("negotiated protocol=%d cipher=%s\n",
+                    s2n_connection_get_actual_protocol_version(conn), s2n_connection_get_cipher(conn));
+            s2n_shutdown(conn, &blocked);
+            close(fd);
+            return 0;
+        }
+        EOF
+        cc client.c -o client -ls2n
+        handshake() {
+          openssl s_server -quiet -accept 4433 -cert server.crt -key server.key "$1" -naccept 1 \
+            >/dev/null 2>&1 &
+          sleep 1
+          ./client "$2" 4433 "$3"
+        }
+        # 34 is TLS 1.3 and 33 is TLS 1.2 in s2n.
+        handshake -tls1_3 ca.crt default_tls13 | grep 'protocol=34'
+        handshake -tls1_2 ca.crt default | grep 'protocol=33'
+        # A server certificate from an untrusted CA must be rejected.
+        if handshake -tls1_3 other-ca.crt default_tls13; then
+          echo "handshake with an untrusted server certificate succeeded" >&2
+          exit 1
+        fi
 
 update:
   enabled: true

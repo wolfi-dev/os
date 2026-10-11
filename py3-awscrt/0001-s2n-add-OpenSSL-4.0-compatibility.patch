@@ -1,0 +1,372 @@
+From 73e9018e3cc6c5e0913f0b643ad59e182d98b586 Mon Sep 17 00:00:00 2001
+From: kaukabrizvi <100529019+kaukabrizvi@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 17:06:02 -0700
+Subject: [PATCH] feat: add OpenSSL 4.0 compatibility (#6111)
+
+Signed-off-by: Sebastian Andrzej Siewior <sebastian@breakpoint.cc>
+Co-authored-by: Sebastian Andrzej Siewior <sebastian@breakpoint.cc>
+(cherry picked from commit b170000016fb44fa4dfdd86ed0b75bd28241e707)
+---
+ crypto/s2n_certificate.c                      | 36 ++++++++-------
+ crypto/s2n_openssl_x509.c                     |  4 +-
+ crypto/s2n_openssl_x509.h                     | 16 +++++++
+ ...LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.c | 28 ++++++++++++
+ ...RYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.flags |  0
+ ...2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.c | 44 +++++++++++++++++++
+ ...IBCRYPTO_SUPPORTS_CONST_X509_GETTERS.flags |  1 +
+ tls/extensions/s2n_cert_authorities.c         |  8 +++-
+ tls/s2n_crl.c                                 |  7 ++-
+ tls/s2n_x509_validator.c                      | 12 ++---
+ 10 files changed, 127 insertions(+), 29 deletions(-)
+ create mode 100644 tests/features/S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.c
+ create mode 100644 tests/features/S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.flags
+ create mode 100644 tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.c
+ create mode 100644 tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.flags
+
+diff --git a/crypto/s2n_certificate.c b/crypto/s2n_certificate.c
+index caece6dd..f1879c5a 100644
+--- a/crypto/s2n_certificate.c
++++ b/crypto/s2n_certificate.c
+@@ -233,8 +233,8 @@ int s2n_cert_chain_and_key_load_sans(struct s2n_cert_chain_and_key *chain_and_ke
+ 
+         if (san_name->type == GEN_DNS) {
+             /* Decoding isn't necessary here since a DNS SAN name is ASCII(type V_ASN1_IA5STRING) */
+-            unsigned char *san_str = san_name->d.dNSName->data;
+-            const size_t san_str_len = san_name->d.dNSName->length;
++            const unsigned char *san_str = S2N_ASN1_STRING_DATA(san_name->d.dNSName);
++            const size_t san_str_len = ASN1_STRING_length(san_name->d.dNSName);
+             struct s2n_blob *san_blob = NULL;
+             POSIX_GUARD_RESULT(s2n_array_pushback(chain_and_key->san_names, (void **) &san_blob));
+             if (!san_blob) {
+@@ -271,19 +271,19 @@ int s2n_cert_chain_and_key_load_cns(struct s2n_cert_chain_and_key *chain_and_key
+     POSIX_ENSURE_REF(chain_and_key->cn_names);
+     POSIX_ENSURE_REF(x509_cert);
+ 
+-    X509_NAME *subject = X509_get_subject_name(x509_cert);
++    S2N_X509_CONST X509_NAME *subject = X509_get_subject_name(x509_cert);
+     if (!subject) {
+         return 0;
+     }
+ 
+     int lastpos = -1;
+     while ((lastpos = X509_NAME_get_index_by_NID(subject, NID_commonName, lastpos)) >= 0) {
+-        X509_NAME_ENTRY *name_entry = X509_NAME_get_entry(subject, lastpos);
++        S2N_X509_CONST X509_NAME_ENTRY *name_entry = X509_NAME_get_entry(subject, lastpos);
+         if (!name_entry) {
+             continue;
+         }
+ 
+-        ASN1_STRING *asn1_str = X509_NAME_ENTRY_get_data(name_entry);
++        S2N_X509_CONST ASN1_STRING *asn1_str = X509_NAME_ENTRY_get_data(name_entry);
+         if (!asn1_str) {
+             continue;
+         }
+@@ -727,11 +727,12 @@ static int s2n_utf8_string_from_extension_data(const uint8_t *extension_data, ui
+     POSIX_ENSURE_GTE(len, 0);
+     if (out_data != NULL) {
+         POSIX_ENSURE((int64_t) *out_len >= (int64_t) len, S2N_ERR_INSUFFICIENT_MEM_SIZE);
+-        /* ASN1_STRING_data() returns an internal pointer to the data.
+-        * Since this is an internal pointer it should not be freed or modified in any way.
+-        * Ref: https://www.openssl.org/docs/man1.0.2/man3/ASN1_STRING_data.html.
+-        */
+-        unsigned char *internal_data = ASN1_STRING_data(asn1_str);
++        /* ASN1_STRING_get0_data(x) returns an internal pointer to the data of
++         * x. Since this is an internal pointer it should not be freed or
++         * modified in any way.
++         * Ref: https://docs.openssl.org/master/man3/ASN1_STRING_length/
++         */
++        const unsigned char *internal_data = S2N_ASN1_STRING_DATA(asn1_str);
+         POSIX_ENSURE_REF(internal_data);
+         POSIX_CHECKED_MEMCPY(out_data, internal_data, len);
+     }
+@@ -794,7 +795,7 @@ static int s2n_parse_x509_extension(struct s2n_cert *cert, const uint8_t *oid,
+     POSIX_ENSURE_REF(asn1_obj_in);
+ 
+     for (size_t loc = 0; loc < ext_count; loc++) {
+-        ASN1_OCTET_STRING *asn1_str = NULL;
++        S2N_X509_CONST ASN1_OCTET_STRING *asn1_str = NULL;
+         bool match_found = false;
+ 
+         /* Retrieve the x509 extension at location loc.
+@@ -803,7 +804,7 @@ static int s2n_parse_x509_extension(struct s2n_cert *cert, const uint8_t *oid,
+          * The returned extension is an internal pointer which must not be freed up by the application.
+          * Ref: https://www.openssl.org/docs/man1.1.0/man3/X509_get_ext.html.
+          */
+-        X509_EXTENSION *x509_ext = X509_get_ext(x509_cert, loc);
++        S2N_X509_CONST X509_EXTENSION *x509_ext = X509_get_ext(x509_cert, loc);
+         POSIX_ENSURE_REF(x509_ext);
+ 
+         /* Retrieve the extension object/OID/extnId.
+@@ -811,7 +812,7 @@ static int s2n_parse_x509_extension(struct s2n_cert *cert, const uint8_t *oid,
+          * The returned pointer is an internal value which must not be freed up.
+          * Ref: https://www.openssl.org/docs/man1.1.0/man3/X509_EXTENSION_get_object.html.
+          */
+-        ASN1_OBJECT *asn1_obj = X509_EXTENSION_get_object(x509_ext);
++        S2N_X509_CONST ASN1_OBJECT *asn1_obj = X509_EXTENSION_get_object(x509_ext);
+         POSIX_ENSURE_REF(asn1_obj);
+ 
+         /* OBJ_cmp() compares two ASN1_OBJECT objects. If the two are identical 0 is returned.
+@@ -834,11 +835,12 @@ static int s2n_parse_x509_extension(struct s2n_cert *cert, const uint8_t *oid,
+             if (ext_value != NULL) {
+                 POSIX_ENSURE_GTE(len, 0);
+                 POSIX_ENSURE(*ext_value_len >= (uint32_t) len, S2N_ERR_INSUFFICIENT_MEM_SIZE);
+-                /* ASN1_STRING_data() returns an internal pointer to the data.
+-                 * Since this is an internal pointer it should not be freed or modified in any way.
+-                 * Ref: https://www.openssl.org/docs/man1.0.2/man3/ASN1_STRING_data.html.
++                /* ASN1_STRING_get0_data(x) returns an internal pointer to the data of
++                 * x. Since this is an internal pointer it should not be freed or
++                 * modified in any way.
++                 * Ref: https://docs.openssl.org/master/man3/ASN1_STRING_length/
+                  */
+-                unsigned char *internal_data = ASN1_STRING_data(asn1_str);
++                const unsigned char *internal_data = S2N_ASN1_STRING_DATA(asn1_str);
+                 POSIX_ENSURE_REF(internal_data);
+                 POSIX_CHECKED_MEMCPY(ext_value, internal_data, len);
+             }
+diff --git a/crypto/s2n_openssl_x509.c b/crypto/s2n_openssl_x509.c
+index 550f8155..d0dd7b2f 100644
+--- a/crypto/s2n_openssl_x509.c
++++ b/crypto/s2n_openssl_x509.c
+@@ -93,10 +93,10 @@ S2N_RESULT s2n_openssl_x509_get_cert_info(X509 *cert, struct s2n_cert_info *info
+     RESULT_ENSURE_REF(cert);
+     RESULT_ENSURE_REF(info);
+ 
+-    X509_NAME *issuer_name = X509_get_issuer_name(cert);
++    S2N_X509_CONST X509_NAME *issuer_name = X509_get_issuer_name(cert);
+     RESULT_ENSURE_REF(issuer_name);
+ 
+-    X509_NAME *subject_name = X509_get_subject_name(cert);
++    S2N_X509_CONST X509_NAME *subject_name = X509_get_subject_name(cert);
+     RESULT_ENSURE_REF(subject_name);
+ 
+     if (X509_NAME_cmp(issuer_name, subject_name) == 0) {
+diff --git a/crypto/s2n_openssl_x509.h b/crypto/s2n_openssl_x509.h
+index 41784949..f327558f 100644
+--- a/crypto/s2n_openssl_x509.h
++++ b/crypto/s2n_openssl_x509.h
+@@ -23,6 +23,22 @@
+ #include "utils/s2n_blob.h"
+ #include "utils/s2n_safety.h"
+ 
++/* OpenSSL 4.0 and AWS-LC return const pointers from the X509 getters. Older
++ * OpenSSL returns non-const. Qualify the declaration instead of duplicating it.
++ */
++#if defined(S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS)
++    #define S2N_X509_CONST const
++#else
++    #define S2N_X509_CONST
++#endif
++
++/* ASN1_STRING_data was removed in OpenSSL 4.0. Its replacement returns const. */
++#if defined(S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA)
++    #define S2N_ASN1_STRING_DATA(str) ASN1_STRING_get0_data(str)
++#else
++    #define S2N_ASN1_STRING_DATA(str) ASN1_STRING_data(str)
++#endif
++
+ #define S2N_MAX_ALLOWED_CERT_TRAILING_BYTES 3
+ 
+ DEFINE_POINTER_CLEANUP_FUNC(X509 *, X509_free);
+diff --git a/tests/features/S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.c b/tests/features/S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.c
+new file mode 100644
+index 00000000..e1c8c7b6
+--- /dev/null
++++ b/tests/features/S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.c
+@@ -0,0 +1,28 @@
++/*
++ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * A copy of the License is located at
++ *
++ *  http://aws.amazon.com/apache2.0
++ *
++ * or in the "license" file accompanying this file. This file is distributed
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
++ * express or implied. See the License for the specific language governing
++ * permissions and limitations under the License.
++ */
++
++#include <openssl/asn1.h>
++
++int main()
++{
++    /* ASN1_STRING_get0_data() replaces both direct ASN1_STRING member access
++     * and ASN1_STRING_data(), which were removed in OpenSSL 4.0.
++     */
++    const ASN1_STRING *asn1_str = NULL;
++    const unsigned char *data = ASN1_STRING_get0_data(asn1_str);
++    (void) data;
++
++    return 0;
++}
+diff --git a/tests/features/S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.flags b/tests/features/S2N_LIBCRYPTO_SUPPORTS_ASN1_STRING_GET0_DATA.flags
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.c b/tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.c
+new file mode 100644
+index 00000000..b0dead45
+--- /dev/null
++++ b/tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.c
+@@ -0,0 +1,44 @@
++/*
++ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * A copy of the License is located at
++ *
++ *  http://aws.amazon.com/apache2.0
++ *
++ * or in the "license" file accompanying this file. This file is distributed
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
++ * express or implied. See the License for the specific language governing
++ * permissions and limitations under the License.
++ */
++
++#include <openssl/x509.h>
++
++/* OpenSSL 4.0 changed the X509 getters to return const pointers, so callers
++ * must hold the results in const variables. Older OpenSSL headers declare the
++ * corresponding read-only APIs with non-const parameters, which rejects those
++ * const variables. This probe compiles the const-qualified usage with -Werror
++ * so that it only succeeds when the libcrypto headers accept const arguments
++ * throughout.
++ */
++int main()
++{
++    X509 *x509_cert = NULL;
++
++    const X509_NAME *subject = X509_get_subject_name(x509_cert);
++    int idx = X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
++    (void) idx;
++
++    const X509_NAME_ENTRY *name_entry = X509_NAME_get_entry(subject, 0);
++    const ASN1_STRING *asn1_str = X509_NAME_ENTRY_get_data(name_entry);
++    (void) asn1_str;
++
++    const X509_EXTENSION *x509_ext = X509_get_ext(x509_cert, 0);
++    const ASN1_OBJECT *asn1_obj = X509_EXTENSION_get_object(x509_ext);
++    (void) asn1_obj;
++    const ASN1_OCTET_STRING *ext_data = X509_EXTENSION_get_data(x509_ext);
++    (void) ext_data;
++
++    return 0;
++}
+diff --git a/tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.flags b/tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.flags
+new file mode 100644
+index 00000000..2f41be66
+--- /dev/null
++++ b/tests/features/S2N_LIBCRYPTO_SUPPORTS_CONST_X509_GETTERS.flags
+@@ -0,0 +1 @@
++-Werror
+diff --git a/tls/extensions/s2n_cert_authorities.c b/tls/extensions/s2n_cert_authorities.c
+index 40e6f499..f1e17434 100644
+--- a/tls/extensions/s2n_cert_authorities.c
++++ b/tls/extensions/s2n_cert_authorities.c
+@@ -16,6 +16,7 @@
+ 
+ #include <openssl/x509.h>
+ 
++#include "crypto/s2n_openssl_x509.h"
+ #include "utils/s2n_safety.h"
+ 
+ bool s2n_cert_authorities_supported_from_trust_store()
+@@ -55,12 +56,15 @@ static S2N_RESULT s2n_cert_authorities_set_from_trust_store(struct s2n_config *c
+             continue;
+         }
+ 
+-        X509_NAME *name = X509_get_subject_name(cert);
++        S2N_X509_CONST X509_NAME *name = X509_get_subject_name(cert);
+         RESULT_ENSURE(name, S2N_ERR_INTERNAL_LIBCRYPTO_ERROR);
+ 
+         const uint8_t *name_bytes = NULL;
+         size_t name_size = 0;
+-        RESULT_GUARD_OSSL(X509_NAME_get0_der(name, &name_bytes, &name_size),
++        /* Some libcryptos (AWS-LC) return a const X509_NAME* from
++         * X509_get_subject_name but still take a non-const X509_NAME* in
++         * X509_NAME_get0_der, which only reads the name. Cast to bridge that. */
++        RESULT_GUARD_OSSL(X509_NAME_get0_der((X509_NAME *) (uintptr_t) name, &name_bytes, &name_size),
+                 S2N_ERR_INTERNAL_LIBCRYPTO_ERROR);
+ 
+         RESULT_GUARD_POSIX(s2n_stuffer_write_uint16(&output, name_size));
+diff --git a/tls/s2n_crl.c b/tls/s2n_crl.c
+index f99cfc08..1c35ba98 100644
+--- a/tls/s2n_crl.c
++++ b/tls/s2n_crl.c
+@@ -15,6 +15,7 @@
+ 
+ #include "s2n_crl.h"
+ 
++#include "crypto/s2n_openssl_x509.h"
+ #include "tls/s2n_connection.h"
+ 
+ struct s2n_crl *s2n_crl_new(void)
+@@ -81,10 +82,12 @@ int s2n_crl_get_issuer_hash(struct s2n_crl *crl, uint64_t *hash)
+     POSIX_ENSURE_REF(crl->crl);
+     POSIX_ENSURE_REF(hash);
+ 
+-    X509_NAME *crl_name = X509_CRL_get_issuer(crl->crl);
++    S2N_X509_CONST X509_NAME *crl_name = X509_CRL_get_issuer(crl->crl);
+     POSIX_ENSURE_REF(crl_name);
+ 
+-    unsigned long temp_hash = X509_NAME_hash(crl_name);
++    /* X509_NAME_hash takes a non-const X509_NAME* even on libcryptos (AWS-LC)
++     * whose X509_CRL_get_issuer returns const; it only reads the name. */
++    unsigned long temp_hash = X509_NAME_hash((X509_NAME *) (uintptr_t) crl_name);
+     POSIX_ENSURE(temp_hash != 0, S2N_ERR_INTERNAL_LIBCRYPTO_ERROR);
+ 
+     *hash = temp_hash;
+diff --git a/tls/s2n_x509_validator.c b/tls/s2n_x509_validator.c
+index 1ce15c1c..f9cbe630 100644
+--- a/tls/s2n_x509_validator.c
++++ b/tls/s2n_x509_validator.c
+@@ -235,7 +235,7 @@ static S2N_RESULT s2n_verify_host_information_san_entry(struct s2n_connection *c
+     if (current_name->type == GEN_DNS || current_name->type == GEN_URI) {
+         *san_found = true;
+ 
+-        const char *name = (const char *) ASN1_STRING_data(current_name->d.ia5);
++        const char *name = (const char *) S2N_ASN1_STRING_DATA(current_name->d.ia5);
+         RESULT_ENSURE_REF(name);
+         int name_len = ASN1_STRING_length(current_name->d.ia5);
+         RESULT_ENSURE_GT(name_len, 0);
+@@ -249,9 +249,9 @@ static S2N_RESULT s2n_verify_host_information_san_entry(struct s2n_connection *c
+         *san_found = true;
+ 
+         /* try to validate an IP address if it's in the subject alt name. */
+-        const unsigned char *ip_addr = current_name->d.iPAddress->data;
++        const unsigned char *ip_addr = S2N_ASN1_STRING_DATA(current_name->d.iPAddress);
+         RESULT_ENSURE_REF(ip_addr);
+-        int ip_addr_len = current_name->d.iPAddress->length;
++        int ip_addr_len = ASN1_STRING_length(current_name->d.iPAddress);
+         RESULT_ENSURE_GT(ip_addr_len, 0);
+ 
+         RESULT_STACK_BLOB(address, INET6_ADDRSTRLEN + 1, INET6_ADDRSTRLEN + 1);
+@@ -317,7 +317,7 @@ static S2N_RESULT s2n_verify_host_information_common_name(struct s2n_connection
+     RESULT_ENSURE_REF(public_cert);
+     RESULT_ENSURE_REF(cn_found);
+ 
+-    X509_NAME *subject_name = X509_get_subject_name(public_cert);
++    S2N_X509_CONST X509_NAME *subject_name = X509_get_subject_name(public_cert);
+     RESULT_ENSURE(subject_name, S2N_ERR_CERT_UNTRUSTED);
+ 
+     int curr_idx = -1;
+@@ -332,7 +332,7 @@ static S2N_RESULT s2n_verify_host_information_common_name(struct s2n_connection
+ 
+     RESULT_ENSURE(curr_idx >= 0, S2N_ERR_CERT_UNTRUSTED);
+ 
+-    ASN1_STRING *common_name = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject_name, curr_idx));
++    S2N_X509_CONST ASN1_STRING *common_name = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject_name, curr_idx));
+     RESULT_ENSURE(common_name, S2N_ERR_CERT_UNTRUSTED);
+ 
+     /* X520CommonName allows the following ANSI string types per RFC 5280 Appendix A.1 */
+@@ -351,7 +351,7 @@ static S2N_RESULT s2n_verify_host_information_common_name(struct s2n_connection
+     RESULT_ENSURE_GT(cn_len, 0);
+     uint32_t len = (uint32_t) cn_len;
+     RESULT_ENSURE_LTE(len, s2n_array_len(peer_cn) - 1);
+-    RESULT_CHECKED_MEMCPY(peer_cn, ASN1_STRING_data(common_name), len);
++    RESULT_CHECKED_MEMCPY(peer_cn, S2N_ASN1_STRING_DATA(common_name), len);
+ 
+     /* According to https://www.rfc-editor.org/rfc/rfc6125#section-6.4.4,
+      * the CN fallback only applies to fully qualified DNS domain names.

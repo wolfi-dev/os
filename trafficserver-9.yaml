@@ -1,13 +1,13 @@
 package:
   name: trafficserver-9
   version: "9.2.15"
-  epoch: 3 # openssl: 3.6->4.0, backport OpenSSL 4 support
+  epoch: 2
   description: Apache Traffic Server™ is a fast, scalable and extensible HTTP/1.1 and HTTP/2 compliant caching proxy server.
   copyright:
     - license: Apache-2.0
 
 vars:
-  openssl-version: "4.0"
+  openssl-version: "3.6"
 
 environment:
   contents:
@@ -30,10 +30,6 @@ pipeline:
       expected-commit: f671e525110be50452f607fc1f2657f3dba7fe3b
       repository: https://github.com/apache/trafficserver
       tag: ${{package.version}}
-
-  - uses: patch
-    with:
-      patches: openssl4-const-asn1.patch openssl4-no-engine.patch openssl4-handshake-bio-eof.patch
 
   - runs: |
       autoreconf -if
@@ -65,12 +61,6 @@ update:
     tag-filter-prefix: 9.
 
 test:
-  environment:
-    contents:
-      packages:
-        - curl
-        - openssl-${{vars.openssl-version}}
-        - wait-for-port
   pipeline:
     - name: Verify Traffic Server binaries
       runs: |
@@ -93,74 +83,5 @@ test:
         # Valid short-form Via headers must be exactly 6 characters
         traffic_via uScMsS 2>&1
         traffic_via uHsMsS 2>&1
-    - name: TLS listener on the OpenSSL ${{vars.openssl-version}} ABI
-      runs: |
-        set -euo pipefail
-        cd "$(mktemp -d)"
-        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
-          -keyout server.key -out server.crt 2>/dev/null
-        # The configuration lives in /etc (pkgsysconfdir). Loading the
-        # certificate reads its subject CN through the const X509_NAME getters.
-        echo "dest_ip=* ssl_cert_name=$PWD/server.crt ssl_key_name=$PWD/server.key" > /etc/ssl_multicert.config
-        # Listen for TLS on 8443, and stay root (#-1) so the server can read
-        # the key in this private directory.
-        sed -i \
-          -e 's/^CONFIG proxy.config.http.server_ports STRING .*/CONFIG proxy.config.http.server_ports STRING 8080 8443:ssl/' \
-          -e '/^CONFIG proxy.config.admin.user_id /d' \
-          /etc/records.config
-        echo 'CONFIG proxy.config.admin.user_id STRING #-1' >> /etc/records.config
-        grep -x 'CONFIG proxy.config.http.server_ports STRING 8080 8443:ssl' /etc/records.config
-        grep -x 'CONFIG proxy.config.admin.user_id STRING #-1' /etc/records.config
-        mkdir -p /var/log/trafficserver /var/trafficserver
-        traffic_server > traffic_server.log 2>&1 &
-        ts_pid=$!
-        stop_ts() { kill -9 "$ts_pid" 2>/dev/null || true; wait "$ts_pid" 2>/dev/null || true; }
-        trap stop_ts EXIT
-        wait-for-port 8443 -t 30
-        # Without the BIO_ctrl_pending() backport the server-side handshake
-        # stalls on OpenSSL 4 and s_client times out.
-        for v in 2 3; do
-          timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername localhost \
-            -tls1_$v </dev/null > s_client.log 2>&1 || true
-          grep -E "Protocol *: *TLSv1\.$v\$" s_client.log
-          grep -x 'subject=CN=localhost' s_client.log
-        done
-        curl -sk --max-time 10 https://127.0.0.1:8443/ | grep 'Not Found on Accelerator'
-        grep -m1 -E '/libssl\.so\.4$' "/proc/$ts_pid/maps"
-        if grep -E '/lib(ssl|crypto)\.so\.3$' "/proc/$ts_pid/maps"; then
-          echo "traffic_server mapped OpenSSL 3" >&2
-          exit 1
-        fi
-    - name: certifier plugin signs certificates on the OpenSSL ${{vars.openssl-version}} ABI
-      runs: |
-        set -euo pipefail
-        cd "$(mktemp -d)"
-        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
-          -keyout server.key -out server.crt 2>/dev/null
-        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=ts-test-ca \
-          -keyout ca.key -out ca.crt 2>/dev/null
-        echo 01 > ca-serial.txt
-        mkdir certs
-        echo "dest_ip=* ssl_cert_name=$PWD/server.crt ssl_key_name=$PWD/server.key" > /etc/ssl_multicert.config
-        echo "certifier.so --store=$PWD/certs --max=8 --sign-cert=$PWD/ca.crt --sign-key=$PWD/ca.key --sign-serial=$PWD/ca-serial.txt" > /etc/plugin.config
-        sed -i \
-          -e 's/^CONFIG proxy.config.http.server_ports STRING .*/CONFIG proxy.config.http.server_ports STRING 8080 8443:ssl/' \
-          -e '/^CONFIG proxy.config.admin.user_id /d' \
-          /etc/records.config
-        echo 'CONFIG proxy.config.admin.user_id STRING #-1' >> /etc/records.config
-        mkdir -p /var/log/trafficserver /var/trafficserver
-        traffic_server > traffic_server.log 2>&1 &
-        ts_pid=$!
-        stop_ts() { kill -9 "$ts_pid" 2>/dev/null || true; wait "$ts_pid" 2>/dev/null || true; }
-        trap stop_ts EXIT
-        wait-for-port 8443 -t 30
-        # For a new SNI name the plugin builds a CSR in mkcsr() and signs it
-        # with the CA key in mkcrt().
-        timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername gen.example.test \
-          </dev/null > s_client.log 2>&1 || true
-        grep -x 'subject=CN=gen.example.test' s_client.log
-        grep -x 'issuer=CN=ts-test-ca' s_client.log
-        sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' s_client.log > gen.crt
-        openssl verify -CAfile ca.crt gen.crt
     - uses: test/pkgconf
     - uses: test/tw/ldd-check

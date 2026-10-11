@@ -1,0 +1,301 @@
+From 815dedd031ddec0db846d2e6d06d40d5057e1aee Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@chainguard.dev>
+Date: Tue, 15 Sep 2026 10:41:57 +0000
+Subject: [PATCH 3/3] Gate every legacy algorithm behind a new
+ "enable-legacy-allowed" switch
+
+Add a provider parameter "enable-legacy-allowed", defaulting to 0.  While
+it is off, the provider's query callback answers every operation with an
+empty algorithm list, so nothing from this module can be fetched -- the
+same outcome as "activate = 0" -- but the provider is still loaded,
+activated and registered with the core: OSSL_PROVIDER_available() reports
+it, "openssl list -providers" shows it as active, and its parameters can
+be queried.  Set it with "enable-legacy-allowed = 1" in the provider's
+configuration section, OSSL_PROVIDER_add_conf_parameter(), or
+-provparam legacy:enable-legacy-allowed=1 on the command line.
+
+The value is read the same way as "enable-des", through the core's
+get_params upcall with ossl_prov_ctx_get_bool_param(), and is checked
+before the per-operation switch, so "enable-des" has no effect unless the
+provider as a whole is enabled.  Because the core remembers which
+operations it has already asked a provider about, both parameters must be
+set before the first fetch; this is now noted in the source and README.
+
+The test configurations that activate the legacy provider --
+test/legacy.cnf, test/default-and-legacy.cnf and the 90-test_includes
+data file -- set the parameter, so the test suite continues to see the
+full algorithm set.  Those with "activate = false" are unchanged.
+
+Verified with a no-asm no-quic no-secure-memory build: legacy.so still
+depends only on libc and exports only OSSL_provider_init; "openssl list"
+shows no legacy algorithms by default, seven with the switch, nine with
+enable-des as well, and none with enable-des alone; the provider stays
+listed as active in the off state; an MD5 fetch with -propquery
+provider=legacy succeeds with the switch and fails without it; evp_test on
+evpciph_rc4.txt passes under the updated test/legacy.cnf and fails rather
+than skipping when the switch line is removed; and conf_include_test
+-providers passes.
+
+README-LEGACY-FREESTANDING.md documents the parameter, the updated
+"openssl list" and known-answer command lines, and the first-fetch caveat.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Assisted-by: Claude:claude-fable-5-1
+---
+ README-LEGACY-FREESTANDING.md                 | 68 +++++++++++++++----
+ providers/legacyprov.c                        | 31 +++++++--
+ test/default-and-legacy.cnf                   |  1 +
+ test/legacy.cnf                               |  1 +
+ test/provider_test.c                          | 12 +++-
+ .../conf-includes-prov/inc-legacy.cnf         |  1 +
+ 6 files changed, 95 insertions(+), 19 deletions(-)
+
+diff --git a/README-LEGACY-FREESTANDING.md b/README-LEGACY-FREESTANDING.md
+index 24ecf90343..3df0520520 100644
+--- a/README-LEGACY-FREESTANDING.md
++++ b/README-LEGACY-FREESTANDING.md
+@@ -7,7 +7,8 @@ The resulting module depends only on the C library, exports a single symbol
+ (`OSSL_provider_init`) and can therefore be loaded by a `libcrypto` it was not
+ built against.
+ 
+-The algorithm set is deliberately small:
++The algorithm set is deliberately small, and none of it is offered until
++the provider is told to (see "Enabling the provider" below):
+ 
+ | Operation | Algorithms                                                  |
+ |-----------|-------------------------------------------------------------|
+@@ -17,6 +18,32 @@ The algorithm set is deliberately small:
+ 
+ No KDFs, no key management and no other ciphers or digests are registered.
+ 
++### Enabling the provider
++
++Loading and activating the module registers nothing by itself.  A second
++switch, the provider parameter `enable-legacy-allowed`, defaults to `0`, and
++while it is off every operation query from the core is answered with an empty
++list.  For fetches this is indistinguishable from `activate = 0`; the
++difference is that the provider is loaded, activated and stays registered
++with the core, so `OSSL_PROVIDER_available()` reports it, `openssl list
++-providers` shows it, and its parameters can be queried.  Set it in the
++provider's configuration section:
++
++    [legacy_sect]
++    activate = 1
++    enable-legacy-allowed = 1
++
++or, for the command-line tools, after loading the provider:
++
++    openssl dgst -provider legacy -provparam legacy:enable-legacy-allowed=1 ...
++
++Programmatically, call `OSSL_PROVIDER_add_conf_parameter(prov,
++"enable-legacy-allowed", "1")` on the loaded provider before the first fetch.
++The value is parsed like `enable-des` below, and has to be set before the
++first fetch for the same reason.  `test/legacy.cnf`,
++`test/default-and-legacy.cnf` and the `90-test_includes` data file that
++activate this provider all set it, so the test suite sees the full set.
++
+ ### Enabling DES
+ 
+ DES-CBC and DES-EDE3-CBC are compiled in but not registered unless the
+@@ -36,8 +63,13 @@ Programmatically, call `OSSL_PROVIDER_add_conf_parameter(prov, "enable-des",
+ through the core's `get_params` each time the cipher list is queried, using
+ the same parser as the other providers: `1`, `yes`, `true` and `on` enable,
+ `0`, `no`, `false` and `off` disable, anything else is treated as the default.
+-Without it, `openssl list` shows seven algorithms from this provider; with
+-it, nine.  A `no-des` build has nothing to enable and ignores the parameter.
++The core remembers which operations it has already asked a provider about,
++so a value set after the first fetch of that operation is not seen until the
++method store is flushed (for example by activating another provider).
++With `enable-legacy-allowed = 1` alone, `openssl list` shows seven algorithms
++from this provider; with `enable-des = 1` as well, nine.  `enable-des` has no
++effect while `enable-legacy-allowed` is off.  A `no-des` build has nothing to
++enable and ignores the parameter.
+ 
+ ### Configure options that shrink the set further
+ 
+@@ -178,19 +210,28 @@ The module should depend on nothing but the C library:
+     $ nm -D --defined-only providers/legacy.so
+     0000000000006f10 T OSSL_provider_init
+ 
+-And it should offer exactly seven algorithms by default, nine with DES
+-enabled:
++And it should offer no algorithms by default, exactly seven with
++`enable-legacy-allowed`, and nine with DES enabled as well:
+ 
+     export LD_LIBRARY_PATH=$PWD OPENSSL_CONF=/dev/null
+     ./apps/openssl list -digest-algorithms -cipher-algorithms \
+         -provider-path $PWD/providers -provider legacy | grep '@ legacy'
+     ./apps/openssl list -digest-algorithms -cipher-algorithms \
+         -provider-path $PWD/providers -provider legacy \
++        -provparam legacy:enable-legacy-allowed=1 | grep '@ legacy'
++    ./apps/openssl list -digest-algorithms -cipher-algorithms \
++        -provider-path $PWD/providers -provider legacy \
++        -provparam legacy:enable-legacy-allowed=1 \
+         -provparam legacy:enable-des=1 | grep '@ legacy'
+ 
++The first command prints nothing, yet `openssl list -providers` with the same
++`-provider-path` and `-provider` options still lists the legacy provider as
++active.
++
+ Known-answer checks, forcing every fetch through this provider:
+ 
+     P="-provider-path $PWD/providers -provider legacy -propquery provider=legacy"
++    P="$P -provparam legacy:enable-legacy-allowed=1"
+     PD="$P -provparam legacy:enable-des=1"
+     printf 'abc' > /tmp/abc
+ 
+@@ -277,8 +318,9 @@ No stock data file exercises the two DES ciphers in isolation.
+ offer; the latter also fetches DES-EDE3-CBC from the default provider when
+ both are loaded.  Use the `openssl enc` known-answer checks under
+ "Verifying" above, which force the fetch to `provider=legacy` and pass
+-`enable-des=1`.  (`test/legacy.cnf` and `test/default-and-legacy.cnf` do not
+-set `enable-des`, so DES stanzas would be unavailable under them anyway.)
++`enable-des=1`.  (`test/legacy.cnf` and `test/default-and-legacy.cnf` set
++`enable-legacy-allowed` but not `enable-des`, so DES stanzas would be
++unavailable under them anyway.)
+ 
+ **`OPENSSL_MODULES` must be set for these.**  Without it, `evp_test` cannot
+ find the module, silently skips every legacy stanza with
+@@ -348,11 +390,13 @@ because they would otherwise pull in most of the library:
+ algorithms are self-contained and never fetch anything from the core, and not
+ creating one is what removes the last dependency on `libcrypto`.  The two
+ remaining upcalls — entropy for random DES keys, and `core_get_params` for
+-`enable-des` — go through the `OSSL_CORE_HANDLE` the core passes at init, not
+-through a library context.  `enable-des` is evaluated in the provider's
+-`query_operation` callback with `ossl_prov_ctx_get_bool_param()`; the DES
+-entries sit at the front of the cipher table so the disabled view is the same
+-array starting two entries in.
++`enable-legacy-allowed` and `enable-des` — go through the `OSSL_CORE_HANDLE`
++the core passes at init, not through a library context.  Both parameters are
++evaluated in the provider's `query_operation` callback with
++`ossl_prov_ctx_get_bool_param()`: with `enable-legacy-allowed` off the
++callback returns `NULL` for every operation, and the DES entries sit at the
++front of the cipher table so the DES-disabled view is the same array starting
++two entries in.
+ 
+ The implementations themselves are added to `liblegacy.a` by the usual
+ mechanism — a `SOURCE[../../providers/liblegacy.a]` line guarded on
+diff --git a/providers/legacyprov.c b/providers/legacyprov.c
+index 3294a412dd..7219789ee3 100644
+--- a/providers/legacyprov.c
++++ b/providers/legacyprov.c
+@@ -111,11 +111,24 @@ static const OSSL_ALGORITHM legacy_digests[] = {
+ };
+ 
+ /*
+- * The DES ciphers are only registered when the provider is configured with
+- * "enable-des = 1" (in its config section, or via
+- * OSSL_PROVIDER_add_conf_parameter()).  They are placed first so that the
+- * disabled view is simply the same array starting after them.
++ * Nothing at all is registered unless the provider is configured with
++ * "enable-legacy-allowed = 1" (in its config section, or via
++ * OSSL_PROVIDER_add_conf_parameter()).  Without it the provider still
++ * loads and activates, and stays registered with the core, but every
++ * operation query answers with an empty algorithm list -- the same
++ * outcome for fetches as "activate = 0", except that the provider is
++ * present and OSSL_PROVIDER_available() reports it.
++ *
++ * On top of that, the DES ciphers are only registered when the provider
++ * is also configured with "enable-des = 1".  They are placed first so that
++ * the disabled view is simply the same array starting after them.
++ *
++ * Both values are read through the core's get_params each time an
++ * operation is queried, but the core remembers which operations a
++ * provider has already been asked about, so they must be set before the
++ * first fetch to take effect.
+  */
++#define LEGACY_ENABLE_ALLOWED_PARAM "enable-legacy-allowed"
+ #ifndef OPENSSL_NO_DES
+ #define LEGACY_DES_CIPHERS 2
+ #else
+@@ -141,6 +154,8 @@ static const OSSL_ALGORITHM *legacy_query(void *provctx, int operation_id,
+     int *no_cache)
+ {
+     *no_cache = 0;
++    if (!ossl_prov_ctx_get_bool_param(provctx, LEGACY_ENABLE_ALLOWED_PARAM, 0))
++        return NULL;
+     switch (operation_id) {
+     case OSSL_OP_DIGEST:
+         return legacy_digests;
+@@ -174,7 +189,10 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+     const OSSL_DISPATCH *tmp;
+     OSSL_FUNC_core_get_params_fn *c_get_params = NULL;
+ 
+-    /* Needed in every build to read "enable-des" from the configuration */
++    /*
++     * Needed in every build to read "enable-legacy-allowed" and "enable-des"
++     * from the configuration
++     */
+     for (tmp = in; tmp->function_id != 0; tmp++)
+         if (tmp->function_id == OSSL_FUNC_CORE_GET_PARAMS)
+             c_get_params = OSSL_FUNC_core_get_params(tmp);
+@@ -228,7 +246,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+      * The things that do need the core are random DES key generation
+      * (OSSL_CIPHER_PARAM_RANDOM_KEY): there is no DRBG in this module, so
+      * the entropy upcalls are recorded here and used in its place; and the
+-     * "enable-des" configuration parameter, read through core_get_params.
++     * "enable-legacy-allowed" and "enable-des" configuration parameters,
++     * read through core_get_params.
+      */
+     if (!ossl_prov_seeding_from_dispatch(in))
+         return 0;
+diff --git a/test/default-and-legacy.cnf b/test/default-and-legacy.cnf
+index 4e288a45ea..19c6a15093 100644
+--- a/test/default-and-legacy.cnf
++++ b/test/default-and-legacy.cnf
+@@ -15,3 +15,4 @@ activate = 1
+ 
+ [legacy_sect]
+ activate = 1
++enable-legacy-allowed = 1
+diff --git a/test/legacy.cnf b/test/legacy.cnf
+index ffbcbd16ba..14315e812d 100644
+--- a/test/legacy.cnf
++++ b/test/legacy.cnf
+@@ -11,3 +11,4 @@ legacy = legacy_sect
+ 
+ [legacy_sect]
+ activate = 1
++enable-legacy-allowed = 1
+diff --git a/test/provider_test.c b/test/provider_test.c
+index 475f9ba08c..0967ffeb27 100644
+--- a/test/provider_test.c
++++ b/test/provider_test.c
+@@ -114,6 +114,10 @@ static int test_provider(OSSL_LIB_CTX **libctx, const char *name,
+          * before this point.
+          */
+         legacy = OSSL_PROVIDER_load(*libctx, "legacy");
++        if (legacy != NULL
++            && !TEST_true(OSSL_PROVIDER_add_conf_parameter(legacy,
++                "enable-legacy-allowed", "1")))
++            goto err;
+         deflt = OSSL_PROVIDER_load(*libctx, "default");
+         if (!TEST_ptr(deflt)
+             || !TEST_true(OSSL_PROVIDER_available(*libctx, "default")))
+@@ -251,7 +255,13 @@ static int test_builtin_provider_with_child(void)
+         return 1;
+     }
+ 
+-    if (!TEST_true(OSSL_PROVIDER_add_builtin(libctx, name,
++    /*
++     * The legacy provider registers nothing until it is told to; the MD4
++     * check below relies on it doing so.
++     */
++    if (!TEST_true(OSSL_PROVIDER_add_conf_parameter(legacy,
++            "enable-legacy-allowed", "1"))
++        || !TEST_true(OSSL_PROVIDER_add_builtin(libctx, name,
+             PROVIDER_INIT_FUNCTION_NAME))) {
+         OSSL_PROVIDER_unload(legacy);
+         OSSL_LIB_CTX_free(libctx);
+diff --git a/test/recipes/90-test_includes_data/conf-includes-prov/inc-legacy.cnf b/test/recipes/90-test_includes_data/conf-includes-prov/inc-legacy.cnf
+index 1987d66bce..994c91adad 100644
+--- a/test/recipes/90-test_includes_data/conf-includes-prov/inc-legacy.cnf
++++ b/test/recipes/90-test_includes_data/conf-includes-prov/inc-legacy.cnf
+@@ -3,3 +3,4 @@ legacy = legacy_sect
+ 
+ [legacy_sect]
+ activate = 1
++enable-legacy-allowed = 1
+-- 
+2.53.0
+

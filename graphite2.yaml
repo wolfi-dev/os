@@ -1,7 +1,7 @@
 package:
   name: graphite2
   version: "1.3.15"
-  epoch: 3 # glibc: 2.43->2.44
+  epoch: 4
   description: reimplementation of the SIL Graphite text processing engine
   copyright:
     - license: LGPL-2.1-or-later OR MPL-1.1
@@ -31,6 +31,12 @@ pipeline:
       repository: https://github.com/silnrsi/graphite
       tag: ${{package.version}}
 
+  # GRAPHITE2_NFILEFACE is left at upstream's default (OFF), so the library
+  # exports gr_make_file_face and friends. HarfBuzz builds faces through
+  # gr_make_face with its own table callback and does not need them, but SIL's
+  # palaso (cmptxtrender) binds gr_make_file_face through ctypes at import
+  # time and cannot load at all without it. The same option also makes
+  # upstream build and install gr2fonttest, which is removed below.
   - runs: |
       # static and shared version needs to be build in separated dirs
       # See https://github.com/silnrsi/graphite/pull/12#issuecomment-311756732
@@ -40,7 +46,7 @@ pipeline:
         -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_BUILD_TYPE=MinSizeRel \
         -DGRAPHITE2_COMPARE_RENDERER=OFF \
-        -DGRAPHITE2_NFILEFACE=ON
+        -DGRAPHITE2_NFILEFACE=OFF
       cmake --build build-shared
 
       # static
@@ -48,13 +54,24 @@ pipeline:
         -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_BUILD_TYPE=MinSizeRel \
         -DGRAPHITE2_COMPARE_RENDERER=OFF \
-        -DGRAPHITE2_NFILEFACE=ON \
+        -DGRAPHITE2_NFILEFACE=OFF \
         -DBUILD_SHARED_LIBS=OFF
       cmake --build build-static
 
   - runs: |
       DESTDIR=${{targets.destdir}} cmake --install build-static
       DESTDIR=${{targets.destdir}} cmake --install build-shared
+
+  # With GRAPHITE2_NFILEFACE OFF, upstream's CMakeLists.txt adds the
+  # gr2fonttest subdirectory, which installs a C++ debugging tool to bin.
+  # Nothing in stereo uses it, and shipping it would add libstdc++ and
+  # libgcc_s to this library package's runtime dependencies (the library
+  # itself links with -nodefaultlibs). Drop it so the package carries the
+  # same files as before, plus the file-face symbols.
+  - name: remove gr2fonttest
+    runs: |
+      rm -f "${{targets.destdir}}/usr/bin/gr2fonttest"
+      find "${{targets.destdir}}/usr/bin" -maxdepth 0 -empty -delete
 
   - name: remove libtool .la files
     runs: find "${{targets.destdir}}" -name '*.la' -delete
@@ -99,6 +116,7 @@ test:
         - graphite2-dev
         - build-base
         - pkgconf
+        - ttf-dejavu
   pipeline:
     - uses: test/tw/ldd-check
     - name: Test graphite2 library compilation and linkage
@@ -121,3 +139,36 @@ test:
 
         gcc $(pkg-config --cflags graphite2) test.c -o test $(pkg-config --libs graphite2)
         ./test
+    - name: gr2fonttest is not shipped
+      runs: |
+        # Built only because GRAPHITE2_NFILEFACE is OFF; removed in the
+        # pipeline so the library package does not pull in libstdc++.
+        test ! -e /usr/bin/gr2fonttest
+    - name: The file-face API is compiled in
+      runs: |
+        # gr_make_file_face and friends are compiled out when
+        # GRAPHITE2_NFILEFACE is ON, and then this program does not link.
+        # 1.3.15's load_face refuses any font without a Silf table, and no
+        # os/ font ships Graphite tables, so the calls below assert the
+        # contract instead: a missing file and a non-Graphite font both come
+        # back NULL, through graphite2's own file reader, without crashing.
+        font=/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf
+        test -s "$font"
+        tee fileface.c <<'EOF'
+        #include <graphite2/Font.h>
+        #include <stdio.h>
+        int main(int argc, char **argv) {
+            if (gr_make_file_face("/nonexistent.ttf", 0)) {
+                fprintf(stderr, "FAIL: a face was made from a missing file\n");
+                return 1;
+            }
+            if (gr_make_file_face(argv[1], 0)) {
+                fprintf(stderr, "FAIL: a face was made from %s, which has no Silf table\n", argv[1]);
+                return 1;
+            }
+            printf("gr_make_file_face: linked; missing and non-Graphite fonts refused\n");
+            return 0;
+        }
+        EOF
+        gcc $(pkg-config --cflags graphite2) fileface.c -o fileface $(pkg-config --libs graphite2)
+        ./fileface "$font"

@@ -1,0 +1,825 @@
+From b6c9baf34ec01e0fd2c70e3b768caf42f731fc6a Mon Sep 17 00:00:00 2001
+From: Pranav Senthilnathan <pranas@microsoft.com>
+Date: Mon, 13 Apr 2026 12:35:55 -0700
+Subject: [PATCH 5/9] Remove deprecated OpenSSL RSA APIs (#126034)
+
+Remove deprecated OpenSSL RSA APIs. The `RSA` type and `RSA_*` methods
+have been deprecated in favor of `EVP_PKEY`. Most of our code already
+has moved, but this cleans up the function loading and updates the
+remaining places. The build allows deprecated APIs, but for local
+testing I've been using `-DOPENSSL_API_COMPAT=0x30500000L
+-DOPENSSL_NO_DEPRECATED` to error on deprecated APIs.
+
+(cherry picked from commit 770e62e503383732a746019ff894c8afc2fbda54)
+---
+ .../tests/RSACreateTests.cs                   |  15 +
+ .../configure.cmake                           |   5 +
+ .../opensslshim.h                             |  72 ++---
+ .../osslcompat_30.h                           |  10 +
+ .../pal_crypto_config.h.in                    |   1 +
+ .../pal_evp_pkey.c                            | 299 ++++++++++++++++--
+ .../pal_evp_pkey_rsa.c                        |  55 +++-
+ .../pal_ssl.c                                 |  37 +--
+ 8 files changed, 393 insertions(+), 101 deletions(-)
+
+diff --git a/src/libraries/System.Security.Cryptography/tests/RSACreateTests.cs b/src/libraries/System.Security.Cryptography/tests/RSACreateTests.cs
+index f5fc62b87c7..7110573ec2a 100644
+--- a/src/libraries/System.Security.Cryptography/tests/RSACreateTests.cs
++++ b/src/libraries/System.Security.Cryptography/tests/RSACreateTests.cs
+@@ -76,5 +76,20 @@ public static void CreateWithInvalidParameters()
+             parameters.Exponent = null;
+             Assert.Throws<CryptographicException>(() => RSA.Create(parameters));
+         }
++
++        [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsOpenSslSupported))]
++        public static void CreateWithMismatchedPQ_ThrowsCryptographicException()
++        {
++            RSAParameters parameters = TestData.RSA1032Parameters;
++
++            // Flip a bit in P so that p * q != n
++            // This is an error that is not caught in the managed layer, but will be caught in the native layer.
++            parameters.P = (byte[])parameters.P.Clone();
++            parameters.P[0] ^= 1;
++            CryptographicException ex = Assert.ThrowsAny<CryptographicException>(
++                () => RSA.Create(parameters));
++
++            Assert.Contains("n does not equal p q", ex.Message);
++        }
+     }
+ }
+diff --git a/src/native/libs/System.Security.Cryptography.Native/configure.cmake b/src/native/libs/System.Security.Cryptography.Native/configure.cmake
+index fe995eb2fbb..20208c33866 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/configure.cmake
++++ b/src/native/libs/System.Security.Cryptography.Native/configure.cmake
+@@ -39,6 +39,11 @@ check_source_compiles(C "
+ int main(void) { ENGINE_init(NULL); return 1; }"
+ HAVE_OPENSSL_ENGINE)
+ 
++check_source_compiles(C "
++#include <openssl/rsa.h>
++int main(void) { RSA *r = RSA_new(); RSA_free(r); return 0; }"
++HAVE_OPENSSL_RSA_PRIMITIVE)
++
+ configure_file(
+     ${CMAKE_CURRENT_SOURCE_DIR}/pal_crypto_config.h.in
+     ${CMAKE_CURRENT_BINARY_DIR}/pal_crypto_config.h)
+diff --git a/src/native/libs/System.Security.Cryptography.Native/opensslshim.h b/src/native/libs/System.Security.Cryptography.Native/opensslshim.h
+index ac02b7ae47c..4f9f574b976 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/opensslshim.h
++++ b/src/native/libs/System.Security.Cryptography.Native/opensslshim.h
+@@ -165,6 +165,12 @@ c_static_assert(EVP_PKEY_PUBLIC_KEY == 134);
+ #define OSSL_SIGNATURE_PARAM_MU "mu"
+ #endif
+ 
++#ifndef RSA_FLAG_EXT_PKEY
++#define RSA_FLAG_EXT_PKEY 0x0020
++#else
++c_static_assert(RSA_FLAG_EXT_PKEY == 0x0020);
++#endif
++
+ #if defined FEATURE_DISTRO_AGNOSTIC_SSL || OPENSSL_VERSION_NUMBER >= OPENSSL_VERSION_3_0_RTM
+ #include "apibridge_30_rev.h"
+ #endif
+@@ -202,6 +208,26 @@ int SSL_set_ciphersuites(SSL *s, const char *str);
+ const SSL_CIPHER* SSL_CIPHER_find(SSL *ssl, const unsigned char *ptr);
+ #endif
+ 
++#if !HAVE_OPENSSL_RSA_PRIMITIVE
++// In portable build, we need to support legacy RSA functions even if they were not present
++// on the build OS. The shim will detect their presence at runtime.
++#undef HAVE_OPENSSL_RSA_PRIMITIVE
++#define HAVE_OPENSSL_RSA_PRIMITIVE 1
++
++typedef struct rsa_st RSA;
++typedef struct rsa_meth_st RSA_METHOD;
++
++const RSA* EVP_PKEY_get0_RSA(const EVP_PKEY* pkey);
++int EVP_PKEY_set1_RSA(EVP_PKEY* pkey, RSA* key);
++const RSA_METHOD* RSA_get_method(const RSA* rsa);
++int RSA_get_multi_prime_extra_count(const RSA* rsa);
++void RSA_get0_key(const RSA* r, const BIGNUM** n, const BIGNUM** e, const BIGNUM** d);
++void RSA_get0_factors(const RSA* r, const BIGNUM** p, const BIGNUM** q);
++void RSA_get0_crt_params(const RSA* r, const BIGNUM** dmp1, const BIGNUM** dmq1, const BIGNUM** iqmp);
++int RSA_meth_get_flags(const RSA_METHOD* meth);
++int RSA_test_flags(const RSA* r, int flags);
++#endif
++
+ #if OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_4_0_RTM
+ #include "osslcompat_40.h"
+ #endif
+@@ -357,7 +383,6 @@ extern bool g_libSslUses32BitTime;
+     REQUIRED_FUNCTION(d2i_PKCS7_bio) \
+     REQUIRED_FUNCTION(d2i_PKCS8_PRIV_KEY_INFO) \
+     REQUIRED_FUNCTION(d2i_PUBKEY) \
+-    REQUIRED_FUNCTION(d2i_RSAPublicKey) \
+     REQUIRED_FUNCTION(d2i_X509) \
+     REQUIRED_FUNCTION(d2i_X509_bio) \
+     REQUIRED_FUNCTION(d2i_X509_CRL) \
+@@ -535,11 +560,10 @@ extern bool g_libSslUses32BitTime;
+     LIGHTUP_FUNCTION(EVP_PKEY_fromdata_init) \
+     RENAMED_FUNCTION(EVP_PKEY_get_base_id, EVP_PKEY_base_id) \
+     RENAMED_FUNCTION(EVP_PKEY_get_bits, EVP_PKEY_bits) \
+-    REQUIRED_FUNCTION(EVP_PKEY_get0_RSA) \
++    LIGHTUP_FUNCTION(EVP_PKEY_get0_RSA) \
+     LIGHTUP_FUNCTION(EVP_PKEY_get0_type_name) \
+     REQUIRED_FUNCTION(EVP_PKEY_get1_DSA) \
+     REQUIRED_FUNCTION(EVP_PKEY_get1_EC_KEY) \
+-    REQUIRED_FUNCTION(EVP_PKEY_get1_RSA) \
+     LIGHTUP_FUNCTION(EVP_PKEY_is_a) \
+     REQUIRED_FUNCTION(EVP_PKEY_keygen) \
+     REQUIRED_FUNCTION(EVP_PKEY_keygen_init) \
+@@ -547,7 +571,7 @@ extern bool g_libSslUses32BitTime;
+     REQUIRED_FUNCTION(EVP_PKEY_public_check) \
+     REQUIRED_FUNCTION(EVP_PKEY_set1_DSA) \
+     REQUIRED_FUNCTION(EVP_PKEY_set1_EC_KEY) \
+-    REQUIRED_FUNCTION(EVP_PKEY_set1_RSA) \
++    LIGHTUP_FUNCTION(EVP_PKEY_set1_RSA) \
+     REQUIRED_FUNCTION(EVP_PKEY_sign) \
+     REQUIRED_FUNCTION(EVP_PKEY_sign_init) \
+     LIGHTUP_FUNCTION(EVP_PKEY_sign_message_init) \
+@@ -651,26 +675,14 @@ extern bool g_libSslUses32BitTime;
+     REQUIRED_FUNCTION(PKCS7_free) \
+     REQUIRED_FUNCTION(RAND_bytes) \
+     REQUIRED_FUNCTION(RAND_poll) \
+-    REQUIRED_FUNCTION(RSA_check_key) \
+-    REQUIRED_FUNCTION(RSA_free) \
+-    REQUIRED_FUNCTION(RSA_generate_key_ex) \
+-    REQUIRED_FUNCTION(RSA_get_method) \
+-    REQUIRED_FUNCTION(RSA_get_multi_prime_extra_count) \
+-    REQUIRED_FUNCTION(RSA_get0_crt_params) \
+-    REQUIRED_FUNCTION(RSA_get0_factors) \
+-    REQUIRED_FUNCTION(RSA_get0_key) \
+-    REQUIRED_FUNCTION(RSA_meth_get_flags) \
+-    REQUIRED_FUNCTION(RSA_new) \
++    LIGHTUP_FUNCTION(RSA_get_method) \
++    LIGHTUP_FUNCTION(RSA_get_multi_prime_extra_count) \
++    LIGHTUP_FUNCTION(RSA_get0_crt_params) \
++    LIGHTUP_FUNCTION(RSA_get0_factors) \
++    LIGHTUP_FUNCTION(RSA_get0_key) \
++    LIGHTUP_FUNCTION(RSA_meth_get_flags) \
+     REQUIRED_FUNCTION(RSA_pkey_ctx_ctrl) \
+-    REQUIRED_FUNCTION(RSA_PKCS1_OpenSSL) \
+-    REQUIRED_FUNCTION(RSA_set0_crt_params) \
+-    REQUIRED_FUNCTION(RSA_set0_factors) \
+-    REQUIRED_FUNCTION(RSA_set0_key) \
+-    REQUIRED_FUNCTION(RSA_set_method) \
+-    REQUIRED_FUNCTION(RSA_size) \
+-    REQUIRED_FUNCTION(RSA_test_flags) \
+-    REQUIRED_FUNCTION(RSA_up_ref) \
+-    REQUIRED_FUNCTION(RSA_verify) \
++    LIGHTUP_FUNCTION(RSA_test_flags) \
+     LIGHTUP_FUNCTION(SSL_CIPHER_find) \
+     REQUIRED_FUNCTION(SSL_CIPHER_get_bits) \
+     REQUIRED_FUNCTION(SSL_CIPHER_get_id) \
+@@ -918,7 +930,6 @@ extern TYPEOF(OPENSSL_gmtime)* OPENSSL_gmtime_ptr;
+ #define d2i_PKCS7_bio d2i_PKCS7_bio_ptr
+ #define d2i_PKCS8_PRIV_KEY_INFO d2i_PKCS8_PRIV_KEY_INFO_ptr
+ #define d2i_PUBKEY d2i_PUBKEY_ptr
+-#define d2i_RSAPublicKey d2i_RSAPublicKey_ptr
+ #define d2i_X509 d2i_X509_ptr
+ #define d2i_X509_bio d2i_X509_bio_ptr
+ #define d2i_X509_CRL d2i_X509_CRL_ptr
+@@ -1098,7 +1109,6 @@ extern TYPEOF(OPENSSL_gmtime)* OPENSSL_gmtime_ptr;
+ #define EVP_PKEY_get0_type_name EVP_PKEY_get0_type_name_ptr
+ #define EVP_PKEY_get1_DSA EVP_PKEY_get1_DSA_ptr
+ #define EVP_PKEY_get1_EC_KEY EVP_PKEY_get1_EC_KEY_ptr
+-#define EVP_PKEY_get1_RSA EVP_PKEY_get1_RSA_ptr
+ #define EVP_PKEY_is_a EVP_PKEY_is_a_ptr
+ #define EVP_PKEY_keygen EVP_PKEY_keygen_ptr
+ #define EVP_PKEY_keygen_init EVP_PKEY_keygen_init_ptr
+@@ -1215,28 +1225,16 @@ extern TYPEOF(OPENSSL_gmtime)* OPENSSL_gmtime_ptr;
+ #define PKCS7_free PKCS7_free_ptr
+ #define RAND_bytes RAND_bytes_ptr
+ #define RAND_poll RAND_poll_ptr
+-#define RSA_check_key RSA_check_key_ptr
+-#define RSA_free RSA_free_ptr
+-#define RSA_generate_key_ex RSA_generate_key_ex_ptr
+ #define RSA_get0_crt_params RSA_get0_crt_params_ptr
+ #define RSA_get0_factors RSA_get0_factors_ptr
+ #define RSA_get0_key RSA_get0_key_ptr
+ #define RSA_get_method RSA_get_method_ptr
+ #define RSA_get_multi_prime_extra_count RSA_get_multi_prime_extra_count_ptr
+ #define RSA_meth_get_flags RSA_meth_get_flags_ptr
+-#define RSA_new RSA_new_ptr
+ #define RSA_pkey_ctx_ctrl RSA_pkey_ctx_ctrl_ptr
+-#define RSA_PKCS1_OpenSSL RSA_PKCS1_OpenSSL_ptr
+ #define RSA_public_decrypt RSA_public_decrypt_ptr
+ #define RSA_public_encrypt RSA_public_encrypt_ptr
+-#define RSA_set0_crt_params RSA_set0_crt_params_ptr
+-#define RSA_set0_factors RSA_set0_factors_ptr
+-#define RSA_set0_key RSA_set0_key_ptr
+-#define RSA_set_method RSA_set_method_ptr
+-#define RSA_size RSA_size_ptr
+ #define RSA_test_flags RSA_test_flags_ptr
+-#define RSA_up_ref RSA_up_ref_ptr
+-#define RSA_verify RSA_verify_ptr
+ #define SSL_CIPHER_get_bits SSL_CIPHER_get_bits_ptr
+ #define SSL_CIPHER_find SSL_CIPHER_find_ptr
+ #define SSL_CIPHER_get_id SSL_CIPHER_get_id_ptr
+diff --git a/src/native/libs/System.Security.Cryptography.Native/osslcompat_30.h b/src/native/libs/System.Security.Cryptography.Native/osslcompat_30.h
+index 84ac0bb7265..39e6c7b690d 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/osslcompat_30.h
++++ b/src/native/libs/System.Security.Cryptography.Native/osslcompat_30.h
+@@ -36,6 +36,16 @@
+ #define OSSL_PKEY_PARAM_EC_COFACTOR  "cofactor"
+ #define OSSL_PKEY_PARAM_EC_SEED      "seed"
+ 
++#define OSSL_PKEY_PARAM_RSA_N            "n"
++#define OSSL_PKEY_PARAM_RSA_E            "e"
++#define OSSL_PKEY_PARAM_RSA_D            "d"
++#define OSSL_PKEY_PARAM_RSA_FACTOR1      "rsa-factor1"
++#define OSSL_PKEY_PARAM_RSA_FACTOR2      "rsa-factor2"
++#define OSSL_PKEY_PARAM_RSA_FACTOR3      "rsa-factor3"
++#define OSSL_PKEY_PARAM_RSA_EXPONENT1    "rsa-exponent1"
++#define OSSL_PKEY_PARAM_RSA_EXPONENT2    "rsa-exponent2"
++#define OSSL_PKEY_PARAM_RSA_COEFFICIENT1 "rsa-coefficient1"
++
+ #define OSSL_STORE_INFO_PKEY 4
+ #define OSSL_STORE_INFO_PUBKEY 3
+ 
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_crypto_config.h.in b/src/native/libs/System.Security.Cryptography.Native/pal_crypto_config.h.in
+index 3664c96114b..f2aa341b632 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_crypto_config.h.in
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_crypto_config.h.in
+@@ -7,3 +7,4 @@
+ #cmakedefine01 HAVE_OPENSSL_SHA3_SQUEEZE
+ #cmakedefine01 HAVE_OPENSSL_EVP_PKEY_SIGN_MESSAGE_INIT
+ #cmakedefine01 HAVE_OPENSSL_ENGINE
++#cmakedefine01 HAVE_OPENSSL_RSA_PRIMITIVE
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey.c b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey.c
+index d71c5f7fa97..e569b769fe6 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey.c
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey.c
+@@ -176,20 +176,33 @@ done:
+     return ret;
+ }
+ 
+-static int32_t QuickRsaCheck(const RSA* rsa, bool isPublic)
++// Accessor callbacks for extracting RSA key components.
++// All accessors return owned BIGNUM copies that must be freed by the caller.
++typedef bool (*RsaGetKeyFn)(const void* key, BIGNUM** n, BIGNUM** e, BIGNUM** d);
++typedef bool (*RsaGetFactorsFn)(const void* key, BIGNUM** p, BIGNUM** q);
++typedef bool (*RsaGetCrtParamsFn)(const void* key, BIGNUM** dp, BIGNUM** dq, BIGNUM** inverseQ);
++// Returns true if the key has more than 2 prime factors (multi-prime RSA).
++typedef bool (*RsaIsMultiPrimeFn)(const void* key);
++
++static int32_t QuickRsaCheckCore(const void* key,
++                                 bool isPublic,
++                                 RsaGetKeyFn getKey,
++                                 RsaGetFactorsFn getFactors,
++                                 RsaGetCrtParamsFn getCrtParams,
++                                 RsaIsMultiPrimeFn isMultiPrime)
+ {
+     // This method does some lightweight key consistency checks on an RSA key to make sure all supplied values are
+     // sensible. This is not intended to be a strict key check that verifies a key conforms to any particular set
+     // of criteria or standards.
+ 
+-    const BIGNUM* n = NULL;
+-    const BIGNUM* e = NULL;
+-    const BIGNUM* d = NULL;
+-    const BIGNUM* p = NULL;
+-    const BIGNUM* q = NULL;
+-    const BIGNUM* dp = NULL;
+-    const BIGNUM* dq = NULL;
+-    const BIGNUM* inverseQ = NULL;
++    BIGNUM* n = NULL;
++    BIGNUM* e = NULL;
++    BIGNUM* d = NULL;
++    BIGNUM* p = NULL;
++    BIGNUM* q = NULL;
++    BIGNUM* dp = NULL;
++    BIGNUM* dq = NULL;
++    BIGNUM* inverseQ = NULL;
+     BN_CTX* ctx = NULL;
+ 
+     // x and y are scratch integers that receive the result of some operations.
+@@ -202,7 +215,15 @@ static int32_t QuickRsaCheck(const RSA* rsa, bool isPublic)
+     BIGNUM* qM1 = NULL;
+     int ret = 0;
+ 
+-    RSA_get0_key(rsa, &n, &e, &d);
++    if (!getKey(key, &n, &e, &d))
++    {
++        if (ERR_peek_error() == 0)
++        {
++            ERR_PUT_error(ERR_LIB_RSA, 0, RSA_R_VALUE_MISSING, __FILE__, __LINE__);
++        }
++
++        goto done;
++    }
+ 
+     // Always need public parameters.
+     if (!n || !e)
+@@ -242,19 +263,24 @@ static int32_t QuickRsaCheck(const RSA* rsa, bool isPublic)
+ 
+     // We do not support validating multi-prime RSA. Multi-prime RSA is not common. For these, we fall back to the
+     // OpenSSL key check.
+-    if (RSA_get_multi_prime_extra_count(rsa) != 0)
++    if (isMultiPrime(key))
+     {
+         ret = -1;
+         goto done;
+     }
+ 
+-    // Get the private components now that we've moved on to checking the private parameters.
+-    RSA_get0_factors(rsa, &p, &q);
+-
+     // Need all the private parameters now. If we cannot get them, fall back to the OpenSSL key check so the provider
+     // or engine routine can be used.
+-    if (!d || !p || !q)
++    if (!d)
++    {
++        ret = -1;
++        goto done;
++    }
++
++    // Get the private components now that we've moved on to checking the private parameters.
++    if (!getFactors(key, &p, &q) || !p || !q)
+     {
++        ERR_clear_error();
+         ret = -1;
+         goto done;
+     }
+@@ -320,9 +346,7 @@ static int32_t QuickRsaCheck(const RSA* rsa, bool isPublic)
+ 
+     // Move on to checking the CRT parameters. In compatibility with what OpenSSL does,
+     // these are optional and only check them if all are present.
+-    RSA_get0_crt_params(rsa, &dp, &dq, &inverseQ);
+-
+-    if (dp && dq && inverseQ)
++    if (getCrtParams(key, &dp, &dq, &inverseQ) && dp && dq && inverseQ)
+     {
+         // Check dp = d % (p-1)
+         // compute d % (p-1) and put in x
+@@ -363,10 +387,23 @@ static int32_t QuickRsaCheck(const RSA* rsa, bool isPublic)
+             goto done;
+         }
+     }
++    else
++    {
++        // If we couldn't get all CRT params, clear errors from the attempts and skip CRT checks.
++        ERR_clear_error();
++    }
+ 
+     // If we made it to the end, everything looks good.
+     ret = 1;
+ done:
++    if (n) BN_clear_free(n);
++    if (e) BN_clear_free(e);
++    if (d) BN_clear_free(d);
++    if (p) BN_clear_free(p);
++    if (q) BN_clear_free(q);
++    if (dp) BN_clear_free(dp);
++    if (dq) BN_clear_free(dq);
++    if (inverseQ) BN_clear_free(inverseQ);
+     if (x) BN_clear_free(x);
+     if (y) BN_clear_free(y);
+     if (pM1) BN_clear_free(pM1);
+@@ -375,6 +412,180 @@ done:
+     return ret;
+ }
+ 
++#if defined(NEED_OPENSSL_1_0) || defined(NEED_OPENSSL_1_1)
++// Legacy RSA accessors: duplicate shared pointers into owned copies.
++static bool RsaLegacyGetKey(const void* key, BIGNUM** n, BIGNUM** e, BIGNUM** d)
++{
++    // This function is only called when EVP_PKEY_get0_RSA is available, so RSA_get0_key
++    // should always exist. Guard defensively to avoid a NULL function pointer call.
++    if (!API_EXISTS(RSA_get0_key))
++        return false;
++
++    const RSA* rsa = (const RSA*)key;
++    const BIGNUM* sharedN = NULL;
++    const BIGNUM* sharedE = NULL;
++    const BIGNUM* sharedD = NULL;
++    RSA_get0_key(rsa, &sharedN, &sharedE, &sharedD);
++
++    if (!sharedN || !sharedE)
++        return false;
++
++    *n = BN_dup(sharedN);
++    *e = BN_dup(sharedE);
++    *d = sharedD ? BN_dup(sharedD) : NULL;
++
++    if (!*n || !*e || (sharedD && !*d))
++    {
++        if (*n) BN_clear_free(*n);
++        if (*e) BN_clear_free(*e);
++        if (*d) BN_clear_free(*d);
++        *n = *e = *d = NULL;
++        return false;
++    }
++
++    return true;
++}
++
++static bool RsaLegacyGetFactors(const void* key, BIGNUM** p, BIGNUM** q)
++{
++    // This function is only called when EVP_PKEY_get0_RSA is available, so RSA_get0_factors
++    // should always exist. Guard defensively to avoid a NULL function pointer call.
++    if (!API_EXISTS(RSA_get0_factors))
++        return false;
++
++    const RSA* rsa = (const RSA*)key;
++    const BIGNUM* sharedP = NULL;
++    const BIGNUM* sharedQ = NULL;
++    RSA_get0_factors(rsa, &sharedP, &sharedQ);
++
++    if (!sharedP || !sharedQ)
++        return false;
++
++    *p = BN_dup(sharedP);
++    *q = BN_dup(sharedQ);
++
++    if (!*p || !*q)
++    {
++        if (*p) BN_clear_free(*p);
++        if (*q) BN_clear_free(*q);
++        *p = *q = NULL;
++        return false;
++    }
++
++    return true;
++}
++
++static bool RsaLegacyGetCrtParams(const void* key, BIGNUM** dp, BIGNUM** dq, BIGNUM** inverseQ)
++{
++    // This function is only called when EVP_PKEY_get0_RSA is available, so RSA_get0_crt_params
++    // should always exist. Guard defensively to avoid a NULL function pointer call.
++    if (!API_EXISTS(RSA_get0_crt_params))
++        return false;
++
++    const RSA* rsa = (const RSA*)key;
++    const BIGNUM* sharedDp = NULL;
++    const BIGNUM* sharedDq = NULL;
++    const BIGNUM* sharedInverseQ = NULL;
++    RSA_get0_crt_params(rsa, &sharedDp, &sharedDq, &sharedInverseQ);
++
++    if (!sharedDp || !sharedDq || !sharedInverseQ)
++        return false;
++
++    *dp = BN_dup(sharedDp);
++    *dq = BN_dup(sharedDq);
++    *inverseQ = BN_dup(sharedInverseQ);
++
++    if (!*dp || !*dq || !*inverseQ)
++    {
++        if (*dp) BN_clear_free(*dp);
++        if (*dq) BN_clear_free(*dq);
++        if (*inverseQ) BN_clear_free(*inverseQ);
++        *dp = *dq = *inverseQ = NULL;
++        return false;
++    }
++
++    return true;
++}
++
++static bool RsaLegacyIsMultiPrime(const void* key)
++{
++    // This function is only called when EVP_PKEY_get0_RSA is available, so RSA_get_multi_prime_extra_count
++    // should always exist. Guard defensively to avoid a NULL function pointer call.
++    if (!API_EXISTS(RSA_get_multi_prime_extra_count))
++        return false;
++
++    const RSA* rsa = (const RSA*)key;
++    return RSA_get_multi_prime_extra_count(rsa) != 0;
++}
++
++static int32_t QuickRsaCheck(const RSA* rsa, bool isPublic)
++{
++    return QuickRsaCheckCore(rsa, isPublic, RsaLegacyGetKey, RsaLegacyGetFactors, RsaLegacyGetCrtParams, RsaLegacyIsMultiPrime);
++}
++#endif // NEED_OPENSSL_1_0 || NEED_OPENSSL_1_1
++
++#ifdef NEED_OPENSSL_3_0
++// EVP accessors for OpenSSL 3.0+: return owned copies (must be freed).
++static bool RsaEvpGetKey(const void* key, BIGNUM** n, BIGNUM** e, BIGNUM** d)
++{
++    const EVP_PKEY* pkey = (const EVP_PKEY*)key;
++
++    if (!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_N, n) ||
++        !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, e))
++    {
++        return false;
++    }
++
++    // d is optional; not available for public keys.
++    if (!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_D, d))
++    {
++        ERR_clear_error();
++        *d = NULL;
++    }
++
++    return true;
++}
++
++static bool RsaEvpGetFactors(const void* key, BIGNUM** p, BIGNUM** q)
++{
++    const EVP_PKEY* pkey = (const EVP_PKEY*)key;
++
++    return EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR1, p) &&
++           EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR2, q);
++}
++
++static bool RsaEvpGetCrtParams(const void* key, BIGNUM** dp, BIGNUM** dq, BIGNUM** inverseQ)
++{
++    const EVP_PKEY* pkey = (const EVP_PKEY*)key;
++
++    return EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT1, dp) &&
++           EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT2, dq) &&
++           EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, inverseQ);
++}
++
++static bool RsaEvpIsMultiPrime(const void* key)
++{
++    const EVP_PKEY* pkey = (const EVP_PKEY*)key;
++    BIGNUM* factor3 = NULL;
++
++    if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR3, &factor3))
++    {
++        BN_clear_free(factor3);
++        return true;
++    }
++
++    BN_clear_free(factor3);
++    ERR_clear_error();
++    return false;
++}
++
++// EVP-based version of QuickRsaCheck for OpenSSL 3.0+ where legacy RSA APIs may not be available.
++static int32_t QuickRsaCheckEvp(const EVP_PKEY* pkey, bool isPublic)
++{
++    return QuickRsaCheckCore(pkey, isPublic, RsaEvpGetKey, RsaEvpGetFactors, RsaEvpGetCrtParams, RsaEvpIsMultiPrime);
++}
++#endif // NEED_OPENSSL_3_0
++
+ static bool CheckKey(EVP_PKEY* key, int32_t algId, bool isPublic, int32_t (*check_func)(EVP_PKEY_CTX*))
+ {
+     if (algId != NID_undef && EVP_PKEY_get_base_id(key) != algId)
+@@ -388,30 +599,52 @@ static bool CheckKey(EVP_PKEY* key, int32_t algId, bool isPublic, int32_t (*chec
+     // OpenSSL 3 correctly fails with with an invalid modulus error.
+     if (algId == NID_rsaEncryption)
+     {
+-        const RSA* rsa = EVP_PKEY_get0_RSA(key);
++        int32_t result;
+ 
+-        // If we can get the RSA object, use that for a faster path to validating the key that skips primality tests.
+-        if (rsa != NULL)
++#ifdef NEED_OPENSSL_3_0
++        if (API_EXISTS(EVP_PKEY_get_bn_param))
++        {
++            // OpenSSL 3.0+: use EVP_PKEY_get_bn_param to extract RSA components directly.
++            result = QuickRsaCheckEvp(key, isPublic);
++        }
++        else
++#endif
++#if defined(NEED_OPENSSL_1_0) || defined(NEED_OPENSSL_1_1)
++        if (API_EXISTS(EVP_PKEY_get0_RSA))
+         {
+-            //  0 = key check failed
+-            //  1 = key check passed
+-            // -1 = could not assess private key.
+-            int32_t result = QuickRsaCheck(rsa, isPublic);
++            const RSA* rsa = EVP_PKEY_get0_RSA(key);
+ 
+-            if (result == 0)
++            if (rsa != NULL)
+             {
+-                return false;
++                result = QuickRsaCheck(rsa, isPublic);
+             }
+-            if (result == 1)
++            else
+             {
+-                return true;
++                // Could not get RSA object, fall through to EVP_PKEY_check.
++                result = -1;
+             }
++        }
++        else
++#endif
++        {
++            // Neither API available, fall through to EVP_PKEY_check.
++            result = -1;
++        }
+ 
+-            // -1 falls though.
+-            // If the fast check was indeterminate, fall though and use the OpenSSL routine.
+-            // Clear out any errors we may have accumulated in our check.
+-            ERR_clear_error();
++        if (result == 0)
++        {
++            return false;
+         }
++
++        if (result == 1)
++        {
++            return true;
++        }
++
++        // -1 falls though.
++        // If the fast check was indeterminate, fall though and use the OpenSSL routine.
++        // Clear out any errors we may have accumulated in our check.
++        ERR_clear_error();
+     }
+ 
+     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(key, NULL);
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_rsa.c b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_rsa.c
+index f4a79df5fa1..73ad67b7d07 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_rsa.c
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_evp_pkey_rsa.c
+@@ -7,7 +7,19 @@
+ #include "openssl.h"
+ #include <assert.h>
+ 
++#if defined(NEED_OPENSSL_1_0) || defined(NEED_OPENSSL_1_1)
+ static int HasNoPrivateKey(const RSA* rsa);
++static int CheckLegacyPrivateKeyAvailable(EVP_PKEY* pkey);
++
++// RSA_F_RSA_NULL_PRIVATE_DECRYPT is always defined but its value is 0 in OpenSSL 3.0+ since it is no longer used for error reporting.
++// So to simplify the portable build, we'll avoid RSA_F_RSA_NULL_PRIVATE_DECRYPT and instead define a new constant with the old value to use for older OpenSSL versions.
++#define LEGACY_RSA_F_RSA_NULL_PRIVATE_DECRYPT 132
++
++#ifdef RSA_F_RSA_NULL_PRIVATE_DECRYPT
++c_static_assert(RSA_F_RSA_NULL_PRIVATE_DECRYPT == (OPENSSL_VERSION_NUMBER < OPENSSL_VERSION_3_0_RTM ? LEGACY_RSA_F_RSA_NULL_PRIVATE_DECRYPT : 0));
++#endif
++
++#endif // NEED_OPENSSL_1_0 || NEED_OPENSSL_1_1
+ 
+ EVP_PKEY* CryptoNative_EvpPKeyCreateRsa(RSA* currentKey)
+ {
+@@ -22,7 +34,7 @@ EVP_PKEY* CryptoNative_EvpPKeyCreateRsa(RSA* currentKey)
+         return NULL;
+     }
+ 
+-    if (!EVP_PKEY_set1_RSA(pkey, currentKey))
++    if (!API_EXISTS(EVP_PKEY_set1_RSA) || !EVP_PKEY_set1_RSA(pkey, currentKey))
+     {
+         EVP_PKEY_free(pkey);
+         return NULL;
+@@ -140,16 +152,15 @@ int32_t CryptoNative_RsaDecrypt(EVP_PKEY* pkey,
+     // ENGINE-s may or may not set it.
+     // This is needed only on OpenSSL < 3.0,
+     // see: https://github.com/dotnet/runtime/issues/53345
++#if defined(NEED_OPENSSL_1_0) || defined(NEED_OPENSSL_1_1)
+     if (CryptoNative_OpenSslVersionNumber() < OPENSSL_VERSION_3_0_RTM)
+     {
+-        const RSA* rsa = EVP_PKEY_get0_RSA(pkey);
+-
+-        if (rsa == NULL || HasNoPrivateKey(rsa))
++        if (!CheckLegacyPrivateKeyAvailable(pkey))
+         {
+-            ERR_PUT_error(ERR_LIB_RSA, RSA_F_RSA_NULL_PRIVATE_DECRYPT, RSA_R_VALUE_MISSING, __FILE__, __LINE__);
+             goto done;
+         }
+     }
++#endif
+ 
+     size_t written = Int32ToSizeT(destinationLen);
+ 
+@@ -280,16 +291,15 @@ int32_t CryptoNative_RsaSignHash(EVP_PKEY* pkey,
+     // ENGINE-s may or may not set it.
+     // This is needed only on OpenSSL < 3.0,
+     // see: https://github.com/dotnet/runtime/issues/53345
++#if defined(NEED_OPENSSL_1_0) || defined(NEED_OPENSSL_1_1)
+     if (CryptoNative_OpenSslVersionNumber() < OPENSSL_VERSION_3_0_RTM)
+     {
+-        const RSA* rsa = EVP_PKEY_get0_RSA(pkey);
+-
+-        if (rsa == NULL || HasNoPrivateKey(rsa))
++        if (!CheckLegacyPrivateKeyAvailable(pkey))
+         {
+-            ERR_PUT_error(ERR_LIB_RSA, RSA_F_RSA_NULL_PRIVATE_DECRYPT, RSA_R_VALUE_MISSING, __FILE__, __LINE__);
+             goto done;
+         }
+     }
++#endif
+ 
+     size_t written = Int32ToSizeT(destinationLen);
+ 
+@@ -356,6 +366,32 @@ done:
+     return ret;
+ }
+ 
++#if defined(NEED_OPENSSL_1_0) || defined(NEED_OPENSSL_1_1)
++// On OpenSSL < 3.0, check that the legacy RSA key has a private key available.
++// Only call this for OpenSSL < 3.0.
++// Returns 1 if the check passes, 0 if no private key.
++static int CheckLegacyPrivateKeyAvailable(EVP_PKEY* pkey)
++{
++    // This function is only called for OpenSSL < 3.0, where EVP_PKEY_get0_RSA is guaranteed
++    // to exist. The API_EXISTS check is a defensive guard that produces a proper error rather
++    // than a crash in the unexpected case that it is somehow unavailable.
++    if (!API_EXISTS(EVP_PKEY_get0_RSA))
++    {
++        ERR_PUT_error(ERR_LIB_RSA, LEGACY_RSA_F_RSA_NULL_PRIVATE_DECRYPT, RSA_R_VALUE_MISSING, __FILE__, __LINE__);
++        return 0;
++    }
++
++    const RSA* rsa = EVP_PKEY_get0_RSA(pkey);
++
++    if (rsa == NULL || HasNoPrivateKey(rsa))
++    {
++        ERR_PUT_error(ERR_LIB_RSA, LEGACY_RSA_F_RSA_NULL_PRIVATE_DECRYPT, RSA_R_VALUE_MISSING, __FILE__, __LINE__);
++        return 0;
++    }
++
++    return 1;
++}
++
+ static int HasNoPrivateKey(const RSA* rsa)
+ {
+     if (rsa == NULL)
+@@ -409,3 +445,4 @@ static int HasNoPrivateKey(const RSA* rsa)
+ 
+     return 0;
+ }
++#endif // NEED_OPENSSL_1_0 || NEED_OPENSSL_1_1
+diff --git a/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c b/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c
+index dfbd61491a6..76c0620e004 100644
+--- a/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c
++++ b/src/native/libs/System.Security.Cryptography.Native/pal_ssl.c
+@@ -1004,9 +1004,9 @@ int32_t CryptoNative_SslGetCurrentCipherId(SSL* ssl, int32_t* cipherId)
+ }
+ 
+ // This function generates key pair and creates simple certificate.
+-static int MakeSelfSignedCertificate(X509* cert, EVP_PKEY* evp)
++// On success, the generated key is stored in *pEvp and the caller takes ownership.
++static int MakeSelfSignedCertificate(X509* cert, EVP_PKEY** pEvp)
+ {
+-    RSA* rsa = NULL;
+     ASN1_TIME* time = ASN1_TIME_new();
+     X509_NAME * asnName;
+     unsigned char * name = (unsigned char*)"localhost";
+@@ -1017,18 +1017,7 @@ static int MakeSelfSignedCertificate(X509* cert, EVP_PKEY* evp)
+ 
+     if (pkey != NULL)
+     {
+-        rsa = EVP_PKEY_get1_RSA(pkey);
+-        EVP_PKEY_free(pkey);
+-    }
+-
+-    if (rsa != NULL)
+-    {
+-        if (EVP_PKEY_set1_RSA(evp, rsa) == 1)
+-        {
+-            rsa = NULL;
+-        }
+-
+-        X509_set_pubkey(cert, evp);
++        X509_set_pubkey(cert, pkey);
+ 
+         asnName = X509_NAME_dup(X509_get_subject_name(cert));
+ 
+@@ -1050,14 +1039,18 @@ static int MakeSelfSignedCertificate(X509* cert, EVP_PKEY* evp)
+                 X509_set1_notBefore(cert, time);
+                 X509_set1_notAfter(cert, time);
+ 
+-                ret = X509_sign(cert, evp, EVP_sha256());
++                ret = X509_sign(cert, pkey, EVP_sha256());
+             }
+         }
+-    }
+ 
+-    if (rsa != NULL)
+-    {
+-        RSA_free(rsa);
++        if (ret)
++        {
++            *pEvp = pkey;
++        }
++        else
++        {
++            EVP_PKEY_free(pkey);
++        }
+     }
+ 
+     if (time != NULL)
+@@ -1163,21 +1156,21 @@ int32_t CryptoNative_OpenSslGetProtocolSupport(SslProtocols protocol)
+     SSL_CTX* clientCtx = CryptoNative_SslCtxCreate(TLS_method());
+     SSL_CTX* serverCtx = CryptoNative_SslCtxCreate(TLS_method());
+     X509 * cert = X509_new();
+-    EVP_PKEY* evp = CryptoNative_EvpPkeyCreate();
++    EVP_PKEY* evp = NULL;
+     BIO *bio1 = BIO_new(BIO_s_mem());
+     BIO *bio2 = BIO_new(BIO_s_mem());
+ 
+     SSL* client = NULL;
+     SSL* server = NULL;
+ 
+-    if (clientCtx != NULL && serverCtx != NULL && cert != NULL && evp != NULL && bio1 != NULL && bio2 != NULL)
++    if (clientCtx != NULL && serverCtx != NULL && cert != NULL && bio1 != NULL && bio2 != NULL)
+     {
+         CryptoNative_SslCtxSetProtocolOptions(serverCtx, protocol);
+         CryptoNative_SslCtxSetProtocolOptions(clientCtx, protocol);
+         SSL_CTX_set_verify(clientCtx, SSL_VERIFY_NONE, NULL);
+         SSL_CTX_set_verify(serverCtx, SSL_VERIFY_NONE, NULL);
+ 
+-        if (MakeSelfSignedCertificate(cert, evp))
++        if (MakeSelfSignedCertificate(cert, &evp))
+         {
+             CryptoNative_SslCtxUseCertificate(serverCtx, cert);
+             CryptoNative_SslCtxUsePrivateKey(serverCtx, evp);
+-- 
+2.53.0
+

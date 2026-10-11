@@ -1,7 +1,7 @@
 package:
   name: dotnet-10
   version: "10.0.112"
-  epoch: 5 # dbg and agnostic
+  epoch: 4 # openssl-hardened: 3.6->4.0
   description: ".NET ${{vars.major-version}} host"
   copyright:
     - license: MIT
@@ -9,6 +9,8 @@ package:
     cpu: "17"
     memory: 64Gi
   dependencies:
+    runtime:
+      - icu
     provider-priority: ${{vars.major-version}}
     provides:
       - dotnet=${{package.full-version}}
@@ -30,12 +32,7 @@ var-transforms:
 environment:
   environment:
     DOTNET_CLI_TELEMETRY_OPTOUT: 1
-    # To support automatic discovery of source code in debug symbols
-    # packaged in dotnet-10-dbg, build with file-prefix-map (the native
-    # build already passes -g). Also see "Create dbg sourcecode" and
-    # split/debug.
-    CFLAGS: "-Wno-error=used-but-marked-unused -ffile-prefix-map=/home/build=/usr/src/${{package.name}}"
-    CXXFLAGS: "-ffile-prefix-map=/home/build=/usr/src/${{package.name}}"
+    CFLAGS: "-Wno-error=used-but-marked-unused"
   contents:
     packages:
       - bash
@@ -54,7 +51,6 @@ environment:
       - openssl-hardened-${{vars.openssl-version}}-dev
       - python3
       - rapidjson-dev
-      - so:libssl.so.3 # bootstrap runtimes currently only support .so.3
       - zlib-dev
 
 pipeline:
@@ -64,8 +60,19 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: 95017c711e6afc1085133d440e42b4bd78155701
 
-  - runs: |
-      git -c "user.name=Melange Build" -c "user.email=melange-build@cgr.dev" am *.patch
+  - working-directory: src/runtime
+    uses: patch
+    with:
+      patches: |
+        0001-Fix-build-compilation-with-OpenSSL-4.0-dev.patch
+        0002-Remove-OpenSSL-1.0.2-and-1.1.0-support.patch
+        0003-Enable-the-crypto-shim-to-build-against-OpenSSL-4.0-.patch
+        0004-Allow-binding-to-OpenSSL-4-from-portable-builds.patch
+        0005-Remove-deprecated-OpenSSL-RSA-APIs-126034.patch
+        0006-Prefer-using-non-deprecated-EC-OSSL-APIs-where-possi.patch
+        0007-Fix-if-that-should-have-been-an-ifdef-on-non-portabl.patch
+        0008-Remove-SafeEcKeyHandle.patch
+        0009-Shim-CRYPTO_zalloc-for-OPENSSL_zalloc-callers.patch
 
   - runs: |
       # Setup bootstrap .NET SDK
@@ -80,14 +87,8 @@ pipeline:
         # so directly override the values which is supposedly a no-no
         # See also: https://github.com/dotnet/runtime/issues/61859
         export CFLAGS="$CFLAGS -mbranch-protection=none"
-        export CXXFLAGS="$CXXFLAGS -mbranch-protection=none"
+        export CXXFLAGS="-mbranch-protection=none"
       fi
-
-      # Create dbg sourcecode: ship the native sources referenced by the
-      # debug symbols, after patching and before building.
-      mkdir -p ${{targets.destdir}}-dbg/usr/src/${{package.name}}/src/runtime/src
-      cp -r src/runtime/src/native src/runtime/src/coreclr \
-        ${{targets.destdir}}-dbg/usr/src/${{package.name}}/src/runtime/src/
 
       # The .NET runtime is built with O0 so we cannot enable FORTIFY_SOURCE
       sed -i 's/-D_FORTIFY_SOURCE=3//g' /etc/clang-${{vars.llvm-version}}/common.cfg
@@ -102,8 +103,7 @@ pipeline:
         /p:ContinueOnPrebuiltBaselineError=true \
         /p:MinimalConsoleLogOutput=true \
         /p:SkipPortableRuntimeBuild=true \
-        /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind \
-        /p:DistroAgnosticOpenSsl=true
+        /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind
 
       # Install .NET
       mkdir -p ${{targets.contextdir}}/usr/share/dotnet
@@ -113,28 +113,9 @@ pipeline:
       mkdir -p ${{targets.contextdir}}/usr/bin
       ln -s /usr/share/dotnet/dotnet ${{targets.contextdir}}/usr/bin/dotnet
 
-      # strip omitted: because we use split/debug to ship debug symbols
+  - uses: strip
 
 subpackages:
-  # Must be first, so split/debug sees all binaries before other
-  # subpackages move them out of destdir.
-  - name: "${{package.name}}-dbg"
-    description: ".NET ${{vars.major-version}} debug symbols"
-    dependencies:
-      runtime:
-        # Debug symbols only match the exact build they were split from
-        - ${{package.name}}=${{package.full-version}}
-        - dotnet-${{vars.major-version}}-runtime=${{package.full-version}}
-    pipeline:
-      - uses: split/debug
-    test:
-      environment:
-        contents:
-          packages:
-            - dotnet-${{vars.major-version}}-runtime=${{package.full-version}}
-      pipeline:
-        - uses: test/tw/debugpackage
-
   - name: dotnet-${{vars.major-version}}-sdk
     description: ".NET ${{vars.major-version}} SDK"
     dependencies:
@@ -164,14 +145,7 @@ subpackages:
           mv ${{targets.destdir}}/usr/share/dotnet/shared/Microsoft.NETCore.App ${{targets.contextdir}}/usr/share/dotnet/shared/
     dependencies:
       runtime:
-        - dotnet>=${{vars.major-version}}
-        - icu # dlopen: System.Globalization.Native
-        - so:libssl.so.4 # dlopen: opensslshim (DistroAgnosticOpenSsl)
-        - so:libgssapi_krb5.so.2 # dlopen: System.Net.Security.Native (Kerberos/Negotiate)
-        - ca-certificates-bundle # TLS trust store
-        - tzdata # TimeZoneInfo
-        - libexpat1
-        - libbrotlidec1
+        - dotnet
     test:
       pipeline:
         - uses: test/tw/ldd-check
@@ -185,6 +159,8 @@ subpackages:
     dependencies:
       runtime:
         - dotnet-${{vars.major-version}}-runtime=${{package.full-version}}
+        - libexpat1
+        - libbrotlidec1
     test:
       pipeline:
         - uses: test/tw/ldd-check
@@ -256,27 +232,18 @@ test:
       runs: |
         cat <<'EOF' > HelloWorld.cs
         using System;
-        using System.Security.Cryptography;
-        using System.Text;
 
         class Program
         {
             static void Main()
             {
-                string message = "Hello, World!";
-                Console.WriteLine(message);
-                // SHA256 is backed by OpenSSL on Linux, exercise it
-                byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(message));
-                Console.WriteLine("SHA256: " + Convert.ToHexString(hash).ToLowerInvariant());
+                Console.WriteLine("Hello, World!");
             }
         }
         EOF
         dotnet new console -o HelloWorldApp --force
         mv HelloWorld.cs HelloWorldApp/Program.cs
-        dotnet run --project HelloWorldApp > output.txt
-        cat output.txt
-        grep -q "Hello, World!" output.txt
-        grep -q "SHA256: dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f" output.txt
+        dotnet run --project HelloWorldApp
     - name: Compile and run a .NET application with arguments
       runs: |
         cat <<'EOF' > ArgumentEcho.cs

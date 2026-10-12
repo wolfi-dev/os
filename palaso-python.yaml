@@ -1,0 +1,241 @@
+package:
+  name: palaso-python
+  # Master snapshot after the 0.7.1 tag; the _git suffix sorts above 0.7.1 and
+  # below any later release tag, so a real release supersedes this cleanly.
+  version: "0.7.1_git20260911"
+  epoch: 0
+  description: "SIL's palaso Python library and scripts for font and language engineering, including cmptxtrender for comparing font shaping output"
+  copyright:
+    - license: MIT AND LGPL-2.1-or-later
+  dependencies:
+    runtime:
+      # palaso.font.graphite, palaso.font.hbng and freetype-py dlopen these
+      # through ctypes, so SCA cannot see them.
+      - freetype
+      - graphite2
+      - harfbuzz
+      # The staged venv's bin/python3 symlinks back to the system interpreter;
+      # SCA does not follow the venv symlink farm.
+      - python-${{vars.python-version}}-base
+  options:
+    # Don't resolve libraries installed in the virtual environment as providers.
+    no-provides: true
+
+vars:
+  # The request specifies python-3.13. It is also the interpreter that
+  # os/pysilfont.yaml, the companion SIL font tool, stages its venv against.
+  python-version: "3.13"
+  venv-home: "/opt/chainguard/palaso"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      # uharfbuzz is built against the system HarfBuzz (USE_SYSTEM_LIBS=1),
+      # which it finds through pkg-config (harfbuzz-subset, harfbuzz-raster).
+      - harfbuzz-dev
+      - pkgconf
+      - python-${{vars.python-version}}-dev
+      - uv
+
+pipeline:
+  # The only tags (0.7, 0.7.1) date from 2012. The maintainer advised building
+  # master until a new release is tagged (silnrsi/font-padauk#56).
+  - uses: git-checkout
+    with:
+      repository: https://github.com/silnrsi/palaso-python
+      branch: master
+      expected-commit: a829ca0f59de1da8b79999fc0ac6e53e6ce8ef26
+
+  # ctypes.util.find_library needs ldconfig/gcc/ld, which a runtime image may
+  # lack. Make the fallbacks load the runtime sonames instead of a wheel-local
+  # path and the unversioned -dev symlink.
+  - uses: sed
+    with:
+      path: lib/palaso/font/graphite.py
+      pattern: "os\\.path\\.join\\(wheel, 'lib', 'libgraphite2\\.so'\\)"
+      replacement: "'libgraphite2.so.3'"
+
+  - uses: sed
+    with:
+      path: lib/palaso/font/hbng.py
+      pattern: 'CDLL\("libharfbuzz\.so"\)'
+      replacement: 'CDLL("libharfbuzz.so.0")'
+
+  - uses: auth/uv
+    with:
+      allow-fallback-indexes: true
+
+  - uses: uv/venv
+    with:
+      venv: ${{vars.venv-home}}
+      python: ${{vars.python-version}}
+
+  # requirements.txt is repo-wide (mercurial, PyGObject, scikit_learn, ...) and
+  # setup.cfg declares no install_requires, so install only what the font
+  # shaping stack imports: fontTools (cmptxtrender), uharfbuzz and freetype-py
+  # (palaso.font.shape). Cython is deliberately absent from the venv so
+  # palaso's setup.py skips the kmfl extension and stays pure Python.
+  #
+  # fontTools is a Chainguard Libraries wheel. uharfbuzz and freetype-py are
+  # built here from their sdists so that neither ships an upstream-built copy
+  # of HarfBuzz or FreeType: uharfbuzz links the system libharfbuzz-subset and
+  # libharfbuzz-raster (0.56.3 vendors HarfBuzz 14.6.0, the version os/
+  # ships), and freetype-py's sdist bundles nothing unless FREETYPEPY_BUNDLE_FT
+  # is set, so it loads the system libfreetype through ctypes. All three are
+  # pinned, so a rebuild does not silently move them.
+  - name: Install shaping dependencies, then palaso from the checkout
+    runs: |
+      export VIRTUAL_ENV="${{vars.venv-home}}"
+      uv pip install --only-binary :all: fonttools==4.66.1
+      USE_SYSTEM_LIBS=1 uv pip install \
+        --no-binary uharfbuzz --no-binary freetype-py \
+        uharfbuzz==0.56.3 freetype-py==2.5.1
+      uv pip install --no-deps .
+
+      # freetype-py's last-resort ctypes fallback is the unversioned -dev
+      # symlink; point it at the runtime soname, as for graphite2 and harfbuzz
+      # above, so it loads without ldconfig, gcc or ld.
+      raw="$(echo "${{vars.venv-home}}"/lib/python*/site-packages/freetype/raw.py)"
+      [ "$(grep -c "library_name = 'libfreetype.so'" "$raw")" = 1 ]
+      sed -i "s/library_name = 'libfreetype.so'/library_name = 'libfreetype.so.6'/" "$raw"
+      test ! -e "$(dirname "$raw")/libfreetype.so"
+
+      uv pip uninstall pip virtualenv
+      uv pip check
+      chmod 644 "${{vars.venv-home}}/.lock"
+      mkdir -p "$(dirname "${{targets.contextdir}}${{vars.venv-home}}")"
+      mv "${{vars.venv-home}}" "${{targets.contextdir}}${{vars.venv-home}}"
+
+  - name: Verify the installed venv and expose cmptxtrender
+    runs: |
+      staged="${{targets.contextdir}}${{vars.venv-home}}"
+      # Upstream's in-development version string on the pinned commit; the
+      # apk version cannot carry it, so assert it to notice when it moves.
+      "$staged/bin/python" -c "import palaso; assert palaso.__version__ == '0.7.10', palaso.__version__"
+      test -x "$staged/bin/cmptxtrender"
+
+      # Only cmptxtrender goes on PATH: the other installed scripts need
+      # dependencies from requirements.txt that this package does not ship.
+      mkdir -p "${{targets.contextdir}}/usr/bin"
+      ln -sf "${{vars.venv-home}}/bin/cmptxtrender" "${{targets.contextdir}}/usr/bin/cmptxtrender"
+
+  - uses: strip
+
+# Needed only by the test pipeline's xcover/profile step, which attaches BPF
+# uprobes to the interpreter; no build step uses it.
+capabilities:
+  add:
+    - CAP_SYS_ADMIN
+
+test:
+  pipeline:
+    # The venv's native extensions (uharfbuzz, fontTools' compiled modules)
+    # are the only ELF objects shipped.
+    - uses: test/tw/ldd-check
+    # cmptxtrender is interpreted, so the interpreter the venv symlinks to is
+    # the only executable to attach to; CPython takes longer than the default
+    # window to attach.
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/python${{vars.python-version}}
+        wait-timeout: "120"
+    - uses: test/tw/help-check
+      with:
+        bins: cmptxtrender
+    - name: palaso imports and reports the pinned development version
+      runs: |
+        ver=$(${{vars.venv-home}}/bin/python -c "import palaso; print(palaso.__version__)")
+        echo "palaso.__version__: ${ver}"
+        [ "${ver}" = "0.7.10" ]
+    - name: Shaping backends load without ldconfig, gcc or ld
+      runs: |
+        ${{vars.venv-home}}/bin/python <<'EOF'
+        import sys
+        from palaso.font.shape import make_shaper
+        assert callable(make_shaper)
+        for mod in ("palaso.font.graphite", "palaso.font.hbng", "uharfbuzz", "freetype"):
+            assert mod in sys.modules, mod
+            print("loaded", mod)
+        EOF
+    - name: The shaping backends use the system HarfBuzz and FreeType
+      runs: |
+        # Neither binding may carry its own copy: uharfbuzz must run on the
+        # system libharfbuzz, and freetype-py must load the system libfreetype.
+        site="$(echo ${{vars.venv-home}}/lib/python*/site-packages)"
+        test ! -e "$site/freetype/libfreetype.so"
+        ${{vars.venv-home}}/bin/python - <<'EOF'
+        import ctypes, freetype, uharfbuzz
+        maps = open("/proc/self/maps").read()
+        for lib in ("/usr/lib/libharfbuzz-subset.so", "/usr/lib/libfreetype.so"):
+            assert lib in maps, f"{lib} is not mapped"
+        hb = ctypes.CDLL("libharfbuzz.so.0")
+        hb.hb_version_string.restype = ctypes.c_char_p
+        system = hb.hb_version_string().decode()
+        print("uharfbuzz", uharfbuzz.__version__, "reports HarfBuzz",
+              uharfbuzz.version_string(), "; system", system)
+        assert uharfbuzz.version_string() == system
+        print("freetype-py loaded", freetype.raw._lib._name,
+              "FreeType", freetype.version())
+        EOF
+    - name: Generate test fonts
+      runs: |
+        # a.ttf and c.ttf are byte-identical; b.ttf differs only in the advance
+        # of "A" (700 vs 600). Equal-length names keep the reports comparable.
+        ${{vars.venv-home}}/bin/python - <<'EOF'
+        import os
+        from fontTools.fontBuilder import FontBuilder
+        from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+        def build(path, advance):
+            fb = FontBuilder(1000, isTTF=True)
+            fb.setupGlyphOrder([".notdef", "space", "A"])
+            fb.setupCharacterMap({0x20: "space", 0x41: "A"})
+            pen = TTGlyphPen(None)
+            pen.moveTo((100, 0)); pen.lineTo((100, 700)); pen.lineTo((500, 700)); pen.lineTo((500, 0)); pen.closePath()
+            fb.setupGlyf({".notdef": TTGlyphPen(None).glyph(), "space": TTGlyphPen(None).glyph(), "A": pen.glyph()})
+            fb.setupHorizontalMetrics({".notdef": (600, 0), "space": (300, 0), "A": (advance, 100)})
+            fb.setupHorizontalHeader(ascent=800, descent=-200)
+            fb.setupNameTable({"familyName": "CmpTest", "styleName": "Regular"})
+            fb.setupOS2()
+            fb.setupPost()
+            fb.save(path)
+
+        os.makedirs("/tmp/cmp", exist_ok=True)
+        build("/tmp/cmp/a.ttf", 600)
+        build("/tmp/cmp/b.ttf", 700)
+        EOF
+        install -Dm644 /tmp/cmp/a.ttf /tmp/cmp/c.ttf
+        printf 'AAA\nA A\n' > /tmp/cmp/text.txt
+    - name: cmptxtrender reports no differences for identical fonts and some for different fonts
+      working-directory: /tmp/cmp
+      runs: |
+        cmptxtrender -e ot -t text.txt -o same.html a.ttf c.ttf
+        stat same.html
+        # A comparison tool may signal differences through its exit status, so
+        # record it and judge the run by the report it wrote.
+        rc=0
+        cmptxtrender -e ot -t text.txt -o diff.html a.ttf b.ttf || rc=$?
+        echo "exit status for differing fonts: ${rc}"
+        test -s diff.html
+        echo "--- identical fonts ---"; cat same.html
+        echo "--- differing fonts ---"; cat diff.html
+        same_size=$(wc -c < same.html)
+        diff_size=$(wc -c < diff.html)
+        if [ "${diff_size}" -le "${same_size}" ]; then
+          echo "FAIL: differing fonts produced no more report output (${diff_size}) than identical fonts (${same_size})"
+          exit 1
+        fi
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        min-coverage: 90
+
+update:
+  enabled: false
+  exclude-reason: |
+    Pinned to a master commit because the only upstream tags (0.7, 0.7.1) are
+    from 2012 and the maintainer advised using master until a new tag exists.
+    Re-enable with github tracking once upstream tags a release after a829ca0f.

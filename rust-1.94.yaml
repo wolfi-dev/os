@@ -1,0 +1,258 @@
+package:
+  name: rust-1.94
+  version: "1.94.1"
+  epoch: 11 # split/manpages
+  description: "Empowering everyone to build reliable and efficient software."
+  copyright:
+    - license: Apache-2.0 AND MIT
+  resources:
+    cpu: "11"
+    memory: 24Gi
+  dependencies:
+    runtime:
+      - libLLVM-21
+    provides:
+      - rust=${{package.full-version}}
+  annotations:
+    toolchain: true
+    toolchain-stream: true
+    toolchain-stream-pkgs: _ALL
+    # rustc embeds libLLVM-N; transitions gated on upstream rust compat window.
+    toolchain-stream-reconcile-optout: true
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
+
+vars:
+  openssl-version: "4.0"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-21
+      - cmake
+      - coreutils
+      - curl
+      - curl-dev
+      - file
+      - glibc-2.44-dev
+      - libLLVM-21
+      - libssh2-dev
+      - libxml2-dev
+      - llvm-21
+      - llvm-21-dev
+      - openssl-${{vars.openssl-version}}-dev # FTBFS with openssl-hardened-dev: bundled libgit2-sys uses deprecated SHA256_CTX, SHA256_Init/Update/Final and SSL_get_peer_certificate removed in OpenSSL 3.x
+      - patch
+      - python3
+      - samurai
+      - wasi-libc
+      - xz-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rust-lang/rust
+      tag: ${{package.version}}
+      expected-commit: e408947bfd200af42db322daf0fadfe7e26d3bd1
+
+  - runs: |
+      # Reconstructed vendored crates and bootstrap toolchain
+      ./x vendor
+
+      # The vendored openssl-sys build script predates OpenSSL 4.0 and aborts
+      # with a version_error() panic for any OPENSSL_VERSION_NUMBER >=
+      # 0x40000000. OpenSSL 4.0 is API-compatible with the 3.x cfg surface
+      # openssl-sys already understands, so raise the upper bound it
+      # recognizes (0x40000000 -> 0x50000000) instead of patching every
+      # numeric literal by hand, since the exact underscore grouping differs
+      # across openssl-sys releases.
+      python3 - <<'PYEOF'
+      import glob
+      import hashlib
+      import json
+      import os
+      import re
+
+      for path in glob.glob("vendor/openssl-sys*/build/main.rs"):
+          with open(path) as f:
+              content = f.read()
+
+          def repl(m):
+              value = int(m.group(0).replace("_", ""), 16)
+              return "0x50000000" if value == 0x40000000 else m.group(0)
+
+          new_content = re.sub(r"0x[0-9a-fA-F_]+", repl, content)
+          if new_content != content:
+              with open(path, "w") as f:
+                  f.write(new_content)
+              print(f"patched {path} for OpenSSL 4.0 support")
+
+              # Cargo's directory source verifies each vendored file against
+              # the checksum recorded in .cargo-checksum.json and refuses to
+              # build if they differ. Recompute the checksum for the file we
+              # just edited so the vendored directory source stays trusted.
+              crate_dir = os.path.dirname(os.path.dirname(path))
+              checksum_path = os.path.join(crate_dir, ".cargo-checksum.json")
+              rel_path = os.path.relpath(path, crate_dir)
+              with open(checksum_path) as f:
+                  checksums = json.load(f)
+              checksums["files"][rel_path] = hashlib.sha256(
+                  new_content.encode()
+              ).hexdigest()
+              with open(checksum_path, "w") as f:
+                  json.dump(checksums, f)
+      PYEOF
+
+      # Populate cargo config
+      mkdir .cargo
+      cat > .cargo/config.toml <<EOF
+      [source.crates-io]
+      replace-with = "vendored-sources"
+      [source."git+https://github.com/rust-lang/team"]
+      git = "https://github.com/rust-lang/team"
+      replace-with = "vendored-sources"
+      [source.vendored-sources]
+      directory = "vendor"
+      EOF
+
+      export CFLAGS="$CFLAGS -O2 -I/usr/lib/llvm-21/include"
+      export CXXFLAGS="$CXXFLAGS -O2 -I/usr/lib/llvm-21/include"
+      export OPENSSL_NO_VENDOR=1
+      export ARCH=${{host.triplet.rust}}
+
+      # Using downloaded toolchain, alternative is to build-depend on
+      # our builds of rust/cargo, and then update this to /usr/bin, or
+      # drop this setting together with build.cargo and build.rustc
+      # settings in configure
+      export TOOLCHAIN_BIN_DIR=`pwd`/build/${ARCH}/stage0/bin
+
+      # Create a minimal config.toml with necessary options
+      # This is needed because of upstream changes in Rust 1.87 that removed automatic config.toml creation
+      cat > config.toml <<EOF
+      [rust]
+      deny-warnings = false
+      EOF
+
+      ./configure \
+        --host="${ARCH}" \
+        --target="${ARCH}" \
+        --prefix="/usr" \
+        --release-channel="stable" \
+        --enable-local-rust \
+        --local-rust-root="/usr" \
+        --llvm-root="/usr/lib/llvm-21" \
+        --llvm-config="/usr/lib/llvm-21/bin/llvm-config" \
+        --disable-docs \
+        --enable-extended \
+        --tools="cargo,src,clippy,rustfmt,rustdoc" \
+        --enable-llvm-link-shared \
+        --enable-option-checking \
+        --enable-locked-deps \
+        --enable-profiler \
+        --enable-vendor \
+        --dist-compression-formats=gz \
+        --python="python3" \
+        --set="rust.musl-root=/usr" \
+        --set="rust.codegen-units=1" \
+        --set="rust.codegen-units-std=1" \
+        --set="target.${ARCH}.musl-root=/usr" \
+        --set="target.${ARCH}.crt-static=false" \
+        --set="target.${ARCH}.musl-root=/usr" \
+        --set="target.${ARCH}.crt-static=false" \
+        --set="build.cargo=$TOOLCHAIN_BIN_DIR/cargo" \
+        --set="build.rustc=$TOOLCHAIN_BIN_DIR/rustc"
+
+      # Configure the bootstrap process not to use Rust's LLD (as we use our
+      # system LLVM); see
+      # https://github.com/rust-lang/rust/issues/143076#issuecomment-3018803649
+      sed -i '/^\[rust\]$/a lld=false' bootstrap.toml
+
+  - runs: |
+      sed 's|deny(warnings,|deny(|' -i src/bootstrap/src/lib.rs
+      mkdir -p "${{targets.destdir}}/usr"
+      unset CARGO_PROFILE_RELEASE_LTO
+      unset CARGO_PROFILE_RELEASE_OPT_LEVEL
+      unset CARGO_PROFILE_RELEASE_PANIC
+      unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+      export CFLAGS="$CFLAGS -O2 -I/usr/lib/llvm-21/include/"
+      export CXXFLAGS="$CXXFLAGS -O2 -I/usr/lib/llvm-21/include/"
+      export OPENSSL_NO_VENDOR=1
+      export RUSTC_BOOTSTRAP=1
+      export RUST_BACKTRACE=full
+      DESTDIR=${{targets.destdir}} python3 ./x.py install --jobs $(nproc)
+
+  - uses: strip
+
+  # delete uneeded files eg uninstalltion
+  - runs: |
+      rm ${{targets.destdir}}/usr/lib/rustlib/components
+      rm ${{targets.destdir}}/usr/lib/rustlib/install.log
+      rm ${{targets.destdir}}/usr/lib/rustlib/rust-installer-version
+      rm ${{targets.destdir}}/usr/lib/rustlib/uninstall.sh
+      rm ${{targets.destdir}}/usr/lib/rustlib/manifest-*
+
+  - name: ensure libraries are executable for melange SCA provides generation
+    runs: |
+      chmod +x ${{targets.destdir}}/usr/lib/*.so
+
+subpackages:
+  - name: ${{package.name}}-doc
+    description: ${{package.name}} documentation and manpages
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+update:
+  enabled: true
+  github:
+    identifier: rust-lang/rust
+    use-tag: true
+    tag-filter: 1.94.
+
+test:
+  environment:
+    contents:
+      packages:
+        - gcc
+        - glibc-dev
+  pipeline:
+    - uses: test/tw/ver-check
+      with:
+        bins: |
+          cargo
+          rustc
+          rustdoc
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          cargo
+          cargo-clippy
+          cargo-fmt
+          clippy-driver
+          rust-gdbgui
+          rustc
+          rustdoc
+          rustfmt
+    - name: Compile and run Hello World
+      runs: |
+        set -euo pipefail
+        cat <<'EOF' > hello.rs
+        fn main() {
+          println!("Hello, World!");
+        }
+        EOF
+        rustc hello.rs
+        ./hello | grep -qF "Hello, World!"
+    - name: Cargo project creation and run
+      runs: |
+        set -euo pipefail
+        cargo new hello_cargo --bin
+        cd hello_cargo
+        cargo run | grep -qF "Hello, world!"
+    - uses: test/tw/ldd-check

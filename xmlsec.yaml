@@ -1,7 +1,7 @@
 package:
   name: xmlsec
   version: "1.3.12"
-  epoch: 4 # openssl-hardened: 3.6->4.0
+  epoch: 5 # openssl-hardened: 3.6->4.0, drop libssl3 from build env
   description: C based implementation for XML Signature Syntax and Processing and XML Encryption Syntax and Processing
   copyright:
     - license: MIT
@@ -17,6 +17,7 @@ package:
 
 vars:
   openssl-version: "4.0"
+  openssl-soversion: "4"
 
 environment:
   contents:
@@ -31,7 +32,6 @@ environment:
       - help2man
       - libgcrypt-dev
       - libltdl
-      - libssl3
       - libtool
       - libxml2
       - libxml2-dev
@@ -122,6 +122,12 @@ subpackages:
         - uses: test/docs
 
 test:
+  environment:
+    contents:
+      packages:
+        - binutils
+        - openssl-${{vars.openssl-version}}
+        - xmlsec-openssl
   pipeline:
     - uses: test/tw/ldd-check
     - uses: test/tw/ver-check
@@ -130,6 +136,102 @@ test:
     - uses: test/tw/help-check
       with:
         bins: xmlsec1
+    - name: Check xmlsec links only OpenSSL ${{vars.openssl-version}}
+      runs: |
+        readelf -d /usr/bin/xmlsec1 > needed.txt
+        grep -F 'Shared library: [libcrypto.so.${{vars.openssl-soversion}}]' needed.txt
+        for f in /usr/bin/xmlsec1 /usr/lib/libxmlsec1*.so.*; do
+          readelf -d "$f" > needed.txt
+          if grep -E 'Shared library: \[lib(ssl|crypto)\.so\.' needed.txt | grep -v '\.so\.${{vars.openssl-soversion}}\]'; then
+            echo "$f links an OpenSSL other than ${{vars.openssl-version}}"
+            exit 1
+          fi
+        done
+    - name: Sign, verify, encrypt and decrypt with the OpenSSL backend
+      runs: |
+        cd "$(mktemp -d)"
+        openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out key.pem
+        openssl pkey -in key.pem -pubout -out pub.pem
+        openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out other.pem
+        openssl pkey -in other.pem -pubout -out otherpub.pem
+        cat > tmpl.xml <<'XML'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Envelope xmlns="urn:envelope">
+          <Data>Hello, OpenSSL</Data>
+          <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <SignedInfo>
+              <CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
+              <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+              <Reference URI="">
+                <Transforms>
+                  <Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+                </Transforms>
+                <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <DigestValue/>
+              </Reference>
+            </SignedInfo>
+            <SignatureValue/>
+            <KeyInfo>
+              <KeyName>signkey</KeyName>
+            </KeyInfo>
+          </Signature>
+        </Envelope>
+        XML
+
+        # RSA-SHA256 enveloped signature. xmlsec 1.3 looks keys up by the
+        # <KeyName> in the document, so every key is loaded under that name.
+        xmlsec1 --sign --crypto openssl --privkey-pem:signkey key.pem --output signed.xml tmpl.xml
+        grep -E '<SignatureValue>[A-Za-z0-9+/=]' signed.xml
+        xmlsec1 --verify --crypto openssl --pubkey-pem:signkey pub.pem signed.xml > verify.log 2>&1
+        grep -E '(^| )OK$' verify.log
+
+        # The wrong key and a tampered document must both get a FAIL verdict.
+        # The key is found under the same name, so the failure must not be
+        # KEY-NOT-FOUND but a real signature or digest mismatch.
+        if xmlsec1 --verify --crypto openssl --pubkey-pem:signkey otherpub.pem signed.xml > wrongkey.log 2>&1; then
+          echo "verification with the wrong key succeeded"
+          exit 1
+        fi
+        grep -E '(^| )FAIL(ED)?$' wrongkey.log
+        if grep -F 'KEY-NOT-FOUND' wrongkey.log; then
+          echo "wrong-key verification failed to find the key instead of rejecting the signature"
+          exit 1
+        fi
+        sed 's/Hello, OpenSSL/Hello, OpenSSX/' signed.xml > tampered.xml
+        if xmlsec1 --verify --crypto openssl --pubkey-pem:signkey pub.pem tampered.xml > tampered.log 2>&1; then
+          echo "verification of a tampered document succeeded"
+          exit 1
+        fi
+        grep -E '(^| )FAIL(ED)?$' tampered.log
+        if grep -F 'KEY-NOT-FOUND' tampered.log; then
+          echo "tampered-document verification failed to find the key instead of rejecting the digest"
+          exit 1
+        fi
+
+        # AES-256-CBC encryption round trip of raw binary data. The template
+        # has no Type attribute, so --decrypt writes the bytes back unchanged
+        # instead of parsing them as an XML element.
+        openssl rand -out aes.key 32
+        cat > enc-tmpl.xml <<'XML'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#">
+          <EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+          <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyName>aes</KeyName>
+          </KeyInfo>
+          <CipherData>
+            <CipherValue/>
+          </CipherData>
+        </EncryptedData>
+        XML
+        printf 'secret payload for xmlsec' > plain.bin
+        xmlsec1 --encrypt --crypto openssl --aeskey:aes aes.key --binary-data plain.bin --output enc.xml enc-tmpl.xml
+        if grep -F 'secret payload' enc.xml; then
+          echo "plaintext found in the encrypted output"
+          exit 1
+        fi
+        xmlsec1 --decrypt --crypto openssl --aeskey:aes aes.key --output dec.bin enc.xml
+        cmp plain.bin dec.bin
 
 update:
   enabled: true

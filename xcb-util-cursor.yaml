@@ -1,0 +1,155 @@
+package:
+  name: xcb-util-cursor
+  version: "0.1.6"
+  epoch: 0
+  description: X C-language Binding - cursor library (port of libXcursor)
+  copyright:
+    - license: MIT
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - glibc-2.44-dev
+      # cursor/shape_to_id.c is generated from shape_to_id.gperf at build time
+      # and is not committed, so gperf is required for a git checkout to build.
+      - gperf
+      - libtool
+      - libxcb-dev
+      - m4
+      - pkgconf-dev
+      - util-macros-dev
+      - xcb-util-dev
+      - xcb-util-image-dev
+      - xcb-util-renderutil-dev
+
+pipeline:
+  # configure.ac calls XCB_UTIL_M4_WITH_INCLUDE_PATH / XCB_UTIL_COMMON, which
+  # upstream ships as the xcb-util-m4 submodule mounted at m4/. recurse-submodules
+  # fetches it during the network-enabled clone; .gitmodules already points at the
+  # gitlab URL so no rewrite patch is needed.
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.freedesktop.org/xorg/lib/libxcb-cursor
+      tag: xcb-util-cursor-${{package.version}}
+      expected-commit: 7b0fa99aa13084a9bf7be4180066f6a74b0adef1
+      recurse-submodules: true
+
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --with-pic \
+        --disable-static \
+        --disable-silent-rules
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - runs: rm -rf ${{targets.destdir}}/usr/lib/*.la
+
+  - uses: strip
+
+subpackages:
+  - name: xcb-util-cursor-dev
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      runtime:
+        - xcb-util-cursor
+        - xcb-util-image-dev
+        - xcb-util-renderutil-dev
+    description: xcb-util-cursor dev
+    test:
+      pipeline:
+        - uses: test/tw/devpackage
+        - uses: test/pkgconf
+        - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  git:
+    tag-filter-prefix: xcb-util-cursor-
+    strip-prefix: xcb-util-cursor-
+
+test:
+  environment:
+    contents:
+      packages:
+        - xcb-util-cursor-dev
+        - build-base
+        - pkgconf
+        # Xvfb needs a compilable keymap to start at all; without these it dies
+        # with "XKB: Failed to compile keymap" before any client can connect.
+        - xkbcomp
+        - xkeyboard-config
+        - Xvfb
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/no-docs
+    - name: Build library exerciser
+      runs: |
+        # The pkg-config module is xcb-cursor, not xcb-util-cursor.
+        tee test.c <<'EOF'
+        #include <stdio.h>
+        #include <xcb/xcb.h>
+        #include <xcb/xcb_cursor.h>
+        int main() {
+            xcb_connection_t *conn = xcb_connect(NULL, NULL);
+            if (xcb_connection_has_error(conn)) {
+                fprintf(stderr, "cannot connect to X server\n");
+                return 1;
+            }
+            xcb_screen_t *screen =
+                xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
+
+            xcb_cursor_context_t *ctx = NULL;
+            if (xcb_cursor_context_new(conn, screen, &ctx) < 0) {
+                fprintf(stderr, "xcb_cursor_context_new failed\n");
+                return 1;
+            }
+            /* Returns XCB_NONE on failure (cursor/load_cursor.c). */
+            xcb_cursor_t cursor = xcb_cursor_load_cursor(ctx, "left_ptr");
+            if (cursor == XCB_NONE) {
+                fprintf(stderr, "xcb_cursor_load_cursor failed\n");
+                return 1;
+            }
+            xcb_cursor_context_free(ctx);
+            xcb_disconnect(conn);
+            printf("loaded cursor xid=%u\n", cursor);
+            return 0;
+        }
+        EOF
+
+        # Intentional word splitting: pkg-config emits multiple flags, and
+        # the test pipeline runs under /bin/sh, where `read -ra` and
+        # `< <(...)` are both unavailable.
+        # shellcheck disable=SC2046
+        gcc $(pkg-config --cflags xcb-cursor) test.c -o cursor_check $(pkg-config --libs xcb-cursor)
+    - name: Load a cursor through the library against a headless X server
+      runs: |
+        Xvfb :99 -screen 0 640x480x24 -nolisten tcp > xvfb.log 2>&1 &
+        xvfb=$!
+        # Xvfb serves :99 over a unix socket; wait for it rather than sleeping.
+        i=0
+        while [ ! -S /tmp/.X11-unix/X99 ] && [ "$i" -lt 100 ]; do
+          kill -0 "$xvfb" 2>/dev/null || { cat xvfb.log; exit 1; }
+          sleep 0.1
+          i=$((i + 1))
+        done
+        test -S /tmp/.X11-unix/X99 || { echo "Xvfb never opened :99"; cat xvfb.log; exit 1; }
+
+        rc=0
+        DISPLAY=:99 ./cursor_check > result.txt || rc=$?
+        kill "$xvfb" 2>/dev/null || true
+        cat result.txt
+        [ "$rc" -eq 0 ] || { cat xvfb.log; exit "$rc"; }
+        grep -F "loaded cursor xid=" result.txt
+
+        nm -D --defined-only /usr/lib/libxcb-cursor.so.0 > syms.txt
+        grep -F "xcb_cursor_context_new" syms.txt
+        grep -F "xcb_cursor_load_cursor" syms.txt

@@ -1,0 +1,79 @@
+package:
+  name: ghostty-terminfo
+  version: "1.3.1"
+  epoch: 0
+  description: Terminfo for the Ghostty terminal emulator
+  copyright:
+    - license: MIT
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ncurses
+      - zig
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/ghostty-org/ghostty
+      tag: v${{package.version}}
+      expected-commit: 332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28
+
+  # Ghostty keeps its terminfo definition as Zig source (src/terminfo/ghostty.zig)
+  # and emits the terminfo source file by running `ghostty +terminfo`. Building the
+  # full terminal just to dump terminfo would pull in GTK and friends, so instead we
+  # compile a tiny generator against the self-contained terminfo module.
+  - name: Generate ghostty.terminfo
+    runs: |
+      export ZIG_GLOBAL_CACHE_DIR="${PWD}/.zig-cache-global"
+
+      cat > src/terminfo-gen.zig <<'EOF'
+      const std = @import("std");
+      const ghostty = @import("terminfo/ghostty.zig").ghostty;
+
+      pub fn main() !void {
+          var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+          const gpa = gpa_state.allocator();
+          var threaded: std.Io.Threaded = .init(gpa, .{});
+          defer threaded.deinit();
+
+          var buffer: [4096]u8 = undefined;
+          var stdout = std.Io.File.stdout().writer(threaded.io(), &buffer);
+          try ghostty.encode(&stdout.interface);
+          try stdout.interface.flush();
+      }
+      EOF
+
+      zig build-exe src/terminfo-gen.zig -O ReleaseSafe --name terminfo-gen
+      ./terminfo-gen > ghostty.terminfo
+
+      # Sanity check: the primary entry must be the TERM value Ghostty sets.
+      head -n 1 ghostty.terminfo | grep -q '^xterm-ghostty|'
+
+  - name: Compile the terminfo database
+    runs: |
+      mkdir -p "${{targets.destdir}}/etc/terminfo"
+      tic -x -o "${{targets.destdir}}/etc/terminfo" ghostty.terminfo
+
+update:
+  enabled: true
+  github:
+    identifier: ghostty-org/ghostty
+    strip-prefix: v
+    tag-filter-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - ncurses
+  pipeline:
+    - uses: test/tw/contains-files
+      with:
+        dir: /etc/terminfo/x/
+        name: xterm-ghostty
+    - name: Verify the terminfo entry is usable
+      runs: |
+        TERMINFO=/etc/terminfo infocmp -x xterm-ghostty | grep -F "xterm-ghostty"
+        TERMINFO=/etc/terminfo TERM=xterm-ghostty tput colors | grep -x 256

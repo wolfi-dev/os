@@ -1,0 +1,97 @@
+From d27328ca666e4577a5c00298eb822381b4b6d038 Mon Sep 17 00:00:00 2001
+From: Kevin Monroe <kevin.monroe@chainguard.dev>
+Date: Wed, 7 Oct 2026 09:35:03 -0500
+Subject: [PATCH] Fix sign extension of TLS stream SSL_CTX options
+
+php_openssl_setup_crypto() kept the SSL_CTX options in an int. SSL_OP_ALL
+includes SSL_OP_CRYPTOPRO_TLSEXT_BUG (bit 31), so the value is negative and
+SSL_CTX_set_options(), which takes a uint64_t since OpenSSL 3.0, receives it
+sign-extended with bits 32-63 set, turning on options nobody asked for.
+OpenSSL 4.0 assigns SSL_OP_ECH_GREASE to bit 37, so every TLS client stream
+sends an ECH GREASE extension. Generating it needs an X25519 key, which fails
+when the X25519 implementation isn't available (e.g. the FIPS provider), and
+the handshake aborts with an internal error.
+
+Store the options in a uint64_t.
+
+[Backport to PHP-8.5: drop the php_openssl_get_crypto_method_ctx_flags()
+hunk; that function no longer exists on this branch.]
+
+Signed-off-by: Kevin Monroe <kevin.monroe@chainguard.dev>
+---
+ .../tests/client_hello_no_ech_grease.phpt     | 49 +++++++++++++++++++
+ ext/openssl/xp_ssl.c                          |  2 +-
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+ create mode 100644 ext/openssl/tests/client_hello_no_ech_grease.phpt
+
+diff --git a/ext/openssl/tests/client_hello_no_ech_grease.phpt b/ext/openssl/tests/client_hello_no_ech_grease.phpt
+new file mode 100644
+index 0000000000..eb4a08b455
+--- /dev/null
++++ b/ext/openssl/tests/client_hello_no_ech_grease.phpt
+@@ -0,0 +1,49 @@
++--TEST--
++TLS client does not send an ECH GREASE extension it did not ask for
++--EXTENSIONS--
++openssl
++--SKIPIF--
++<?php
++if (OPENSSL_VERSION_NUMBER < 0x40000000) die('skip For OpenSSL >= 4.0');
++?>
++--FILE--
++<?php
++/* SSL_OP_ALL has bit 31 set; storing the context options in a signed 32-bit
++ * int sign-extended it into SSL_OP_ECH_GREASE (bit 37) on OpenSSL >= 4.0. */
++$server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
++$address = stream_socket_get_name($server, false);
++
++$context = stream_context_create(['ssl' => ['verify_peer' => false]]);
++$client = stream_socket_client("tcp://$address", $errno, $errstr, 1, STREAM_CLIENT_CONNECT, $context);
++stream_set_blocking($client, false);
++/* Sends the ClientHello, then returns 0 waiting for the ServerHello */
++var_dump(stream_socket_enable_crypto($client, true, STREAM_CRYPTO_METHOD_TLS_CLIENT));
++
++$conn = stream_socket_accept($server, 1);
++$record = '';
++while (strlen($record) < 5 || strlen($record) < 5 + unpack('n', $record, 3)[1]) {
++    $chunk = fread($conn, 16384);
++    if ($chunk === '' || $chunk === false) {
++        break;
++    }
++    $record .= $chunk;
++}
++
++/* Skip record header (5), handshake header (4), version (2) and random (32) */
++$pos = 43;
++$pos += 1 + ord($record[$pos]);                  /* session id */
++$pos += 2 + unpack('n', $record, $pos)[1];      /* cipher suites */
++$pos += 1 + ord($record[$pos]);                  /* compression methods */
++$end = $pos + 2 + unpack('n', $record, $pos)[1];
++$extensions = [];
++for ($pos += 2; $pos < $end; $pos += 4 + unpack('n', $record, $pos + 2)[1]) {
++    $extensions[] = unpack('n', $record, $pos)[1];
++}
++
++var_dump(in_array(0x002b, $extensions, true)); /* supported_versions, sanity check */
++var_dump(in_array(0xfe0d, $extensions, true)); /* encrypted_client_hello */
++?>
++--EXPECT--
++int(0)
++bool(true)
++bool(false)
+diff --git a/ext/openssl/xp_ssl.c b/ext/openssl/xp_ssl.c
+index 125b224238..2e8ed08007 100644
+--- a/ext/openssl/xp_ssl.c
++++ b/ext/openssl/xp_ssl.c
+@@ -1688,7 +1688,7 @@ static zend_result php_openssl_setup_crypto(php_stream *stream,
+ 		php_stream_xport_crypto_param *cparam) /* {{{ */
+ {
+ 	const SSL_METHOD *method;
+-	int ssl_ctx_options;
++	uint64_t ssl_ctx_options;
+ 	int method_flags;
+ 	zend_long min_version = 0;
+ 	zend_long max_version = 0;
+-- 
+2.43.0
+

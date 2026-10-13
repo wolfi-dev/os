@@ -2,7 +2,7 @@
 package:
   name: mosquitto
   version: "2.1.2"
-  epoch: 6 # provider-priority over mosquitto-fips
+  epoch: 7 # provider-priority over mosquitto-fips
   description: open source MQTT broker
   copyright:
     - license: EPL-1.0
@@ -197,9 +197,58 @@ test:
         - mosquitto-libs
         - mosquitto-clients
         - ${{package.name}}-compat
+        - openssl
         - posix-libc-utils
   pipeline:
     - uses: test/tw/ldd-check
+    - name: MQTTS password authentication with short passwords
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          mkdir -p /tmp/pwcerts
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tmp/pwcerts/ca.key -out /tmp/pwcerts/ca.crt \
+            -days 2 -subj '/CN=TestCA'
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout /tmp/pwcerts/server.key -out /tmp/pwcerts/server.csr \
+            -subj '/CN=localhost'
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > /tmp/pwcerts/san.cnf
+          openssl x509 -req -in /tmp/pwcerts/server.csr \
+            -CA /tmp/pwcerts/ca.crt -CAkey /tmp/pwcerts/ca.key -CAcreateserial \
+            -out /tmp/pwcerts/server.crt -days 2 -extfile /tmp/pwcerts/san.cnf
+          # Both the right and the wrong password are under 8 characters, so
+          # PBKDF2 must still accept short passwords and verify them rather
+          # than error out or let a client through.
+          mosquitto_passwd -c -b /tmp/tlspw alice s3cret
+          # The broker drops privileges, so its user must read these.
+          chmod -R a+rX /tmp/pwcerts /tmp/tlspw
+          cat > /tmp/tlspw.conf <<'EOF'
+          listener 8888 127.0.0.1
+          allow_anonymous false
+          password_file /tmp/tlspw
+          cafile /tmp/pwcerts/ca.crt
+          certfile /tmp/pwcerts/server.crt
+          keyfile /tmp/pwcerts/server.key
+          EOF
+        start: /usr/bin/mosquitto -c /tmp/tlspw.conf
+        expected_output: |
+          mosquitto version ${{package.version}} starting
+          Opening ipv4 listen socket on port 8888
+        error_strings: |
+          Error:
+        post: |
+          set -euo pipefail
+          wait-for-it 127.0.0.1:8888 -t 10
+          tls='-h localhost -p 8888 --cafile /tmp/pwcerts/ca.crt'
+          # Retained, so the subscriber receives it on connect.
+          mosquitto_pub $tls -u alice -P s3cret -t 'tlsauth/ok' -m 'tls-authed' -r
+          mosquitto_sub $tls -u alice -P s3cret -t 'tlsauth/#' -C 1 -W 10 > /tmp/tlspw.out
+          grep -F 'tls-authed' /tmp/tlspw.out
+          # The TLS handshake succeeds; the broker must refuse the credentials.
+          status=0
+          out=$(mosquitto_pub $tls -u alice -P wrong -t 'tlsauth/bad' -m 'nope' 2>&1) || status=$?
+          [ "$status" -ne 0 ]
+          echo "$out" | grep -F 'Connection Refused: not authorised'
     - runs: |
         #!/bin/bash
 

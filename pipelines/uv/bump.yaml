@@ -21,6 +21,8 @@ needs:
 # The venv input should point to the already-staged venv in the destdir
 # (i.e. ${{targets.contextdir}}${{vars.venv-home}}). Use uv/install or
 # uv/venv to set up and stage the venv before calling this pipeline.
+# A staged venv is moved back to its runtime path for the install and then
+# staged again, so the console scripts uv rewrites keep runtime shebangs.
 
 inputs:
   packages:
@@ -43,7 +45,29 @@ pipeline:
     runs: |
       set -euo pipefail
 
-      export VIRTUAL_ENV="${{inputs.venv}}"
+      # uv writes console-script shebangs from the venv's current path, so
+      # install into a staged venv at its runtime path and stage it again.
+      _venv="${{inputs.venv}}"
+      _staged=""
+      for _root in "${{targets.contextdir}}" "${{targets.destdir}}"; do
+        case "$_venv" in
+          "$_root"/*)
+            _staged="$_venv"
+            _venv="${_venv#"$_root"}"
+            break
+            ;;
+        esac
+      done
+      if [ -n "$_staged" ]; then
+        if [ -e "$_venv" ]; then
+          echo "ERROR: $_venv exists, cannot move $_staged back to bump it"
+          exit 1
+        fi
+        mkdir -p "$(dirname "$_venv")"
+        mv "$_staged" "$_venv"
+      fi
+
+      export VIRTUAL_ENV="$_venv"
 
       # Validate that all package specs use == pinning.
       _invalid=""
@@ -98,23 +122,6 @@ pipeline:
       # Verify the environment is consistent after bumping.
       uv pip check
 
-  - name: rewrite build-path shebangs
-    runs: |
-      set -eu
-
-      # uv writes console-script shebangs from the venv's current path, so a
-      # bump into a venv already moved under the package dir points them at
-      # the build. Strip that prefix so they resolve at runtime.
-      _venv="${{inputs.venv}}"
-      for _root in "${{targets.contextdir}}" "${{targets.destdir}}"; do
-        case "$_venv" in
-          "$_root"/*) ;;
-          *) continue ;;
-        esac
-        for _f in "$_venv"/bin/*; do
-          [ -f "$_f" ] && [ ! -L "$_f" ] || continue
-          head -n 1 "$_f" | grep -q "^#!$_root/" || continue
-          sed -i "1s|^#!$_root/|#!/|" "$_f"
-          echo "rewrote shebang: ${_f##*/}"
-        done
-      done
+      if [ -n "$_staged" ]; then
+        mv "$_venv" "$_staged"
+      fi

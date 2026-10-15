@@ -1,0 +1,131 @@
+name: Download npm package tarballs from an npm registry
+
+# Downloads one or more npm package tarballs into a directory, named the way
+# npm pack names them, so that a later pipeline step can read them. That is
+# the whole of what it does. Use it when you need a tarball on disk as a step
+# towards something else, such as unpacking it into a tree upstream does not
+# ship it in.
+#
+# fetch-package applies no guards of any kind. It does not:
+# * look at what is already on disk
+# * read or compare versions, or give any downgrade protection
+# * check whether the package is used anywhere in the package being built
+#
+# Use fetch-package to download a tarball, including to add a package that
+# upstream does not ship. Use npm/replace-package to replace a package that
+# already exists in a built node_modules tree, which carries the guards above.
+#
+# The download is npm pack, so every tarball is verified against the
+# dist.integrity digest the registry publishes for that exact version, and the
+# download URL is the one the packument names rather than a hand-built one.
+#
+# By default this pipeline downloads from registry.npmjs.org. It honours the
+# user and global npmrc, so running auth/npm first points it at Chainguard
+# Libraries instead.
+#
+# needs.packages names npm and deliberately names no Node.js, even though npm
+# cannot run without one and npm does not depend on one. A package that
+# builds with Node.js pins its own nodejs-<n>, and a second one conflicts with
+# it on /usr/bin/node. The node already in the build environment is used, and
+# a missing one stops the build with a clear error.
+needs:
+  packages:
+    - busybox
+    - npm
+
+inputs:
+  destination-dir:
+    description: |
+      Directory the tarballs are written to, created if it does not exist.
+      Each file is named the way npm pack names it: <name>-<version>.tgz,
+      with a scope's leading @ dropped and its / turned into a -, so
+      @hapi/content 6.0.2 is written as hapi-content-6.0.2.tgz.
+    default: "/tmp"
+  package:
+    description: |
+      The npm package to download, scope included (e.g. brace-expansion or
+      @hapi/content). May be a whitespace-separated list. A list entry may
+      carry its own version as <name>@<version>; one that does not is
+      downloaded at version.
+    required: true
+  version:
+    description: |
+      The version to download every listed package at that does not carry a
+      version of its own. Required unless every entry does.
+    default: ""
+
+pipeline:
+  - name: Download npm packages
+    runs: |
+      set -euo pipefail
+
+      packages="${{inputs.package}}"
+      version="${{inputs.version}}"
+      destination_dir="${{inputs.destination-dir}}"
+
+      # Collapse whatever whitespace a folded YAML scalar produced.
+      packages=$(echo $packages)
+
+      die() {
+        echo "ERROR: $*" >&2
+        exit 1
+      }
+
+      if [ -z "$packages" ]; then
+        die "package must name at least one package"
+      fi
+      if [ -z "$destination_dir" ]; then
+        die "destination-dir must not be empty"
+      fi
+      if ! command -v node > /dev/null 2>&1; then
+        die "no node found; add a nodejs-<n> to the build environment so that npm can run"
+      fi
+      mkdir -p "$destination_dir"
+      # Resolved before the cd below, which would otherwise reinterpret a
+      # relative destination.
+      destination_dir=$(cd "$destination_dir" && pwd)
+
+      work=$(mktemp -d)
+      log="$work/npm.log"
+
+      # Run from an empty directory. A melange step runs in the source tree,
+      # and npm would otherwise read a project .npmrc or package.json sitting
+      # there.
+      registry=$(cd "$work" && npm config get registry 2>/dev/null) || registry="unknown"
+      registry_note="the registry in effect was $registry"
+
+      for entry in $packages; do
+        # The version follows the last @ that does not open a scope.
+        case "$entry" in
+          ?*@*)
+            name=${entry%@*}
+            entry_version=${entry##*@}
+            ;;
+          *)
+            name="$entry"
+            entry_version="$version"
+            ;;
+        esac
+        if [ -z "$entry_version" ]; then
+          die "$name names no version and version is not set"
+        fi
+
+        file=$(echo "$name" | sed -e 's|^@||' -e 's|/|-|')-${entry_version}.tgz
+
+        echo "Downloading ${name}@${entry_version} to ${destination_dir}/"
+        # npm pack of a registry spec runs no lifecycle script, and
+        # --ignore-scripts keeps it that way should that ever change.
+        if ! (cd "$work" && npm pack --ignore-scripts \
+            --pack-destination "$destination_dir" \
+            "${name}@${entry_version}") > "$log" 2>&1; then
+          cat "$log" >&2
+          die "failed to download ${name}@${entry_version} ($registry_note)"
+        fi
+        if [ ! -f "$destination_dir/$file" ]; then
+          cat "$log" >&2
+          die "the download of ${name}@${entry_version} produced no $file ($registry_note)"
+        fi
+        # npm writes the file with the process umask. Set the mode explicitly
+        # so a tarball added to a package has a predictable one.
+        chmod 0644 "$destination_dir/$file"
+      done

@@ -1,0 +1,525 @@
+name: Replace vulnerable npm packages with fixed versions from an npm registry
+
+# Replaces vulnerable copies of npm packages in a built node_modules tree with
+# fixed releases fetched from an npm registry.
+#
+# Use this to remediate CVEs in npm dependencies that a lockfile override or a
+# yarn/pnpm resolution cannot reach: builds that resolve against a committed
+# lockfile with --frozen-lockfile, trees unpacked from a pre-built upstream
+# tarball, and copies bundled inside another package's own node_modules.
+#
+# Replaces packages that exist in the tree; to add one, use npm/fetch-package
+# and unpack it yourself. Each replaced copy is deleted and the fixed release
+# is unpacked in its place, so the path stays the same and every require()
+# keeps resolving. A copy's nested node_modules goes with it, so once every
+# replacement is made, each dependency of every installed package must still
+# resolve, the way Node.js resolves it, to a version within the declared
+# range. The build fails naming each one that does not; use nest to put back
+# what the fixed release needs.
+#
+# The download is delegated to npm/fetch-package, which honours the user and
+# global npmrc, so the source registry is whatever that configures: run
+# auth/npm first to draw from Chainguard Libraries. With no npmrc the source
+# is registry.npmjs.org. This step is therefore two steps: the nested
+# download, then the replacement logic.
+#
+# Forwarding an input to a nested pipeline input needs a melange new enough
+# to resolve it, as java/replace-jar notes; an older binary fails to compile
+# any caller.
+#
+# Every copy the pattern reaches is identified by the name its package.json
+# records, not by the directory it sits in, so an aliased install of a listed
+# package is replaced and another package reached by the pattern is ignored.
+# Only a package directory directly under node_modules, or under a scope
+# directory there, is acted on. Each copy acted on is then compared against
+# version through npm's own semver ordering, and on-downgrade decides what
+# happens to one that is already newer.
+#
+# needs.packages names npm and busybox. npm is needed for the semver module it
+# carries, which orders versions and evaluates ranges, as well as for the
+# download, which
+# npm/fetch-package performs. It deliberately names no Node.js, for the reason
+# npm/fetch-package gives: a second nodejs-<n> conflicts with the one the
+# package builds with. A Node.js is present regardless, because npm cannot run
+# without one, so node is located at run time and a missing one stops the
+# build with a clear error.
+needs:
+  packages:
+    - busybox
+    - npm
+
+inputs:
+  match:
+    description: |
+      Pattern selecting the package.json of each copy to replace. A pattern
+      holding a slash is matched against the path below search-dir; start it
+      with */ to match at any depth. One without a slash matches the basename
+      at any depth. Defaults to every package directory under any
+      node_modules, so aliased installs are found along with the rest; the
+      name check keeps it to the listed packages. Narrow it to one spot in
+      the tree with e.g. */npm/node_modules/tar/package.json for a copy
+      bundled inside npm.
+    default: ""
+  nest:
+    description: |
+      Whitespace-separated <name>@<version> specs to unpack into
+      <replaced copy>/node_modules after every replacement this step makes.
+      A replacement takes the whole directory with it, nested node_modules
+      included, so use this to put back what the fixed release needs: a major
+      bump usually wants a co-bumped transitive dependency that the hoisted
+      tree does not carry. The dependency check names what is missing.
+    default: ""
+  on-downgrade:
+    description: |
+      What to do with a copy whose installed version is newer than version.
+      "fail" stops the build, naming every such copy, "skip" leaves those
+      copies untouched and warns, "force" replaces them anyway. Use "force"
+      to install an older version on purpose.
+    default: "fail"
+  package:
+    description: |
+      The npm package to replace, scope included (e.g. brace-expansion or
+      @hapi/content). May be a whitespace-separated list of packages sharing
+      the same version.
+    required: true
+  replace-version:
+    description: |
+      semver range the installed copy's version must satisfy for it to be
+      replaced (e.g. ">=1.1.0 <1.1.18"), in the form advisories publish
+      affected ranges in. Prerelease versions are included. A copy outside it
+      is passed over and logged, and counts for nothing towards
+      require-match. Use it to scope a replacement to one major line, or to
+      spell out exactly which versions are vulnerable. Defaults to every copy
+      found.
+    default: ""
+  require-match:
+    description: |
+      Fail the build unless every listed package was found at least once
+      within replace-version. Set to "false" where the vulnerable copy is not
+      always present.
+    default: "true"
+  search-dir:
+    description: |
+      Root of the tree searched for copies. Must be set deliberately: a
+      /-rooted search takes a long time and will have unintended matches.
+    required: true
+  version:
+    description: |
+      The version to install. Every listed package is installed at this one
+      version, so packages at two versions need two invocations.
+    required: true
+
+pipeline:
+  # Nested inputs are fixed at template time, so the staging directory cannot
+  # come from mktemp. Every file in it carries its name and version, so two
+  # invocations share one only when they asked for the same tarball.
+  - uses: npm/fetch-package
+    with:
+      destination-dir: /tmp/npm-replace-package
+      package: ${{inputs.package}} ${{inputs.nest}}
+      version: ${{inputs.version}}
+
+  - name: Replace npm packages
+    runs: |
+      set -euo pipefail
+
+      packages="${{inputs.package}}"
+      version="${{inputs.version}}"
+      match="${{inputs.match}}"
+      nest="${{inputs.nest}}"
+      search_dir="${{inputs.search-dir}}"
+      on_downgrade="${{inputs.on-downgrade}}"
+      require_match="${{inputs.require-match}}"
+      # Quoted, so a range such as "<1.2.0 || >=2.0.0 <2.1.0" reaches node
+      # exactly as it was written in the YAML.
+      replace_version='${{inputs.replace-version}}'
+
+      tab=$(printf '\t')
+
+      # Collapse whatever whitespace a folded YAML scalar produced.
+      packages=$(echo $packages)
+      nest=$(echo $nest)
+
+      die() {
+        echo "ERROR: $*" >&2
+        exit 1
+      }
+
+      # ---------------------------------------------------------------- #
+      # Input validation                                                 #
+      # ---------------------------------------------------------------- #
+
+      case "$require_match" in
+        true|false) ;;
+        *) die "require-match must be \"true\" or \"false\", got \"$require_match\"" ;;
+      esac
+
+      case "$on_downgrade" in
+        fail|skip|force) ;;
+        *) die "on-downgrade must be \"fail\", \"skip\" or \"force\", got \"$on_downgrade\"" ;;
+      esac
+
+      if [ -z "$packages" ]; then
+        die "package must name at least one package"
+      fi
+      # A list entry carrying its own version would be fetched at it by
+      # npm/fetch-package and then looked for here at version.
+      for name in $packages; do
+        case "$name" in
+          ?*@*) die "package takes names only, got \"$name\"; every listed package is installed at version" ;;
+        esac
+      done
+      for spec in $nest; do
+        case "$spec" in
+          ?*@?*) ;;
+          *) die "nest takes <name>@<version> specs, got \"$spec\"" ;;
+        esac
+      done
+
+      # find prints paths beginning with exactly the start directory it was
+      # given, so stripping a trailing slash keeps the anchor below from
+      # producing a doubled one.
+      search_dir=${search_dir%/}
+      if [ -z "$search_dir" ]; then
+        die "search-dir must not be /; scope it to the tree holding the target"
+      fi
+      # Said plainly here. Left to the require-match check it would be
+      # reported as a package that upstream had dropped.
+      if [ ! -d "$search_dir" ]; then
+        if [ "$require_match" = "true" ]; then
+          die "search-dir $search_dir is not a directory"
+        fi
+        echo "WARNING: search-dir $search_dir is not a directory; nothing to replace"
+        exit 0
+      fi
+
+      # npm/fetch-package has already needed both, so these only fail where
+      # something shadows them between the two steps.
+      if ! command -v node > /dev/null 2>&1; then
+        die "no node found; add a nodejs-<n> to the build environment so that semver ordering can be evaluated"
+      fi
+      npm_dir=$(dirname "$(dirname "$(readlink -f "$(command -v npm)")")")
+      if ! node -e 'require.resolve("semver", { paths: [process.argv[1]] })' "$npm_dir" 2>/dev/null; then
+        die "no semver module found alongside npm in $npm_dir"
+      fi
+      if [ -n "$replace_version" ] && ! node -e '
+          const semver = require(require.resolve("semver", { paths: [process.argv[1]] }))
+          process.exit(semver.validRange(process.argv[2]) ? 0 : 1)
+        ' "$npm_dir" "$replace_version"; then
+        die "replace-version \"$replace_version\" is not a semver range"
+      fi
+
+      work=$(mktemp -d)
+      fetched="/tmp/npm-replace-package"
+
+      # ---------------------------------------------------------------- #
+      # Helpers                                                          #
+      # ---------------------------------------------------------------- #
+
+      # The file npm pack writes for <name> <version>.
+      tarball() {
+        echo "$fetched/$(echo "$1" | sed -e 's|^@||' -e 's|/|-|')-$2.tgz"
+      }
+
+      # npm's own version ordering, which string comparison cannot stand in
+      # for: 1.1.18 must outrank 1.1.9, and 1.2.3-rc.1 must rank below 1.2.3.
+      # Prints one of < > ==, and nothing for a version semver rejects.
+      #
+      # Every caller must take the result through a plain assignment guarded
+      # with "|| exit 1". A die inside a command substitution ends only the
+      # subshell, so a comparison used directly inside a test would evaluate
+      # to the empty string and let a downgrade through unnoticed.
+      version_compare() {
+        _result=$(node -e '
+          const semver = require(require.resolve("semver", { paths: [process.argv[1]] }))
+          const a = semver.valid(process.argv[2])
+          const b = semver.valid(process.argv[3])
+          if (a && b) {
+            console.log(["<", "==", ">"][semver.compare(a, b) + 1])
+          }
+        ' "$npm_dir" "$1" "$2")
+        case "$_result" in
+          '<'|'>'|'==') echo "$_result" ;;
+          *) die "could not compare versions \"$1\" and \"$2\" with semver" ;;
+        esac
+      }
+
+      # find -path matches the whole path as printed, which begins with
+      # search-dir, so a pattern holding a slash is anchored there. One
+      # starting with / or * is left alone, so */ keeps its any-depth meaning.
+      anchor_pattern() {
+        case "$1" in
+          "" | /* | \**) echo "$1" ;;
+          */*) echo "$search_dir/$1" ;;
+          *) echo "$1" ;;
+        esac
+      }
+
+      find_pattern() {
+        case "$1" in
+          */*) find "$search_dir" -type f -path "$1" ;;
+          *) find "$search_dir" -type f -name "$1" ;;
+        esac
+      }
+
+      # Reads the package.json paths on stdin and writes the copies in scope
+      # to $targets, one "<directory><tab><name><tab><version>" line each, with
+      # an absent version written as "-", because read with IFS set to a tab
+      # collapses adjacent tabs and would shift the later fields left.
+      #
+      # The name the copy records, not the directory it sits in, is what it
+      # is: an aliased install puts a package under another name, and a broad
+      # pattern reaches packages that are not ours to touch. A package.json
+      # that records no name, or does not parse, is not a package root; many
+      # packages ship one under dist/ to mark a directory as ESM or CJS. One
+      # that records a listed name somewhere other than directly under
+      # node_modules is not a package root either, and replacing it would put
+      # a whole package where a subdirectory was. Files that are not ours are
+      # only logged for an explicit match, since the default reaches every
+      # package in the tree.
+      classify() {
+        node -e '
+          const fs = require("fs")
+          const path = require("path")
+          const semver = require(require.resolve("semver", { paths: [process.argv[1]] }))
+          const listed = new Set(process.argv[2].split(" "))
+          const range = process.argv[3]
+          const verbose = process.argv[4] === "true"
+          const out = fs.openSync(process.argv[5], "w")
+          for (const file of fs.readFileSync(0, "utf8").split("\n")) {
+            if (!file) continue
+            const dir = path.dirname(file)
+            let name = ""
+            let version = ""
+            try {
+              const manifest = JSON.parse(fs.readFileSync(file, "utf8"))
+              if (typeof manifest.name === "string") name = manifest.name
+              if (typeof manifest.version === "string") version = manifest.version
+            } catch (e) {}
+            if (!listed.has(name)) {
+              if (verbose) {
+                console.log(name ? `Ignoring ${dir}: it is ${name}` : `Ignoring ${dir}: its package.json records no package name`)
+              }
+              continue
+            }
+            const parent = path.basename(path.dirname(dir))
+            const grandparent = path.basename(path.dirname(path.dirname(dir)))
+            if (parent !== "node_modules" && !(parent.startsWith("@") && grandparent === "node_modules")) {
+              console.log(`Ignoring ${dir}: it records ${name} but is not a package directory under node_modules`)
+              continue
+            }
+            if (range && !(version && semver.satisfies(version, range, { includePrerelease: true }))) {
+              console.log(`Passing over ${dir}: ${name} ${version || "with no version"} is outside replace-version`)
+              continue
+            }
+            fs.writeSync(out, [dir, name, version || "-"].join("\t") + "\n")
+          }
+        ' "$npm_dir" "$packages" "$replace_version" "$1" "$targets"
+      }
+
+      # Reads installed package directories on stdin and prints, one line
+      # each, every dependency that does not resolve to a version within its
+      # declared range. Resolution walks up from the package the way Node.js
+      # does: its own node_modules, then each enclosing node_modules, stopping
+      # at search-dir, since whatever lies above it is not part of the tree
+      # being shipped. A missing optional dependency is not a problem. A
+      # specifier that is not a range, such as a git URL, is checked for
+      # presence only; an npm: alias is checked against the range it carries.
+      check_dependencies() {
+        node -e '
+          const fs = require("fs")
+          const path = require("path")
+          const semver = require(require.resolve("semver", { paths: [process.argv[1]] }))
+          const root = path.resolve(process.argv[2])
+          const read = (file) => {
+            try {
+              return JSON.parse(fs.readFileSync(file, "utf8"))
+            } catch (e) {
+              return null
+            }
+          }
+          const resolve = (from, dep) => {
+            let dir = path.resolve(from)
+            for (;;) {
+              if (path.basename(dir) !== "node_modules") {
+                const manifest = read(path.join(dir, "node_modules", dep, "package.json"))
+                if (manifest) return manifest
+              }
+              if (dir === root || !dir.startsWith(root + path.sep)) return null
+              dir = path.dirname(dir)
+            }
+          }
+          for (const pkg of fs.readFileSync(0, "utf8").split("\n")) {
+            if (!pkg) continue
+            const manifest = read(path.join(pkg, "package.json"))
+            if (!manifest) continue
+            const optional = manifest.optionalDependencies || {}
+            for (const [dep, spec] of Object.entries(manifest.dependencies || {})) {
+              const found = resolve(pkg, dep)
+              if (!found) {
+                if (!(dep in optional)) console.log(`${pkg}: needs ${dep}@${spec}, which does not resolve`)
+                continue
+              }
+              const range = spec.startsWith("npm:") ? spec.slice(spec.lastIndexOf("@") + 1) : spec
+              if (semver.validRange(range) && !semver.satisfies(found.version || "", range, { includePrerelease: true })) {
+                console.log(`${pkg}: needs ${dep}@${spec}, but ${dep} ${found.version} resolves`)
+              }
+            }
+          }
+        ' "$npm_dir" "$search_dir"
+      }
+
+      # ---------------------------------------------------------------- #
+      # Select candidates                                                #
+      # ---------------------------------------------------------------- #
+
+      match=$(anchor_pattern "$match")
+
+      if [ -n "$match" ]; then
+        verbose="true"
+        find_pattern "$match" | sort -u > "$work/candidates"
+      else
+        # Every package directory under any node_modules, scoped or not. find
+        # -path cannot say "directly under", since its * also matches a
+        # slash, so the shape is checked with grep.
+        verbose="false"
+        find "$search_dir" -type f -name package.json -path '*/node_modules/*' \
+          | { grep -E '/node_modules/(@[^/]+/)?[^/]+/package\.json$' || :; } \
+          | sort -u > "$work/candidates"
+      fi
+
+      # ---------------------------------------------------------------- #
+      # Classification and scope                                         #
+      # ---------------------------------------------------------------- #
+
+      targets="$work/targets"
+      classify "$verbose" < "$work/candidates"
+
+      # ---------------------------------------------------------------- #
+      # require-match                                                    #
+      # ---------------------------------------------------------------- #
+
+      # Counted per package, so that one hit cannot mask nine misses, and
+      # before the downgrade decision, so that a package that was found and
+      # then skipped as already newer still satisfies it.
+      if [ "$require_match" = "true" ]; then
+        cut -f 2 "$targets" | sort -u > "$work/found"
+        for name in $packages; do
+          if ! grep -qxF "$name" "$work/found"; then
+            die "no copy of $name within replace-version was found under $search_dir. Upstream may have moved past it: correct the pattern or replace-version, drop the package from the list, or set require-match to false."
+          fi
+        done
+      fi
+
+      if [ ! -s "$targets" ]; then
+        echo "Nothing to replace under $search_dir"
+        exit 0
+      fi
+
+      # ---------------------------------------------------------------- #
+      # Downgrade decision                                               #
+      # ---------------------------------------------------------------- #
+
+      # A copy that records no version is replaced with no comparison: there
+      # is nothing to compare against, so there is no way to know whether the
+      # result is a downgrade.
+      accepted="$work/accepted"
+      newer="$work/newer"
+      : > "$accepted"
+      : > "$newer"
+      while IFS="$tab" read -r dir name installed; do
+        if [ "$installed" != "-" ]; then
+          ordering=$(version_compare "$installed" "$version") || exit 1
+          if [ "$ordering" = ">" ]; then
+            printf '%s\t%s\t%s\n' "$dir" "$name" "$installed" >> "$newer"
+            [ "$on_downgrade" = "force" ] || continue
+          fi
+        fi
+        printf '%s\t%s\t%s\n' "$dir" "$name" "$installed" >> "$accepted"
+      done < "$targets"
+
+      if [ -s "$newer" ]; then
+        case "$on_downgrade" in
+          fail)
+            {
+              echo "ERROR: these copies are already newer than the requested $version:"
+              awk -F"$tab" '{ print "  " $1 ": " $2 " " $3 }' "$newer"
+              echo
+              echo "Replacing them would be a downgrade. Raise version, scope the step to the"
+              echo "copies that are actually vulnerable with replace-version or match, drop the"
+              echo "step if upstream has overtaken it, or set on-downgrade to skip or force."
+            } >&2
+            exit 1
+            ;;
+          skip)
+            awk -F"$tab" -v v="$version" '{ print "WARNING: leaving " $2 " " $3 " in place in " $1 ", which is newer than the requested " v }' "$newer"
+            ;;
+          force)
+            awk -F"$tab" -v v="$version" '{ print "Forcing a downgrade of " $2 " in " $1 " from " $3 " to " v }' "$newer"
+            ;;
+        esac
+      fi
+
+      # ---------------------------------------------------------------- #
+      # Replace                                                          #
+      # ---------------------------------------------------------------- #
+
+      # A copy sorts before every copy nested inside it, so an outer
+      # replacement runs first and a nested copy it removed is reported as
+      # gone rather than recreated inside the fixed release.
+      sort "$accepted" > "$work/ordered"
+
+      replaced=0
+      : > "$work/installed"
+      while IFS="$tab" read -r dir name installed; do
+        if [ ! -f "$dir/package.json" ]; then
+          echo "Skipping $dir: an earlier replacement in this step removed it"
+          continue
+        fi
+
+        # Deleting the copy discards its mode and owner, so capture them
+        # first and apply them to the installed copy.
+        old_mode=$(stat -c '%a' "$dir")
+        old_owner=$(stat -c '%u:%g' "$dir")
+
+        echo "Replacing $name $installed in $dir with $version"
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        tar -xzf "$(tarball "$name" "$version")" -C "$dir" --strip-components=1
+        echo "$dir" >> "$work/installed"
+
+        for spec in $nest; do
+          nest_name=${spec%@*}
+          nest_version=${spec##*@}
+          echo "  nesting $nest_name $nest_version under $dir"
+          mkdir -p "$dir/node_modules/$nest_name"
+          tar -xzf "$(tarball "$nest_name" "$nest_version")" \
+            -C "$dir/node_modules/$nest_name" --strip-components=1
+          echo "$dir/node_modules/$nest_name" >> "$work/installed"
+        done
+
+        chmod "$old_mode" "$dir"
+        chown -R "$old_owner" "$dir"
+        replaced=$((replaced + 1))
+      done < "$work/ordered"
+
+      echo "Replaced ${replaced} copy/copies of ${packages} with ${version}"
+
+      # ---------------------------------------------------------------- #
+      # Dependency check                                                 #
+      # ---------------------------------------------------------------- #
+
+      # Run once every replacement is made, so that a dependency one
+      # replacement needs and another removed is caught too.
+      check_dependencies < "$work/installed" > "$work/unresolved"
+      if [ -s "$work/unresolved" ]; then
+        {
+          echo "ERROR: these dependencies of what this step installed no longer resolve:"
+          sed 's/^/  /' "$work/unresolved"
+          echo
+          echo "A replacement takes the old copy's nested node_modules with it, and a fixed"
+          echo "release may need a dependency, or a newer major of one, that the tree does"
+          echo "not carry. Put back what is missing with nest."
+        } >&2
+        exit 1
+      fi

@@ -1,0 +1,170 @@
+package:
+  name: py3-av
+  version: "19.0.1"
+  epoch: 0
+  description: Pythonic bindings for FFmpeg's libraries
+  copyright:
+    - license: BSD-3-Clause
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: av
+  import: av
+  # PyAV 19.x supports FFmpeg 9.x
+  ffmpeg-version: "9.0"
+  glibc-version: "2.44"
+
+# PyAV 19.x requires Python >= 3.12. py3-* ranges stop at 3.13, so 3.14 is
+# packaged separately in py3.14-av.yaml.
+data:
+  - name: py-versions
+    items:
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - ffmpeg-${{vars.ffmpeg-version}}-dev
+      - glibc-${{vars.glibc-version}}-dev
+      - pkgconf
+      - py3-supported-build-base-dev
+      - py3.12-cython
+      - py3.13-cython
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/PyAV-Org/PyAV
+      tag: v${{package.version}}
+      expected-commit: 52e6691c8221a53ac1f1bf111f282cefa7d568e1
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}
+    pipeline:
+      # Built from source so the extensions link the system FFmpeg (and its
+      # OpenSSL) instead of the libraries the PyPI wheel vendors under av.libs/
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - name: move usr/bin executables for -bin
+        runs: |
+          mkdir -p ./cleanup/${{range.key}}/
+          mv ${{targets.contextdir}}/usr/bin ./cleanup/${{range.key}}/
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils
+            - posix-libc-utils # ldd
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+        - uses: test/tw/ldd-check
+        - uses: test/tw/virtualpackage
+          with:
+            virtual-pkg-name: py3-${{vars.pypi-package}}
+        - name: Links the system FFmpeg rather than vendored libraries
+          runs: |
+            sitepkgs="$(python${{range.key}} -c 'import site; print(site.getsitepackages()[0])')"
+            if [ -e "${sitepkgs}/av.libs" ]; then
+              echo "vendored av.libs directory present"
+              exit 1
+            fi
+            readelf -d "${sitepkgs}"/av/format*.so > /tmp/needed.txt
+            # libavformat.so.63 is FFmpeg 9.x, matching ffmpeg-${{vars.ffmpeg-version}}-dev above
+            grep 'NEEDED.*\[libavformat\.so\.63\]' /tmp/needed.txt
+            # The PyPI wheel bundles GnuTLS, nettle and hogweed under av.libs/.
+            # ldd walks the FFmpeg closure, where these would actually come from.
+            find "${sitepkgs}/av" -name '*.so*' -exec ldd {} + > /tmp/all-needed.txt
+            if grep -E 'lib(gnutls|nettle|hogweed|k5crypto)' /tmp/all-needed.txt; then
+              echo "av or its FFmpeg closure links GnuTLS, nettle or k5crypto"
+              exit 1
+            fi
+        - name: Encode and decode video and audio
+          runs: |
+            python${{range.key}} - <<'EOF'
+            import av
+
+            path = "/tmp/test.mp4"
+            with av.open(path, mode="w") as out:
+                video = out.add_stream("mpeg4", rate=24)
+                video.width, video.height, video.pix_fmt = 64, 48, "yuv420p"
+                audio = out.add_stream("aac", rate=44100)
+                audio.layout = "mono"
+                for _ in range(24):
+                    frame = av.VideoFrame(64, 48, "yuv420p")
+                    out.mux(video.encode(frame))
+                for _ in range(10):
+                    samples = av.AudioFrame(format="fltp", layout="mono", samples=1024)
+                    samples.sample_rate = 44100
+                    for plane in samples.planes:
+                        plane.update(bytes(plane.buffer_size))
+                    out.mux(audio.encode(samples))
+                out.mux(video.encode())
+                out.mux(audio.encode())
+
+            with av.open(path) as src:
+                assert src.streams.video[0].codec_context.name == "mpeg4"
+                assert src.streams.audio[0].codec_context.name == "aac"
+                frames = sum(1 for _ in src.decode(video=0))
+            assert frames == 24, f"decoded {frames} video frames, expected 24"
+            print("encoded and decoded", frames, "video frames")
+            EOF
+
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: Executable scripts for ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}-bin
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/
+          mv ./cleanup/${{range.key}}/bin ${{targets.contextdir}}/usr/
+    test:
+      pipeline:
+        - uses: test/tw/virtualpackage
+          with:
+            virtual-pkg-name: py3-${{vars.pypi-package}}-bin
+        - uses: test/tw/ver-check
+          with:
+            bins: pyav
+            version: ${{package.version}}
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: PyAV-Org/PyAV
+    strip-prefix: v

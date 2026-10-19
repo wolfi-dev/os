@@ -1,0 +1,201 @@
+package:
+  name: libcupsfilters
+  version: "2.2.1"
+  epoch: 0
+  description: OpenPrinting library of CUPS filter functions (PDF, raster, image and color management), the core of cups-filters 2.x
+  copyright:
+    # Upstream COPYING grants Apache-2.0 with an extra exception permitting
+    # combination with GPL-2.0/LGPL-2.0 code; SPDX has no id for it.
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ghostscript
+      - poppler-utils
+
+vars:
+  glibc-version: "2.44"
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - bash
+      - build-base
+      - busybox
+      - cups-dev
+      - dbus-dev
+      - fontconfig-dev
+      - gettext
+      - gettext-dev
+      - ghostscript
+      - glibc-${{vars.glibc-version}}-dev
+      - lcms2-dev
+      - libexif-dev
+      - libjpeg-turbo-dev
+      - libjxl-dev
+      - libpng-dev
+      - libtool
+      - pdfio-dev
+      - pkgconf
+      - pkgconf-dev
+      - poppler-utils
+      - tiff-dev
+      - ttf-dejavu
+      - xz
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/OpenPrinting/libcupsfilters
+      tag: ${{package.version}}
+      expected-commit: 2a00cf6aa4234e2e0ac91b9844ab8990d04c7089
+
+  # AM_GNU_GETTEXT_VERSION pins gettext 0.18.3, so autopoint copies 2013-era
+  # iconv/gettext macros into m4/. ACLOCAL_PATH plus aclocal --install replaces
+  # them with the higher-serial copies gettext-dev ships in /usr/share/gettext/m4.
+  - runs: |
+      export ACLOCAL_PATH=/usr/share/gettext/m4:/usr/share/aclocal
+      ACLOCAL_FLAGS=--install ./autogen.sh
+
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --disable-static \
+        --disable-mutool \
+        --with-gs-path=/usr/bin/gs \
+        --with-pdftoppm-path=/usr/bin/pdftoppm \
+        --with-ippfind-path=/usr/bin/ippfind
+
+  - uses: autoconf/make
+
+  # The two security-regression scripts in the suite use #!/usr/bin/env bash.
+  - runs: make check
+
+  - uses: autoconf/make-install
+
+  - runs: find ${{targets.destdir}} -name '*.la' -delete
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: Development files for ${{package.name}}
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - cups-dev
+        - pdfio-dev
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - pkgconf
+      pipeline:
+        - uses: test/tw/devpackage
+        - uses: test/pkgconf
+        - name: pkg-config module matches the packaged release
+          runs: |
+            # --exact-version exits non-zero unless the .pc Version field equals the release.
+            pkg-config --print-errors --exact-version="${{package.version}}" libcupsfilters
+        - name: Public headers compile and link with only the -dev runtime deps
+          runs: |
+            # pdf.h pulls in <pdfio.h> and filter.h pulls in <cups/cups.h>, so
+            # this only builds if cups-dev and pdfio-dev arrive as runtime deps.
+            tee hdr.c <<'EOF'
+            #include <cupsfilters/pdf.h>
+            #include <cupsfilters/filter.h>
+            #include <stdio.h>
+            int main(void) {
+                cf_filter_data_t data = {0};
+                data.copies = 1;
+                printf("filter fn %s\n", cfFilterPDFToPDF != NULL ? "linked" : "missing");
+                return data.copies != 1;
+            }
+            EOF
+            pkg-config --cflags --libs libcupsfilters > pc.rsp
+            gcc hdr.c -o hdr @pc.rsp
+            ./hdr | grep -Fx "filter fn linked"
+
+  - name: ${{package.name}}-doc
+    description: Documentation for ${{package.name}}
+    pipeline:
+      - uses: split/alldocs
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+        - ghostscript
+        - libcupsfilters-dev
+        - pkgconf
+        - poppler-utils
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/contains-files
+      with:
+        dir: /usr/share/cups
+    - name: cfFilterPDFToPDF converts a generated one-page PDF
+      runs: |
+        gs -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=in.pdf \
+          -c "newpath 72 72 moveto 300 300 lineto stroke showpage"
+        head -c 4 in.pdf | grep -Fx "%PDF"
+
+        tee pdftopdf.c <<'EOF'
+        #include <cupsfilters/filter.h>
+        #include <fcntl.h>
+        #include <stdio.h>
+        #include <string.h>
+        #include <unistd.h>
+
+        int main(int argc, char **argv) {
+            cf_filter_data_t data;
+            int in, out, ret;
+
+            if (argc != 3)
+                return 2;
+            memset(&data, 0, sizeof(data));
+            data.printer = "test";
+            data.job_id = 1;
+            data.job_user = "build";
+            data.job_title = "melange";
+            data.copies = 1;
+            data.content_type = "application/pdf";
+            data.final_content_type = "application/vnd.cups-pdf";
+            data.back_pipe[0] = data.back_pipe[1] = -1;
+            data.side_pipe[0] = data.side_pipe[1] = -1;
+            data.logfunc = cfCUPSLogFunc;
+
+            in = open(argv[1], O_RDONLY);
+            out = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (in < 0 || out < 0)
+                return 3;
+            ret = cfFilterPDFToPDF(in, out, 1, &data, NULL);
+            close(out);
+            printf("cfFilterPDFToPDF returned %d\n", ret);
+            return ret;
+        }
+        EOF
+
+        # gcc reads the pkg-config flags from a response file, so no unquoted
+        # command substitution is needed; it sits after the source so the
+        # libraries still follow it on the link line.
+        pkg-config --cflags --libs libcupsfilters > pc.rsp
+        gcc pdftopdf.c -o pdftopdf @pc.rsp
+        ./pdftopdf in.pdf out.pdf | grep -F "cfFilterPDFToPDF returned 0"
+        head -c 4 out.pdf | grep -Fx "%PDF"
+        pdfinfo out.pdf | grep -E "^Pages: +1$"
+
+update:
+  enabled: true
+  github:
+    identifier: OpenPrinting/libcupsfilters
+    use-tag: true

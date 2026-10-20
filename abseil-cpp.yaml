@@ -1,7 +1,7 @@
 package:
   name: abseil-cpp
   version: "20260817.0" # On update, please check if -fdelete-null-pointer-checks is still required
-  epoch: 4 # glibc: 2.43->2.44
+  epoch: 5
   description: Abseil Common Libraries (C++)
   copyright:
     - license: Apache-2.0
@@ -28,6 +28,13 @@ environment:
     # https://github.com/wolfi-dev/os/issues/34075
     CMAKE_CXX_FLAGS: -fdelete-null-pointer-checks
 
+vars:
+  cmake-common-opts: -DCMAKE_CXX_FLAGS="$CMAKE_CXX_FLAGS" -DCMAKE_CXX_STANDARD=17 -DCMAKE_BUILD_TYPE=MinSizeRel -DABSL_PROPAGATE_CXX_STD=ON
+  cmake-shared-opts: -DBUILD_SHARED_LIBS=ON -DABSL_BUILD_TESTING=ON -DABSL_BUILD_TEST_HELPERS=ON -DABSL_USE_EXTERNAL_GOOGLETEST=ON -DABSL_FIND_GOOGLETEST=ON
+  # PIC (position-independent code) lets the archives link into a shared
+  # object.
+  cmake-static-opts: -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DABSL_BUILD_TESTING=OFF -DABSL_BUILD_TEST_HELPERS=OFF
+
 var-transforms:
   - from: ${{package.version}}
     match: ^\d{2}(\d{4}).*$
@@ -37,33 +44,32 @@ var-transforms:
 pipeline:
   - uses: git-checkout
     with:
+      destination: src
       repository: https://github.com/abseil/abseil-cpp
       tag: ${{package.version}}
       expected-commit: 2065f4ded0558c6f89fee67c8e5228feb4eb960e
 
-  - runs: |
-      cmake -B build -G Ninja \
-      -DCMAKE_CXX_FLAGS="$CMAKE_CXX_FLAGS" \
-      -DCMAKE_CXX_STANDARD=17 \
-      -DCMAKE_BUILD_TYPE=MinSizeRel \
-      -DCMAKE_INSTALL_PREFIX=/usr \
-      -DCMAKE_INSTALL_LIBDIR=lib \
-      -DBUILD_SHARED_LIBS=ON \
-      -DABSL_BUILD_TESTING=ON \
-      -DABSL_BUILD_TEST_HELPERS=ON \
-      -DABSL_USE_EXTERNAL_GOOGLETEST=ON \
-      -DABSL_PROPAGATE_CXX_STD=ON \
-      -DABSL_FIND_GOOGLETEST=ON
-      cmake --build build
-
-  - runs: |
-      DESTDIR="${{targets.destdir}}" cmake --install build
-
-  - uses: strip
-
 subpackages:
-  # Must come before libabsl${{vars.soversion}}, which globs whatever .so.* is
-  # left. abseil builds these only because ABSL_BUILD_TEST_HELPERS is on, and
+  # The shared build. Later subpackages take the test-support libraries,
+  # headers and development files out of it. The runtime libraries stay.
+  - name: libabsl${{vars.soversion}}
+    pipeline:
+      - runs: cp -a src build-shared
+      - uses: cmake/configure
+        working-directory: build-shared
+        with:
+          opts: ${{vars.cmake-common-opts}} ${{vars.cmake-shared-opts}}
+      - uses: cmake/build
+        working-directory: build-shared
+      - uses: cmake/install
+        working-directory: build-shared
+      - runs: rm -rf build-shared
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  # abseil builds these only because ABSL_BUILD_TEST_HELPERS is on, and
   # several of them link gtest/gmock -- shipping them in the runtime package
   # gave every libabsl generation a hard dep on one gtest/gmock soname, so two
   # generations in a single closure conflict and the solve fails (OS-2758).
@@ -78,7 +84,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/lib
-          cd ${{targets.destdir}}/usr/lib
+          cd ${{targets.outdir}}/libabsl${{vars.soversion}}/usr/lib
           moved=0
           for f in libabsl_*_test_*.so.* libabsl_*_testing.so.* \
                    libabsl_test_*.so.* libabsl_scoped_mock_log.so.* \
@@ -91,21 +97,13 @@ subpackages:
           # would silently put them back in the runtime package.
           [ "$moved" -gt 0 ] || { echo "no abseil test-support libs matched"; exit 1; }
           echo "moved $moved test-support libraries"
-    test:
-      pipeline:
-        - uses: test/tw/ldd-check
-
-  - name: libabsl${{vars.soversion}}
-    pipeline:
-      - runs: |
-          mkdir -p ${{targets.contextdir}}/usr/lib
-          mv ${{targets.destdir}}/usr/lib/*.so.* ${{targets.contextdir}}/usr/lib/
           # The globs above are name-based and will miss a helper that does not
           # say "test" -- libabsl_status_matchers did exactly that. A gtest or
-          # gmock dep here is what makes two libabsl generations unco-installable
-          # (OS-2758), so make it a build failure rather than a silent one.
+          # gmock dep in libabsl${{vars.soversion}} is what makes two libabsl
+          # generations unco-installable (OS-2758), so make it a build failure
+          # rather than a silent one.
           bad=""
-          for f in ${{targets.contextdir}}/usr/lib/*.so.*; do
+          for f in ${{targets.outdir}}/libabsl${{vars.soversion}}/usr/lib/*.so.*; do
               readelf -d "$f" 2>/dev/null | grep -qE 'lib(gtest|gmock)\.so' &&
                   bad="$bad $(basename "$f")"
           done
@@ -118,18 +116,113 @@ subpackages:
       pipeline:
         - uses: test/tw/ldd-check
 
-  - name: ${{package.name}}-dev
+  - name: ${{package.name}}-static
+    description: ${{package.name}} static libraries
+    dependencies:
+      runtime:
+        - ${{package.name}}-headers=${{package.full-version}}
     pipeline:
-      - uses: split/dev
-    description: ${{package.name}} dev
+      - runs: cp -a src build-static
+      - uses: cmake/configure
+        working-directory: build-static
+        with:
+          opts: ${{vars.cmake-common-opts}} ${{vars.cmake-static-opts}}
+      - uses: cmake/build
+        working-directory: build-static
+      - uses: cmake/install
+        working-directory: build-static
+      - runs: rm -rf build-static
+      - runs: |
+          # ${{package.name}}-headers serves the shared and static packages.
+          # Each static header must be identical to the shared copy.
+          n=0
+          for f in $(cd ${{targets.contextdir}}/usr/include && find . -type f); do
+            cmp "${{targets.contextdir}}/usr/include/$f" "${{targets.outdir}}/libabsl${{vars.soversion}}/usr/include/$f" || exit 1
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "no static headers were compared"; exit 1; }
+          rm -rf ${{targets.contextdir}}/usr/include
+          # The .pc files are packaged in ${{package.name}}-dev, not here.
+          rm -rf ${{targets.contextdir}}/usr/lib/pkgconfig
+          # Install under absl-static so it does not conflict with the shared
+          # lib/cmake/absl in ${{package.name}}-dev. find_package(absl) also
+          # matches absl*/, so it finds this copy when ${{package.name}}-dev is
+          # not installed.
+          mv ${{targets.contextdir}}/usr/lib/cmake/absl ${{targets.contextdir}}/usr/lib/cmake/absl-static
+    test:
+      # No test/tw/staticpackage: it rejects any file that is not a .a,
+      # including the lib/cmake/absl-static files.
+      environment:
+        contents:
+          packages:
+            - build-base
+            - cmake
+            - samurai
+      pipeline:
+        - name: Link statically through find_package without abseil-cpp-dev
+          runs: |
+            mkdir -p proj
+            cat > proj/CMakeLists.txt <<'EOF'
+            cmake_minimum_required(VERSION 3.16)
+            project(t CXX)
+            set(CMAKE_CXX_STANDARD 17)
+            find_package(absl CONFIG REQUIRED)
+            get_target_property(type absl::strings TYPE)
+            if(NOT type STREQUAL "STATIC_LIBRARY")
+              message(FATAL_ERROR "absl::strings is ${type}, from ${absl_DIR}")
+            endif()
+            add_executable(t t.cc)
+            target_link_libraries(t absl::strings)
+            EOF
+            cat > proj/t.cc <<'EOF'
+            #include <absl/strings/str_cat.h>
+            int main() { return absl::StrCat("a", "b") == "ab" ? 0 : 1; }
+            EOF
+            cmake -S proj -B build -G Ninja
+            cmake --build build
+            ./build/t
+            if readelf -d build/t | grep -q libabsl; then
+              echo "t links libabsl dynamically"
+              exit 1
+            fi
+
+  - name: ${{package.name}}-headers
+    description: ${{package.name}} headers, shared by ${{package.name}}-dev and ${{package.name}}-static
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr
+          mv ${{targets.outdir}}/libabsl${{vars.soversion}}/usr/include ${{targets.contextdir}}/usr/
     test:
       environment:
         contents:
           packages:
             - build-base
-            - libabsl${{vars.soversion}}
       pipeline:
-        - uses: test/tw/devpackage
+        - runs: |
+            echo '#include <absl/strings/str_cat.h>' | g++ -std=c++17 -x c++ -fsyntax-only -
+
+  - name: ${{package.name}}-dev
+    dependencies:
+      runtime:
+        - ${{package.name}}-headers=${{package.full-version}}
+        # Older libabsl${{vars.soversion}} builds also ship the test-support
+        # libraries. They satisfy every so: dependency here on their own.
+        # Without these pins, apk can install one of them with this -dev.
+        - libabsl${{vars.soversion}}=${{package.full-version}}
+        - libabsl${{vars.soversion}}-test-helpers=${{package.full-version}}
+    description: ${{package.name}} dev
+    pipeline:
+      - uses: split/dev
+        with:
+          package: libabsl${{vars.soversion}}
+    # No test/tw/devpackage: it requires headers in this package, and they
+    # ship in ${{package.name}}-headers.
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+      pipeline:
         - uses: test/pkgconf
         - uses: test/tw/ldd-check
           with:

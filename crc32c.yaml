@@ -1,13 +1,16 @@
 package:
   name: crc32c
   version: 1.1.2
-  epoch: 7
-  description: CRC32C implementation with support for CPU-specific acceleration instructions
+  epoch: 8
+  description: CRC32C implementation with support for CPU-specific acceleration instructions (metapackage for libcrc32c${{vars.abinum}})
   copyright:
     - license: BSD-3-Clause
   resources:
     cpu: "1"
     memory: 5Gi
+  dependencies:
+    runtime:
+      - libcrc32c${{vars.abinum}}=${{package.full-version}}
 
 environment:
   contents:
@@ -17,40 +20,148 @@ environment:
       - ca-certificates-bundle
       - cmake-3
 
+vars:
+  cmake-common-opts: -DCRC32C_BUILD_TESTS=OFF -DCRC32C_BUILD_BENCHMARKS=OFF -DCRC32C_USE_GLOG=OFF -DCRC32C_INSTALL=ON
+  cmake-shared-opts: -DBUILD_SHARED_LIBS=ON
+  # PIC (position-independent code) lets the archive link into a shared
+  # object.
+  cmake-static-opts: -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+
+# abinum is the package's major version. Upstream sets SOVERSION from
+# project() in CMakeLists.txt, which can drift from the package version.
+# The soname check below fails if they differ.
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\..*$
+    replace: ${1}
+    to: abinum
+
 pipeline:
   - uses: git-checkout
     with:
+      destination: src
       expected-commit: 02e65f4fd3065d27b2e29324800ca6d04df16126
       repository: https://github.com/google/crc32c
       tag: ${{package.version}}
 
   - uses: patch
+    working-directory: src
     with:
-      patches: 10-third-party.patch
-
-  - uses: cmake/configure
-    with:
-      opts: |
-        -DBUILD_SHARED_LIBS=True \
-        -DCRC32C_BUILD_TESTS="OFF" \
-        -DCRC32C_BUILD_BENCHMARKS="OFF" \
-        -DCRC32C_USE_GLOG="OFF" \
-        -DCRC32C_INSTALL="ON"
-
-  - uses: cmake/build
-
-  - uses: cmake/install
-
-  - uses: strip
+      patches: ../10-third-party.patch
 
 subpackages:
-  - name: crc32c-dev
+  - name: libcrc32c${{vars.abinum}}
+    description: crc32c shared library
     pipeline:
-      - uses: split/dev
-    description: crc32c dev
+      - runs: cp -a src build-shared
+      - uses: cmake/configure
+        working-directory: build-shared
+        with:
+          opts: ${{vars.cmake-common-opts}} ${{vars.cmake-shared-opts}}
+      - uses: cmake/build
+        working-directory: build-shared
+      - uses: cmake/install
+        working-directory: build-shared
+      - name: Check the soname matches abinum
+        runs: test -e ${{targets.contextdir}}/usr/lib/libcrc32c.so.${{vars.abinum}}
+      - runs: rm -rf build-shared
+      - uses: strip
     test:
       pipeline:
-        - uses: test/tw/devpackage
+        - uses: test/tw/ldd-check
+
+  - name: crc32c-static
+    description: crc32c static library
+    dependencies:
+      runtime:
+        - crc32c-headers=${{package.full-version}}
+    pipeline:
+      - runs: cp -a src build-static
+      - uses: cmake/configure
+        working-directory: build-static
+        with:
+          opts: ${{vars.cmake-common-opts}} ${{vars.cmake-static-opts}}
+      - uses: cmake/build
+        working-directory: build-static
+      - uses: cmake/install
+        working-directory: build-static
+      - runs: |
+          # crc32c-headers serves the shared and static packages.
+          # Their header trees must be identical.
+          diff -r ${{targets.contextdir}}/usr/include ${{targets.outdir}}/libcrc32c${{vars.abinum}}/usr/include
+          rm -rf ${{targets.contextdir}}/usr/include
+          # Install under Crc32c-static so it does not conflict with the shared
+          # lib/cmake/Crc32c in crc32c-dev. find_package(Crc32c) also matches
+          # Crc32c*/, so it finds this copy when crc32c-dev is not installed.
+          mv ${{targets.contextdir}}/usr/lib/cmake/Crc32c ${{targets.contextdir}}/usr/lib/cmake/Crc32c-static
+          rm -rf build-static
+    test:
+      # No test/tw/staticpackage: it rejects any file that is not a .a,
+      # including the lib/cmake/Crc32c-static files.
+      environment:
+        contents:
+          packages:
+            - build-base
+            - cmake-3
+            - samurai
+      pipeline:
+        - name: Link statically through find_package without crc32c-dev
+          runs: |
+            mkdir -p proj
+            cat > proj/CMakeLists.txt <<'EOF'
+            cmake_minimum_required(VERSION 3.16)
+            project(t CXX)
+            find_package(Crc32c CONFIG REQUIRED)
+            get_target_property(type Crc32c::crc32c TYPE)
+            if(NOT type STREQUAL "STATIC_LIBRARY")
+              message(FATAL_ERROR "Crc32c::crc32c is ${type}, from ${Crc32c_DIR}")
+            endif()
+            add_executable(t t.cc)
+            target_link_libraries(t Crc32c::crc32c)
+            EOF
+            cat > proj/t.cc <<'EOF'
+            #include <crc32c/crc32c.h>
+            int main() { return crc32c::Crc32c("hello world", 11) == 0xc99465aaU ? 0 : 1; }
+            EOF
+            cmake -S proj -B build -G Ninja
+            cmake --build build
+            ./build/t
+            if readelf -d build/t | grep -q libcrc32c; then
+              echo "t links libcrc32c dynamically"
+              exit 1
+            fi
+
+  - name: crc32c-headers
+    description: crc32c headers, shared by crc32c-dev and crc32c-static
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr
+          mv ${{targets.outdir}}/libcrc32c${{vars.abinum}}/usr/include ${{targets.contextdir}}/usr/
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+      pipeline:
+        - runs: |
+            echo '#include <crc32c/crc32c.h>' | g++ -x c++ -fsyntax-only -
+
+  - name: crc32c-dev
+    dependencies:
+      runtime:
+        - crc32c-headers=${{package.full-version}}
+        # Older crc32c packages also provide so:libcrc32c.so.1. Without this pin,
+        # apk can install one of them with this -dev.
+        - libcrc32c${{vars.abinum}}=${{package.full-version}}
+    description: crc32c dev
+    pipeline:
+      - uses: split/dev
+        with:
+          package: libcrc32c${{vars.abinum}}
+    # No test/tw/devpackage: it requires headers in this package, and they
+    # ship in crc32c-headers.
+    test:
+      pipeline:
         - uses: test/tw/ldd-check
 
 update:
@@ -66,7 +177,7 @@ test:
         - crc32c-dev
         - build-base
   pipeline:
-    - uses: test/tw/ldd-check
+    - uses: test/tw/metapackage
     - name: Test CRC32C library compilation and functionality
       runs: |
         cat > test.cpp << 'EOF'

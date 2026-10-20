@@ -1,0 +1,226 @@
+package:
+  name: libppd
+  version: "2.1.1"
+  epoch: 0
+  description: OpenPrinting legacy PPD (PostScript Printer Description) support library, split out of CUPS for cups-filters 2.x and printer drivers
+  copyright:
+    # Upstream COPYING grants Apache-2.0 with an extra exception permitting
+    # combination with GPL-2.0/LGPL-2.0 code; SPDX has no id for it.
+    - license: Apache-2.0
+
+vars:
+  glibc-version: "2.44"
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - cups-dev
+      - gettext
+      - gettext-dev
+      - ghostscript
+      - glibc-${{vars.glibc-version}}-dev
+      - libcupsfilters-dev
+      - libtool
+      - pkgconf
+      - pkgconf-dev
+      - poppler-utils
+      - ttf-dejavu
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/OpenPrinting/libppd
+      tag: ${{package.version}}
+      expected-commit: 2b37a73c02126d1ba031270322b6c79034cc0d0f
+
+  # AM_GNU_GETTEXT_VERSION pins gettext 0.18.3, so autopoint copies 2013-era
+  # iconv/gettext macros into m4/. ACLOCAL_PATH plus aclocal --install replaces
+  # them with the higher-serial copies gettext-dev ships in /usr/share/gettext/m4.
+  - runs: |
+      export ACLOCAL_PATH=/usr/share/gettext/m4:/usr/share/aclocal
+      ACLOCAL_FLAGS=--install ./autogen.sh
+
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --disable-static \
+        --disable-mutool \
+        --with-gs-path=/usr/bin/gs \
+        --with-pdftops-path=/usr/bin/pdftops \
+        --with-pdftocairo-path=/usr/bin/pdftocairo \
+        --with-ippfind-path=/usr/bin/ippfind
+
+  - uses: autoconf/make
+
+  - runs: make check
+
+  - uses: autoconf/make-install
+
+  - runs: find ${{targets.destdir}} -name '*.la' -delete
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: Development files for ${{package.name}}
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        # ppd.h includes <cups/*.h> and ppd-filter.h includes <cupsfilters/*.h>.
+        - cups-dev
+        - libcupsfilters-dev
+    test:
+      environment:
+        contents:
+          packages:
+            - cups
+            - build-base
+            - file
+            - fontconfig
+            - pkgconf
+            - ttf-dejavu
+      pipeline:
+        - uses: test/tw/devpackage
+        - uses: test/pkgconf
+        - name: pkg-config reports the packaged libppd version
+          runs: |
+            modversion=$(pkg-config --modversion libppd)
+            echo "libppd modversion: ${modversion}"
+            [ "${modversion}" = "${{package.version}}" ]
+        - name: Link a ppdFilterCUPSWrapper program and convert text to PDF
+          runs: |
+            cat > test.drv <<'EOF'
+            #include <font.defs>
+            #include <media.defs>
+            Font *
+            Manufacturer "Test"
+            ModelName "TestPrinter"
+            Version 1.0
+            DriverType ps
+            *Resolution - 8 0 0 0 "1200dpi/1200 DPI"
+            MediaSize Letter
+            *MediaSize A4
+            PCFileName "test.ppd"
+            EOF
+            ppdc test.drv
+            grep -F 'TestPrinter' ppd/test.ppd
+
+            # g++ on a .c file mirrors upstream and lets the C++-only ppdc.h compile.
+            cat > test.c <<'EOF'
+            #include <string.h>
+            #include <ppd/ppd.h>
+            #include <ppd/ppd-filter.h>
+            #include <ppd/ppdc.h>
+            #include <cupsfilters/filter.h>
+
+            int main(int argc, char *argv[])
+            {
+              cf_filter_universal_parameter_t universal_parameters;
+              memset(&universal_parameters, 0, sizeof(universal_parameters));
+              // As cups-filters' universal wrapper does: texttopdf needs the
+              // data dir holding charsets/pdf.utf-8.
+              universal_parameters.texttopdf_params.data_dir = "/usr/share/cups";
+              return ppdFilterCUPSWrapper(argc, argv, cfFilterUniversal,
+                                          &universal_parameters, NULL);
+            }
+            EOF
+            PPD_FLAGS="$(pkg-config --cflags --libs libppd libcupsfilters)"
+            # shellcheck disable=SC2086
+            g++ -o libppd-test test.c ${PPD_FLAGS}
+
+            # Five filter args (job, user, title, copies, options) and no file
+            # name make the wrapper read the job from stdin.
+            printf 'Test1\nTest2\nTest3\n' | \
+              PPD=./ppd/test.ppd CONTENT_TYPE=text/plain FINAL_CONTENT_TYPE=application/vnd.cups-pdf \
+              ./libppd-test 1 1 1 1 'PageSize=A4 Resolution=1200dpi' > test.pdf
+            file test.pdf | grep -F 'PDF document'
+
+  - name: ${{package.name}}-doc
+    description: Documentation for ${{package.name}}
+    pipeline:
+      - uses: split/alldocs
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-dev
+        - cups
+        - build-base
+        - pkgconf
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Open, mark and query a PPD through the libppd API
+      runs: |
+        cat > test.drv <<'EOF'
+        #include <font.defs>
+        #include <media.defs>
+        Font *
+        Manufacturer "Test"
+        ModelName "TestPrinter"
+        Version 1.0
+        DriverType ps
+        *Resolution - 8 0 0 0 "1200dpi/1200 DPI"
+        MediaSize Letter
+        *MediaSize A4
+        PCFileName "test.ppd"
+        EOF
+        ppdc test.drv
+
+        cat > ppdtest.c <<'EOF'
+        #include <stdio.h>
+        #include <ppd/ppd.h>
+
+        int main(int argc, char *argv[])
+        {
+          ppd_file_t *ppd;
+          ppd_choice_t *choice;
+          ppd_size_t *size;
+          int line;
+
+          if ((ppd = ppdOpenFile(argv[1])) == NULL)
+          {
+            ppd_status_t status = ppdLastError(&line);
+            fprintf(stderr, "ppdOpenFile: %s on line %d\n", ppdErrorString(status), line);
+            return 1;
+          }
+          ppdMarkDefaults(ppd);
+          ppdMarkOption(ppd, "PageSize", "Letter");
+          choice = ppdFindMarkedChoice(ppd, "PageSize");
+          size = ppdPageSize(ppd, NULL);
+          printf("model=%s\n", ppd->modelname);
+          printf("marked=%s\n", choice ? choice->choice : "none");
+          if (size)
+            printf("size=%s %.0fx%.0f\n", size->name, size->width, size->length);
+          printf("conflicts=%d\n", ppdConflicts(ppd));
+          ppdClose(ppd);
+          return 0;
+        }
+        EOF
+        PPD_CFLAGS="$(pkg-config --cflags libppd)"
+        PPD_LIBS="$(pkg-config --libs libppd)"
+        # shellcheck disable=SC2086
+        gcc ${PPD_CFLAGS} ppdtest.c -o ppdtest ${PPD_LIBS}
+        ./ppdtest ppd/test.ppd > out.txt
+        cat out.txt
+        grep -F 'model=TestPrinter' out.txt
+        # Marking Letter must override the A4 default set in the driver file.
+        grep -F 'marked=Letter' out.txt
+        grep -F 'size=Letter 612x792' out.txt
+        grep -F 'conflicts=0' out.txt
+
+update:
+  enabled: true
+  github:
+    identifier: OpenPrinting/libppd
+    use-tag: true

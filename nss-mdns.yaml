@@ -1,0 +1,154 @@
+package:
+  name: nss-mdns
+  version: "0.15.1"
+  epoch: 0
+  description: glibc NSS module providing host name resolution via Multicast DNS (.local) through avahi-daemon
+  copyright:
+    - license: LGPL-2.1-or-later
+  dependencies:
+    runtime:
+      - avahi
+
+vars:
+  glibc-version: "2.44"
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - check-dev
+      - glibc-${{vars.glibc-version}}-dev
+      - libtool
+      - pkgconf-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/avahi/nss-mdns
+      tag: v${{package.version}}
+      expected-commit: 4b3cfe818bf72d99a02b8ca8b8813cb2d6b40633
+
+  # Match the socket location of os/avahi.yaml, which configures --runstatedir=/run.
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --enable-tests \
+        AVAHI_SOCKET=/run/avahi-daemon/socket
+
+  - uses: autoconf/make
+
+  - runs: make check
+
+  - uses: autoconf/make-install
+
+  - uses: strip
+
+capabilities:
+  add:
+    - CAP_NET_ADMIN
+
+test:
+  environment:
+    contents:
+      packages:
+        - binutils
+        - iproute2
+        - posix-libc-utils-bin
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: NSS modules export the glibc host lookup entry points
+      runs: |
+        missing=0
+        for mod in mdns mdns4 mdns6 mdns_minimal mdns4_minimal mdns6_minimal; do
+          syms=$(nm -D --defined-only "/usr/lib/libnss_${mod}.so.2" | grep -F "_nss_${mod}_" || true)
+          # The optional @suffix tolerates a linker version script.
+          for fn in gethostbyname2_r gethostbyname4_r gethostbyaddr_r; do
+            if ! echo "$syms" | grep -E " [TW] _nss_${mod}_${fn}(@.*)?\$"; then
+              echo "libnss_${mod}.so.2 lacks _nss_${mod}_${fn}; it exports:"
+              echo "$syms"
+              missing=1
+            fi
+          done
+        done
+        [ "$missing" -eq 0 ]
+    - name: getent resolves a .local name through avahi-daemon
+      runs: |
+        # avahi only uses non-loopback multicast interfaces, so give it a
+        # dummy one; the sandbox may have no other network device.
+        ip link add nssmdns0 type dummy
+        ip link set nssmdns0 multicast on
+        ip addr add 192.168.77.1/24 dev nssmdns0
+        ip link set nssmdns0 up
+
+        # make_runtime_dir in avahi-daemon looks up the avahi user even
+        # with --no-drop-root.
+        getent group avahi || addgroup -S avahi
+        getent passwd avahi || adduser -S -D -H -G avahi avahi
+
+        # A 169.254.x.x address lets the _minimal modules answer the reverse
+        # lookup too; they only handle link-local addresses.
+        echo "169.254.77.50 foo.local" > /etc/avahi/hosts
+
+        cat > /tmp/avahi-daemon.conf <<'EOF'
+        [server]
+        host-name=nssmdns-test
+        use-ipv4=yes
+        use-ipv6=no
+        enable-dbus=no
+        allow-interfaces=nssmdns0
+        [publish]
+        publish-addresses=yes
+        EOF
+
+        avahi-daemon -f /tmp/avahi-daemon.conf --no-drop-root --no-rlimits > /tmp/avahi.log 2>&1 &
+        avahi_pid=$!
+
+        i=0
+        until [ -S /run/avahi-daemon/socket ] && grep -F "Server startup complete" /tmp/avahi.log; do
+          i=$((i + 1))
+          if [ "$i" -ge 30 ]; then
+            cat /tmp/avahi.log
+            exit 1
+          fi
+          sleep 1
+        done
+
+        echo "hosts: files mdns4_minimal [NOTFOUND=return] dns" > /etc/nsswitch.conf
+
+        # The static host entry is announced only after avahi finishes probing.
+        i=0
+        until out=$(getent hosts foo.local); do
+          i=$((i + 1))
+          if [ "$i" -ge 20 ]; then
+            cat /tmp/avahi.log
+            exit 1
+          fi
+          sleep 1
+        done
+        echo "$out"
+        echo "$out" | grep -E '^169\.254\.77\.50[[:space:]]+foo\.local'
+
+        getent hosts 169.254.77.50 | grep -F "foo.local"
+
+        # [NOTFOUND=return] must stop the lookup with exit status 2.
+        rc=0
+        getent hosts no-such-host.local || rc=$?
+        if [ "$rc" -ne 2 ]; then
+          echo "expected exit 2 for an unknown .local name, got $rc"
+          exit 1
+        fi
+
+        echo "hosts: files mdns4" > /etc/nsswitch.conf
+        getent hosts foo.local | grep -E '^169\.254\.77\.50[[:space:]]+foo\.local'
+
+        kill "$avahi_pid"
+
+update:
+  enabled: true
+  github:
+    identifier: avahi/nss-mdns
+    strip-prefix: v
+    use-tag: true

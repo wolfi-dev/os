@@ -1,0 +1,213 @@
+name: git over HTTPS with credentials
+
+description: |
+  Clones and pushes through a local smart-HTTP git server that requires Basic
+  auth over TLS. Covers credentials in the URL, a token-only URL, and a global
+  url.<base>.insteadOf rewrite that injects credentials. Fails if git drops the
+  credentials or warns about a redirect that never happened.
+
+  Runs git, libcurl and the TLS stack together on loopback with a throwaway CA,
+  so it suits git, curl, openssl and FIPS provider tests. No network access or
+  real credentials are needed.
+
+  Example:
+    - uses: test/git-https-auth
+
+needs:
+  packages:
+    - busybox
+    - curl
+    - git
+    - git-daemon
+    - openssl
+    - python3
+    - wait-for-it
+
+inputs:
+  port:
+    description: Loopback port for the test git server.
+    default: "8443"
+
+pipeline:
+  - name: git over HTTPS with credentials
+    runs: |
+      port="${{inputs.port}}"
+      work="$(mktemp -d /tmp/git-https-auth.XXXXXX)"
+      fail() {
+        echo "FAIL: $*" >&2
+        exit 1
+      }
+
+      export GIT_CONFIG_GLOBAL="$work/gitconfig" GIT_CONFIG_NOSYSTEM=1
+      : >"$GIT_CONFIG_GLOBAL"
+
+      # RSA-2048 and SHA-256 so FIPS providers accept the certificates.
+      openssl req -x509 -newkey rsa:2048 -sha256 -noenc -days 1 \
+        -subj /CN=test-ca -keyout "$work/ca.key" -out "$work/ca.crt"
+      openssl req -newkey rsa:2048 -sha256 -noenc -subj /CN=localhost \
+        -keyout "$work/server.key" -out "$work/server.csr"
+      printf '%s\n' basicConstraints=CA:FALSE extendedKeyUsage=serverAuth \
+        subjectAltName=DNS:localhost,IP:127.0.0.1 >"$work/ext.cnf"
+      openssl x509 -req -sha256 -days 1 -in "$work/server.csr" \
+        -CA "$work/ca.crt" -CAkey "$work/ca.key" -CAcreateserial \
+        -extfile "$work/ext.cnf" -out "$work/server.crt"
+
+      git init -q --bare -b main "$work/srv/repo.git"
+      git -C "$work/srv/repo.git" config http.receivepack true
+      git init -q -b main "$work/seed"
+      echo hello >"$work/seed/README"
+      git -C "$work/seed" add README
+      git -C "$work/seed" -c user.name=test -c user.email=test@example.com \
+        commit -q -m seed
+      git -C "$work/seed" push -q "$work/srv/repo.git" main
+
+      # Smart HTTP through git http-backend, accepting user:secret and the
+      # token-only form (tok with an empty password) that GitHub tokens use.
+      cat >"$work/server.py" <<'PY'
+      import base64, http.server, os, ssl, subprocess, sys
+
+      root, port, cert, key = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+      accepted = {"Basic " + base64.b64encode(c).decode() for c in (b"user:secret", b"tok:")}
+
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def handle_git(self):
+              if self.headers.get("Authorization") not in accepted:
+                  self.send_response(401)
+                  self.send_header("WWW-Authenticate", 'Basic realm="git"')
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
+                  return
+              if self.headers.get("Transfer-Encoding"):
+                  self.send_error(411)
+                  return
+              length = int(self.headers.get("Content-Length") or 0)
+              path, _, query = self.path.partition("?")
+              env = {
+                  "PATH": os.environ["PATH"],
+                  "GIT_CONFIG_NOSYSTEM": "1",
+                  "GIT_HTTP_EXPORT_ALL": "1",
+                  "GIT_PROJECT_ROOT": root,
+                  "REQUEST_METHOD": self.command,
+                  "PATH_INFO": path,
+                  "QUERY_STRING": query,
+                  "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                  "CONTENT_LENGTH": str(length),
+                  "HTTP_CONTENT_ENCODING": self.headers.get("Content-Encoding", ""),
+                  "HTTP_GIT_PROTOCOL": self.headers.get("Git-Protocol", ""),
+                  "REMOTE_ADDR": "127.0.0.1",
+                  "REMOTE_USER": "user",
+              }
+              cgi = subprocess.run(["git", "http-backend"], input=self.rfile.read(length),
+                                   env=env, capture_output=True, check=True)
+              head, _, body = cgi.stdout.partition(b"\r\n\r\n")
+              status, headers = 200, []
+              for line in head.decode().split("\r\n"):
+                  name, _, value = line.partition(":")
+                  if name.lower() == "status":
+                      status = int(value.split()[0])
+                  else:
+                      headers.append((name, value.strip()))
+              self.send_response(status)
+              for name, value in headers:
+                  self.send_header(name, value)
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          do_GET = do_POST = handle_git
+
+
+      ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+      ctx.load_cert_chain(cert, key)
+      server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+      server.socket = ctx.wrap_socket(server.socket, server_side=True)
+      server.serve_forever()
+      PY
+      python3 "$work/server.py" "$work/srv" "$port" "$work/server.crt" \
+        "$work/server.key" 2>"$work/server.log" &
+      srv=$!
+      trap 'kill "$srv" 2>/dev/null; rm -rf "$work"' EXIT
+      wait-for-it "127.0.0.1:$port" -t 30 || {
+        cat "$work/server.log" >&2
+        fail "test git server did not start"
+      }
+
+      echo | openssl s_client -connect "127.0.0.1:$port" -servername localhost \
+        -CAfile "$work/ca.crt" >"$work/s_client.log" 2>&1 || true
+      grep -F "Verify return code: 0 (ok)" "$work/s_client.log" >/dev/null || {
+        cat "$work/s_client.log" >&2
+        fail "TLS handshake against the test CA"
+      }
+
+      export GIT_TERMINAL_PROMPT=0 GIT_SSL_CAINFO="$work/ca.crt"
+      anon="https://127.0.0.1:$port/repo.git"
+      authed="https://user:secret@127.0.0.1:$port/repo.git"
+
+      # check <description> <git args...>: the git command must succeed without
+      # the "redirecting to" warning that means git dropped the credentials.
+      # Failures are collected so one run reports every broken case.
+      failed=""
+      check() {
+        what=$1
+        shift
+        if ! git "$@" >"$work/out" 2>"$work/err"; then
+          cat "$work/err" >&2
+          echo "FAIL: $what" >&2
+          failed="$failed\n  $what"
+        elif grep -F "redirecting to" "$work/err" >&2; then
+          echo "FAIL: $what: spurious redirect, git dropped the credentials" >&2
+          failed="$failed\n  $what (spurious redirect)"
+        else
+          echo "PASS: $what"
+        fi
+      }
+
+      if git ls-remote "$anon" >"$work/out" 2>"$work/err"; then
+        fail "ls-remote without credentials succeeded"
+      fi
+      grep -F '" 401 ' "$work/server.log" >/dev/null ||
+        fail "server never rejected the request without credentials"
+      if env -u GIT_SSL_CAINFO git ls-remote "$authed" >"$work/out" 2>"$work/err"; then
+        fail "ls-remote succeeded without trusting the test CA"
+      fi
+      grep -i -F certificate "$work/err" >/dev/null || {
+        cat "$work/err" >&2
+        fail "untrusted server was not rejected for its certificate"
+      }
+      echo "PASS: auth and certificate verification are enforced"
+
+      code="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$work/ca.crt" \
+        "$anon/info/refs?service=git-upload-pack")"
+      [ "$code" = 401 ] || fail "curl without credentials got HTTP $code, want 401"
+      curl -sf --cacert "$work/ca.crt" "$authed/info/refs?service=git-upload-pack" |
+        grep -F "# service=git-upload-pack" >/dev/null ||
+        fail "curl with credentials in the URL"
+      echo "PASS: curl with credentials in the URL"
+
+      check "clone with user:password in the URL" clone -q "$authed" "$work/c1"
+      check "clone with a token-only URL" \
+        clone -q "https://tok@127.0.0.1:$port/repo.git" "$work/c2"
+
+      # The .invalid hosts only resolve through the rewrite, as with the
+      # url."https://<token>@github.com/".insteadOf setups used for go modules.
+      git config --global url."https://tok@127.0.0.1:$port/".insteadOf \
+        https://tok.example.invalid/
+      git config --global url."https://user:secret@127.0.0.1:$port/".insteadOf \
+        https://user.example.invalid/
+      check "clone through a token-only insteadOf rewrite" \
+        clone -q https://tok.example.invalid/repo.git "$work/c3"
+      check "clone through a user:password insteadOf rewrite" \
+        clone -q https://user.example.invalid/repo.git "$work/c4"
+
+      if [ -d "$work/c4" ]; then
+        grep -x -F hello "$work/c4/README" >/dev/null || fail "cloned content differs"
+        git -C "$work/c4" -c user.name=test -c user.email=test@example.com \
+          commit -q --allow-empty -m pushed
+        check "push through a user:password insteadOf rewrite" \
+          -C "$work/c4" push -q origin main
+        [ "$(git -C "$work/srv/repo.git" log -1 --format=%s main)" = pushed ] ||
+          failed="$failed\n  push did not reach the server"
+      fi
+
+      [ -z "$failed" ] || fail "git lost credentials over HTTPS:$(printf "$failed")"

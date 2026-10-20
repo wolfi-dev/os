@@ -1,0 +1,316 @@
+From: Dustin Kirkland <dustin.kirkland@chainguard.dev>
+Subject: pdftopdf: keep annotations without an appearance from aborting the job
+
+Backport of upstream d3043e3 (OpenPrinting/libcupsfilters#246), source
+change only (the upstream test plumbing does not apply to 2.2.1).
+
+Flattening a link or form field with no /N appearance registered a Form
+XObject under a heap-allocated name and then freed that name; PDFio keeps
+the key pointer, so the page /XObject dictionary was corrupt when the
+flattened file was written and cfFilterPDFToPDF() exited 1. Chrome's
+direct-to-CUPS PDF hits this for every hyperlink.
+---
+diff --git a/cupsfilters/pdftopdf.c b/cupsfilters/pdftopdf.c
+index 8945003..eb22a79 100644
+--- a/cupsfilters/pdftopdf.c
++++ b/cupsfilters/pdftopdf.c
+@@ -1521,7 +1521,7 @@ flatten_pdf(xform_prepare_t *p,			// I - Preparation data
+   rotate_val = (int)pdfioDictGetNumber(idict, "Rotate"); 
+   count = pdfioArrayGetSize(annotsArray); 
+   
+-  p->annotation_contents = (char**)malloc(count * sizeof(char*)); 
++  p->annotation_contents = (char**)calloc(count, sizeof(char*)); 
+   
+   int* noAppearanceobjectIndex = (int *)malloc(count * sizeof(int)); 
+   noAppearanceobjectCount = 0; 
+@@ -1766,148 +1766,177 @@ flatten_pdf(xform_prepare_t *p,			// I - Preparation data
+       fprintf(stderr, "ignore annotation with no appearance\n");
+       noAppearanceobjectCount++;
+     } 
+-    else 
+-    { 
+-      char *name = (char *)malloc(sizeof(char) * 32);
+-      snprintf(name, 32, "Fxo%d", next_fx);
+-
+-      pdfio_dict_t *page_resources = pdfioDictGetDict(outpage->pagedict, "Resources");
+-      if (!page_resources) 
++    else
++    {
++      // No selected appearance stream (/N).  Link annotations and form
++      // fields with no appearance have nothing to paint.  This branch used
++      // to build a Form XObject anyway and register it under a
++      // heap-allocated name, then free that name.  pdfioDictSetObj() keeps
++      // the caller's key pointer, so by the time the flattened file was
++      // written every /XObject key was a dangling pointer.  Reopening the
++      // file failed and pdftopdf exited 1.  Issue #246.
++      //
++      // Text and choice fields that still carry a value are synthesized
++      // below.  The XObject name is a PDFio-owned string.
++      const char	*field_type,
++			*field_value = NULL,
++			*da_string = NULL;
++
++      field_type = pdfioDictGetName(Annot_dict, "FT");
++      if (field_type && (strcmp(field_type, "Tx") == 0 ||
++			 strcmp(field_type, "Ch") == 0))
+       {
+-	page_resources = pdfioDictCreate(outpage->pdf); 
+-	pdfioDictSetDict(outpage->pagedict, "Resources", page_resources);
+-      } 
++	field_value = pdfioDictGetName(Annot_dict, "V");
++	if (!field_value)
++	  field_value = pdfioDictGetString(Annot_dict, "V");
+ 
+-      pdfio_dict_t *xobj_dict = pdfioDictGetDict(page_resources, "XObject");
+-      if (!xobj_dict) 
+-      { 
+-	xobj_dict = pdfioDictCreate(outpage->pdf);
+-	pdfioDictSetDict(page_resources, "XObject", xobj_dict);
++	da_string = pdfioDictGetName(Annot_dict, "DA");
++	if (!da_string)
++	  da_string = pdfioDictGetString(Annot_dict, "DA");
+       }
+-      
+-      pdfio_array_t *procset = pdfioArrayCreate(outpage->pdf);
+-      pdfioArrayAppendName(procset, "PDF");   // adds /PDF
+-      pdfioArrayAppendName(procset, "Text");  // adds /Text
+ 
+-      pdfio_dict_t *resources = pdfioDictCreate(outpage->pdf);
+-      pdfioDictSetArray(resources, "ProcSet", procset);
++      if (!field_value || !da_string)
++      {
++	fprintf(stderr, "DEBUG: special case ignore annotation with no appearance\n");
++	noAppearanceobjectIndex[noAppearanceobjectCount] = (int)i;
++	noAppearanceobjectCount++;
++      }
++      else
++      {
++	const char	*name;
++	char		*content;
++	pdfio_dict_t	*page_resources,
++			*xobj_dict,
++			*form_xobj_dict,
++			*resources;
++	pdfio_array_t	*procset;
++	pdfio_obj_t	*form_xobj;
++	pdfio_rect_t	rect,
++			bbox;
++	char		font_key[64];
++	double		font_size = 10.0;
++
++	name = pdfioStringCreatef(outpage->pdf, "Fxo%d", next_fx);
++	content = name ? special_pdfio_annotation_get_content(Annot_obj, name,
++			    rotate_val, forbidden_flags, required_flags) : NULL;
++	if (!name || !content || content[0] == '\0')
++	{
++	  free(content);
++	  fprintf(stderr, "DEBUG: special case ignore annotation with no appearance\n");
++	  noAppearanceobjectIndex[noAppearanceobjectCount] = (int)i;
++	  noAppearanceobjectCount++;
++	}
++	else
++	{
++	  page_resources = pdfioDictGetDict(outpage->pagedict, "Resources");
++	  if (!page_resources)
++	  {
++	    page_resources = pdfioDictCreate(outpage->pdf);
++	    pdfioDictSetDict(outpage->pagedict, "Resources", page_resources);
++	  }
++
++	  xobj_dict = pdfioDictGetDict(page_resources, "XObject");
++	  if (!xobj_dict)
++	  {
++	    xobj_dict = pdfioDictCreate(outpage->pdf);
++	    pdfioDictSetDict(page_resources, "XObject", xobj_dict);
++	  }
+ 
+-      pdfio_dict_t *form_xobj_dict = pdfioDictCreate(outpage->pdf);
+-      pdfioDictSetName(form_xobj_dict, "Type", "XObject");
+-      pdfioDictSetName(form_xobj_dict, "Subtype", "Form");
++	  procset = pdfioArrayCreate(outpage->pdf);
++	  pdfioArrayAppendName(procset, "PDF");
++	  pdfioArrayAppendName(procset, "Text");
+ 
+-      char *content = special_pdfio_annotation_get_content(Annot_obj, name, rotate_val, forbidden_flags, required_flags);
+-      p->annotation_contents[i-noAppearanceobjectCount] = content;
++	  resources = pdfioDictCreate(outpage->pdf);
++	  pdfioDictSetArray(resources, "ProcSet", procset);
+ 
+-      // The addition to page xobject should be made only if the content stream is not NULL.
+-      if (content && content[0] != '\0')
+-      {
+-        pdfio_array_t *bbox = pdfioDictGetArray(Annot_dict, "BBox");
+-        if (bbox) 
+-        { 
+-          pdfioDictSetArray(form_xobj_dict, "BBox", pdfioArrayCopy(outpage->pdf, bbox));
+-        } 
+-        else 
+-        { 
+-     	  fprintf(stderr, "WARNING: Appearance stream is missing required /BBox.\n");
+-	  pdfio_rect_t rect; 
+-	    
+-	  if (pdfioDictGetRect(Annot_dict, "Rect", &rect)) 
+-	  { 
+-	    pdfio_rect_t Bbox;
+-	    Bbox.x1 = 0;
+-	    Bbox.y1 = 0;
+-	    Bbox.x2 = rect.x2 - rect.x1;
+-	    Bbox.y2 = rect.y2 - rect.y1;
+-	    pdfioDictSetRect(form_xobj_dict, "BBox", &Bbox);
+-	  } 
+-        }
+-       
+-        pdfio_obj_t *form_xobj = pdfioFileCreateObj(outpage->pdf, form_xobj_dict);
+-      
+-        const char *field_type = pdfioDictGetName(Annot_dict, "FT");
+-        if (field_type && (strcmp(field_type, "Tx") == 0 || strcmp(field_type, "Ch") == 0)) 
+-        { 
+-     	  const char *field_value = pdfioDictGetName(Annot_dict, "V");
+-	  if (!field_value) field_value = pdfioDictGetString(Annot_dict, "V");
++	  form_xobj_dict = pdfioDictCreate(outpage->pdf);
++	  pdfioDictSetName(form_xobj_dict, "Type", "XObject");
++	  pdfioDictSetName(form_xobj_dict, "Subtype", "Form");
++
++	  if (!pdfioDictGetRect(Annot_dict, "Rect", &rect))
++	  {
++	    rect.x1 = 0.0;
++	    rect.y1 = 0.0;
++	    rect.x2 = 0.0;
++	    rect.y2 = 0.0;
++	  }
++	  bbox.x1 = 0.0;
++	  bbox.y1 = 0.0;
++	  bbox.x2 = rect.x2 - rect.x1;
++	  bbox.y2 = rect.y2 - rect.y1;
++	  pdfioDictSetRect(form_xobj_dict, "BBox", &bbox);
+ 
+-	  const char *da_string = pdfioDictGetName(Annot_dict, "DA");
+-	  if (!da_string) da_string = pdfioDictGetString(Annot_dict, "DA");
++	  form_xobj = pdfioFileCreateObj(outpage->pdf, form_xobj_dict);
+ 
+-	  char font_key[64];
+-	  double font_size = 10.0;
+ 	  if (extractFontDetails(da_string, font_key, sizeof(font_key), &font_size))
+-       	  {
+-	    pdfio_obj_t *font_obj = NULL;
+-	    pdfio_dict_t *page_resource_dict = pdfioDictGetDict(outpage->pagedict, "Resources");
+-	    pdfio_dict_t *font_dict = page_resource_dict ? pdfioDictGetDict(page_resource_dict, "Font") : NULL;
+-	 
++	  {
++	    pdfio_obj_t		*font_obj = NULL;
++	    pdfio_dict_t	*page_resource_dict,
++				*font_dict;
++
++	    page_resource_dict = pdfioDictGetDict(outpage->pagedict, "Resources");
++	    font_dict = page_resource_dict ? pdfioDictGetDict(page_resource_dict, "Font") : NULL;
+ 	    if (font_dict)
++	      font_obj = pdfioDictGetObj(font_dict, font_key);
++
++	    if (!font_obj)
+ 	    {
+-              font_obj = pdfioDictGetObj(font_dict, font_key);
+-	    } 
+-	 
+-	    // If font_obj is not found in the page's resources, check the AcroForm's /DR.
+-    	    if (!font_obj)
+-	    {
+-              pdfio_dict_t *catalog = pdfioFileGetCatalog(p->inpdf);
+-	      pdfio_dict_t *acroform = catalog ? pdfioDictGetDict(catalog, "AcroForm") : NULL;
+-	      pdfio_dict_t *acroform_dr = acroform ? pdfioDictGetDict(acroform, "DR") : NULL;
+-	      pdfio_dict_t *acroform_font_dict = acroform_dr ? pdfioDictGetDict(acroform_dr, "Font") : NULL;
++	      pdfio_dict_t	*catalog,
++				*acroform,
++				*acroform_dr,
++				*acroform_font_dict;
++
++	      catalog = pdfioFileGetCatalog(p->inpdf);
++	      acroform = catalog ? pdfioDictGetDict(catalog, "AcroForm") : NULL;
++	      acroform_dr = acroform ? pdfioDictGetDict(acroform, "DR") : NULL;
++	      acroform_font_dict = acroform_dr ? pdfioDictGetDict(acroform_dr, "Font") : NULL;
+ 	      if (acroform_font_dict)
+-	      {
+-                font_obj = pdfioDictGetObj(acroform_font_dict, font_key);
+-	      }
++		font_obj = pdfioDictGetObj(acroform_font_dict, font_key);
+ 	    }
+ 	    if (font_obj)
+ 	    {
+-	      // 1. Create the dedicated sub-dictionary for fonts.
+ 	      pdfio_dict_t *sub_font_dict = pdfioDictCreate(outpage->pdf);
+-	      pdfioDictSetObj(sub_font_dict, font_key, font_obj);
++
++	      pdfioDictSetObj(sub_font_dict, pdfioStringCreate(outpage->pdf, font_key), font_obj);
+ 	      pdfioDictSetDict(resources, "Font", sub_font_dict);
+ 	      pdfioDictSetDict(form_xobj_dict, "Resources", resources);
+-	   
+-	      fprintf(stderr, "SUCCESS: Font /%s correctly nested in /Resources /Font dictionary.\\n", font_key); 
+-	    } 
+-	    else
+-	    {
+-	      fprintf(stderr, "ERROR: Font %s not found in page or AcroForm resources.\\n", font_key);
+ 	    }
+-       	  }
++	    else
++	      fprintf(stderr, "ERROR: Font %s not found in page or AcroForm resources.\n", font_key);
++	  }
+ 
+-	  if (field_value && da_string) 
+-	  { 
++	  if (form_xobj)
++	  {
+ 	    pdfio_stream_t *dst_stream = pdfioObjCreateStream(form_xobj, PDFIO_FILTER_NONE);
++
+ 	    if (dst_stream)
+ 	    {
+-              pdfio_rect_t form_bbox;
+-              if (pdfioDictGetRect(form_xobj_dict, "BBox", &form_bbox))
+-	      {
+-	        double field_height = form_bbox.y2 - form_bbox.y1;
+-	        double x = 2.0;
+-	        double y = (field_height / 2.0) - (font_size * 0.35);
+-
+-	        pdfioStreamPuts(dst_stream, "BT\n");
+-	        pdfioStreamPrintf(dst_stream, "%s\n", da_string);       // Assuming da_string is safe
+-	        pdfioStreamPrintf(dst_stream, "%.2f %.2f Td\n", x, y);
+-	        pdfioStreamPrintf(dst_stream, "(%s) Tj\n", field_value);  // The critical fix
+-	        pdfioStreamPuts(dst_stream, "ET\n");
++	      pdfio_rect_t	form_bbox;
++	      double		field_height,
++				x,
++				y;
+ 
++	      if (pdfioDictGetRect(form_xobj_dict, "BBox", &form_bbox))
++	      {
++		field_height = form_bbox.y2 - form_bbox.y1;
++		x = 2.0;
++		y = (field_height / 2.0) - (font_size * 0.35);
++		pdfioStreamPuts(dst_stream, "BT\n");
++		pdfioStreamPrintf(dst_stream, "%s\n", da_string);
++		pdfioStreamPrintf(dst_stream, "%.2f %.2f Td\n", x, y);
++		pdfioStreamPrintf(dst_stream, "(%s) Tj\n", field_value);
++		pdfioStreamPuts(dst_stream, "ET\n");
+ 	      }
+ 	      pdfioStreamClose(dst_stream);
+ 	    }
+-	  } 
+-        }
+-      
+-        pdfioDictSetObj(xobj_dict, name, form_xobj);
+-        next_fx++; 
++	  }
++
++	  pdfioDictSetObj(xobj_dict, name, form_xobj);
++	  p->annotation_contents[i - noAppearanceobjectCount] = content;
++	  next_fx++;
++	}
+       }
+-      
+-      //Annot_dict
+-      free(name);
+-      fprintf(stderr, "DEBUG: special case ignore annotation with no appearance\n");
+-      noAppearanceobjectIndex[noAppearanceobjectCount] = i;
+-    } 
++    }
+     if(N_stream)
+       pdfioStreamClose(N_stream);
+   } 

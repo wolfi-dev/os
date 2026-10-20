@@ -1,0 +1,78 @@
+diff --git a/src/OVAL/oval_probe.c b/src/OVAL/oval_probe.c
+index 3c130b5..83acf33 100644
+--- a/src/OVAL/oval_probe.c
++++ b/src/OVAL/oval_probe.c
+@@ -49,6 +49,12 @@
+ #include "oval_probe_ext.h"
+ #include "collectVarRefs_impl.h"
+ 
++#if defined(__linux__)
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <linux/capability.h>
++#endif
++
+ #ifdef OS_WINDOWS
+ #define X_OK 0
+ #endif
+@@ -94,6 +100,41 @@ static void _syschar_add_bindings(struct oval_syschar *sc, struct oval_string_ma
+ 	oval_collection_iterator_free(var_itr);
+ }
+ 
++/*
++ * In offline mode the RPM probes enter the scanned root with chroot(), which
++ * needs CAP_SYS_CHROOT. Without it the probe fails and the whole scan aborts.
++ * Treat the object as not supported instead, as if the probe was not built in.
++ */
++static bool _rpm_probe_unusable_offline(oval_subtype_t type)
++{
++#if defined(__linux__)
++	const char *rootdir;
++	struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
++	struct __user_cap_data_struct data[2];
++
++	switch (type) {
++	case OVAL_LINUX_RPM_INFO:
++	case OVAL_LINUX_RPMVERIFY:
++	case OVAL_LINUX_RPMVERIFYFILE:
++	case OVAL_LINUX_RPMVERIFYPACKAGE:
++		break;
++	default:
++		return false;
++	}
++
++	rootdir = getenv("OSCAP_PROBE_ROOT");
++	if (rootdir == NULL || rootdir[0] == '\0')
++		return false;
++
++	if (syscall(SYS_capget, &hdr, data) != 0)
++		return true;
++	return (data[CAP_SYS_CHROOT / 32].effective & (1U << (CAP_SYS_CHROOT % 32))) == 0;
++#else
++	(void)type;
++	return false;
++#endif
++}
++
+ int oval_probe_query_object(oval_probe_session_t *psess, struct oval_object *object, int flags, struct oval_syschar **out_syschar)
+ {
+ 	char *oid;
+@@ -142,6 +183,18 @@ int oval_probe_query_object(oval_probe_session_t *psess, struct oval_object *obj
+ 
+ 	ph = oval_probe_handler_get(psess->ph, type);
+ 
++	if (ph != NULL && _rpm_probe_unusable_offline(type)) {
++		char *msg = oscap_sprintf("OVAL object '%s_object' is not supported: offline scanning of "
++			"RPM data needs the CAP_SYS_CHROOT capability, which this process does not have.", type_name);
++
++		dW("%s", msg);
++		oval_syschar_add_new_message(sysc, msg, OVAL_MESSAGE_LEVEL_WARNING);
++		free(msg);
++		oval_syschar_set_flag(sysc, SYSCHAR_FLAG_NOT_COLLECTED);
++
++		return 1;
++	}
++
+ 	if (ph == NULL) {
+ 		char *msg = oscap_sprintf("OVAL object '%s_object' is not supported.", type_name);
+ 

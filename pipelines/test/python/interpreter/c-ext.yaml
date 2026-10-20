@@ -1,0 +1,71 @@
+name: c-ext
+
+description: |
+  Builds a small C extension module against the given interpreter's
+  installed headers, then imports it. On a free-threaded interpreter, it
+  also checks that the import leaves the GIL disabled.
+
+needs:
+  packages:
+    - build-base
+
+inputs:
+  python:
+    description: |
+      The Python interpreter to build the extension for. Its headers must be
+      installed. The package under test usually installs them.
+    required: true
+
+pipeline:
+  - name: "build and import a C extension"
+    runs: |
+      python="${{inputs.python}}"
+      d=$(mktemp -d)
+
+      cat > "$d/c_ext_check.c" <<'EOF'
+      #include <Python.h>
+
+      static PyObject *answer(PyObject *self, PyObject *args) {
+          return PyLong_FromLong(42);
+      }
+
+      static PyMethodDef methods[] = {
+          {"answer", answer, METH_NOARGS, NULL},
+          {NULL, NULL, 0, NULL},
+      };
+
+      static PyModuleDef_Slot slots[] = {
+      #ifdef Py_mod_gil
+          /* Py_mod_gil exists in 3.13 and later. Without this slot, a
+             free-threaded interpreter re-enables the GIL on import. */
+          {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+      #endif
+          {0, NULL},
+      };
+
+      static struct PyModuleDef module = {
+          PyModuleDef_HEAD_INIT, "c_ext_check", NULL, 0, methods, slots,
+      };
+
+      PyMODINIT_FUNC PyInit_c_ext_check(void) { return PyModuleDef_Init(&module); }
+      EOF
+
+      include=$("$python" -c 'import sysconfig; print(sysconfig.get_path("include"))')
+      ext=$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
+      cc -shared -fPIC -I"$include" "$d/c_ext_check.c" -o "$d/c_ext_check$ext"
+
+      cd "$d"
+      "$python" - <<'EOF'
+      import sys
+      import sysconfig
+
+      import c_ext_check
+
+      assert c_ext_check.answer() == 42
+      if sysconfig.get_config_var("Py_GIL_DISABLED"):
+          assert not sys._is_gil_enabled(), "importing c_ext_check re-enabled the GIL"
+      print("c_ext_check: built and imported with", sys.executable)
+      EOF
+
+      cd /
+      rm -rf "$d"

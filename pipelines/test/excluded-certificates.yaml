@@ -1,0 +1,91 @@
+name: Excluded certificates check
+
+description: |
+  Fails if any certificate in the given PEM files has an excluded public key
+  or an excluded subject common name. Each file may hold a single certificate
+  or a bundle. Use it to check that distrusted roots stay out of CA bundles.
+
+needs:
+  packages:
+    - openssl
+
+inputs:
+  files:
+    description: |
+      Whitespace-separated list of PEM files to check. Shell globs are allowed.
+    required: true
+  excluded-spki-hashes:
+    description: |
+      SHA-256 hashes of the DER-encoded public keys (SubjectPublicKeyInfo) of
+      the excluded certificates, separated by "|".
+    required: true
+  excluded-names:
+    description: |
+      Subject common names of the excluded certificates, one per line.
+    required: true
+
+# USAGE EXAMPLE:
+#
+#   - uses: test/excluded-certificates
+#     with:
+#       files: /etc/ssl/certs/ca-certificates.crt
+#       excluded-spki-hashes: ${{vars.excluded-spki-hashes}}
+#       excluded-names: ${{vars.excluded-names}}
+#
+pipeline:
+  - name: Check for excluded certificates
+    runs: |
+      set -o pipefail
+      excluded_names=$(cat <<'MELANGE_NAMES_EOF'
+      ${{inputs.excluded-names}}
+      MELANGE_NAMES_EOF
+      )
+      excluded_names=$(printf '%s\n' "$excluded_names" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
+      if [ -z "$excluded_names" ]; then
+        echo "excluded-names is empty"
+        exit 1
+      fi
+
+      check_cert() {
+        spki_hash="$(openssl x509 -in "$1" -pubkey -noout |
+          openssl pkey -pubin -outform der |
+          openssl dgst -sha256 -r)"
+        case "${spki_hash%% *}" in
+          ${{inputs.excluded-spki-hashes}})
+            echo "Excluded public key ${spki_hash%% *} found in $2"
+            exit 1
+            ;;
+        esac
+        cn="$(openssl x509 -in "$1" -noout -subject -nameopt multiline | sed -n 's/^ *commonName *= *//p')"
+        if [ -n "$cn" ] && printf '%s\n' "$excluded_names" | grep -Fxq -- "$cn"; then
+          echo "Excluded certificate \"$cn\" found in $2"
+          exit 1
+        fi
+      }
+
+      split="$(mktemp -d)"
+      total=0
+      for file in ${{inputs.files}}; do
+        if [ ! -f "$file" ]; then
+          echo "No such file: $file"
+          exit 1
+        fi
+        rm -f "$split"/*.pem
+        awk -v dir="$split" '
+          /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/cert-%04d.pem", dir, n) }
+          out { print > out }
+          /-----END CERTIFICATE-----/ { close(out); out = "" }
+        ' "$file"
+        count=0
+        for cert in "$split"/*.pem; do
+          [ -f "$cert" ] || continue
+          check_cert "$cert" "$file"
+          count=$((count + 1))
+        done
+        if [ "$count" -eq 0 ]; then
+          echo "No certificates in $file"
+          exit 1
+        fi
+        total=$((total + count))
+      done
+      echo "Checked $total certificates, none excluded"

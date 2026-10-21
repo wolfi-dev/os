@@ -27,25 +27,25 @@ inputs:
 pipeline:
   - name: Install chainctl
     runs: |
-      set -eu
+      set -euo pipefail
 
       ARCH=${{build.arch}}
       PLATFORM="linux_${ARCH/aarch64/arm64}"
-      curl --fail-with-body -sSL -o /usr/local/bin/chainctl \
-        "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}"
+      VERSION=$(curl --fail-with-body -sS "https://dl.enforce.dev/chainctl/latest/metadata.json" | jq -er .version)
+      BASE="https://dl.enforce.dev/chainctl/${VERSION}/chainctl_${PLATFORM}"
+      curl --fail-with-body -sSL -o /usr/local/bin/chainctl "$BASE"
       chmod 755 /usr/local/bin/chainctl
 
-      VERSION=$(curl -sS "https://dl.enforce.dev/chainctl/latest/metadata.json" | jq -r .version)
       cosign verify-blob \
-        --signature "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}.sig" \
-        --certificate "https://dl.enforce.dev/chainctl/latest/chainctl_${PLATFORM}.cert.pem" \
+        --signature "${BASE}.sig" \
+        --certificate "${BASE}.cert.pem" \
         --certificate-identity "https://github.com/chainguard-dev/mono/.github/workflows/.release-drop.yaml@refs/tags/v${VERSION}" \
         --certificate-oidc-issuer https://token.actions.githubusercontent.com \
         /usr/local/bin/chainctl
 
   - name: Setup npm credentials
     runs: |
-      set -eu
+      set -euo pipefail
 
       if [ -f ${{package.srcdir}}/.libraries.token ]; then
         cgtoken=$(cat ${{package.srcdir}}/.libraries.token)
@@ -69,13 +69,20 @@ pipeline:
         (cd "$(dirname "$npmrc")" && pnpm config set registry=https://libraries.cgr.dev/javascript/ --location=project)
       done
 
+      cp /etc/npmrc "$HOME/.npmrc"
+      # Home is not respected under bwrap
+      if [ "$HOME" != "/root" ]; then
+        cp /etc/npmrc /root/.npmrc
+      fi
+
       fallback_flag=""
       if [ "${{inputs.allow-fallback-registry}}" = "true" ]; then
         fallback_flag="--fallback-registry-url ${{inputs.fallback-registry-url}}"
       fi
 
       for lockfile_name in package-lock.json yarn.lock pnpm-lock.yaml bun.lock; do
-        find . -name "$lockfile_name" -not -path '*/node_modules/*' -type f \
-          -exec echo "Updating {} hashes for Chainguard Libraries..." \; \
-          -exec env CHAINCTL_AUTH_TOKEN="$cgtoken" chainctl libraries update-hashes --replace --parent ${{inputs.group}} $fallback_flag {} \;
+        for lockfile in $(find . -name "$lockfile_name" -not -path '*/node_modules/*' -type f); do
+          echo "Updating ${lockfile} hashes for Chainguard Libraries..."
+          CHAINCTL_AUTH_TOKEN="$cgtoken" chainctl libraries update-hashes --replace --parent ${{inputs.group}} $fallback_flag "$lockfile"
+        done
       done

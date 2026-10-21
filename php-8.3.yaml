@@ -1,7 +1,7 @@
 package:
   name: php-8.3
-  version: "8.3.35"
-  epoch: 4 # GHSA-w8hw-w9fx-j79w: PHP maintainers' memory-limit (interrupted-operation) series, pre-disclosure
+  version: "8.3.36"
+  epoch: 0
   description: "the PHP programming language"
   copyright:
     - license: PHP-3.01
@@ -78,7 +78,7 @@ pipeline:
     with:
       repository: https://github.com/php/php-src
       tag: php-${{package.version}}
-      expected-commit: 2d3433d24d59f45703be2b4fb40d74e5a41b136b
+      expected-commit: 5ba6ad519229ac09fc4fc74155c76bdca69ae0de
 
   # https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/php83/install-pear.patch
   - uses: patch
@@ -89,15 +89,6 @@ pipeline:
   - uses: patch
     with:
       patches: openssl-ssl-ctx-options-uint64.patch
-
-  # GHSA-w8hw-w9fx-j79w (pre-disclosure): the PHP maintainers' fix series for the memory_limit
-  # bailout class: the (un)serialize context and the session globals surviving an
-  # interrupted request startup, and the Zend hash bucket counted before its key is
-  # allocated. Derived copy of the private branch GHSA-h37m-fxqh-w76h-throw-2-fallible-8.3;
-  # provenance and the two dropped content-less stanzas are in the patch header.
-  - uses: patch
-    with:
-      patches: GHSA-w8hw-w9fx-j79w.patch
 
   - name: Configure
     runs: |
@@ -175,29 +166,6 @@ pipeline:
         --with-external-pcre
 
   - uses: autoconf/make
-
-  - name: Regenerate the VM executor for GHSA-w8hw-w9fx-j79w
-    runs: |
-      # Zend/zend_vm_execute.h is generated from Zend/zend_vm_def.h and carries the
-      # -diff attribute upstream, so the maintainers' series could not carry it as
-      # text (see the patch header). Regenerate it with the in-tree generator, run by
-      # the CLI the build above produced, check the result against the maintainers'
-      # blob and rebuild what depends on it.
-      blob() { { printf 'blob %s\0' "$(stat -c %s "$1")"; cat "$1"; } | sha1sum | cut -c1-40; }
-      before=$(blob Zend/zend_vm_execute.h)
-      sapi/cli/php -n -d memory_limit=-1 Zend/zend_vm_gen.php
-      after=$(blob Zend/zend_vm_execute.h)
-      echo "GHSA-w8hw-w9fx-j79w zend_vm_execute.h blob: before=$before after=$after series=5f7f4997ce..3f4ead26d2"
-      case "$after" in
-        3f4ead26d2*) echo "regenerated executor matches the maintainers' branch" ;;
-        *)
-          case "$before" in
-            5f7f4997ce*) echo "ERROR: the regenerated executor does not reproduce the maintainers' blob" >&2; exit 1 ;;
-            *) echo "WARNING: the executor at this tag differs from the series merge-base (upstream drift); the regenerated file cannot be compared" ;;
-          esac ;;
-      esac
-      rm -f Zend/zend_execute.lo Zend/zend_execute.o Zend/.libs/zend_execute.o
-      make -j"$(nproc)"
 
   - name: Copy httpd.conf before install for apxs
     runs: |
@@ -554,35 +522,3 @@ test:
         EOF
 
         php /tmp/hello.php
-    - name: GHSA-w8hw-w9fx-j79w memory-limit regression
-      runs: |
-        # The maintainers' series registers memory_hard_limit_percent (ini_get() returns
-        # false for a directive PHP does not know) and turns the memory_limit bailout
-        # into a delayed fatal error raised at a safe point: the statement after the
-        # offending allocation still runs, shutdown functions still run and the process
-        # exits 255. One non-fallible request beyond the hard limit (200% of memory_limit
-        # by default) ends the process at once with status 137; random_bytes() allocates
-        # its result non-fallibly, whereas str_repeat() and friends now allocate fallibly
-        # and report the soft limit instead (checked on the built packages, 2026-10-19).
-        php -n -i | grep -F memory_hard_limit_percent
-        php -n -r 'exit(ini_get("memory_hard_limit_percent") === false ? 1 : 0);'
-        cat > /tmp/ghsa-w8hw-w9fx-j79w-oom.php <<'PHPEOF'
-        <?php
-        register_shutdown_function(function () { echo "shutdown function called\n"; });
-        function test() {
-            $a = str_repeat('a', 3 * 1024 * 1024);
-            $b = $a . $a;
-            echo "after the allocation\n";
-        }
-        test();
-        PHPEOF
-        rc=0; out=$(php -n -d memory_limit=8M -d display_errors=1 /tmp/ghsa-w8hw-w9fx-j79w-oom.php 2>&1) || rc=$?
-        printf '%s\nexit=%s\n' "$out" "$rc"
-        [ "$rc" -eq 255 ]
-        printf '%s\n' "$out" | grep -F 'Allowed memory size of 8388608 bytes exhausted'
-        printf '%s\n' "$out" | grep -F 'after the allocation'
-        printf '%s\n' "$out" | grep -F 'shutdown function called'
-        rc=0; out=$(php -n -d memory_limit=8M -r 'random_bytes(1 << 30);' 2>&1) || rc=$?
-        printf '%s\nexit=%s\n' "$out" "$rc"
-        [ "$rc" -eq 137 ]
-        printf '%s\n' "$out" | grep -F 'Hard memory limit of 16777216 bytes exhausted'

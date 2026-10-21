@@ -1,7 +1,7 @@
 package:
   name: ruby-4.0
   version: "4.0.7"
-  epoch: 5 # toolchain rebuild for  rust-1.99-1.99.1
+  epoch: 6 # CVE-2026-110264, plus regexp compiler hardening backports
   description: "the Ruby programming language"
   copyright:
     - license: Ruby
@@ -75,6 +75,12 @@ pipeline:
       repository: https://github.com/ruby/ruby
       tag: v${{package.version}}
       expected-commit: 229531a6cfbf07e3caef30dbac24a2a3f3fed482
+      cherry-picks: |
+        # CVE-2026-110264: https://github.com/ruby/ruby/pull/16801
+        master/493d26dcdea8b2f0ac5d28e057b401bc809e7fae: reject overflowed repeat/null-check IDs in huge regexps
+        # Hardening: regexp compiler program size overflow, https://github.com/ruby/ruby/pull/19020
+        master/7cfe8dc82f9f1b3f9c37c78e362fcbdf3c0b84f4: avoid overflow in the quantifier expansion size check
+        master/cf35145fc46bc278e0ab0003478fc4afe6564819: reject a compiled program too big for its offset type
 
   - uses: git-checkout
     with:
@@ -204,6 +210,41 @@ test:
         if echo "$OUTPUT" | grep -Fi "failed"; then
           exit 1
         fi
+    - name: Regexp compiler rejects overflowing repeat/null-check IDs (CVE-2026-110264)
+      runs: |
+        cat >/tmp/regexp-cve.rb <<'EOF'
+        { "(?:foobar){0,100}" => /too many range repeat/,
+          "(?:(?:foo)?|(?:bar)?)*" => /too many null check/ }.each do |pat, want|
+          begin
+            Regexp.new(pat * 100000)
+            abort "not rejected: #{pat} * 100000"
+          rescue RegexpError => e
+            abort "wrong error for #{pat}: #{e.message[0, 80]}" unless e.message =~ want
+            puts "ok: #{pat} * 100000 -> #{e.message[0, 40]}"
+          end
+        end
+        EOF
+        ruby /tmp/regexp-cve.rb
+    - name: Regexp compiler hardening (ruby/ruby#13332, ruby/ruby#19020)
+      runs: |
+        cat >/tmp/regexp-hardening.rb <<'EOF'
+        # ruby/ruby#13332: used to double-free the parse node
+        begin
+          Regexp.new("|{2,1}")
+          abort "not rejected: |{2,1}"
+        rescue RegexpError => e
+          puts "ok: |{2,1} -> #{e.message}"
+        end
+        # ruby/ruby#19020: the expansion check overflowed and compile hung
+        ["(?:.{90000,}){90000}", "(?:.{46341,}){46341}"].each do |src|
+          abort "unexpected match: #{src}" unless Regexp.new(src).match("x" * 10).nil?
+          puts "ok: #{src} compiled"
+        end
+        EOF
+        # A regressed compile hangs while growing memory. Ruby defers SIGTERM
+        # to an interrupt check that regexp compilation never reaches, so a
+        # plain timeout cannot stop it: use SIGKILL.
+        timeout -s KILL 60 ruby /tmp/regexp-hardening.rb
     - uses: test/tw/help-check
       with:
         bins: |

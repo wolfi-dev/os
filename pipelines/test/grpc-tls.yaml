@@ -1,0 +1,140 @@
+name: gRPC Python TLS loopback
+
+description: |
+  Serves a unary gRPC method over TLS on 127.0.0.1 with grpcio's
+  ssl_server_credentials, then checks two things: a client that trusts the
+  issuing CA gets the expected response, and a client that trusts a different
+  CA is rejected with UNAVAILABLE. Every certificate is generated fresh by a
+  throwaway CA, so the test needs no network access and no real credentials.
+
+  This exercises grpcio's TLS path through the system OpenSSL it was built
+  against, which grpcio's import test does not reach. Upstream's own C++ tests
+  are disabled in our builds (-DgRPC_BUILD_TESTS=OFF).
+
+  The caller's test environment must provide the openssl CLI from the same
+  stream the package builds against (the openssl-<version> package matching
+  vars.openssl-version in grpc YAMLs). This pipeline deliberately does not list `openssl`
+  in its needs: the default openssl could pull in a second libcrypto beside
+  the one under test.
+
+  Prints grep-able summary lines:
+    UPSTREAM-TESTS <label>: pass=N fail=N skip=0
+    UPSTREAM-TESTS <label>: duration=Ns
+
+  Example, in a per-Python grpcio subpackage:
+    test:
+      environment:
+        contents:
+          packages:
+            - openssl-<openssl-version>
+      pipeline:
+        - uses: test/grpc-tls
+          with:
+            python: python<X.Y>
+            label: py<X.Y>-grpcio-<major.minor>
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  python:
+    description: Python interpreter that has grpcio installed.
+    default: python3
+  label:
+    description: Name printed in the UPSTREAM-TESTS summary lines.
+    default: grpcio
+
+pipeline:
+  - name: gRPC TLS unary round-trip (trusted CA accepted, untrusted CA rejected)
+    runs: |
+      if ! command -v openssl >/dev/null 2>&1; then
+        echo "FAIL: openssl CLI not found; add the package's openssl-<version> stream to the test environment" >&2
+        exit 1
+      fi
+      ut_start=$(date +%s)
+      d=$(mktemp -d /tmp/grpc-tls.XXXXXX)
+      cd "$d"
+      # Throwaway trusted CA, an untrusted CA, and a server cert for
+      # 127.0.0.1/localhost signed by the trusted CA.
+      for ca in ca bad-ca; do
+        openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+          -keyout $ca.key -out $ca.crt -days 1 -subj "/CN=$ca" \
+          -addext basicConstraints=critical,CA:TRUE \
+          -addext keyUsage=critical,keyCertSign,cRLSign
+      done
+      openssl req -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout server.key -out server.csr -subj "/CN=localhost"
+      printf '%s\n' 'basicConstraints=CA:FALSE' \
+        'keyUsage=critical,digitalSignature' 'extendedKeyUsage=serverAuth' \
+        'subjectAltName=IP:127.0.0.1,DNS:localhost' > server.ext
+      openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+        -days 1 -extfile server.ext -out server.crt
+      openssl verify -CAfile ca.crt server.crt
+      cat > tls_test.py <<'PYEOF'
+      import sys
+      from concurrent import futures
+
+      import grpc
+
+      def rd(name):
+          with open(name, "rb") as f:
+              return f.read()
+
+      def ping(request, context):
+          return b"pong:" + request
+
+      server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+      server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
+          "grpctls.Echo", {"Ping": grpc.unary_unary_rpc_method_handler(ping)}),))
+      port = server.add_secure_port(
+          "127.0.0.1:0",
+          grpc.ssl_server_credentials([(rd("server.key"), rd("server.crt"))]))
+      assert port, "add_secure_port failed"
+      server.start()
+      target = "127.0.0.1:%d" % port
+      npass = nfail = 0
+
+      def check(name, ok, detail=""):
+          global npass, nfail
+          print("CHECK %s %s %s" % ("PASS" if ok else "FAIL", name, detail))
+          if ok:
+              npass += 1
+          else:
+              nfail += 1
+
+      with grpc.secure_channel(target, grpc.ssl_channel_credentials(rd("ca.crt"))) as ch:
+          try:
+              resp = ch.unary_unary("/grpctls.Echo/Ping")(b"ping", timeout=15)
+              check("trusted-ca-unary", resp == b"pong:ping", repr(resp))
+          except grpc.RpcError as e:
+              check("trusted-ca-unary", False, "%s %s" % (e.code(), e.details()))
+
+      with grpc.secure_channel(target, grpc.ssl_channel_credentials(rd("bad-ca.crt"))) as ch:
+          try:
+              resp = ch.unary_unary("/grpctls.Echo/Ping")(b"ping", timeout=15)
+              check("untrusted-ca-rejected", False, "unexpected success %r" % resp)
+          except grpc.RpcError as e:
+              check("untrusted-ca-rejected", e.code() == grpc.StatusCode.UNAVAILABLE,
+                    "%s %s" % (e.code(), e.details()))
+
+      server.stop(None)
+      print("RESULT pass=%d fail=%d" % (npass, nfail))
+      sys.exit(1 if nfail else 0)
+      PYEOF
+      ut_rc=0
+      ${{inputs.python}} tls_test.py > tls_test.log 2>&1 || ut_rc=$?
+      cat tls_test.log
+      ut_end=$(date +%s)
+      result=$(grep -E '^RESULT pass=[0-9]+ fail=[0-9]+$' tls_test.log | tail -1 || true)
+      if [ -n "$result" ]; then
+        ut_pass=$(echo "$result" | sed -E 's/.*pass=([0-9]+).*/\1/')
+        ut_fail=$(echo "$result" | sed -E 's/.*fail=([0-9]+).*/\1/')
+      else
+        ut_pass=unknown ut_fail=unknown
+      fi
+      echo "UPSTREAM-TESTS ${{inputs.label}}: pass=${ut_pass} fail=${ut_fail} skip=0"
+      echo "UPSTREAM-TESTS ${{inputs.label}}: duration=$((ut_end - ut_start))s"
+      cd /
+      rm -rf "$d"
+      exit $ut_rc

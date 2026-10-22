@@ -1,7 +1,7 @@
 package:
   name: grpc-1.81
   version: "1.81.1"
-  epoch: 9 # use shared test/grpc-tls pipeline
+  epoch: 8 # add TLS loopback test against system OpenSSL
   description: The C based gRPC
   copyright:
     - license: Apache-2.0 AND BSD-3-Clause AND MIT
@@ -153,10 +153,92 @@ subpackages:
             python: python${{range.key}}
             imports: |
               import ${{vars.import}}
-        - uses: test/grpc-tls
-          with:
-            python: python${{range.key}}
-            label: py${{range.key}}-grpcio-${{vars.major-minor-version}}
+        - name: TLS unary round-trip with ssl_{server,channel}_credentials
+          runs: |
+            ut_start=$(date +%s)
+            d=$(mktemp -d)
+            cd "$d"
+            # Throwaway trusted CA, an untrusted CA, and a server cert for
+            # 127.0.0.1/localhost signed by the trusted CA.
+            for ca in ca bad-ca; do
+              openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+                -keyout $ca.key -out $ca.crt -days 1 -subj "/CN=$ca" \
+                -addext basicConstraints=critical,CA:TRUE \
+                -addext keyUsage=critical,keyCertSign,cRLSign
+            done
+            openssl req -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+              -keyout server.key -out server.csr -subj "/CN=localhost"
+            printf '%s\n' 'basicConstraints=CA:FALSE' \
+              'keyUsage=critical,digitalSignature' 'extendedKeyUsage=serverAuth' \
+              'subjectAltName=IP:127.0.0.1,DNS:localhost' > server.ext
+            openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+              -days 1 -extfile server.ext -out server.crt
+            openssl verify -CAfile ca.crt server.crt
+            cat > tls_test.py <<'PYEOF'
+            import sys
+            from concurrent import futures
+
+            import grpc
+
+            def rd(name):
+                with open(name, "rb") as f:
+                    return f.read()
+
+            def ping(request, context):
+                return b"pong:" + request
+
+            server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+            server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
+                "sniff.Echo", {"Ping": grpc.unary_unary_rpc_method_handler(ping)}),))
+            port = server.add_secure_port(
+                "127.0.0.1:0",
+                grpc.ssl_server_credentials([(rd("server.key"), rd("server.crt"))]))
+            assert port, "add_secure_port failed"
+            server.start()
+            target = "127.0.0.1:%d" % port
+            npass = nfail = 0
+
+            def check(name, ok, detail=""):
+                global npass, nfail
+                print("CHECK %s %s %s" % ("PASS" if ok else "FAIL", name, detail))
+                if ok:
+                    npass += 1
+                else:
+                    nfail += 1
+
+            with grpc.secure_channel(target, grpc.ssl_channel_credentials(rd("ca.crt"))) as ch:
+                try:
+                    resp = ch.unary_unary("/sniff.Echo/Ping")(b"ping", timeout=15)
+                    check("trusted-ca-unary", resp == b"pong:ping", repr(resp))
+                except grpc.RpcError as e:
+                    check("trusted-ca-unary", False, "%s %s" % (e.code(), e.details()))
+
+            with grpc.secure_channel(target, grpc.ssl_channel_credentials(rd("bad-ca.crt"))) as ch:
+                try:
+                    resp = ch.unary_unary("/sniff.Echo/Ping")(b"ping", timeout=15)
+                    check("untrusted-ca-rejected", False, "unexpected success %r" % resp)
+                except grpc.RpcError as e:
+                    check("untrusted-ca-rejected", e.code() == grpc.StatusCode.UNAVAILABLE,
+                          "%s %s" % (e.code(), e.details()))
+
+            server.stop(None)
+            print("RESULT pass=%d fail=%d" % (npass, nfail))
+            sys.exit(1 if nfail else 0)
+            PYEOF
+            ut_rc=0
+            python${{range.key}} tls_test.py > tls_test.log 2>&1 || ut_rc=$?
+            cat tls_test.log
+            ut_end=$(date +%s)
+            result=$(grep -E '^RESULT pass=[0-9]+ fail=[0-9]+$' tls_test.log | tail -1)
+            if [ -n "$result" ]; then
+              ut_pass=$(echo "$result" | sed -E 's/.*pass=([0-9]+).*/\1/')
+              ut_fail=$(echo "$result" | sed -E 's/.*fail=([0-9]+).*/\1/')
+            else
+              ut_pass=unknown ut_fail=unknown
+            fi
+            echo "UPSTREAM-TESTS py${{range.key}}-grpcio-${{vars.major-minor-version}}: pass=${ut_pass} fail=${ut_fail} skip=0"
+            echo "UPSTREAM-TESTS py${{range.key}}-grpcio-${{vars.major-minor-version}}: duration=$((ut_end - ut_start))s"
+            exit $ut_rc
 
   - name: py3-supported-grpcio-${{vars.major-minor-version}}
     description: meta package providing ${{vars.pypi-package}} for supported python versions.

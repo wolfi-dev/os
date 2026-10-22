@@ -1,0 +1,101 @@
+From b4b5a97bce6cbfa2d16cd6ee701baedf04eaef21 Mon Sep 17 00:00:00 2001
+From: ydah <t.yudai92@gmail.com>
+Date: Wed, 30 Sep 2026 22:29:22 +0900
+Subject: [PATCH] Prevent crashes with non-Proc on_load callbacks
+
+Convert non-Proc on_load callbacks through to_proc and validate the result in the shared parser configuration. Previously, arbitrary values were stored and passed directly to rb_proc_call_with_block.
+
+Cover Method callbacks in JSON.parse, JSON::Coder, and ResumableParser, along with invalid types, invalid conversion results, and nil or false callbacks.
+
+(cherry picked from commit 672da19fd50f86efe05ace7ebf37137b14b4e3f0)
+
+Backport to json 2.19.9: the parser.c hunk is adjusted for the adjacent
+allow_duplicate_key line, which 2.19.9 still maps to on_duplicate_key, and
+the test/json/resumable_parser_test.rb hunk is dropped because that file
+does not exist before 3.0. The on_load change and the other tests are
+unchanged from upstream.
+---
+ ext/json/ext/parser/parser.c  | 10 +++++++++-
+ test/json/json_coder_test.rb  | 10 ++++++++++
+ test/json/json_parser_test.rb | 26 ++++++++++++++++++++++++++
+ 3 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/ext/json/ext/parser/parser.c b/ext/json/ext/parser/parser.c
+index 503bed1..390721a 100644
+--- a/ext/json/ext/parser/parser.c
++++ b/ext/json/ext/parser/parser.c
+@@ -1516,7 +1516,15 @@ static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
+     else if (key == sym_allow_invalid_escape)       { config->allow_invalid_escape = RTEST(val); }
+     else if (key == sym_symbolize_names)            { config->symbolize_names = RTEST(val); }
+     else if (key == sym_freeze)                     { config->freeze = RTEST(val); }
+-    else if (key == sym_on_load)                    { parser_config_wb_write(self, &config->on_load_proc, RTEST(val) ? val : Qfalse); }
++    else if (key == sym_on_load)                    {
++        if (RTEST(val) && !rb_obj_is_proc(val)) {
++            val = rb_check_funcall(val, rb_intern("to_proc"), 0, NULL);
++            if (val == Qundef || !rb_obj_is_proc(val)) {
++                rb_raise(rb_eTypeError, "on_load must be a Proc");
++            }
++        }
++        parser_config_wb_write(self, &config->on_load_proc, RTEST(val) ? val : Qfalse);
++    }
+     else if (key == sym_allow_duplicate_key)        { config->on_duplicate_key = RTEST(val) ? JSON_IGNORE : JSON_RAISE; }
+     else if (key == sym_decimal_class)              {
+         if (RTEST(val)) {
+diff --git a/test/json/json_coder_test.rb b/test/json/json_coder_test.rb
+index a8477dd..27533d9 100755
+--- a/test/json/json_coder_test.rb
++++ b/test/json/json_coder_test.rb
+@@ -57,6 +57,16 @@ class JSONCoderTest < Test::Unit::TestCase
+     assert_equal({a: 1}, coder.load('{"a":1}'))
+   end
+ 
++  def test_json_coder_load_with_on_load_method
++    on_load = ->(value) { Integer === value ? value + 1 : value }.method(:call)
++    coder = JSON::Coder.new(on_load: on_load)
++    assert_equal [2], coder.load('[1]')
++  end
++
++  def test_json_coder_on_load_invalid_type
++    assert_raise(TypeError) { JSON::Coder.new(on_load: 'x') }
++  end
++
+   def test_json_coder_dump_NaN_or_Infinity
+     coder = JSON::Coder.new { |o| o.inspect }
+     assert_equal "NaN", coder.load(coder.dump(Float::NAN))
+diff --git a/test/json/json_parser_test.rb b/test/json/json_parser_test.rb
+index 292ca1a..1f97d62 100644
+--- a/test/json/json_parser_test.rb
++++ b/test/json/json_parser_test.rb
+@@ -47,6 +47,32 @@ class JSONParserTest < Test::Unit::TestCase
+     assert_equal 'test', parser.parse
+   end
+ 
++  def test_on_load_method
++    on_load = ->(value) { Integer === value ? value + 1 : value }.method(:call)
++    assert_equal [2], JSON.parse('[1]', on_load: on_load)
++  end
++
++  def test_on_load_invalid_type
++    ['x', Object.new, Time.now].each do |on_load|
++      assert_raise(TypeError) { JSON.parse('[1]', on_load: on_load) }
++    end
++  end
++
++  def test_on_load_invalid_to_proc
++    on_load = Object.new
++    def on_load.to_proc
++      method(:to_proc)
++    end
++    assert_raise(TypeError) { JSON.parse('[1]', on_load: on_load) }
++  end
++
++  def test_on_load_falsy
++    [nil, false].each do |on_load|
++      config = JSON::Parser::Config.new(on_load: on_load)
++      assert_equal [1], config.parse('[1]')
++    end
++  end
++
+   def test_parser_reset
+     parser = Parser.new('{"a":"b"}')
+     assert_equal({ 'a' => 'b' }, parser.parse)

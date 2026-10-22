@@ -1,7 +1,7 @@
 package:
   name: ruby-3.3
   version: "3.3.12"
-  epoch: 10 # CVE-2026-110264, plus regexp compiler hardening backports
+  epoch: 11 # fix regexp alternation memory leak (ruby Bug #22384)
   description: "the Ruby programming language"
   copyright:
     - license: Ruby
@@ -79,15 +79,18 @@ pipeline:
         0001-tools-do-not-escape-build-location.patch
 
   # CVE-2026-110264.patch: https://github.com/ruby/ruby/pull/16801
-  # Regexp compiler hardening (no CVE assigned):
+  # CVE-2026-97229.patch: https://github.com/ruby/ruby/pull/19020
+  # Regexp parser fixes (no CVE assigned):
   #   regexp-repeat-range-double-free.patch: https://github.com/ruby/ruby/pull/13332
-  #   regexp-program-size.patch: https://github.com/ruby/ruby/pull/19020
+  #   regexp-alternation-leak.patch: ruby Bug #22384, a leak the double free fix
+  #   introduced, https://github.com/ruby/ruby/commit/bf937bfa16767a4dd857ee16f4f18df1bae4d5ca
   - uses: patch
     with:
       patches: |
         CVE-2026-110264.patch
         regexp-repeat-range-double-free.patch
-        regexp-program-size.patch
+        CVE-2026-97229.patch
+        regexp-alternation-leak.patch
 
   - uses: patch
     working-directory: upstream/ruby/openssl
@@ -244,24 +247,76 @@ test:
         end
         EOF
         ruby /tmp/regexp-cve.rb
-    - name: Regexp compiler hardening (ruby/ruby#13332, ruby/ruby#19020)
+    - name: Regexp compiler does not unroll an overflowing quantifier expansion (CVE-2026-97229)
       runs: |
-        cat >/tmp/regexp-hardening.rb <<'EOF'
-        # ruby/ruby#13332: used to double-free the parse node
+        cat >/tmp/regexp-cve-2026-97229.rb <<'EOF'
+        $stdout.sync = true
+        # ruby/ruby#19020: the expansion check computed (tlen + SIZE_OP_PUSH) * upper
+        # in int. A ~40 KB body with upper 60000 wraps it negative, so the
+        # compiler unrolled all 60000 copies (~2.4 GB) with jump offsets taken
+        # from the wrapped length: the compile ran out of memory, or matching
+        # then jumped outside the program.
+        body = "a" * 40_000
         begin
-          Regexp.new("|{2,1}")
-          abort "not rejected: |{2,1}"
+          re = Regexp.new("(?:#{body}){0,60000}")
         rescue RegexpError => e
-          puts "ok: |{2,1} -> #{e.message}"
+          abort "bounded repeat: unexpected RegexpError: #{e.message[0, 120]}"
         end
-        # ruby/ruby#19020: the expansion check overflowed and compile hung
+        m = re.match("#{body}#{body}b")
+        abort "bounded repeat: expected two bodies, got #{m && m[0].length}" unless m && m[0] == body * 2
+        puts "ok: bounded quantifier expansion"
+        # The unbounded form (tlen * lower) used to hang unrolling.
         ["(?:.{90000,}){90000}", "(?:.{46341,}){46341}"].each do |src|
           abort "unexpected match: #{src}" unless Regexp.new(src).match("x" * 10).nil?
           puts "ok: #{src} compiled"
         end
         EOF
-        # A regressed compile hangs while growing memory. Ruby defers SIGTERM
+        # A regressed compile can hang while growing memory. Ruby defers SIGTERM
         # to an interrupt check that regexp compilation never reaches, so a
         # plain timeout cannot stop it: use SIGKILL.
-        timeout -s KILL 60 ruby /tmp/regexp-hardening.rb
+        timeout -s KILL 60 ruby /tmp/regexp-cve-2026-97229.rb
+    - name: Regexp parser does not double free on invalid repeat ranges (ruby/ruby#13332)
+      runs: |
+        cat >/tmp/regexp-double-free.rb <<'EOF'
+        $stdout.sync = true
+        # A tokenizer error after "|" freed the first branch twice. One double
+        # free is silent under jemalloc (which ruby links), so repeat it until a
+        # duplicated free-list entry corrupts the heap; glibc aborts at once.
+        # The second Regexp.new reuses the freed nodes' size classes and is
+        # where the corruption surfaces: keep it.
+        10_000.times do |i|
+          begin
+            Regexp.new("|{2,1}")
+            abort "not rejected: |{2,1}"
+          rescue RegexpError => e
+            abort "wrong error for |{2,1}: #{e.message}" unless e.message.include?("upper is smaller than lower")
+          end
+          Regexp.new("(?:x#{i % 97}|y)+z")
+        end
+        puts "ok: |{2,1} rejected 10000 times without heap corruption"
+        EOF
+        timeout -s KILL 60 ruby /tmp/regexp-double-free.rb
+    - name: "Regexp parser does not leak on a compile error in a later alternation branch (ruby Bug #22384)"
+      runs: |
+        cat >/tmp/regexp-alternation-leak.rb <<'EOF'
+        $stdout.sync = true
+        # parse_subexp freed the alternation list but not the failed branch, so
+        # each such compile error, and every /(?:a|b)c(d)/.to_s, left parse
+        # nodes that were never freed (a resource leak, not an information
+        # leak): 300000 iterations grew RSS by ~77 MB.
+        def rss_kb = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i
+        code = proc do
+          Regexp.new("a|b(c") rescue nil
+          /(?:a|b)c(d)/.to_s
+        end
+        1_000.times(&code)
+        GC.start
+        before = rss_kb
+        300_000.times(&code)
+        GC.start
+        growth = rss_kb - before
+        abort "RSS grew #{growth} kB over 300000 failed compiles" if growth > 20_000
+        puts "ok: RSS grew #{growth} kB over 300000 failed compiles"
+        EOF
+        timeout -s KILL 120 ruby /tmp/regexp-alternation-leak.rb
     - uses: test/tw/ldd-check

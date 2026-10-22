@@ -1,7 +1,7 @@
 package:
   name: ruby-3.3
   version: "3.3.12"
-  epoch: 11 # fix regexp alternation memory leak (ruby Bug #22384)
+  epoch: 12 # strftime, CP50220 transcoder and sprintf overflow backports
   description: "the Ruby programming language"
   copyright:
     - license: Ruby
@@ -84,6 +84,14 @@ pipeline:
   #   regexp-repeat-range-double-free.patch: https://github.com/ruby/ruby/pull/13332
   #   regexp-alternation-leak.patch: ruby Bug #22384, a leak the double free fix
   #   introduced, https://github.com/ruby/ruby/commit/bf937bfa16767a4dd857ee16f4f18df1bae4d5ca
+  # Memory-safety fixes on master only, not in any release (no CVE assigned):
+  #   strftime-zone-width-overflow.patch: https://github.com/ruby/ruby/pull/19457
+  #   cp50220-encoder-max-output.patch: https://github.com/ruby/ruby/pull/18661
+  #   sprintf-width-overflow.patch: https://github.com/ruby/ruby/pull/17221
+  # In 3.4 but never backported to 3.3 (no CVE assigned):
+  #   cp50220-undefined-region.patch: ruby Bug #18651, CP50220 encoder read past
+  #   tbl0208, https://bugs.ruby-lang.org/issues/18651. cp50220-encoder-max-output.patch
+  #   applies on top of it.
   - uses: patch
     with:
       patches: |
@@ -91,6 +99,10 @@ pipeline:
         regexp-repeat-range-double-free.patch
         CVE-2026-97229.patch
         regexp-alternation-leak.patch
+        strftime-zone-width-overflow.patch
+        cp50220-undefined-region.patch
+        cp50220-encoder-max-output.patch
+        sprintf-width-overflow.patch
 
   - uses: patch
     working-directory: upstream/ruby/openssl
@@ -319,4 +331,66 @@ test:
         puts "ok: RSS grew #{growth} kB over 300000 failed compiles"
         EOF
         timeout -s KILL 120 ruby /tmp/regexp-alternation-leak.rb
+    - name: Time strftime zone width overflow (ruby/ruby#19457)
+      runs: |
+        cat >/tmp/strftime-zone.rb <<'EOF'
+        require 'rbconfig/sizeof'
+        # An INT_MAX width on the %z family overflowed the buffer size check and
+        # wrote the padding out of bounds; upstream now fails with ERANGE.
+        t = Time.at(0, in: 0)
+        max = RbConfig::LIMITS["INT_MAX"]
+        ["%#{max}z", "%#{max}:z", "%#{max}::z", "%#{max}:::z"].each do |fmt|
+          begin
+            t.strftime(fmt)
+            abort "not rejected: #{fmt}"
+          rescue Errno::ERANGE
+            puts "ok: #{fmt} -> ERANGE"
+          end
+        end
+        EOF
+        ruby /tmp/strftime-zone.rb
+    - name: CP50220 encoder output buffer overflow (ruby/ruby#18661)
+      runs: |
+        cat >/tmp/cp50220.rb <<'EOF'
+        # The encoder declared max_output 5 but a held-back katakana flushed by
+        # the next character writes 9 bytes; this used to abort the process with
+        # "[BUG] probable buffer overflow" or corrupt the heap.
+        ec = Encoding::Converter.new("CP51932", "CP50220")
+        src = "\x8E\xB6\x8E\xE0".b
+        dst = "\0" * 64
+        r = ec.primitive_convert(src, dst, 0, 8)
+        abort "first step: #{r.inspect}, #{dst.bytesize} bytes" unless r == :destination_buffer_full && dst.bytesize == 8
+        r = ec.primitive_convert(src, dst, 8, 8)
+        abort "second step: #{r.inspect}" unless r == :finished
+        want = "\e$B\x25\x2B\e(I\x60\e(B".b
+        abort "wrong output: #{dst.b.inspect}" unless dst.b == want
+        puts "ok: split CP50220 output #{dst.b.inspect}"
+        out = ("x" + "\uFF76a" * 158).encode("CP50220")
+        puts "ok: String#encode produced #{out.bytesize} bytes"
+        # ruby Bug #18651: a byte in CP51932's undefined katakana region used to
+        # be held for a sound mark and flushed through tbl0208 past its end.
+        out = "\x8E\xA1\x8E\xFE".encode("CP50220", "CP51932")
+        want = "\e$B\x21\x23\e(I\x7E\e(B".b
+        abort "undefined region: #{out.b.inspect}" unless out.b == want
+        puts "ok: undefined region passed through as is"
+        EOF
+        ruby /tmp/cp50220.rb
+    - name: sprintf %c width overflow (ruby/ruby#17221)
+      runs: |
+        cat >/tmp/sprintf-width.rb <<'EOF'
+        require 'rbconfig/sizeof'
+        # width + character length overflowed int and the result buffer was
+        # filled past its end; upstream now rejects the width.
+        max = RbConfig::LIMITS["INT_MAX"]
+        [["%*c", [max, 0x80]], ["%#{max}c", [233]], ["%-#{max}c", [233]]].each do |fmt, args|
+          begin
+            format(fmt, *args)
+            abort "not rejected: #{fmt}"
+          rescue ArgumentError => e
+            abort "wrong error for #{fmt}: #{e.message}" unless e.message =~ /width too big/
+            puts "ok: #{fmt} -> #{e.message}"
+          end
+        end
+        EOF
+        ruby /tmp/sprintf-width.rb
     - uses: test/tw/ldd-check

@@ -1,7 +1,7 @@
 package:
   name: ruby-4.0
   version: "4.0.8"
-  epoch: 0 # CVE-2026-110264, plus regexp compiler hardening backports
+  epoch: 1 # strftime, CP50220 transcoder, sprintf and Ractor::Port backports
   description: "the Ruby programming language"
   copyright:
     - license: Ruby
@@ -75,6 +75,13 @@ pipeline:
       repository: https://github.com/ruby/ruby
       tag: v${{package.version}}
       expected-commit: 60c3d71bfbf9790229c682e26f8ec968f078c7da
+      cherry-picks: |
+        # Hardening: Time#strftime zone width overflow, https://github.com/ruby/ruby/pull/19457
+        master/5c52c2a37bed5507c1898486cdf7eba736296ed4: fix out-of-bound write for huge widths on the strftime z conversions
+        # Hardening: CP50220 encoder max_output, https://github.com/ruby/ruby/pull/18661
+        master/720d9e11547bff07e0800725c1cbf54814de2462: fix max_output of the CP50220 encoder
+        # Hardening: sprintf %c width overflow, https://github.com/ruby/ruby/pull/17221
+        master/e39475a544f08ce5f140213c740f2464933a2bae: reject a width that overflows the sprintf result size
 
   - uses: git-checkout
     with:
@@ -89,6 +96,14 @@ pipeline:
         remove-already-provided-gems-from-gems_bundled_gems.patch
         0001-tools-do-not-escape-build-location.patch
         CVE-2026-110264.patch
+
+  # Hardening: Ractor::Port.allocate left the owner Ractor NULL and the port
+  # methods dereferenced it, https://github.com/ruby/ruby/pull/18092. Does not
+  # cherry-pick cleanly onto 4.0.8, so it is carried as a patch.
+  - uses: patch
+    with:
+      patches: |
+        ractor-port-uninitialized.patch
 
   - uses: patch
     working-directory: upstream/ruby/openssl
@@ -240,6 +255,81 @@ test:
         # to an interrupt check that regexp compilation never reaches, so a
         # plain timeout cannot stop it: use SIGKILL.
         timeout -s KILL 60 ruby /tmp/regexp-hardening.rb
+    - name: Time strftime zone width overflow (ruby/ruby#19457)
+      runs: |
+        cat >/tmp/strftime-zone.rb <<'EOF'
+        require 'rbconfig/sizeof'
+        # An INT_MAX width on the %z family overflowed the buffer size check and
+        # wrote the padding out of bounds; upstream now fails with ERANGE.
+        t = Time.at(0, in: 0)
+        max = RbConfig::LIMITS["INT_MAX"]
+        ["%#{max}z", "%#{max}:z", "%#{max}::z", "%#{max}:::z"].each do |fmt|
+          begin
+            t.strftime(fmt)
+            abort "not rejected: #{fmt}"
+          rescue Errno::ERANGE
+            puts "ok: #{fmt} -> ERANGE"
+          end
+        end
+        EOF
+        ruby /tmp/strftime-zone.rb
+    - name: CP50220 encoder output buffer overflow (ruby/ruby#18661)
+      runs: |
+        cat >/tmp/cp50220.rb <<'EOF'
+        # The encoder declared max_output 5 but a held-back katakana flushed by
+        # the next character writes 9 bytes; this used to abort the process with
+        # "[BUG] probable buffer overflow" or corrupt the heap.
+        ec = Encoding::Converter.new("CP51932", "CP50220")
+        src = "\x8E\xB6\x8E\xE0".b
+        dst = "\0" * 64
+        r = ec.primitive_convert(src, dst, 0, 8)
+        abort "first step: #{r.inspect}, #{dst.bytesize} bytes" unless r == :destination_buffer_full && dst.bytesize == 8
+        r = ec.primitive_convert(src, dst, 8, 8)
+        abort "second step: #{r.inspect}" unless r == :finished
+        want = "\e$B\x25\x2B\e(I\x60\e(B".b
+        abort "wrong output: #{dst.b.inspect}" unless dst.b == want
+        puts "ok: split CP50220 output #{dst.b.inspect}"
+        out = ("x" + "\uFF76a" * 158).encode("CP50220")
+        puts "ok: String#encode produced #{out.bytesize} bytes"
+        EOF
+        ruby /tmp/cp50220.rb
+    - name: sprintf %c width overflow (ruby/ruby#17221)
+      runs: |
+        cat >/tmp/sprintf-width.rb <<'EOF'
+        require 'rbconfig/sizeof'
+        # width + character length overflowed int and the result buffer was
+        # filled past its end; upstream now rejects the width.
+        max = RbConfig::LIMITS["INT_MAX"]
+        [["%*c", [max, 0x80]], ["%#{max}c", [233]], ["%-#{max}c", [233]]].each do |fmt, args|
+          begin
+            format(fmt, *args)
+            abort "not rejected: #{fmt}"
+          rescue ArgumentError => e
+            abort "wrong error for #{fmt}: #{e.message}" unless e.message =~ /width too big/
+            puts "ok: #{fmt} -> #{e.message}"
+          end
+        end
+        EOF
+        ruby /tmp/sprintf-width.rb
+    - name: Ractor::Port rejects uninitialized ports (ruby/ruby#18092)
+      runs: |
+        cat >/tmp/ractor-port.rb <<'EOF'
+        # Ractor::Port.allocate leaves the owner Ractor NULL; the methods used
+        # to dereference it and segfault.
+        port = Ractor::Port.allocate
+        { inspect: -> { port.inspect }, closed?: -> { port.closed? },
+          send: -> { port.send(1) }, receive: -> { port.receive },
+          close: -> { port.close } }.each do |name, blk|
+          begin
+            blk.call
+            abort "not rejected: Ractor::Port##{name}"
+          rescue TypeError => e
+            abort "wrong message for #{name}: #{e.message}" unless e.message == "uninitialized Ractor::Port"
+            puts "ok: Ractor::Port##{name} -> TypeError"
+          end
+        end
+        EOF
+        ruby /tmp/ractor-port.rb
     - uses: test/tw/help-check
       with:
         bins: |

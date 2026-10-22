@@ -1,0 +1,189 @@
+From 2d9516f16d4d16fc0c50b28ee3d6d75d266c27fc Mon Sep 17 00:00:00 2001
+From: himura467 <akitoshitara@gmail.com>
+Date: Tue, 28 Jul 2026 22:52:44 +0900
+Subject: [PATCH] Raise TypeError for uninitialized Ractor::Port
+
+Ractor::Port has a public allocator, so Ractor::Port.allocate returns a port whose owner Ractor is still NULL; only ractor_port_init() fills it in. The methods dereferenced it unchecked:
+
+Ractor::Port.allocate.closed?  # [BUG] Segmentation fault at 0x60
+
+Route the paths reachable from Ruby through ractor_port_ptr_check(), which raises TypeError as other uninitialized typed data objects do. The self of #initialize_copy keeps the unchecked accessor because it is legitimately uninitialized there; only orig is checked.
+
+Ractor.select did not crash, but such a port has id 0, the same as the current Ractor's default port, so it took messages from it.
+
+Port#closed? also loses Primitive.attr! :leaf. It can raise now, and it was not a leaf before either, since the foreign Ractor path takes RACTOR_LOCK().
+
+[Bug #22214]
+
+(cherry picked from commit d3aee406de6693a06b87d95fdafa258be1ee1681)
+
+Backport to 4.0.7: ractor_port_closed_p() upstream had already been
+restructured to lock a foreign owner (10e53afd4e, not in 4.0.7), so that
+hunk is reduced to swapping RACTOR_PORT_PTR() for ractor_port_ptr_check()
+in 4.0.7's body; the bootstraptest hunk drops the unrelated upstream tests
+that precede the new ones in master's test_ractor.rb. Everything else is
+unchanged from upstream.
+---
+ bootstraptest/test_ractor.rb | 36 ++++++++++++++++++++++++++++++++++++
+ ractor.rb                    |  2 +-
+ ractor_sync.c                | 31 ++++++++++++++++++++++---------
+ 3 files changed, 59 insertions(+), 10 deletions(-)
+
+diff --git a/bootstraptest/test_ractor.rb b/bootstraptest/test_ractor.rb
+index 33582f90bd..349ab7d64e 100644
+--- a/bootstraptest/test_ractor.rb
++++ b/bootstraptest/test_ractor.rb
+@@ -2575,3 +2575,39 @@ def foo(a:, b:, c:) = super(a: a, b: b, c: c)
+ 
+   :ok
+ }
++# Ractor::Port.allocate leaves the owner Ractor NULL, so every method reachable
++# from Ruby must reject such a port instead of dereferencing it. [Bug #22214]
++assert_equal 'ok', %q{
++  port = Ractor::Port.allocate
++
++  messages = [
++    -> { port.send(1) },
++    -> { port << 1 },
++    -> { port.receive },
++    -> { port.close },
++    -> { port.closed? },
++    -> { port.inspect },
++    -> { Ractor::Port.new.__send__(:initialize_copy, port) },
++    -> { Ractor.new { :x }.monitor(port) },
++    -> { Ractor.new { :x }.unmonitor(port) },
++    -> { Ractor.select(port) },
++  ].map do |blk|
++    begin
++      blk.call
++      'not raised'
++    rescue TypeError => e
++      e.message
++    end
++  end
++
++  messages.uniq == ['uninitialized Ractor::Port'] ? :ok : messages
++}
++
++assert_equal 'uninitialized MyPort', %q{
++  class MyPort < Ractor::Port; end
++  begin
++    MyPort.allocate.closed?
++  rescue TypeError => e
++    e.message
++  end
++}
+diff --git a/ractor.rb b/ractor.rb
+index 6679ad1588..c0f7a56428 100644
+--- a/ractor.rb
++++ b/ractor.rb
+@@ -825,7 +825,7 @@ def closed?
+     #    port.inspect -> string
+     def inspect
+       "#<Ractor::Port to:\##{
+-        __builtin_cexpr! "SIZET2NUM(rb_ractor_id((RACTOR_PORT_PTR(self)->r)))"
++        __builtin_cexpr! "SIZET2NUM(rb_ractor_id(ractor_port_ptr_check(self)->r))"
+       } id:#{
+         __builtin_cexpr! "SIZET2NUM(ractor_port_id(RACTOR_PORT_PTR(self)))"
+       }>"
+diff --git a/ractor_sync.c b/ractor_sync.c
+index a63df7c407..1bc6dded8c 100644
+--- a/ractor_sync.c
++++ b/ractor_sync.c
+@@ -67,6 +67,19 @@ RACTOR_PORT_PTR(VALUE self)
+     return rp;
+ }
+ 
++// r is NULL between Ractor::Port.allocate and ractor_port_init()
++static struct ractor_port *
++ractor_port_ptr_check(VALUE self)
++{
++    struct ractor_port *rp = RACTOR_PORT_PTR(self);
++
++    if (UNLIKELY(rp->r == NULL)) {
++        rb_raise(rb_eTypeError, "uninitialized %"PRIsVALUE, rb_obj_class(self));
++    }
++
++    return rp;
++}
++
+ static VALUE
+ ractor_port_alloc(VALUE klass)
+ {
+@@ -108,8 +121,8 @@ ractor_port_initialize(VALUE self)
+ static VALUE
+ ractor_port_initialize_copy(VALUE self, VALUE orig)
+ {
+-    struct ractor_port *dst = RACTOR_PORT_PTR(self);
+-    struct ractor_port *src = RACTOR_PORT_PTR(orig);
++    struct ractor_port *dst = RACTOR_PORT_PTR(self); // uninitialized by definition
++    struct ractor_port *src = ractor_port_ptr_check(orig);
+     dst->r = src->r;
+     RB_OBJ_WRITTEN(self, Qundef, dst->r->pub.self);
+     dst->id_ = ractor_port_id(src);
+@@ -134,7 +147,7 @@ ractor_port_p(VALUE self)
+ static VALUE
+ ractor_port_receive(rb_execution_context_t *ec, VALUE self)
+ {
+-    const struct ractor_port *rp = RACTOR_PORT_PTR(self);
++    const struct ractor_port *rp = ractor_port_ptr_check(self);
+ 
+     if (rp->r != rb_ec_ractor_ptr(ec)) {
+         rb_raise(rb_eRactorError, "only allowed from the creator Ractor of this port");
+@@ -146,7 +159,7 @@ ractor_port_receive(rb_execution_context_t *ec, VALUE self)
+ static VALUE
+ ractor_port_send(rb_execution_context_t *ec, VALUE self, VALUE obj, VALUE move)
+ {
+-    const struct ractor_port *rp = RACTOR_PORT_PTR(self);
++    const struct ractor_port *rp = ractor_port_ptr_check(self);
+     ractor_send(ec, rp, obj, RTEST(move));
+     return self;
+ }
+@@ -157,7 +170,7 @@ static bool ractor_close_port(rb_execution_context_t *ec, rb_ractor_t *r, const
+ static VALUE
+ ractor_port_closed_p(rb_execution_context_t *ec, VALUE self)
+ {
+-    const struct ractor_port *rp = RACTOR_PORT_PTR(self);
++    const struct ractor_port *rp = ractor_port_ptr_check(self);
+ 
+     if (ractor_closed_port_p(ec, rp->r, rp)) {
+         return Qtrue;
+@@ -170,7 +183,7 @@ ractor_port_closed_p(rb_execution_context_t *ec, VALUE self)
+ static VALUE
+ ractor_port_close(rb_execution_context_t *ec, VALUE self)
+ {
+-    const struct ractor_port *rp = RACTOR_PORT_PTR(self);
++    const struct ractor_port *rp = ractor_port_ptr_check(self);
+     rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
+ 
+     if (cr != rp->r) {
+@@ -557,7 +570,7 @@ ractor_monitor(rb_execution_context_t *ec, VALUE self, VALUE port)
+ {
+     rb_ractor_t *r = RACTOR_PTR(self);
+     bool terminated = false;
+-    const struct ractor_port *rp = RACTOR_PORT_PTR(port);
++    const struct ractor_port *rp = ractor_port_ptr_check(port);
+     struct ractor_monitor *rm = ALLOC(struct ractor_monitor);
+     rm->port = *rp; // copy port information
+ 
+@@ -589,7 +602,7 @@ static VALUE
+ ractor_unmonitor(rb_execution_context_t *ec, VALUE self, VALUE port)
+ {
+     rb_ractor_t *r = RACTOR_PTR(self);
+-    const struct ractor_port *rp = RACTOR_PORT_PTR(port);
++    const struct ractor_port *rp = ractor_port_ptr_check(port);
+ 
+     RACTOR_LOCK(r);
+     {
+@@ -1320,7 +1333,7 @@ ractor_selector_add(VALUE selv, VALUE rpv)
+     }
+ 
+     struct ractor_selector *s = RACTOR_SELECTOR_PTR(selv);
+-    const struct ractor_port *rp = RACTOR_PORT_PTR(rpv);
++    const struct ractor_port *rp = ractor_port_ptr_check(rpv);
+ 
+     if (st_lookup(s->ports, (st_data_t)rpv, NULL)) {
+         rb_raise(rb_eArgError, "already added");
+-- 
+2.50.1 (Apple Git-155)
+

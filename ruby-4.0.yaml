@@ -1,7 +1,7 @@
 package:
   name: ruby-4.0
   version: "4.0.8"
-  epoch: 1 # strftime, CP50220 transcoder, sprintf and Ractor::Port backports
+  epoch: 2 # json default gem 2.19.9
   description: "the Ruby programming language"
   copyright:
     - license: Ruby
@@ -90,6 +90,20 @@ pipeline:
       expected-commit: 6e410b804f4c6a52c146fe651941bafdbb332754
       destination: upstream/ruby/openssl
 
+  # The bundled json default gem (2.18.0) is what `require "json"` loads
+  # without Bundler. 2.19.x fixes a string unescape overflow with
+  # allow_control_characters, generator depth overflows, a JSON::State
+  # use-after-free during Array#to_json, CVE-2026-33210, a parser read of a
+  # source string mutated by a callback (2.19.7) and CVE-2026-54696, a heap
+  # overflow in JSON.dump into an IO (2.19.9), none of which are in a 4.0
+  # release; sync it from upstream the way openssl is.
+  - uses: git-checkout
+    with:
+      repository: https://github.com/ruby/json
+      tag: v2.19.9
+      expected-commit: 2cff2678d5af54890a49da58345ac141b571f661
+      destination: upstream/ruby/json
+
   - uses: patch
     with:
       patches: |
@@ -111,9 +125,19 @@ pipeline:
       patches: |
         ../../../0001-Add-pkcs5-argument-to-OpenSSL-KDF.pbkdf2_hmac.patch
 
-  - name: Update default openssl gems with our patched version
+  # on_load type confusion, https://github.com/ruby/json/pull/1084: fixed in
+  # json 3.1.0, which is too far from 2.19 for a default gem, so it is
+  # backported onto 2.19.9.
+  - uses: patch
+    working-directory: upstream/ruby/json
+    with:
+      patches: |
+        ../../../json-on-load-type-confusion.patch
+
+  - name: Update default openssl and json gems with our patched versions
     runs: |
       ruby tool/sync_default_gems.rb openssl
+      ruby tool/sync_default_gems.rb json
 
   - name: Generate and Configure
     runs: |
@@ -330,6 +354,67 @@ test:
         end
         EOF
         ruby /tmp/ractor-port.rb
+    - name: Bundled json default gem is 2.19.9 with the on_load fix
+      runs: |
+        cat >/tmp/json-default-gem.rb <<'EOF'
+        require 'rbconfig'
+        # Load the interpreter's own copy, not whatever json gem is installed.
+        require File.join(RbConfig::CONFIG["rubylibdir"], "json")
+        abort "json #{JSON::VERSION} loaded from #{$LOADED_FEATURES.grep(/json\.rb/).first}" unless JSON::VERSION == "2.19.9"
+        puts "ok: json #{JSON::VERSION}"
+        # ruby/json#1084: a non-Proc on_load used to be called as one and crash
+        [-> { JSON::Coder.new(on_load: 42).load("[1]") },
+         -> { JSON.parse("[1]", on_load: "x") }].each do |blk|
+          begin
+            blk.call
+            abort "on_load not rejected"
+          rescue TypeError => e
+            puts "ok: on_load -> #{e.message}"
+          end
+        end
+        # ruby/json#948 and 2.19.6: negative and huge depths used to overflow
+        # the indentation size
+        begin
+          JSON.generate({"a" => 1}, depth: -1)
+          abort "negative depth not rejected"
+        rescue ArgumentError => e
+          puts "ok: depth -1 -> #{e.message}"
+        end
+        begin
+          JSON.generate([[1]], indent: " " * 5, array_nl: "\n", depth: 3_689_348_814_741_910_324, max_nesting: 0)
+          abort "huge depth not rejected"
+        rescue RangeError, ArgumentError => e
+          puts "ok: huge depth -> #{e.class}"
+        end
+        # 2.19.7: a depth whose indentation size still fits in size_t wrapped
+        # the buffer growth and wrote past the stack buffer
+        begin
+          JSON.generate([[1]], indent: "  ", array_nl: "\n", depth: 2**62, max_nesting: 0)
+          abort "depth 2**62 not rejected"
+        rescue ArgumentError => e
+          puts "ok: depth 2**62 -> #{e.message}"
+        end
+        # CVE-2026-54696 (2.19.9): JSON.dump into an IO grew the stack buffer to
+        # the 16383-byte IO buffer without counting what it already held, then
+        # wrote past it. Under jemalloc the overrun is silent, so check for it
+        # directly: it surfaces as one write larger than the buffer.
+        sink = Object.new
+        def sink.chunks = (@chunks ||= [])
+        def sink.write(s) = (chunks << s.bytesize; s.bytesize)
+        def sink.flush = self
+        JSON.dump(["a" * 490, "b" * 16_000], sink)
+        abort "JSON.dump overran its IO buffer: wrote #{sink.chunks.max} bytes at once" if sink.chunks.max > 16_383
+        puts "ok: JSON.dump IO chunks #{sink.chunks.inspect}"
+        # 2.19.7: the parser read straight from the caller's string, so a
+        # callback that rewrote it changed the rest of the parse. The float sits
+        # in a nested array so its callback runs before the rest is scanned.
+        source = "[[2.5]," + ("1," * 200) + "1]"
+        mutator = Class.new { define_method(:initialize) { |_| source.tr!("1", "0") } }
+        rest = JSON.parse(source, decimal_class: mutator).drop(1)
+        abort "parse followed a mutated source: #{rest.tally.inspect}" unless rest == [1] * 201
+        puts "ok: parse unaffected by source mutation"
+        EOF
+        ruby /tmp/json-default-gem.rb
     - uses: test/tw/help-check
       with:
         bins: |

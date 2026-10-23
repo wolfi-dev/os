@@ -2,7 +2,7 @@
 package:
   name: py3-cryptography
   version: "50.0.2"
-  epoch: 3 # toolchain rebuild for  rust-1.99-1.99.1
+  epoch: 4 # run upstream pytest suite at build time (non-gating)
   description: cryptography is a package which provides cryptographic recipes and primitives to Python developers.
   copyright:
     - license: Apache-2.0 OR BSD-3-Clause
@@ -42,8 +42,12 @@ environment:
       - py3-supported-cffi
       - py3-supported-maturin
       - py3-supported-pip
+      # test-only: upstream pytest suite (see the subpackage build step)
+      - py3-supported-pretend
+      - py3-supported-pytest
       - py3-supported-python-dev
       - py3-supported-setuptools
+      - py3-supported-typing-extensions
       - rust-${{vars.rust-version}}
       - wolfi-base
 
@@ -70,6 +74,48 @@ subpackages:
       - uses: py/pip-build-install
         with:
           python: python${{range.key}}
+      - name: Upstream pytest suite against the just-installed package
+        runs: |
+          # Runs pyca/cryptography's own tests from the checked-out source tree
+          # (tests/ and the same-version vectors/), importing the package that
+          # was just installed into this subpackage. Nothing is fetched.
+          # pytest-benchmark is not packaged and only backs --benchmark-disable
+          # and tests/bench, so override addopts and skip tests/bench.
+          sp="${{targets.contextdir}}/usr/lib/python${{range.key}}/site-packages"
+          export PYTHONPATH="$sp:$PWD/vectors"
+          log=$(mktemp)
+          ut_start=$(date +%s)
+          # Fails today on OpenSSL 4: legacy algorithms are opt-in, and some
+          # algorithms the backend reports as supported raise InternalError.
+          # See https://github.com/chainguard-dev/stereo/issues/400899
+          # TODO(upstream-tests): gate on expected pass rate + named exceptions; see os/glibc-2.44.yaml
+          python${{range.key}} -m pytest -q -rfE -p no:cacheprovider \
+            -o addopts="-r s --capture=no --strict-markers" \
+            --continue-on-collection-errors \
+            --ignore=tests/bench tests/ > "$log" 2>&1 || true
+          cat "$log"
+          ut_end=$(date +%s)
+          summary=$(grep -E '^(=+ )?[0-9]+ (passed|failed|skipped|errors?)' "$log" | tail -1 || true)
+          if [ -z "$summary" ]; then
+            # No summary means pytest could not start or collection crashed:
+            # that is a real failure, not a known test result.
+            echo "UPSTREAM-TESTS py${{range.key}}-${{vars.pypi-package}}: no pytest summary found" >&2
+            exit 1
+          fi
+          n() { echo "$summary" | grep -oE "[0-9]+ $1" | grep -oE '^[0-9]+' || echo 0; }
+          ut_pass=$(n passed)
+          if [ "$ut_pass" -eq 0 ] || grep -q '^!.* Interrupted' "$log"; then
+            # Nothing ran (interrupted session or zero passes): a real failure.
+            echo "UPSTREAM-TESTS py${{range.key}}-${{vars.pypi-package}}: suite did not run ($summary)" >&2
+            exit 1
+          fi
+          ut_fail=$(( $(n failed) + $(n 'errors?') ))
+          ut_skip=$(n skipped)
+          grep -E '^(FAILED|ERROR) ' "$log" | \
+            sed 's/^/UPSTREAM-TESTS-FAIL py${{range.key}}-${{vars.pypi-package}}: /' || true
+          echo "UPSTREAM-TESTS py${{range.key}}-${{vars.pypi-package}}: pass=${ut_pass} fail=${ut_fail} skip=${ut_skip}"
+          echo "UPSTREAM-TESTS py${{range.key}}-${{vars.pypi-package}}: duration=$((ut_end - ut_start))s"
+          rm -f "$log"
       - uses: strip
     test:
       pipeline:

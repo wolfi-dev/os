@@ -1,0 +1,173 @@
+name: Meson upstream test suite (meson test)
+
+description: |
+  Runs a Meson project's upstream test suite with `meson test` against the
+  freshly built tree. Use it right after the main `meson/compile` step,
+  before `meson/install`. It runs in the build workspace and needs no
+  network.
+
+  The suite is a hard gate: any failing test (Fail, Unexpected Pass or
+  Timeout in meson's summary) fails the build. It also fails if no tests
+  ran ("No tests defined." or every test filtered out), which usually means
+  the package configures with tests disabled (e.g. -Dtests=false or
+  -Dtests=disabled); enable them in the `meson/configure` opts.
+
+  Prints the full meson test log, then summary lines:
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS-FAIL <package>: <project>:<test>      (one per failing test)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>]
+  parsed from meson's summary block: pass = Ok, xfail = Expected Fail,
+  fail = Fail + Unexpected Pass + Timeout, skip = Skipped (+ Ignored TAP
+  subtests), ignored = tests excluded through `ignore`.
+
+  Example:
+    - uses: meson/configure
+    - uses: meson/compile
+    - uses: upstream-tests/meson-test
+    - uses: meson/install
+
+  With a non-default build directory, or a suite filter:
+    - uses: upstream-tests/meson-test
+      with:
+        dir: build
+        args: --no-suite slow
+
+  Named exceptions go in ignore: space-separated test names as meson
+  prints them in UPSTREAM-TESTS-FAIL ("<project>:<test>") or the bare test
+  name for tests of the main project. They are passed to
+  `meson test --exclude` (meson >= 1.10), so ignored tests do not run and
+  are reported as IGNORE. Test names containing spaces cannot be listed;
+  use `args: --no-suite <suite>` for those. Every exception needs a comment
+  in the calling package explaining why and a `TODO(upstream-tests): ...`
+  to remove it:
+    # test-foo needs /dev/kvm, which the build sandbox does not have.
+    # TODO(upstream-tests): drop the ignore once the builders expose kvm.
+    - uses: upstream-tests/meson-test
+      with:
+        ignore: test-foo
+
+needs:
+  packages:
+    - meson
+
+inputs:
+  dir:
+    description: |
+      Meson build directory, relative to the workspace. Matches the
+      `output-dir` default of the meson/configure and meson/compile
+      pipelines.
+    default: output
+  jobs:
+    description: Parallel test processes (meson test --num-processes).
+    default: "$(nproc)"
+  ignore:
+    description: |
+      Space-separated test names to exclude (meson test --exclude), either
+      "<test>" (main project) or "<project>:<test>". Each one needs a
+      comment and TODO in the caller.
+    default: ""
+  args:
+    description: |
+      Extra meson test arguments, inserted verbatim into the command line,
+      e.g. `--suite unit` or `--no-suite slow`. Do not pass --logbase or
+      --list here.
+    default: ""
+  timeout-multiplier:
+    description: |
+      Multiplier for the per-test timeouts declared in meson.build
+      (meson test -t); <= 0 disables them.
+    default: "1"
+  overall-timeout:
+    description: Timeout in seconds for the whole meson test run.
+    default: "7200"
+
+pipeline:
+  - name: upstream-tests (meson test)
+    runs: |
+      PKG="${{package.name}}"
+      dir="${{inputs.dir}}"
+      if [ ! -f "$dir/meson-private/coredata.dat" ]; then
+        echo "upstream-tests/meson-test: '$dir' is not a configured meson build directory; set 'dir' to the meson/compile output-dir" >&2
+        exit 1
+      fi
+      set -f
+      set --
+      for t in ${{inputs.ignore}}; do
+        set -- "$@" --exclude "$t"
+      done
+      set +f
+      wrap=""
+      if command -v timeout >/dev/null 2>&1; then
+        wrap="timeout ${{inputs.overall-timeout}}"
+      fi
+      # Tests excluded through ignore that actually exist ("--list" prints
+      # "[<suites> - ]<project>:<test>").
+      ignored=0
+      if [ $# -gt 0 ]; then
+        list=$(meson test -C "$dir" --list ${{inputs.args}} 2>/dev/null \
+          | sed -E 's/^[^:]* - //' || true)
+        set -f
+        for t in ${{inputs.ignore}}; do
+          n=$(printf '%s\n' "$list" | awk -v t="$t" '{
+                name = substr($0, index($0, ":") + 1)
+                if ($0 == t || name == t) c++ } END { print c + 0 }')
+          if [ "$n" -gt 0 ]; then
+            echo "IGNORE ${PKG}: $t (excluded, $n test(s))"
+            ignored=$((ignored + n))
+          else
+            echo "upstream-tests/meson-test: WARNING: ignore entry '$t' matches no test" >&2
+          fi
+        done
+        set +f
+      fi
+      log=$(mktemp)
+      start=$(date +%s)
+      rc=0
+      $wrap meson test -C "$dir" --print-errorlogs \
+        --num-processes ${{inputs.jobs}} -t ${{inputs.timeout-multiplier}} \
+        "$@" ${{inputs.args}} > "$log" 2>&1 || rc=$?
+      end=$(date +%s)
+      cat "$log"
+      echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s"
+      if [ "$rc" -eq 124 ] && [ -n "$wrap" ]; then
+        echo "upstream-tests/meson-test: meson test exceeded overall-timeout=${{inputs.overall-timeout}}s" >&2
+      fi
+      if grep -qE '^No (suitable )?tests defined\.' "$log"; then
+        echo "UPSTREAM-TESTS ${PKG}: pass=0 fail=0 skip=0"
+        echo "upstream-tests/meson-test: no tests ran in '$dir'. The package is probably configured with tests disabled (e.g. -Dtests=false or -Dtests=disabled); enable them in the meson/configure opts. Also check that 'dir' is the meson build directory and that ignore/args do not filter out every test." >&2
+        exit 1
+      fi
+      # meson's summary block, printed last: "Ok:                 12"
+      sl=$(grep -nE '^Ok: +[0-9]+' "$log" | tail -n1 | cut -d: -f1 || true)
+      if [ -z "$sl" ]; then
+        echo "upstream-tests/meson-test: no meson test summary found (exit $rc)" >&2
+        exit 1
+      fi
+      set -- $(tail -n +"$sl" "$log" | awk '
+        /^Ok: /{ok=$2} /^Expected Fail: /{xf=$3} /^Fail: /{f=$2}
+        /^Unexpected Pass: /{up=$3} /^Skipped: /{s=$2} /^Ignored: /{ig=$2}
+        /^Timeout: /{to=$2}
+        END {print ok+0, xf+0, f+up+to, s+ig}')
+      pass=$1 xfail=$2 fail=$3 skip=$4
+      extra=""
+      [ "$xfail" -gt 0 ] && extra="$extra xfail=$xfail"
+      [ "$ignored" -gt 0 ] && extra="$extra ignored=$ignored"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
+      # "Summary of Failures:" block, last in the log, one line per failing
+      # test: " 3/9 [<suites> - ]<project>:<test>   FAIL   0.01s   exit status 1"
+      fl=$(grep -n '^Summary of Failures:' "$log" | tail -n1 | cut -d: -f1 || true)
+      if [ -n "$fl" ]; then
+        awk -v a="$fl" -v b="$sl" 'NR > a && NR < b' "$log" \
+          | sed -nE 's/^ *[0-9]+\/[0-9]+ (.*[^ ]) +(FAIL|ERROR|INTERRUPT|TIMEOUT|UNEXPECTEDPASS) +[0-9.]+s.*$/\1/p' \
+          | sed -E 's/^[^:]* - //' | awk '!seen[$0]++' \
+          | while read -r t; do echo "UPSTREAM-TESTS-FAIL ${PKG}: $t"; done
+      fi
+      rm -f "$log"
+      if [ $((pass + xfail)) -eq 0 ]; then
+        echo "upstream-tests/meson-test: no test passed in '$dir' (all skipped?); the suite did not really run" >&2
+        exit 1
+      fi
+      if [ "$rc" -eq 0 ] && [ "$fail" -ne 0 ]; then
+        rc=1
+      fi
+      exit $rc

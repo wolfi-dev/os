@@ -1,0 +1,184 @@
+name: Upstream make check/test suite
+
+description: |
+  Runs a package's upstream test suite through make (`make check` by
+  default) in the freshly built tree. Use it right after the main build step
+  (`autoconf/make` or equivalent), before `autoconf/make-install`. It makes
+  no network assumptions.
+
+  The suite is a hard gate. The step fails if:
+    - a test that is not in `ignore` fails (automake FAIL, XPASS or ERROR),
+    - make fails for any reason other than test failures (missing target,
+      test build error, timeout),
+    - the suite did not actually run (no automake test passed, make had
+      nothing to do for the target, or an automake tree recursed through
+      `make check` without running any tests).
+
+  For automake parallel-harness suites (any "# TOTAL:" summary block), the
+  counts are summed across all subdirectories. Prints the full make log,
+  test-suite.log of any directory with failures, then:
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS-FAIL <package>: <test>      (one per non-ignored failure)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>]
+  where fail = FAIL + XPASS + ERROR (automake semantics) including ignored
+  ones, and ignored = how many of those were in `ignore`. Other harnesses
+  (plain Makefiles, custom `make test`) are gated on make's exit status only
+  and report pass=unknown fail=unknown skip=unknown; `ignore` cannot be
+  honoured there.
+
+  Examples:
+    - uses: autoconf/make
+    - uses: upstream-tests/make-check
+
+    - uses: upstream-tests/make-check
+      with:
+        target: test
+        dir: build
+        args: VERBOSE=1
+
+  Named exceptions go in ignore: space-separated test names as automake
+  prints them on its "FAIL: <name>" lines (the basename also matches). Each
+  ignored test still runs and is reported as IGNORE. Every exception needs a
+  comment in the calling package explaining why and a
+  `TODO(upstream-tests): ...` to remove it:
+    # foo_unittest: asserts wall-clock timings; flaky on loaded builders.
+    # TODO(upstream-tests): fix the timing assumption upstream and drop it.
+    - uses: upstream-tests/make-check
+      with:
+        ignore: foo_unittest
+
+inputs:
+  target:
+    description: |
+      make target(s) that run the suite, space-separated, e.g. check, test,
+      tests, test-nonflaky, or "check test-extra".
+    default: check
+  jobs:
+    description: Parallel make jobs.
+    default: "$(nproc)"
+  dir:
+    description: Directory (relative to the build workspace) to run make in.
+    default: "."
+  args:
+    description: Extra make arguments, e.g. VAR=value.
+    default: ""
+  ignore:
+    description: |
+      Space-separated test names whose failures are allowed (automake
+      harness only). Each one needs a comment and TODO in the caller.
+    default: ""
+  timeout:
+    description: Wall-clock limit for the whole suite, in seconds.
+    default: "3600"
+
+pipeline:
+  - name: upstream-tests (make check)
+    runs: |
+      PKG="${{package.name}}"
+      targets="${{inputs.target}}"
+      ignore=" $(echo ${{inputs.ignore}}) "
+      cd "${{inputs.dir}}"
+      log=$(mktemp)
+      start=$(date +%s)
+      rc=0
+      AM_COLOR_TESTS=no timeout ${{inputs.timeout}} \
+        make -k -j${{inputs.jobs}} ${{inputs.args}} $targets > "$log" 2>&1 || rc=$?
+      duration=$(( $(date +%s) - start ))
+      cat "$log"
+
+      gate=0
+      why=""
+      # coreutils timeout exits 124; busybox timeout (what most stereo build
+      # environments have) kills make with SIGTERM, so the shell sees 143.
+      # Treat any signal exit as a timeout/abort.
+      if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+        gate=1; why="$why timed out or killed (exit $rc, limit ${{inputs.timeout}}s);"
+      fi
+      if grep -q 'No rule to make target' "$log"; then
+        gate=1; why="$why missing make target;"
+      fi
+      for t in $targets; do
+        if grep -qE "^make: (Nothing to be done for .$t.|.$t. is up to date)" "$log"; then
+          gate=1; why="$why make $t did nothing;"
+        fi
+      done
+
+      if grep -qE '^# TOTAL: +[0-9]+' "$log"; then
+        # automake parallel harness: sum the per-directory summary blocks.
+        set -- $(awk '
+          /^# TOTAL: /{t+=$3} /^# PASS: /{p+=$3} /^# SKIP: /{s+=$3}
+          /^# XFAIL: /{xf+=$3} /^# FAIL: /{f+=$3} /^# XPASS: /{xp+=$3}
+          /^# ERROR: /{e+=$3}
+          END {print t+0, p+0, s+0, xf+0, f+xp+e}' "$log")
+        total=$1 pass=$2 skip=$3 xfail=$4 fail=$5
+        # Failures that do not come from test results (compile errors in
+        # test programs, missing files, ...) are never ignorable.
+        bad=$(grep -oE '\*\*\* \[[^]]*\] Error [0-9]+' "$log" \
+          | sed -E 's/^\*\*\* \[(.*: )?([^]]*)\] Error [0-9]+$/\2/' \
+          | grep -vxE 'test-suite\.log|check-TESTS|check-am|check-recursive|check|.*-recursive|.*-am' || true)
+        for t in $targets; do
+          bad=$(echo "$bad" | grep -vxF "$t" || true)
+        done
+        if [ -n "$bad" ]; then
+          gate=1; why="$why make failed outside the test harness ($(echo $bad));"
+        fi
+        ignored=0
+        nfail=0
+        for name in $(grep -E '^(FAIL|XPASS|ERROR): ' "$log" | awk '{print $2}' | sort -u || true); do
+          case "$ignore" in
+            *" $name "*|*" ${name##*/} "*)
+              echo "IGNORE ${PKG}: $name"
+              ignored=$((ignored + $(awk -v n="$name" '($1 == "FAIL:" || $1 == "XPASS:" || $1 == "ERROR:") && $2 == n' "$log" | wc -l)))
+              ;;
+            *)
+              echo "UPSTREAM-TESTS-FAIL ${PKG}: $name"
+              nfail=$((nfail + 1))
+              ;;
+          esac
+        done
+        if [ "$nfail" -gt 0 ]; then
+          gate=1; why="$why $nfail non-ignored failing test(s);"
+        fi
+        if [ "$fail" -gt 0 ] && [ "$nfail" -eq 0 ] && [ "$ignored" -eq 0 ]; then
+          gate=1; why="$why summary reports $fail failure(s) but no FAIL/XPASS/ERROR lines found;"
+        fi
+        if [ "$rc" -ne 0 ] && [ "$fail" -eq 0 ]; then
+          gate=1; why="$why make exited $rc with no test failures;"
+        fi
+        if [ $((pass + xfail)) -eq 0 ]; then
+          gate=1; why="$why no tests passed (total=$total);"
+        fi
+        for f in $(find . -name test-suite.log | sort); do
+          if grep -qE '^(FAIL|XPASS|ERROR): ' "$f"; then
+            echo "===== $f ====="
+            cat "$f"
+          fi
+        done
+        echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+        extra=""
+        [ "$xfail" -gt 0 ] && extra="$extra xfail=$xfail"
+        [ "$ignored" -gt 0 ] && extra="$extra ignored=$ignored"
+        echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
+      else
+        # Custom harness: no per-test counts, gate on make's exit status.
+        # An automake tree whose subdirectories define no TESTS recurses
+        # ("Making check in ...") without running anything: that is not a suite.
+        if grep -q '^Making check in ' "$log" && \
+           ! grep -qE '^(PASS|FAIL|XFAIL|XPASS|SKIP|ERROR): |check-TESTS' "$log"; then
+          gate=1; why="$why automake 'make check' recursed but ran no tests;"
+        fi
+        if [ "$rc" -ne 0 ]; then
+          gate=1; why="$why make $targets exited $rc;"
+          echo "UPSTREAM-TESTS-FAIL ${PKG}: make $targets (exit $rc)"
+        fi
+        if [ "$ignore" != "  " ]; then
+          echo "WARNING: ignore is only honoured for automake harnesses; '$(echo $ignore)' has no effect here"
+        fi
+        echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+        echo "UPSTREAM-TESTS ${PKG}: pass=unknown fail=unknown skip=unknown"
+      fi
+      rm -f "$log"
+      if [ "$gate" -ne 0 ]; then
+        echo "UPSTREAM-TESTS ${PKG}: FAILED:$why"
+        exit 1
+      fi

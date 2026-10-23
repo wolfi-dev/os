@@ -1,7 +1,7 @@
 package:
   name: bun
   version: "1.4.2"
-  epoch: 1 # toolchain rebuild for  go-1.26-1.26.9
+  epoch: 2 # rebuild embedded root store from the system CA bundle (OS-5296)
   description: "Incredibly fast JavaScript runtime, bundler, test runner, and package manager - all in one"
   copyright:
     - license: MIT
@@ -31,6 +31,7 @@ environment:
       - bun-bootstrap # bun requires itself to build. this can get moved to our real build in the future
       - busybox
       - c-ares-dev
+      - ca-certificates-bundle
       - ccache
       - clang-21
       - cmake
@@ -76,6 +77,71 @@ pipeline:
       expected-commit: 744846f844374847c902b5e7fd59b4342a51ef99
       tag: bun-v${{package.version}}
 
+  - name: Rebuild the embedded root store from the system CA bundle
+    runs: |
+      # bun compiles packages/bun-usockets/root_certs.der (Mozilla NSS roots)
+      # into the binary and trusts it unconditionally at runtime, so a root
+      # distrusted by ca-certificates stays live in bun until a rebuild. The
+      # 1.4.2 blob still holds three eMudhra roots whose intermediates were
+      # compromised (OS-5296). Regenerate the blob from our CA bundle, which
+      # already dropped the affected roots, so bun trusts exactly what the
+      # rest of the OS trusts at build time. Drop this step with the update
+      # to bun >= 1.4.4 (upstream moved to NSS 3.131.1 plus a public-key
+      # blocklist in oven-sh/bun#46300).
+      python3 <<'EOF'
+      import base64
+      import os
+      import re
+      import struct
+
+      pem = open("/etc/ssl/certs/ca-certificates.crt").read()
+      certs = [
+          base64.b64decode(body)
+          for body in re.findall(
+              r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----",
+              pem,
+              re.S,
+          )
+      ]
+
+      # The bundle carries roughly 140 roots. Anything far below that means
+      # the bundle was missing or unreadable, and an empty blob would leave
+      # bun without usable TLS trust.
+      assert len(certs) > 100, f"suspiciously small CA bundle: {len(certs)} roots"
+
+      # Blob layout, from src/runtime/socket/bundled_root_certs.rs:
+      # little-endian u32 count, u32 offsets[count + 1] into the data
+      # section, then the DER certificates back to back.
+      offsets = [0]
+      for cert in certs:
+          offsets.append(offsets[-1] + len(cert))
+
+      blob = struct.pack("<I", len(certs))
+      blob += struct.pack(f"<{len(certs) + 1}I", *offsets)
+      blob += b"".join(certs)
+
+      # Overwriting a path that no longer exists would silently leave the
+      # upstream blob in the build, so fail loudly if a version bump moves
+      # the file before this step is dropped.
+      path = "packages/bun-usockets/root_certs.der"
+      assert os.path.exists(path), f"{path} not found, update this step"
+      with open(path, "wb") as f:
+          f.write(blob)
+      print(f"embedded {len(certs)} roots from the system CA bundle")
+      EOF
+
+  - name: Drop test fixture lockfiles
+    runs: |
+      # auth/npm below rehashes every lockfile in the tree against
+      # Chainguard Libraries. bun's test suite carries over a hundred
+      # fixture lockfiles pinning contrived packages, and one of them,
+      # devopt@1.0.0, is withheld by the Libraries malware block-list
+      # (HTTP 409), which fails the build. The fixtures are test data
+      # that build:release never installs, so drop their lockfiles.
+      find test -type f \
+          \( -name package-lock.json -o -name yarn.lock \
+          -o -name pnpm-lock.yaml -o -name bun.lock \) -print -delete
+
   - uses: auth/npm
 
   - runs: |
@@ -104,6 +170,11 @@ update:
     strip-prefix: bun-v
 
 test:
+  environment:
+    contents:
+      packages:
+        - ca-certificates-bundle
+        - openssl
   pipeline:
     - runs: |
         bun --version
@@ -112,3 +183,95 @@ test:
         # TODO: Omit this test for now until upstream cut a new release (>= 1.1.45) with the fix and let's see if it will pass
         # touch foo.js
         # bunx prettier foo.js
+    - name: Embedded roots are a subset of the system CA bundle
+      runs: |
+        # The build rebuilds the embedded root store from the system CA
+        # bundle (OS-5296). tls.rootCertificates reflects exactly that
+        # embedded store, so every entry must still be in the installed
+        # bundle. A failure here means ca-certificates dropped a root after
+        # bun was last built, and bun needs a rebuild to stop trusting it.
+        cat > /tmp/embedded-roots.ts <<'EOF'
+        import { readFileSync } from "node:fs";
+        import { rootCertificates } from "node:tls";
+
+        const strip = (pem: string) => pem.replace(/-----(BEGIN|END) CERTIFICATE-----|\s/g, "");
+        const system = new Set(
+          (readFileSync("/etc/ssl/certs/ca-certificates.crt", "utf8")
+            .match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [])
+            .map(strip),
+        );
+
+        // The bundle carries roughly 140 roots. Far fewer embedded roots
+        // means the build step wrote a truncated or empty blob.
+        if (rootCertificates.length < 100) {
+          throw new Error(`embedded root store looks truncated: ${rootCertificates.length} roots`);
+        }
+
+        const stray = rootCertificates.filter(pem => !system.has(strip(pem)));
+        if (stray.length > 0) {
+          throw new Error(`${stray.length} embedded root(s) are not in the system CA bundle`);
+        }
+
+        console.log(`all ${rootCertificates.length} embedded roots are in the system CA bundle`);
+        EOF
+        bun /tmp/embedded-roots.ts
+    - name: CA added to the system bundle is trusted
+      runs: |
+        tmp=$(mktemp -d)
+
+        # A throwaway CA and a localhost server certificate signed by it.
+        openssl req -x509 -newkey rsa:2048 -keyout "$tmp/ca.key" -out "$tmp/ca.crt" \
+            -days 1 -nodes -subj "/CN=bun-test-ca"
+        openssl req -newkey rsa:2048 -keyout "$tmp/server.key" -out "$tmp/server.csr" \
+            -nodes -subj "/CN=localhost"
+        printf 'subjectAltName=DNS:localhost\n' > "$tmp/san.cnf"
+        openssl x509 -req -in "$tmp/server.csr" -CA "$tmp/ca.crt" -CAkey "$tmp/ca.key" \
+            -CAcreateserial -days 1 -extfile "$tmp/san.cnf" -out "$tmp/server.crt"
+
+        cat > "$tmp/server.ts" <<EOF
+        Bun.serve({
+          port: 8443,
+          tls: { cert: Bun.file("$tmp/server.crt"), key: Bun.file("$tmp/server.key") },
+          fetch: () => new Response("ok-tls"),
+        });
+        EOF
+
+        # Exits 0 on a successful fetch, 21 when the certificate is
+        # rejected, 1 when the server never came up. Connection errors are
+        # retried so the server has time to start.
+        cat > "$tmp/client.ts" <<'EOF'
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          try {
+            const res = await fetch("https://localhost:8443/");
+            if ((await res.text()) !== "ok-tls") throw new Error("unexpected body");
+            process.exit(0);
+          } catch (err) {
+            const code = String((err as any)?.code ?? err);
+            if (code.includes("CERT") || code.includes("VERIFY")) process.exit(21);
+            await Bun.sleep(250);
+          }
+        }
+        process.exit(1);
+        EOF
+
+        bun "$tmp/server.ts" > "$tmp/server.log" 2>&1 &
+        server_pid=$!
+
+        # The test CA is not trusted anywhere yet: bun must reject the
+        # certificate (exit 21 from client.ts).
+        rc=0
+        bun "$tmp/client.ts" || rc=$?
+        if [ "$rc" -ne 21 ]; then
+            echo "expected certificate rejection (exit 21), got $rc"
+            cat "$tmp/server.log"
+            exit 1
+        fi
+
+        # After adding the CA to the system bundle, a fresh bun process
+        # must trust the server without flags or environment variables.
+        cat "$tmp/ca.crt" >> /etc/ssl/certs/ca-certificates.crt
+        bun "$tmp/client.ts"
+        echo "CA added to the system bundle is trusted"
+
+        kill "$server_pid"

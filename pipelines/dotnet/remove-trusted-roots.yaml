@@ -1,0 +1,87 @@
+name: Remove roots from the .NET SDK trusted root bundles
+
+description: |
+  Removes certificates by public key from the code-signing and timestamping
+  root bundles NuGet trusts on Linux (sdk/<version>/trustedroots/*.pem), then
+  fails if any excluded certificate remains. The bundles hold roots only and
+  NuGet reads no distrust list alongside them, so removing a root is the only
+  way to stop it anchoring a chain.
+
+  The defaults are the roots that anchor the code-signing intermediates
+  revoked for CA compromise in October 2026 (CVE-2026-111943): emSign Root CS
+  CA - G3 and Sectigo's AAA Certificate Services issue them, and emSign ECC
+  Root CA - G3 cross-signs emSign Root CS CA - G3 for code signing.
+
+needs:
+  packages:
+    - openssl
+
+inputs:
+  dir:
+    description: |
+      The .NET install root holding the sdk directory, for example
+      ${{targets.contextdir}}/usr/share/dotnet.
+    required: true
+  excluded-spki-hashes:
+    description: |
+      SHA-256 hashes of the DER-encoded public keys (SubjectPublicKeyInfo) of
+      the certificates to remove, separated by "|".
+    default: 8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782|0a6c2b2ca5b364207954171987ac9d2178561569d8205457e77ca90c32ede282|bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
+  excluded-names:
+    description: |
+      Subject common names of the same certificates, one per line, checked
+      after removal.
+    default: |
+      emSign ECC Root CA - G3
+      emSign Root CS CA - G3
+      AAA Certificate Services
+
+# USAGE EXAMPLE:
+#
+#   - uses: dotnet/remove-trusted-roots
+#     with:
+#       dir: ${{targets.contextdir}}/usr/share/dotnet
+#
+pipeline:
+  - name: Remove excluded roots
+    runs: |
+      set -o pipefail
+      set -- "${{inputs.dir}}"/sdk/*/trustedroots/*.pem
+      if [ ! -f "$1" ]; then
+        echo "No trusted root bundles under ${{inputs.dir}}/sdk"
+        exit 1
+      fi
+
+      split="$(mktemp -d)"
+      for file in "$@"; do
+        rm -f "$split"/*.pem
+        awk -v dir="$split" '
+          /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/cert-%04d.pem", dir, n) }
+          out { print > out }
+          /-----END CERTIFICATE-----/ { close(out); out = "" }
+        ' "$file"
+        : > "$file.new"
+        for cert in "$split"/*.pem; do
+          spki_hash="$(openssl x509 -in "$cert" -pubkey -noout |
+            openssl pkey -pubin -outform der |
+            openssl dgst -sha256 -r)"
+          case "${spki_hash%% *}" in
+            ${{inputs.excluded-spki-hashes}})
+              echo "Removing $(openssl x509 -in "$cert" -noout -subject) from $file"
+              continue
+              ;;
+          esac
+          # The SDK separates certificates with a blank line.
+          cat "$cert" >> "$file.new"
+          echo >> "$file.new"
+        done
+        cat "$file.new" > "$file"
+        rm "$file.new"
+      done
+      rm -rf "$split"
+
+  - uses: test/excluded-certificates
+    with:
+      files: ${{inputs.dir}}/sdk/*/trustedroots/*.pem
+      excluded-spki-hashes: ${{inputs.excluded-spki-hashes}}
+      excluded-names: ${{inputs.excluded-names}}

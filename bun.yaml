@@ -1,7 +1,7 @@
 package:
   name: bun
-  version: "1.4.2"
-  epoch: 2 # rebuild embedded root store from the system CA bundle (OS-5296)
+  version: "1.4.4"
+  epoch: 0
   description: "Incredibly fast JavaScript runtime, bundler, test runner, and package manager - all in one"
   copyright:
     - license: MIT
@@ -16,7 +16,6 @@ package:
 
 vars:
   nodejs-version: "26"
-  rust-version: "1.98"
   go-version: "1.26"
 
 environment:
@@ -31,11 +30,10 @@ environment:
       - bun-bootstrap # bun requires itself to build. this can get moved to our real build in the future
       - busybox
       - c-ares-dev
-      - ca-certificates-bundle
       - ccache
-      - clang-21
+      - clang-23
       - cmake
-      - compiler-rt-21
+      - compiler-rt-23
       - coreutils
       - curl
       - git
@@ -47,8 +45,8 @@ environment:
       - libarchive-dev
       - libmd-dev
       - libtool
-      - llvm-21-dev
-      - llvm-lld-21-dev
+      - llvm-23-dev
+      - llvm-lld-23-dev
       - m4
       - mimalloc2-dev
       - nasm
@@ -58,7 +56,7 @@ environment:
       - pkgconf-dev
       - python3
       - ruby-3.3
-      - rust-${{vars.rust-version}}
+      - rustup
       - samurai
       - sed
       - sqlite-dev
@@ -74,61 +72,8 @@ pipeline:
   - uses: git-checkout
     with:
       repository: https://github.com/oven-sh/bun
-      expected-commit: 744846f844374847c902b5e7fd59b4342a51ef99
+      expected-commit: 38afee6c84fcf48c0edb2466aa4b27d287a59c30
       tag: bun-v${{package.version}}
-
-  - name: Rebuild the embedded root store from the system CA bundle
-    runs: |
-      # bun compiles packages/bun-usockets/root_certs.der (Mozilla NSS roots)
-      # into the binary and trusts it unconditionally at runtime, so a root
-      # distrusted by ca-certificates stays live in bun until a rebuild. The
-      # 1.4.2 blob still holds three eMudhra roots whose intermediates were
-      # compromised (OS-5296). Regenerate the blob from our CA bundle, which
-      # already dropped the affected roots, so bun trusts exactly what the
-      # rest of the OS trusts at build time. Drop this step with the update
-      # to bun >= 1.4.4 (upstream moved to NSS 3.131.1 plus a public-key
-      # blocklist in oven-sh/bun#46300).
-      python3 <<'EOF'
-      import base64
-      import os
-      import re
-      import struct
-
-      pem = open("/etc/ssl/certs/ca-certificates.crt").read()
-      certs = [
-          base64.b64decode(body)
-          for body in re.findall(
-              r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----",
-              pem,
-              re.S,
-          )
-      ]
-
-      # The bundle carries roughly 140 roots. Anything far below that means
-      # the bundle was missing or unreadable, and an empty blob would leave
-      # bun without usable TLS trust.
-      assert len(certs) > 100, f"suspiciously small CA bundle: {len(certs)} roots"
-
-      # Blob layout, from src/runtime/socket/bundled_root_certs.rs:
-      # little-endian u32 count, u32 offsets[count + 1] into the data
-      # section, then the DER certificates back to back.
-      offsets = [0]
-      for cert in certs:
-          offsets.append(offsets[-1] + len(cert))
-
-      blob = struct.pack("<I", len(certs))
-      blob += struct.pack(f"<{len(certs) + 1}I", *offsets)
-      blob += b"".join(certs)
-
-      # Overwriting a path that no longer exists would silently leave the
-      # upstream blob in the build, so fail loudly if a version bump moves
-      # the file before this step is dropped.
-      path = "packages/bun-usockets/root_certs.der"
-      assert os.path.exists(path), f"{path} not found, update this step"
-      with open(path, "wb") as f:
-          f.write(blob)
-      print(f"embedded {len(certs)} roots from the system CA bundle")
-      EOF
 
   - name: Drop test fixture lockfiles
     runs: |
@@ -148,12 +93,34 @@ pipeline:
       cd /home/build/src/node-fallbacks && /usr/bin/bun install --frozen-lockfile
       cd /home/build/ && /usr/bin/bun install --frozen-lockfile
 
+  - name: Install Rust toolchain
+    runs: |
+      # The link reads LLVM bitcode from both compilers, so bun requires
+      # rustc's LLVM major to match clang's (23). Every stable Wolfi rust
+      # links LLVM 22; upstream pins a matching Rust nightly in
+      # rust-toolchain.toml and builds with it, so install that one via
+      # rustup (same approach as os/wasmcloud.yaml). Reading the channel
+      # from the checkout keeps the pin in step with upstream on version
+      # bumps. rust-src is a component the build expects for -Zbuild-std.
+      channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+      rustup toolchain install "$channel" --profile minimal --component rust-src
+
+      # RUSTUP_TOOLCHAIN keeps the rustup proxy from applying
+      # rust-toolchain.toml in full, which would also install every
+      # component and cross-target the file lists (~2.4 GB this build
+      # does not need). The symlinks point at the real toolchain
+      # binaries, so the build is not affected by the proxy either way.
+      export RUSTUP_TOOLCHAIN="$channel"
+      for tool in cargo rustc; do
+          ln -sf "$(rustup which $tool)" /usr/bin/$tool
+      done
+
   - runs: |
-      # bun 1.3.14 lolhtml step uses -Zbuild-std (nightly cargo flag);
-      # Wolfi ships stable rust + rust-src, so RUSTC_BOOTSTRAP=1 lets
-      # cargo accept the unstable flags.
-      export RUSTC_BOOTSTRAP=1
-      VERBOSE=1 bun run build:release
+      # --canary=off marks this as a release build of the tag. Without it
+      # the build defaults to canary and the binary reports versions like
+      # "1.4.4-canary.1" (upstream release CI passes the same flag,
+      # .buildkite/ci.ts).
+      VERBOSE=1 bun run build:release --canary=off
 
   - runs: |
       mkdir -p ${{targets.destdir}}/usr/bin
@@ -185,11 +152,13 @@ test:
         # bunx prettier foo.js
     - name: Embedded roots are a subset of the system CA bundle
       runs: |
-        # The build rebuilds the embedded root store from the system CA
-        # bundle (OS-5296). tls.rootCertificates reflects exactly that
-        # embedded store, so every entry must still be in the installed
-        # bundle. A failure here means ca-certificates dropped a root after
-        # bun was last built, and bun needs a rebuild to stop trusting it.
+        # bun embeds upstream's NSS root store (NSS 3.131.1 at 1.4.4),
+        # which matches the bundle our ca-certificates ships (OS-5296).
+        # tls.rootCertificates reflects exactly that embedded store, so
+        # every entry must still be in the installed bundle. A failure
+        # here means ca-certificates dropped a root after this bun
+        # release, and bun needs an update or a downstream store rebuild
+        # (see the git history of this file at 1.4.2) to stop trusting it.
         cat > /tmp/embedded-roots.ts <<'EOF'
         import { readFileSync } from "node:fs";
         import { rootCertificates } from "node:tls";

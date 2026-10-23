@@ -1,0 +1,143 @@
+name: CMake upstream test suite (ctest)
+
+description: |
+  Runs a CMake project's upstream test suite with `ctest` against the
+  freshly built tree. Use it right after the main `cmake/build` step, before
+  `cmake/install`. It runs in the build workspace and needs no network.
+
+  The suite is a hard gate: any failing test fails the build. It also fails
+  if no tests are registered ("No tests were found!!!" or 0 tests), which
+  usually means the package configures with tests disabled (BUILD_TESTING=OFF
+  or a project-specific switch such as -DZSTD_BUILD_TESTS=OFF); enable them
+  in the `cmake/configure` opts.
+
+  Prints the full ctest log, then summary lines:
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n>
+    UPSTREAM-TESTS-FAIL <package>: <test>      (one per failing test)
+  ctest counts skipped tests as passed in its "N% tests passed" line, so
+  pass = total - fail - skipped; skip also includes DISABLED tests, which
+  ctest leaves out of its total.
+
+  Example:
+    - uses: cmake/configure
+    - uses: cmake/build
+    - uses: upstream-tests/ctest
+    - uses: cmake/install
+
+  With a non-default build directory, or a label filter:
+    - uses: upstream-tests/ctest
+      with:
+        dir: build
+        args: -LE slow
+
+  Named exceptions go in ignore (exact ctest test names, space-separated;
+  they are turned into an anchored `-E '^(a|b)$'` exclusion regex with regex
+  metacharacters escaped). Every exception needs a comment in the calling
+  package explaining why and a `TODO(upstream-tests): ...` to remove it:
+    # test-foo needs /dev/kvm, which the build sandbox does not have.
+    # TODO(upstream-tests): drop the ignore once the builders expose kvm.
+    - uses: upstream-tests/ctest
+      with:
+        ignore: test-foo
+
+needs:
+  packages:
+    - cmake
+
+inputs:
+  dir:
+    description: |
+      CMake build directory, relative to the workspace. Matches the
+      `output-dir` default of the cmake/configure and cmake/build pipelines.
+    default: output
+  jobs:
+    description: Parallel ctest jobs (ctest -j).
+    default: "$(nproc)"
+  ignore:
+    description: |
+      Space-separated exact ctest test names to exclude. Each one needs a
+      comment and TODO in the caller.
+    default: ""
+  args:
+    description: |
+      Extra ctest arguments, inserted verbatim into the command line,
+      e.g. `-L unit` or `-LE slow`. Do not pass `-E` here: ctest keeps only
+      the last `-E`, which would silently replace the `ignore` regex.
+    default: ""
+  timeout:
+    description: Per-test timeout in seconds (ctest --timeout).
+    default: "900"
+  overall-timeout:
+    description: Timeout in seconds for the whole ctest run.
+    default: "7200"
+
+pipeline:
+  - name: upstream-tests (ctest)
+    runs: |
+      PKG="${{package.name}}"
+      dir="${{inputs.dir}}"
+      if [ ! -d "$dir" ]; then
+        echo "upstream-tests/ctest: build directory '$dir' does not exist; set 'dir' to the cmake/build output-dir" >&2
+        exit 1
+      fi
+      # Exact names -> anchored, metacharacter-escaped exclusion regex.
+      set -f
+      exclude=""
+      for t in ${{inputs.ignore}}; do
+        esc=$(printf '%s' "$t" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
+        exclude="${exclude:+$exclude|}$esc"
+      done
+      set +f
+      set --
+      if [ -n "$exclude" ]; then
+        set -- -E "^($exclude)\$"
+        echo "upstream-tests/ctest: excluding tests matching: ^($exclude)\$"
+      fi
+      wrap=""
+      if command -v timeout >/dev/null 2>&1; then
+        wrap="timeout ${{inputs.overall-timeout}}"
+      fi
+      log=$(mktemp)
+      start=$(date +%s)
+      rc=0
+      $wrap ctest --test-dir "$dir" --output-on-failure --no-tests=error \
+        -j${{inputs.jobs}} --timeout ${{inputs.timeout}} \
+        "$@" ${{inputs.args}} > "$log" 2>&1 || rc=$?
+      end=$(date +%s)
+      cat "$log"
+      echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s"
+      if [ "$rc" -eq 124 ] && [ -n "$wrap" ]; then
+        echo "upstream-tests/ctest: ctest exceeded overall-timeout=${{inputs.overall-timeout}}s" >&2
+      fi
+      # "NN% tests passed, M tests failed out of T", or "100% tests passed
+      # out of T" when nothing failed (skipped count as passed; disabled
+      # tests are not in T)
+      line=$(grep -E '^[0-9]+% tests passed(, [0-9]+ tests? failed)? out of [0-9]+' "$log" | tail -n1 || true)
+      total=$(echo "$line" | sed -n 's/.* out of \([0-9]*\).*/\1/p')
+      fail=$(echo "$line" | sed -n 's/.*passed, \([0-9]*\) tests\{0,1\} failed.*/\1/p')
+      skipped=$(grep -cE '\*\*\*Skipped' "$log" || true)
+      disabled=$(grep -cE '\*\*\*Not Run \(Disabled\)' "$log" || true)
+      if grep -q 'No tests were found!!!' "$log" || [ "${total:-0}" -eq 0 ]; then
+        echo "UPSTREAM-TESTS ${PKG}: pass=0 fail=0 skip=0"
+        echo "upstream-tests/ctest: no tests ran in '$dir'. The package is probably configured with tests disabled (BUILD_TESTING=OFF or a project-specific switch); enable them in the cmake/configure opts. Also check that 'dir' is the cmake build directory and that ignore/args do not filter out every test." >&2
+        exit 1
+      fi
+      fail=${fail:-0}
+      pass=$((total - fail - skipped))
+      echo "UPSTREAM-TESTS ${PKG}: pass=${pass} fail=${fail} skip=$((skipped + disabled))"
+      # ctest counts SKIP_RETURN_CODE tests as passed: a suite whose tests all
+      # self-skip (missing tool/device/network) did not really run.
+      if [ "$pass" -le 0 ] && [ "$fail" -eq 0 ]; then
+        echo "upstream-tests/ctest: no test passed in '$dir' (all ${total} skipped); the suite did not actually run" >&2
+        rc=1
+      fi
+      # "The following tests FAILED:" block: "<tab>  4 - name (Failed)  labels"
+      sed -n '/^The following tests FAILED:/,/^[^[:space:]]/p' "$log" \
+        | sed -nE 's/^[[:space:]]+[0-9]+ - (.*) \([^()]*\)([[:space:]].*)?$/\1/p' \
+        | while read -r t; do echo "UPSTREAM-TESTS-FAIL ${PKG}: $t"; done
+      rm -f "$log"
+      if [ "$rc" -eq 0 ] && [ "$fail" -ne 0 ]; then
+        rc=1
+      fi
+      exit $rc

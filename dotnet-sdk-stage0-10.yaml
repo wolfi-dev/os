@@ -1,7 +1,7 @@
 package:
   name: dotnet-sdk-stage0-10
   version: "10.0.113"
-  epoch: 0 # openssl-hardened: 3.6->4.0
+  epoch: 1 # CVE-2026-111497
   description: ".NET SDK ${{vars.major-version}} stage0"
   copyright:
     - license: MIT
@@ -103,7 +103,7 @@ pipeline:
         /p:ContinueOnPrebuiltBaselineError=true \
         /p:MinimalConsoleLogOutput=true \
         /p:SkipPortableRuntimeBuild=true \
-        /p:UseSystemLibs=brotli+rapidjson+zlib+libunwind \
+        /p:UseSystemLibs=+brotli+rapidjson+zlib+libunwind \
         /p:OfficialBuilder=Chainguard
 
       mkdir -p ${{targets.contextdir}}/${{vars.prefix}}/artifacts
@@ -127,6 +127,11 @@ pipeline:
   - uses: strip
 
 test:
+  environment:
+    contents:
+      packages:
+        - busybox
+        - unzip
   pipeline:
     - name: Basic .NET command test
       runs: |
@@ -164,6 +169,48 @@ test:
         mv ArgumentEcho.cs ArgumentEchoApp/Program.cs
         dotnet run --project ArgumentEchoApp -- arg1 arg2 arg3 | grep -F "Arguments: arg1, arg2, arg3"
     - uses: test/tw/ldd-check
+    - name: Installed runtime and packs use the system brotli
+      runs: |
+        d=/${{vars.prefix}}
+        for f in $d/shared/Microsoft.NETCore.App/*/libSystem.IO.Compression.Native.so \
+                 $d/packs/Microsoft.NETCore.App.Host.*/*/runtimes/*/native/singlefilehost \
+                 $d/packs/Microsoft.NETCore.App.Runtime.NativeAOT.*/*/runtimes/*/native/libSystem.IO.Compression.Native.so; do
+          grep -q libbrotlidec.so.1 "$f"
+          if grep -aq _ERROR_FORMAT_EXUBERANT_NIBBLE "$f"; then
+            echo "$f still bundles a Brotli decoder" >&2
+            exit 1
+          fi
+        done
+        for a in $d/packs/Microsoft.NETCore.App.Runtime.NativeAOT.*/*/runtimes/*/native/libbrotli*.a; do
+          if [ -e "$a" ]; then
+            echo "$a is the vendored Brotli" >&2
+            exit 1
+          fi
+        done
+    - name: Runtime packs in the artifacts use the system brotli
+      runs: |
+        a=/${{vars.prefix}}/artifacts
+        check() {
+          rm -rf nupkg-check
+          mkdir nupkg-check
+          unzip -q -o "$1" "runtimes/*/native/$2" -d nupkg-check
+          f=$(echo nupkg-check/runtimes/*/native/"$2")
+          grep -q libbrotlidec.so.1 "$f"
+          if grep -aq _ERROR_FORMAT_EXUBERANT_NIBBLE "$f"; then
+            echo "$1: $2 still bundles a Brotli decoder" >&2
+            exit 1
+          fi
+        }
+        check $a/Microsoft.NETCore.App.Runtime.wolfi.*[0-9].nupkg libSystem.IO.Compression.Native.so
+        check $a/Microsoft.NETCore.App.Runtime.NativeAOT.wolfi.*[0-9].nupkg libSystem.IO.Compression.Native.so
+        check $a/Microsoft.NETCore.App.Host.wolfi.*[0-9].nupkg singlefilehost
+        check $a/runtime.wolfi.*.Microsoft.NETCore.DotNetAppHost.*[0-9].nupkg singlefilehost
+        unzip -l $a/Microsoft.NETCore.App.Runtime.NativeAOT.wolfi.*[0-9].nupkg > nupkg-check.list
+        if grep -q 'native/libbrotli' nupkg-check.list; then
+          echo "the NativeAOT runtime pack still ships the vendored libbrotli*.a" >&2
+          exit 1
+        fi
+        rm -rf nupkg-check nupkg-check.list
 
 update:
   enabled: true

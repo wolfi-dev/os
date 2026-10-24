@@ -1,0 +1,338 @@
+name: Go upstream test suite (go test)
+
+description: |
+  Runs a Go module's upstream unit tests with `go test -short -json` against
+  the freshly checked out and built tree. Use it right after the main
+  `go/build` step, before any install/strip steps. It uses the same module
+  cache as go/build (/var/cache/melange/gomodcache) and the package's
+  environment (GOTOOLCHAIN, CGO_ENABLED, ...).
+
+  Build tags and GOEXPERIMENT mirror go/build, which applies them only
+  inside its own step: go/build compiles with
+  `-tags "<toolchaintags>,<tags>"` (toolchaintags defaults to
+  netgo,osusergo) and GOEXPERIMENT=<experiments>. This pipeline has the
+  same three inputs with the same defaults, so a plain go/build caller
+  tests the file set it ships with no extra wiring. A caller that sets
+  `tags`, `toolchaintags` or `experiments` on go/build copies the same
+  values here.
+
+  Module resolution is offline during the test run: `go build` only fetches
+  the modules the built binaries import, so test-only dependencies
+  (testify, go-cmp, ...) are usually missing from the cache. Unless the
+  module is vendored (vendor/modules.txt, then GOFLAGS=-mod=vendor and
+  nothing is downloaded), the pipeline first runs `go mod download`, which
+  fetches the go.mod requirements through the configured GOPROXY and
+  verifies them against go.sum exactly like go/build does. `go list` and
+  `go test` then run with GOPROXY=off GOFLAGS=-mod=mod, so they can only
+  use modules already in the cache. (-mod=mod because a no-argument
+  `go mod download` does not record go.sum entries; a sum that is still
+  missing is looked up at GOSUMDB, the one network path GOPROXY=off
+  leaves open.) In workspace mode (a go.work above `dir`, and GOWORK not
+  set to off) the go command refuses -mod=mod, so the pipeline uses
+  -mod=readonly there; the workspace download fetches `all` and records
+  go.work.sum. None of this stops a test from opening network connections
+  itself: tests that need network, Docker, root or
+  devices must be skipped by `-short` or listed in `ignore`.
+
+  The suite is a hard gate. The step fails if:
+    - a test fails (top-level test reported as fail),
+    - a test package fails to build or set up ("[build failed]",
+      "[setup failed]", e.g. a missing module), or its test binary fails
+      without a failing test (panic in TestMain, -timeout exceeded, ...),
+    - go test exits non-zero for any other reason, or overall-timeout hits,
+    - the suite did not really run: no packages match, or no test passed
+      (no test files, or everything skipped).
+
+  Prints go's human-readable output reconstructed from the -json stream
+  (build errors, package ok/FAIL lines and the full output of every failing
+  test), then summary lines:
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS-FAIL <package>: <importpath>.<Test>      (one per failing test)
+    UPSTREAM-TESTS-FAIL <package>: <importpath> [build failed]  (or [setup failed], [package failed])
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [ignored=<n>]
+  Counts are top-level tests (subtests are folded into their parent, as
+  `-run`/`-skip` see them); fail also counts failed packages. ignored =
+  how many test functions named in `ignore` exist in *_test.go files.
+
+  Example:
+    - uses: go/build
+      with:
+        packages: ./cmd/foo
+        output: foo
+    - uses: upstream-tests/go-test
+
+  With a non-default module directory, a subset of packages or extra flags:
+    - uses: upstream-tests/go-test
+      with:
+        dir: ./cli
+        packages: ./pkg/...
+        tags: integration_off
+        args: -count=1
+
+  Named exceptions go in ignore: space-separated top-level test function
+  names (no "/"; skip the parent of a bad subtest). They are turned into an
+  anchored `-skip '^(A|B)$'` regex (Go 1.20+) with regex metacharacters
+  escaped, so they do not run in any package. Whole packages go in
+  exclude-packages. Every exception needs a comment in the calling package
+  explaining why and a `TODO(upstream-tests): ...` to remove it:
+    # TestPull talks to registry.example.com; the build sandbox has no network.
+    # TODO(upstream-tests): drop it once upstream gates it behind -short.
+    - uses: upstream-tests/go-test
+      with:
+        ignore: TestPull
+        exclude-packages: ./internal/e2e/...
+
+inputs:
+  dir:
+    description: |
+      Go module directory (where go.mod lives), relative to the workspace.
+      Matches the `modroot` input of go/build.
+    default: "."
+  packages:
+    description: |
+      Space-separated package patterns to test, relative to dir.
+    default: ./...
+  exclude-packages:
+    description: |
+      Space-separated packages to leave out, as import paths or relative
+      patterns (`./internal/e2e`, `./test/...`, `example.com/m/pkg`). Each
+      entry is expanded with `go list` and removed from the `packages` list.
+      Each one needs a comment and TODO in the caller.
+    default: ""
+  jobs:
+    description: Packages built and tested in parallel (go test -p).
+    default: "$(nproc)"
+  ignore:
+    description: |
+      Space-separated top-level test names to skip in every package
+      (go test -skip '^(A|B)$'). Each one needs a comment and TODO in the
+      caller.
+    default: ""
+  args:
+    description: |
+      Extra go test arguments, inserted verbatim into the command line,
+      e.g. `-count=1` or `-vet=off`. Do not pass -json, -skip
+      or -timeout here, and use `tags` rather than -tags.
+    default: ""
+  toolchaintags:
+    description: |
+      Same as go/build's `toolchaintags`: build tags always passed to go
+      list and go test, ahead of `tags`.
+    default: netgo,osusergo
+  tags:
+    description: |
+      Same as go/build's `tags`: extra comma-separated build tags, passed
+      as -tags "<toolchaintags>,<tags>".
+    default: ""
+  experiments:
+    description: |
+      Same as go/build's `experiments`: GOEXPERIMENT for the test build
+      and run. Empty leaves GOEXPERIMENT unset.
+    default: ""
+  timeout:
+    description: Per test binary timeout (go test -timeout).
+    default: 20m
+  overall-timeout:
+    description: Timeout in seconds for the whole go test run.
+    default: "7200"
+
+pipeline:
+  - name: upstream-tests (go test)
+    runs: |
+      PKG="${{package.name}}"
+      cd "${{inputs.dir}}"
+      if [ ! -f go.mod ]; then
+        echo "upstream-tests/go-test: no go.mod in '${{inputs.dir}}'; set 'dir' to the go/build modroot" >&2
+        exit 1
+      fi
+      if ! command -v go >/dev/null 2>&1; then
+        echo "upstream-tests/go-test: no go toolchain in the build environment" >&2
+        exit 1
+      fi
+      # Same module cache as go/build. Fetch what the tests need (go.mod
+      # requirements) while the proxy is still allowed, then resolve offline.
+      export GOMODCACHE=/var/cache/melange/gomodcache
+      if [ -f vendor/modules.txt ]; then
+        mod=vendor
+      else
+        go mod download
+        # Workspace mode (a go.work in use) rejects -mod=mod; there the
+        # no-argument download fetches all and writes go.work.sum, so
+        # readonly resolves offline. `go env GOWORK` prints "off" when the
+        # environment disables workspace mode: that is single-module mode.
+        case "$(go env GOWORK)" in
+          ""|off) mod=mod ;;
+          *) mod=readonly ;;
+        esac
+      fi
+      export GOFLAGS="${GOFLAGS:+$GOFLAGS }-mod=$mod"
+      export GOPROXY=off
+      if [ -n "${{inputs.experiments}}" ]; then
+        export GOEXPERIMENT="${{inputs.experiments}}"
+      fi
+      case " ${{inputs.args}} " in
+        *" -tags "*|*" -tags="*|*" --tags"*)
+          echo "upstream-tests/go-test: pass build tags in 'tags' (or 'toolchaintags'), not '-tags' in args: a second -tags replaces the first and drops ${{inputs.toolchaintags}}" >&2
+          exit 1 ;;
+      esac
+      # Same tag set as go/build: "<toolchaintags>,<tags>". Comma separated,
+      # no spaces, so it is safe to expand unquoted below.
+      tags=$(printf '%s,%s' "${{inputs.toolchaintags}}" "${{inputs.tags}}" | sed 's/,,*/,/g; s/^,//; s/,$//')
+      tagsarg="${tags:+-tags $tags}"
+      echo "upstream-tests/go-test: GOFLAGS=$GOFLAGS GOPROXY=$GOPROXY GOWORK=$(go env GOWORK) GOMODCACHE=$GOMODCACHE tags=$tags GOEXPERIMENT=${GOEXPERIMENT:-}"
+
+      set -f
+      pkgs="${{inputs.packages}}"
+      if [ -n "$(echo ${{inputs.exclude-packages}})" ]; then
+        all=$(go list -e $tagsarg $pkgs)
+        drop=""
+        for e in ${{inputs.exclude-packages}}; do
+          m=$(go list -e $tagsarg -f '{{if .Dir}}{{.ImportPath}}{{end}}' "$e" 2>/dev/null || true)
+          if [ -z "$m" ]; then
+            echo "upstream-tests/go-test: WARNING: exclude-packages entry '$e' matches no package" >&2
+          fi
+          drop="$drop $m"
+        done
+        pkgs=$(printf '%s\n' "$all" | awk -v d="$drop" '
+          BEGIN { n = split(d, a, " "); for (i = 1; i <= n; i++) x[a[i]] = 1 }
+          !($0 in x)')
+        for p in $(printf '%s\n' "$all" | awk -v d="$drop" '
+          BEGIN { n = split(d, a, " "); for (i = 1; i <= n; i++) x[a[i]] = 1 }
+          $0 in x'); do
+          echo "EXCLUDE ${PKG}: $p"
+        done
+        if [ -z "$pkgs" ]; then
+          echo "upstream-tests/go-test: exclude-packages removed every package matching '${{inputs.packages}}'" >&2
+          exit 1
+        fi
+      fi
+
+      # Exact top-level names -> anchored, metacharacter-escaped -skip regex.
+      skip=""
+      ignored=0
+      for t in ${{inputs.ignore}}; do
+        case "$t" in
+          */*)
+            echo "upstream-tests/go-test: ignore entry '$t' names a subtest; go test -skip cannot combine subtest patterns, ignore the top-level test instead" >&2
+            exit 1
+            ;;
+        esac
+        re=$(printf '%s' "$t" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
+        skip="${skip:+$skip|}$re"
+        n=$(find . -name '*_test.go' -exec grep -lE "^func ${re}\(" {} + | wc -l || true)
+        if [ "$n" -gt 0 ]; then
+          echo "IGNORE ${PKG}: $t (skipped, defined in $n file(s))"
+          ignored=$((ignored + n))
+        else
+          echo "upstream-tests/go-test: WARNING: ignore entry '$t' matches no test function" >&2
+        fi
+      done
+      set --
+      if [ -n "$skip" ]; then
+        set -- -skip "^($skip)\$"
+        echo "upstream-tests/go-test: skipping tests matching: ^($skip)\$"
+      fi
+
+      wrap=""
+      if command -v timeout >/dev/null 2>&1; then
+        wrap="timeout ${{inputs.overall-timeout}}"
+      fi
+      log=$(mktemp)
+      sum=$(mktemp)
+      start=$(date +%s)
+      rc=0
+      $wrap go test -short -json -p ${{inputs.jobs}} -timeout ${{inputs.timeout}} \
+        $tagsarg "$@" ${{inputs.args}} $pkgs > "$log" 2>&1 || rc=$?
+      end=$(date +%s)
+      set +f
+
+      # One JSON event per line; pull a string field out of it.
+      jf='function jstr(l, k,   re) {
+            re = "\"" k "\":\"([^\"\\\\]|\\\\.)*\""
+            if (!match(l, re)) return ""
+            return substr(l, RSTART + length(k) + 4, RLENGTH - length(k) - 5)
+          }
+          function dec(s,   i) {
+            gsub(/\\\\/, "\001", s); gsub(/\\n/, "\n", s); gsub(/\\t/, "\t", s)
+            gsub(/\\r/, "", s); gsub(/\\"/, "\"", s); gsub(/\\u003c/, "<", s)
+            gsub(/\\u003e/, ">", s); gsub(/\\u0026/, "\\&", s)
+            while ((i = index(s, "\001")) > 0)
+              s = substr(s, 1, i - 1) "\\" substr(s, i + 1)
+            return s
+          }'
+      # Summary: F<tab>pkg<tab>test per failing top-level test, B<tab>pkg<tab>why
+      # per package that failed without a failing test, then the counts.
+      awk "$jf"'
+        /^\{/ {
+          a = jstr($0, "Action"); p = jstr($0, "Package"); t = jstr($0, "Test")
+          if (a == "output" && index($0, "panic: test timed out")) why[p] = "test timed out"
+          if (t != "") {
+            if (index(t, "/")) next
+            if (a == "pass") pass++
+            else if (a == "skip") skip++
+            else if (a == "fail" && !((p, t) in tf)) {
+              tf[p, t] = 1; pf[p] = 1; fail++
+              print "F\t" p "\t" dec(t)
+            }
+            next
+          }
+          if (p == "") next
+          if (a == "output") {
+            o = jstr($0, "Output")
+            if (o ~ /\[build failed\]/) why[p] = "build failed"
+            else if (o ~ /\[setup failed\]/) why[p] = "setup failed"
+            else if (!(p in why) && index(o, "panic: ")) why[p] = "panic"
+          } else if (a == "fail") {
+            pkgf[p] = 1
+            if (!(p in why) && jstr($0, "FailedBuild") != "") why[p] = "build failed"
+          }
+        }
+        END {
+          for (p in pkgf) if (!(p in pf)) {
+            fail++
+            print "B\t" p "\t" (p in why ? why[p] : "package failed")
+          }
+          print "C\t" pass + 0 "\t" fail + 0 "\t" skip + 0
+        }' "$log" > "$sum"
+      # Human-readable go test output: build errors, package-level lines and
+      # everything the failing tests (or failed packages) printed, one
+      # package at a time (packages run in parallel, their events interleave).
+      awk "$jf"'
+        FNR == NR { if ($1 == "F") want[$2, $3] = 1; if ($1 == "B") all[$2] = 1; next }
+        !/^\{/ { print; next }
+        {
+          a = jstr($0, "Action"); p = jstr($0, "Package"); t = dec(jstr($0, "Test"))
+          if (a == "build-output") { printf "%s", dec(jstr($0, "Output")); next }
+          sub(/\/.*/, "", t)
+          if (a == "output" && (t == "" || (p in all) || ((p, t) in want)))
+            buf[p] = buf[p] dec(jstr($0, "Output"))
+          if (t == "" && (a == "pass" || a == "fail" || a == "skip")) {
+            printf "%s", buf[p]; delete buf[p]
+          }
+        }
+        END { for (p in buf) printf "%s", buf[p] }' FS='\t' "$sum" FS=' ' "$log"
+
+      echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s"
+      if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+        echo "upstream-tests/go-test: go test timed out or was killed (exit $rc, overall-timeout=${{inputs.overall-timeout}}s)" >&2
+      fi
+      awk -F '\t' -v pkg="$PKG" '
+        $1 == "F" { print "UPSTREAM-TESTS-FAIL " pkg ": " $2 "." $3 }
+        $1 == "B" { print "UPSTREAM-TESTS-FAIL " pkg ": " $2 " [" $3 "]" }' "$sum" | sort
+      set -- $(awk -F '\t' '$1 == "C" { print $2, $3, $4 }' "$sum")
+      pass=$1 fail=$2 skip=$3
+      extra=""
+      [ "$ignored" -gt 0 ] && extra=" ignored=$ignored"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
+      rm -f "$log" "$sum"
+      if [ "$pass" -eq 0 ] && [ "$fail" -eq 0 ]; then
+        echo "upstream-tests/go-test: no test passed in '${{inputs.dir}}' (no test files, or everything skipped); the suite did not really run. Check 'packages', 'exclude-packages' and 'ignore'." >&2
+        exit 1
+      fi
+      if [ "$fail" -ne 0 ]; then
+        exit 1
+      fi
+      if [ "$rc" -ne 0 ]; then
+        echo "upstream-tests/go-test: go test exited $rc without a reported failure" >&2
+        exit 1
+      fi

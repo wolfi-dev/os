@@ -11,7 +11,8 @@ description: |
   or a project-specific switch such as -DZSTD_BUILD_TESTS=OFF); enable them
   in the `cmake/configure` opts.
 
-  Prints the full ctest log, then summary lines:
+  The ctest output is streamed as it runs (so a hanging suite shows which
+  tests started but never finished), then summary lines are printed:
     UPSTREAM-TESTS <package>: duration=<n>s
     UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n>
     UPSTREAM-TESTS-FAIL <package>: <test>      (one per failing test)
@@ -31,6 +32,27 @@ description: |
         dir: build
         args: -LE slow
 
+  Suites whose tests share fixed ports, temp paths or the build directory
+  (e.g. tests that bind 0.0.0.0:5000, or that re-run ninja in the build
+  tree) fail randomly under the default `ctest -j$(nproc)`; run them
+  serially, with a comment saying why:
+    # tests bind fixed ports and collide when run in parallel
+    - uses: upstream-tests/ctest
+      with:
+        jobs: 1
+
+  Each test is killed after `timeout` seconds (default 900), so with
+  jobs: 1 a few hanging tests can take a long time before the
+  overall-timeout; prefer ignoring a known hanging test (see below) over
+  raising either timeout.
+
+  Enabling tests in the cmake/configure opts (BUILD_TESTING=ON or a project
+  switch) can change what `cmake/install` installs, e.g. bundled
+  googletest/benchmark headers, libraries and CMake configs, or test
+  binaries. Compare the package file lists before and after; turn off the
+  bundled install (e.g. -DINSTALL_GTEST=OFF, -DBENCHMARK_ENABLE_INSTALL=OFF)
+  or build against the system gtest-dev instead.
+
   Named exceptions go in ignore (exact ctest test names, space-separated;
   they are turned into an anchored `-E '^(a|b)$'` exclusion regex with regex
   metacharacters escaped). Every exception needs a comment in the calling
@@ -43,6 +65,9 @@ description: |
 
 needs:
   packages:
+    # Many suites run shell-script tests via bash (e.g. `bash runtests`,
+    # *.sh tests whose shebang is bash).
+    - bash
     - cmake
 
 inputs:
@@ -52,7 +77,9 @@ inputs:
       `output-dir` default of the cmake/configure and cmake/build pipelines.
     default: output
   jobs:
-    description: Parallel ctest jobs (ctest -j).
+    description: |
+      Parallel ctest jobs (ctest -j). Use 1 for suites whose tests share
+      fixed ports, temp paths or the build directory.
     default: "$(nproc)"
   ignore:
     description: |
@@ -99,16 +126,28 @@ pipeline:
         wrap="timeout ${{inputs.overall-timeout}}"
       fi
       log=$(mktemp)
+      rcfile=$(mktemp)
+      echo 0 > "$rcfile"
       start=$(date +%s)
-      rc=0
-      $wrap ctest --test-dir "$dir" --output-on-failure --no-tests=error \
-        -j${{inputs.jobs}} --timeout ${{inputs.timeout}} \
-        "$@" ${{inputs.args}} > "$log" 2>&1 || rc=$?
+      # Stream the output while ctest runs (a hang then shows which tests
+      # started but never finished) and keep a copy to parse. The exit status
+      # of the pipeline is tee's, so ctest's own rc goes through $rcfile.
+      {
+        $wrap ctest --test-dir "$dir" --output-on-failure --no-tests=error \
+          -j${{inputs.jobs}} --timeout ${{inputs.timeout}} \
+          "$@" ${{inputs.args}} 2>&1 || echo $? > "$rcfile"
+      } | tee "$log"
       end=$(date +%s)
-      cat "$log"
+      rc=$(cat "$rcfile")
+      rc=${rc:-1}
       echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s"
-      if [ "$rc" -eq 124 ] && [ -n "$wrap" ]; then
-        echo "upstream-tests/ctest: ctest exceeded overall-timeout=${{inputs.overall-timeout}}s" >&2
+      # GNU timeout exits 124; busybox timeout leaves ctest's SIGTERM status
+      # (143), so also go by the elapsed time.
+      timedout=0
+      if [ "$rc" -ne 0 ] && [ -n "$wrap" ] \
+        && { [ "$rc" -eq 124 ] || [ $((end - start)) -ge ${{inputs.overall-timeout}} ]; }; then
+        timedout=1
+        echo "upstream-tests/ctest: ctest exceeded overall-timeout=${{inputs.overall-timeout}}s; the last 'Start' lines above without a result are the tests still running" >&2
       fi
       # "NN% tests passed, M tests failed out of T", or "100% tests passed
       # out of T" when nothing failed (skipped count as passed; disabled
@@ -120,7 +159,12 @@ pipeline:
       disabled=$(grep -cE '\*\*\*Not Run \(Disabled\)' "$log" || true)
       if grep -q 'No tests were found!!!' "$log" || [ "${total:-0}" -eq 0 ]; then
         echo "UPSTREAM-TESTS ${PKG}: pass=0 fail=0 skip=0"
+        if [ "$timedout" -eq 1 ]; then
+          rm -f "$log" "$rcfile"
+          exit "$rc"
+        fi
         echo "upstream-tests/ctest: no tests ran in '$dir'. The package is probably configured with tests disabled (BUILD_TESTING=OFF or a project-specific switch); enable them in the cmake/configure opts. Also check that 'dir' is the cmake build directory and that ignore/args do not filter out every test." >&2
+        rm -f "$log" "$rcfile"
         exit 1
       fi
       fail=${fail:-0}
@@ -136,7 +180,7 @@ pipeline:
       sed -n '/^The following tests FAILED:/,/^[^[:space:]]/p' "$log" \
         | sed -nE 's/^[[:space:]]+[0-9]+ - (.*) \([^()]*\)([[:space:]].*)?$/\1/p' \
         | while read -r t; do echo "UPSTREAM-TESTS-FAIL ${PKG}: $t"; done
-      rm -f "$log"
+      rm -f "$log" "$rcfile"
       if [ "$rc" -eq 0 ] && [ "$fail" -ne 0 ]; then
         rc=1
       fi

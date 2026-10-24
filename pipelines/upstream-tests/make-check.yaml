@@ -8,23 +8,54 @@ description: |
 
   The suite is a hard gate. The step fails if:
     - a test that is not in `ignore` fails (automake FAIL, XPASS or ERROR),
+      or a recognised summary reports failures,
     - make fails for any reason other than test failures (missing target,
       test build error, timeout),
-    - the suite did not actually run (no automake test passed, make had
-      nothing to do for the target, or an automake tree recursed through
-      `make check` without running any tests).
+    - the suite did not actually run: no test passed, make had nothing to
+      do for the target, or, with `harness: auto` and no recognised summary,
+      the target printed a "check target not available" / "no tests to run"
+      style message or an automake tree recursed through `make check`
+      without running any tests.
 
-  For automake parallel-harness suites (any "# TOTAL:" summary block), the
-  counts are summed across all subdirectories. Prints the full make log,
-  test-suite.log of any directory with failures, then:
+  Prints the full make log, test-suite.log of any directory with failures,
+  then:
     UPSTREAM-TESTS <package>: duration=<n>s
     UPSTREAM-TESTS-FAIL <package>: <test>      (one per non-ignored failure)
     UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>]
-  where fail = FAIL + XPASS + ERROR (automake semantics) including ignored
-  ones, and ignored = how many of those were in `ignore`. Other harnesses
-  (plain Makefiles, custom `make test`) are gated on make's exit status only
-  and report pass=unknown fail=unknown skip=unknown; `ignore` cannot be
-  honoured there.
+
+  Counts come from the first of these summary formats found in the log,
+  summed across subdirectories:
+    - automake parallel harness: the "# TOTAL:", "# PASS:", ... blocks.
+      fail = FAIL + XPASS + ERROR including ignored ones; ignored = how many
+      of those were in `ignore`.
+    - automake serial harness (automake <= 1.11 or `serial-tests`):
+      "All N tests passed", "All N tests behaved as expected (X expected
+      failures)", "F of N tests failed", "F of N tests did not behave as
+      expected (...)", "(S tests were not run)". In the "F of N" forms,
+      pass includes any expected failures.
+    - e2fsprogs style: "N tests succeeded  F tests failed". skip=unknown
+      (skipped tests count as succeeded).
+    - Perl Test::Harness: "Files=N, Tests=..." and "Failed F/N test
+      programs". Counted in test programs (t/*.t), not assertions;
+      skip=unknown.
+    - "Test suite summary: pass: P/N, skip: S/N, fail: F/N" (jemalloc).
+    - "Tests OK: N of M" and "Tests FAILED: F of M" (jp2a).
+  `ignore` is only honoured for the two automake formats. Anything else
+  (plain Makefiles, custom `make test`) is gated on make's exit status only
+  and reports pass=unknown fail=unknown skip=unknown.
+
+  Some suites run from automake's `check-local` hook or a hand-written rule
+  rather than TESTS. They print "Making check in ..." but no automake result
+  lines, which `harness: auto` treats as "no tests ran". Set
+  `harness: custom` for those, once you have checked that the suite really
+  runs and that a failing test makes make exit non-zero. The step then
+  relies on make's exit status, plus any summary format it recognises.
+
+  Test suites often expect tools the build environment lacks. This pipeline
+  always adds bash, because many test-driver and test scripts are
+  #!/bin/bash. Common additions to the calling package's environment are
+  diffutils (busybox diff lacks options such as -c), gawk, tzdata and
+  procps. Add each with a comment saying the suite needs it.
 
   Examples:
     - uses: autoconf/make
@@ -36,6 +67,11 @@ description: |
         dir: build
         args: VERBOSE=1
 
+    # tests/ runs its suite from check-local and exits non-zero on failure.
+    - uses: upstream-tests/make-check
+      with:
+        harness: custom
+
   Named exceptions go in ignore: space-separated test names as automake
   prints them on its "FAIL: <name>" lines (the basename also matches). Each
   ignored test still runs and is reported as IGNORE. Every exception needs a
@@ -46,6 +82,10 @@ description: |
     - uses: upstream-tests/make-check
       with:
         ignore: foo_unittest
+
+needs:
+  packages:
+    - bash
 
 inputs:
   target:
@@ -67,6 +107,15 @@ inputs:
       Space-separated test names whose failures are allowed (automake
       harness only). Each one needs a comment and TODO in the caller.
     default: ""
+  harness:
+    description: |
+      auto (default) or custom. custom skips the "automake recursed but ran
+      no tests" check and the "no tests to run" message check, for suites
+      run from check-local or a hand-written rule, and relies on make's exit
+      status plus any summary format it recognises. Only use it when you
+      have checked that the suite runs and a failing test makes make exit
+      non-zero.
+    default: auto
   timeout:
     description: Wall-clock limit for the whole suite, in seconds.
     default: "3600"
@@ -77,6 +126,14 @@ pipeline:
       PKG="${{package.name}}"
       targets="${{inputs.target}}"
       ignore=" $(echo ${{inputs.ignore}}) "
+      harness="${{inputs.harness}}"
+      case "$harness" in
+        auto|custom) ;;
+        *)
+          echo "UPSTREAM-TESTS ${PKG}: FAILED: harness must be auto or custom, not '$harness'"
+          exit 1
+          ;;
+      esac
       cd "${{inputs.dir}}"
       log=$(mktemp)
       start=$(date +%s)
@@ -103,14 +160,72 @@ pipeline:
         fi
       done
 
+      # Pick the summary format. Counts stay "unknown" if none matches.
+      fmt=custom
+      pass=unknown fail=unknown skip=unknown xfail=0 total=unknown
       if grep -qE '^# TOTAL: +[0-9]+' "$log"; then
         # automake parallel harness: sum the per-directory summary blocks.
+        fmt=automake
         set -- $(awk '
           /^# TOTAL: /{t+=$3} /^# PASS: /{p+=$3} /^# SKIP: /{s+=$3}
           /^# XFAIL: /{xf+=$3} /^# FAIL: /{f+=$3} /^# XPASS: /{xp+=$3}
           /^# ERROR: /{e+=$3}
           END {print t+0, p+0, s+0, xf+0, f+xp+e}' "$log")
         total=$1 pass=$2 skip=$3 xfail=$4 fail=$5
+      elif grep -qE '^((All [0-9]+ tests|1 test) (passed|behaved as expected)|[0-9]+ of [0-9]+ tests? (failed|did not behave as expected))' "$log"; then
+        # automake serial harness: one banner per directory. N excludes
+        # skipped tests; F counts both FAIL and XPASS. With exactly one
+        # test, automake drops "All" ("1 test passed").
+        fmt=automake
+        set -- $(awk '
+          /^(All [0-9]+ tests|1 test) passed/ { o = ($1 == "All"); p+=$(1+o) }
+          /^(All [0-9]+ tests|1 test) behaved as expected \([0-9]+ expected/ {
+            o = ($1 == "All"); x=$(6+o); sub(/^\(/, "", x); p+=$(1+o)-x; xf+=x }
+          /^[0-9]+ of [0-9]+ tests? (failed|did not behave as expected)/ {
+            f+=$1; p+=$3-$1 }
+          /^\([0-9]+ tests? (was|were) not run\)/ {
+            n=$1; sub(/^\(/, "", n); s+=n }
+          END {print p+f+xf+s, p+0, s+0, xf+0, f+0}' "$log")
+        total=$1 pass=$2 skip=$3 xfail=$4 fail=$5
+      elif grep -qE '^[0-9]+ tests succeeded[[:space:]]+[0-9]+ tests failed' "$log"; then
+        fmt=e2fsprogs
+        set -- $(awk '
+          /^[0-9]+ tests succeeded[[:space:]]+[0-9]+ tests failed/ {p+=$1; f+=$4}
+          END {print p+0, f+0}' "$log")
+        pass=$1 fail=$2
+      elif grep -qE '^Files=[0-9]+, Tests=[0-9]+' "$log"; then
+        # Perl Test::Harness ("make test" of a Makefile.PL tree), counted in
+        # test programs (t/*.t files), not assertions.
+        fmt=tap
+        set -- $(awk '
+          /^Files=[0-9]+, Tests=[0-9]+/ {
+            n=$1; sub(/^Files=/, "", n); sub(/,$/, "", n); t+=n }
+          /^Failed [0-9]+\/[0-9]+ test programs/ {
+            split($2, a, "/"); f+=a[1] }
+          END {print t-f, f+0}' "$log")
+        pass=$1 fail=$2
+      elif grep -qE '^Test suite summary: pass: [0-9]+/[0-9]+, skip: [0-9]+/[0-9]+, fail: [0-9]+/' "$log"; then
+        # jemalloc's test/test.sh, one line per suite (unit, integration, ...).
+        fmt=testsh
+        set -- $(awk '
+          /^Test suite summary: pass: [0-9]+\/[0-9]+, skip: [0-9]+\/[0-9]+, fail: [0-9]+\// {
+            split($5, a, "/"); p+=a[1]; split($7, a, "/"); s+=a[1]; split($9, a, "/"); f+=a[1] }
+          END {print p+0, f+0, s+0}' "$log")
+        pass=$1 fail=$2 skip=$3
+      elif grep -qE '^Tests OK *: *[0-9]+ of [0-9]+' "$log"; then
+        fmt=okfailed
+        set -- $(awk '
+          /^Tests OK *: *[0-9]+ of [0-9]+/ {
+            l=$0; sub(/^Tests OK *: */, "", l); split(l, a, " "); p+=a[1]; t+=a[3] }
+          /^Tests FAILED *: *[0-9]+ of [0-9]+/ {
+            l=$0; sub(/^Tests FAILED *: */, "", l); split(l, a, " "); f+=a[1] }
+          END {s=t-p-f; if (s < 0) s=0; print p+0, f+0, s}' "$log")
+        pass=$1 fail=$2 skip=$3
+      fi
+
+      ignored=0
+      nfail=0
+      if [ "$fmt" = automake ]; then
         # Failures that do not come from test results (compile errors in
         # test programs, missing files, ...) are never ignorable.
         bad=$(grep -oE '\*\*\* \[[^]]*\] Error [0-9]+' "$log" \
@@ -122,8 +237,6 @@ pipeline:
         if [ -n "$bad" ]; then
           gate=1; why="$why make failed outside the test harness ($(echo $bad));"
         fi
-        ignored=0
-        nfail=0
         for name in $(grep -E '^(FAIL|XPASS|ERROR): ' "$log" | awk '{print $2}' | sort -u || true); do
           case "$ignore" in
             *" $name "*|*" ${name##*/} "*)
@@ -154,29 +267,64 @@ pipeline:
             cat "$f"
           fi
         done
-        echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
-        extra=""
-        [ "$xfail" -gt 0 ] && extra="$extra xfail=$xfail"
-        [ "$ignored" -gt 0 ] && extra="$extra ignored=$ignored"
-        echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
       else
-        # Custom harness: no per-test counts, gate on make's exit status.
-        # An automake tree whose subdirectories define no TESTS recurses
-        # ("Making check in ...") without running anything: that is not a suite.
-        if grep -q '^Making check in ' "$log" && \
-           ! grep -qE '^(PASS|FAIL|XFAIL|XPASS|SKIP|ERROR): |check-TESTS' "$log"; then
-          gate=1; why="$why automake 'make check' recursed but ran no tests;"
-        fi
-        if [ "$rc" -ne 0 ]; then
-          gate=1; why="$why make $targets exited $rc;"
-          echo "UPSTREAM-TESTS-FAIL ${PKG}: make $targets (exit $rc)"
-        fi
         if [ "$ignore" != "  " ]; then
           echo "WARNING: ignore is only honoured for automake harnesses; '$(echo $ignore)' has no effect here"
         fi
-        echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
-        echo "UPSTREAM-TESTS ${PKG}: pass=unknown fail=unknown skip=unknown"
+        if [ "$fmt" = custom ]; then
+          # No counts. An automake tree whose subdirectories define no TESTS
+          # recurses ("Making check in ...") without running anything.
+          if [ "$harness" = auto ] && grep -q '^Making check in ' "$log" && \
+             ! grep -qE '^(PASS|FAIL|XFAIL|XPASS|SKIP|ERROR): |check-TESTS' "$log"; then
+            gate=1; why="$why automake 'make check' recursed but ran no tests (suites run from check-local or a custom rule need harness: custom);"
+          fi
+          # Hand-written check rules that exit 0 without testing anything.
+          # Skipped with harness: custom, where the caller has checked that
+          # the suite runs (a leaf directory may still say "No tests
+          # defined"). Per-test skip wording ("... not available") is
+          # deliberately not matched.
+          msg=""
+          if [ "$harness" = auto ]; then
+            msg=$(grep -iE 'check target not available|no tests? (to run|available|found|defined)|no test ?suite|test ?suite (is )?not available|nothing to test' "$log" | head -n 1 || true)
+          fi
+          if [ -n "$msg" ]; then
+            gate=1; why="$why suite reports no tests ($msg);"
+          fi
+        else
+          if [ "$fail" -gt 0 ]; then
+            gate=1; why="$why summary reports $fail failure(s);"
+            names=""
+            if [ "$fmt" = e2fsprogs ]; then
+              names=$(grep -E '^Tests failed: ' "$log" | sed 's/^Tests failed: //' || true)
+            elif [ "$fmt" = tap ]; then
+              names=$(grep -E '^[^ ]+ +\(Wstat: ' "$log" | awk '{print $1}' | sort -u || true)
+            fi
+            for name in $names; do
+              echo "UPSTREAM-TESTS-FAIL ${PKG}: $name"
+              nfail=$((nfail + 1))
+            done
+            if [ "$nfail" -eq 0 ]; then
+              echo "UPSTREAM-TESTS-FAIL ${PKG}: $fail test(s) failed (the summary names none)"
+              nfail=1
+            fi
+          fi
+          if [ "$pass" -eq 0 ]; then
+            gate=1; why="$why no tests passed;"
+          fi
+        fi
+        if [ "$rc" -ne 0 ]; then
+          gate=1; why="$why make $targets exited $rc;"
+          if [ "$nfail" -eq 0 ]; then
+            echo "UPSTREAM-TESTS-FAIL ${PKG}: make $targets (exit $rc)"
+          fi
+        fi
       fi
+
+      echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+      extra=""
+      [ "$xfail" -gt 0 ] && extra="$extra xfail=$xfail"
+      [ "$ignored" -gt 0 ] && extra="$extra ignored=$ignored"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
       rm -f "$log"
       if [ "$gate" -ne 0 ]; then
         echo "UPSTREAM-TESTS ${PKG}: FAILED:$why"

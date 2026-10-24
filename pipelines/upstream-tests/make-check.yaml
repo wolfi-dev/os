@@ -12,19 +12,23 @@ description: |
     - make fails for any reason other than test failures (missing target,
       test build error, timeout),
     - the suite did not actually run: no test passed, make had nothing to
-      do for the target, or, with `harness: auto` and no recognised summary,
-      the target printed a "check target not available" / "no tests to run"
-      style message or an automake tree recursed through `make check`
-      without running any tests.
+      do for the target, or, with `harness: auto`, the log has none of the
+      summary formats below (for example PGXS's '"make check" is not
+      supported', an empty check rule, or an automake tree with no TESTS).
+      The reason then says "no recognised test summary", or names the
+      "no tests to run" style message or the automake recursion that ran
+      nothing.
 
-  Prints the full make log, test-suite.log of any directory with failures,
-  then:
+  Streams the make output as the suite runs (a background tail of the log
+  make writes, so the step still ends when make does), prints
+  test-suite.log of any automake directory with failures and the autotest
+  testsuite.log (first 5000 lines) when an autotest suite fails, then:
     UPSTREAM-TESTS <package>: duration=<n>s
     UPSTREAM-TESTS-FAIL <package>: <test>      (one per non-ignored failure)
     UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>]
 
   Counts come from the first of these summary formats found in the log,
-  summed across subdirectories:
+  summed across subdirectories, plus any GNU Autotest suite:
     - automake parallel harness: the "# TOTAL:", "# PASS:", ... blocks.
       fail = FAIL + XPASS + ERROR including ignored ones; ignored = how many
       of those were in `ignore`.
@@ -40,16 +44,24 @@ description: |
       skip=unknown.
     - "Test suite summary: pass: P/N, skip: S/N, fail: F/N" (jemalloc).
     - "Tests OK: N of M" and "Tests FAILED: F of M" (jp2a).
-  `ignore` is only honoured for the two automake formats. Anything else
-  (plain Makefiles, custom `make test`) is gated on make's exit status only
-  and reports pass=unknown fail=unknown skip=unknown.
+    - "Total N tests, no errors" / "Total N tests, E errors, L leaks"
+      (libxml2, libxslt runtest). skip=unknown.
+    - "Summary:" followed by "succeeded: N", "failed: N", "skipped: N"
+      (stunnel).
+    - GNU Autotest, alone or added to any of the above: "[All] N tests
+      were successful.", "N tests behaved as expected.", "ERROR: N tests
+      were run, M failed unexpectedly." (and its other forms), "S tests
+      were skipped.". Failing tests are named "NUM: title".
+  `ignore` is only honoured for the two automake formats; autotest failures
+  are never ignorable.
 
-  Some suites run from automake's `check-local` hook or a hand-written rule
-  rather than TESTS. They print "Making check in ..." but no automake result
-  lines, which `harness: auto` treats as "no tests ran". Set
-  `harness: custom` for those, once you have checked that the suite really
-  runs and that a failing test makes make exit non-zero. The step then
-  relies on make's exit status, plus any summary format it recognises.
+  A suite with none of these formats needs `harness: custom`: plain
+  Makefiles, custom `make test` rules, and suites run from automake's
+  `check-local` hook that print their own wording. Set it once you have
+  checked that the suite really runs and that a failing test makes make
+  exit non-zero. The step then relies on make's exit status, plus any
+  summary format it recognises, and reports pass=unknown fail=unknown
+  skip=unknown.
 
   Test suites often expect tools the build environment lacks. This pipeline
   always adds bash, because many test-driver and test scripts are
@@ -67,7 +79,8 @@ description: |
         dir: build
         args: VERBOSE=1
 
-    # tests/ runs its suite from check-local and exits non-zero on failure.
+    # `make check` runs tests/run.sh, which prints no summary this
+    # pipeline reads but exits non-zero when a test fails.
     - uses: upstream-tests/make-check
       with:
         harness: custom
@@ -109,12 +122,13 @@ inputs:
     default: ""
   harness:
     description: |
-      auto (default) or custom. custom skips the "automake recursed but ran
-      no tests" check and the "no tests to run" message check, for suites
-      run from check-local or a hand-written rule, and relies on make's exit
-      status plus any summary format it recognises. Only use it when you
-      have checked that the suite runs and a failing test makes make exit
-      non-zero.
+      auto (default) or custom. auto fails a suite whose log has no
+      recognised summary format. custom accepts it (and skips the
+      "automake recursed but ran no tests" and "no tests to run" message
+      checks), for suites that report only through make's exit status,
+      such as a hand-written rule or a check-local suite with its own
+      wording. Only use it when you have checked that the suite runs and a
+      failing test makes make exit non-zero.
     default: auto
   timeout:
     description: Wall-clock limit for the whole suite, in seconds.
@@ -137,11 +151,24 @@ pipeline:
       cd "${{inputs.dir}}"
       log=$(mktemp)
       start=$(date +%s)
+      # make writes to the file, so the step's lifetime follows make alone:
+      # busybox timeout signals only make's pid, and a test process that
+      # outlives make (a hung grandchild, a daemon a test script left
+      # behind) must not hold the step open the way it would hold a pipe.
+      # A background tail streams the file while the suite runs, so a hang
+      # shows where it stopped; it is display only, the parse below reads
+      # the file. tail -f polls once a second: the sleep lets it print the
+      # last lines before it is stopped.
+      tail -n +1 -f "$log" &
+      tailpid=$!
+      trap 'kill "$tailpid" 2>/dev/null || true' EXIT
       rc=0
       AM_COLOR_TESTS=no timeout ${{inputs.timeout}} \
         make -k -j${{inputs.jobs}} ${{inputs.args}} $targets > "$log" 2>&1 || rc=$?
       duration=$(( $(date +%s) - start ))
-      cat "$log"
+      sleep 2
+      kill "$tailpid" 2>/dev/null || true
+      wait "$tailpid" 2>/dev/null || true
 
       gate=0
       why=""
@@ -221,6 +248,87 @@ pipeline:
             l=$0; sub(/^Tests FAILED *: */, "", l); split(l, a, " "); f+=a[1] }
           END {s=t-p-f; if (s < 0) s=0; print p+0, f+0, s}' "$log")
         pass=$1 fail=$2 skip=$3
+      elif grep -qE '^Total [0-9]+ tests, (no errors|[0-9]+ errors?)' "$log"; then
+        # libxml2/libxslt runtest (from check-local): "Total N tests, no
+        # errors" or "Total N tests, E errors, L leaks", once per runner.
+        fmt=total
+        set -- $(awk '
+          /^Total [0-9]+ tests, (no errors|[0-9]+ errors?)/ {
+            t+=$2; if ($4 != "no") f+=$4 }
+          END {print t-f, f+0}' "$log")
+        pass=$1 fail=$2
+      elif grep -qE '^[[:space:]]+succeeded: [0-9]+$' "$log" && grep -q '^Summary:$' "$log"; then
+        # stunnel's tests/maketest.py: "Summary:" then indented
+        # "succeeded: N", "failed: N" and "skipped: N" lines.
+        set -- $(awk '
+          /^Summary:$/ {b=1; next}
+          b && /^[[:space:]]+succeeded: [0-9]+$/ {p+=$2; n++; next}
+          b && /^[[:space:]]+failed: [0-9]+$/ {f+=$2; next}
+          b && /^[[:space:]]+skipped: [0-9]+$/ {s+=$2; next}
+          {b=0}
+          END {print n+0, p+0, f+0, s+0}' "$log")
+        if [ "$1" -gt 0 ]; then
+          fmt=summary
+          pass=$2 fail=$3 skip=$4
+        fi
+      fi
+      # GNU Autotest (a "testsuite" script, usually run from check-local),
+      # alone or next to automake's TESTS. After its "## Test results. ##"
+      # box it prints one of:
+      #   [All ]N tests were successful.  /  [All ]N tests behaved as expected.
+      #   ERROR: [All ]N tests were run,
+      #   M failed unexpectedly.  /  M failed (X expected failures).  /
+      #   M passed unexpectedly[,]  /  M did not behave as expected (...).
+      # then "S tests were skipped." N excludes skipped tests; M in
+      # "M failed (X expected ...)" includes the expected failures.
+      set -- $(awk '
+        function fin() {
+          if (st == 2) {
+            if (bae && xl > 0) xf = (xl < n ? xl : n)
+            p += n - u - xf; f += u; x += xf; seen++ }
+          st = 0; n = 0; u = 0; xf = 0; bae = 0 }
+        /^ *[0-9]+: .*[[:space:]]expected failure( \(.*\))?$/ { xl++ }
+        /^## Test results\. ##$/ { fin(); st = 1; next }
+        st == 1 && (/^## -+ ##$/ || /^$/) { next }
+        st == 1 {
+          l = $0; sub(/^ERROR: /, "", l); sub(/^All /, "", l)
+          if (l !~ /^[0-9]+ tests? (was|were) (successful\.|run,)/ && l !~ /^[0-9]+ tests? behaved as expected\.$/) {
+            st = 0; next }
+          n = l + 0; st = 2
+          if (l ~ /behaved as expected/) bae = 1
+          if (l ~ / run, one (failed|passed) unexpectedly/) u = 1
+          next }
+        st == 2 && /^[0-9]+ failed \([0-9]+ expected failures?\)/ {
+          y = $3; sub(/^\(/, "", y); xf += y; u += $1 - y; next }
+        st == 2 && /^[0-9]+ (failed|passed) unexpectedly/ { u += $1; next }
+        st == 2 && /^[0-9]+ did not behave as expected/ { u += $1; next }
+        st == 2 && /^[0-9]+ tests? (was|were) skipped\.$/ { s += $1; next }
+        st == 2 { fin() }
+        END { fin(); print seen + 0, p + 0, f + 0, s + 0, x + 0 }' "$log")
+      atseen=$1 atpass=$2 atfail=$3 atskip=$4 atxfail=$5
+      if [ "$atseen" -gt 0 ]; then
+        if [ "$fmt" = custom ]; then
+          fmt=autotest
+          pass=$atpass fail=$atfail skip=$atskip xfail=$atxfail
+        else
+          # Added to the other format's counts (e.g. automake TESTS plus
+          # an autotest suite, or dpkg's perl t/ plus its autotest suite).
+          pass=$((pass + atpass)) fail=$((fail + atfail)) xfail=$((xfail + atxfail))
+          if [ "$skip" != unknown ]; then
+            skip=$((skip + atskip))
+          fi
+          if [ "$total" != unknown ]; then
+            total=$((total + atpass + atfail + atskip + atxfail))
+          fi
+        fi
+      fi
+      # Autotest names a failing test on its own line:
+      #   " 270: Null nonterminals          FAILED (counterexample.at:621)"
+      atnames=""
+      if [ "$atseen" -gt 0 ] && [ "$atfail" -gt 0 ]; then
+        atnames=$(awk '/^ *[0-9]+: .*[[:space:]](FAILED \(.*\)|UNEXPECTED PASS)$/ {
+            l = $0; sub(/^ */, "", l); sub(/[[:space:]]+(FAILED \(.*\)|UNEXPECTED PASS)$/, "", l)
+            gsub(/[[:space:]]+/, " ", l); print l }' "$log" | sort -un)
       fi
 
       ignored=0
@@ -228,16 +336,22 @@ pipeline:
       if [ "$fmt" = automake ]; then
         # Failures that do not come from test results (compile errors in
         # test programs, missing files, ...) are never ignorable.
-        bad=$(grep -oE '\*\*\* \[[^]]*\] Error [0-9]+' "$log" \
+        bad=""
+        if [ "$atfail" -eq 0 ]; then
+          # (A failing autotest suite fails its own make rule, e.g.
+          # check-local, so this is only meaningful when it passed.)
+          bad=$(grep -oE '\*\*\* \[[^]]*\] Error [0-9]+' "$log" \
           | sed -E 's/^\*\*\* \[(.*: )?([^]]*)\] Error [0-9]+$/\2/' \
-          | grep -vxE 'test-suite\.log|check-TESTS|check-am|check-recursive|check|.*-recursive|.*-am' || true)
+            | grep -vxE 'test-suite\.log|check-TESTS|check-am|check-recursive|check|.*-recursive|.*-am' || true)
+        fi
         for t in $targets; do
           bad=$(echo "$bad" | grep -vxF "$t" || true)
         done
         if [ -n "$bad" ]; then
           gate=1; why="$why make failed outside the test harness ($(echo $bad));"
         fi
-        for name in $(grep -E '^(FAIL|XPASS|ERROR): ' "$log" | awk '{print $2}' | sort -u || true); do
+        # "ERROR: N tests were run," is autotest's summary, not a test.
+        for name in $(grep -E '^(FAIL|XPASS|ERROR): ' "$log" | grep -vE '^ERROR: (All )?[0-9]+ tests? (was|were) run' | awk '{print $2}' | sort -u || true); do
           case "$ignore" in
             *" $name "*|*" ${name##*/} "*)
               echo "IGNORE ${PKG}: $name"
@@ -249,10 +363,20 @@ pipeline:
               ;;
           esac
         done
+        if [ "$atfail" -gt 0 ]; then
+          # Autotest failures are not ignorable.
+          if [ -n "$atnames" ]; then
+            printf '%s\n' "$atnames" | awk -v p="$PKG" '{print "UPSTREAM-TESTS-FAIL " p ": " $0}'
+            nfail=$((nfail + $(printf '%s\n' "$atnames" | wc -l)))
+          else
+            echo "UPSTREAM-TESTS-FAIL ${PKG}: $atfail autotest test(s) failed (the summary names none)"
+            nfail=$((nfail + 1))
+          fi
+        fi
         if [ "$nfail" -gt 0 ]; then
           gate=1; why="$why $nfail non-ignored failing test(s);"
         fi
-        if [ "$fail" -gt 0 ] && [ "$nfail" -eq 0 ] && [ "$ignored" -eq 0 ]; then
+        if [ "$((fail - atfail))" -gt 0 ] && [ "$nfail" -eq 0 ] && [ "$ignored" -eq 0 ]; then
           gate=1; why="$why summary reports $fail failure(s) but no FAIL/XPASS/ERROR lines found;"
         fi
         if [ "$rc" -ne 0 ] && [ "$fail" -eq 0 ]; then
@@ -290,6 +414,13 @@ pipeline:
           if [ -n "$msg" ]; then
             gate=1; why="$why suite reports no tests ($msg);"
           fi
+          # Anything else that exits 0 without a summary this step can read
+          # (PGXS "make check is not supported", an empty check rule, a
+          # non-recursive automake tree with no TESTS, ...) has not shown
+          # that any test ran.
+          if [ "$harness" = auto ] && [ "$gate" -eq 0 ] && [ "$rc" -eq 0 ]; then
+            gate=1; why="$why no recognised test summary; set harness: custom if this suite reports only via exit status;"
+          fi
         else
           if [ "$fail" -gt 0 ]; then
             gate=1; why="$why summary reports $fail failure(s);"
@@ -303,6 +434,10 @@ pipeline:
               echo "UPSTREAM-TESTS-FAIL ${PKG}: $name"
               nfail=$((nfail + 1))
             done
+            if [ -n "$atnames" ]; then
+              printf '%s\n' "$atnames" | awk -v p="$PKG" '{print "UPSTREAM-TESTS-FAIL " p ": " $0}'
+              nfail=$((nfail + $(printf '%s\n' "$atnames" | wc -l)))
+            fi
             if [ "$nfail" -eq 0 ]; then
               echo "UPSTREAM-TESTS-FAIL ${PKG}: $fail test(s) failed (the summary names none)"
               nfail=1
@@ -318,6 +453,16 @@ pipeline:
             echo "UPSTREAM-TESTS-FAIL ${PKG}: make $targets (exit $rc)"
           fi
         fi
+      fi
+
+      # Autotest writes each failing test's full log to testsuite.log.
+      if [ "$atfail" -gt 0 ]; then
+        for f in $(find . -name testsuite.log | sort); do
+          if grep -qE '^ERROR: (All )?[0-9]+ tests? (was|were) run' "$f"; then
+            echo "===== $f ====="
+            awk -v f="$f" 'NR <= 5000 { print } END { if (NR > 5000) print "===== " f ": " NR - 5000 " more lines not shown =====" }' "$f"
+          fi
+        done
       fi
 
       echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"

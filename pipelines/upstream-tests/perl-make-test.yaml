@@ -1,0 +1,317 @@
+name: Perl upstream test suite (make test / ./Build test)
+
+description: |
+  Runs a Perl distribution's upstream test suite (the t/*.t files, through
+  Test::Harness) in the freshly built tree: `make test` for
+  ExtUtils::MakeMaker dists, `perl Build test` for Module::Build dists. Use
+  it right after the main build step (`perl/make` + `autoconf/make`, or
+  `perl Build`), before `autoconf/make-install` / `perl Build install`. It
+  makes no network assumptions.
+
+  The suite is a hard gate. The step fails if:
+    - a test file that is not in `ignore` fails (failed subtests, non-zero
+      exit, bad plan, crash or per-test timeout),
+    - make/Build fails for any reason other than test failures (missing
+      target, timeout),
+    - the suite did not actually run (no Test::Harness summary, "No tests
+      defined", Result: NOTESTS, or no subtest passed because everything
+      was skipped).
+
+  A dist whose whole suite skips in the build sandbox (every file
+  skip_all, e.g. network-only or optional-module-only tests) fails the
+  did-not-run rule, and `ignore` can't help because it names failing files.
+  Such dists don't call this pipeline: there is nothing to gate on. Record
+  them as NO-TESTS in the rollout catalog rather than filing a pipeline bug.
+
+  Tests run verbosely (TEST_VERBOSE=1 / --verbose) so that skipped and TODO
+  subtests can be counted; Test::Harness buffers each file's output, so
+  this works with parallel jobs. Prints the log minus plain passing "ok N"
+  lines (the count is shown), then:
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS-FAIL <package>: <file>      (one per non-ignored failing file)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>]
+  summed over every Test::Harness summary in the log. pass = subtests run
+  (Files=N, Tests=M) minus failed, skipped and expected-failure (TODO)
+  subtests; fail = failed subtests per file from the "Test Summary Report"
+  block, counting a failing file with no failed subtest (non-zero exit, bad
+  plan, crash) as 1, including ignored files; skip = "# skip" subtests plus
+  whole files skipped with skip_all (1 each); xfail = "not ok ... # TODO"
+  subtests; ignored = failing files that were in `ignore`.
+
+  On failure, a HINT line names perl modules that tests could not load
+  ("Can't locate Foo/Bar.pm in @INC") and that are missing from the build
+  environment, with a guessed package name (perl-foo-bar). These are
+  usually the package's runtime dependencies or test-only modules
+  (Test::Needs, Test::Fatal, Test::Warnings, ...); add the packages that
+  provide them to environment.contents.packages. When xt/ author tests ran
+  and failed (some Makefile.PLs enable them in a git checkout), a HINT
+  suggests `args: TEST_FILES=t/*.t`.
+
+  Examples:
+    - uses: perl/make
+    - uses: autoconf/make
+    - uses: upstream-tests/perl-make-test
+    - uses: autoconf/make-install
+
+    - runs: |
+        perl Build.PL --installdirs=vendor
+        perl Build
+    - uses: upstream-tests/perl-make-test
+      with:
+        jobs: 1
+        timeout: 1800
+
+  Named exceptions go in ignore: space-separated test files as
+  Test::Harness prints them (e.g. t/foo.t; the basename also matches).
+  Each ignored file still runs and is reported as IGNORE if it fails. Every
+  exception needs a comment in the calling package explaining why and a
+  `TODO(upstream-tests): ...` to remove it:
+    # t/net.t resolves www.cpan.org; the build sandbox has no network.
+    # TODO(upstream-tests): make the test skip without network upstream.
+    - uses: upstream-tests/perl-make-test
+      with:
+        ignore: t/net.t
+
+needs:
+  packages:
+    - perl
+
+inputs:
+  target:
+    description: |
+      make (or Build) target that runs the suite, e.g. test, test_dynamic or
+      testdb.
+    default: test
+  tool:
+    description: |
+      How to run the target: `make` (ExtUtils::MakeMaker Makefile), `build`
+      (`perl Build <target>`, Module::Build), or `auto`: build if a Build
+      script exists and there is no Makefile, make otherwise.
+    default: auto
+  jobs:
+    description: Parallel test files (HARNESS_OPTIONS=j<n>, TEST_JOBS).
+    default: "$(nproc)"
+  dir:
+    description: Directory (relative to the build workspace) containing the Makefile or Build script.
+    default: "."
+  args:
+    description: |
+      Extra make/Build arguments, e.g. `TEST_FILES="t/*.t xt/*.t"` or
+      `--test_files t/basic.t`.
+    default: ""
+  ignore:
+    description: |
+      Space-separated test files (e.g. t/foo.t) whose failures are allowed.
+      Each one needs a comment and TODO in the caller.
+    default: ""
+  timeout:
+    description: |
+      Per-test-file timeout in seconds (each test's perl is run under
+      `timeout` through HARNESS_PERL); a killed test counts as a failure.
+    default: "900"
+  overall-timeout:
+    description: Wall-clock limit for the whole suite, in seconds.
+    default: "3600"
+
+pipeline:
+  - name: upstream-tests (perl make test)
+    runs: |
+      PKG="${{package.name}}"
+      target="${{inputs.target}}"
+      ignore=" $(echo ${{inputs.ignore}}) "
+      cd "${{inputs.dir}}"
+      tool="${{inputs.tool}}"
+      if [ "$tool" = auto ]; then
+        tool=make
+        if [ -f Build ] && [ ! -f Makefile ]; then
+          tool=build
+        fi
+      fi
+      case "$tool" in
+        make)
+          if [ ! -f Makefile ]; then
+            echo "upstream-tests/perl-make-test: no Makefile in '${{inputs.dir}}'; run perl/make and autoconf/make first, or set dir/tool" >&2
+            exit 1
+          fi
+          set -- make "$target" TEST_VERBOSE=1 ;;
+        build)
+          if [ ! -f Build ]; then
+            echo "upstream-tests/perl-make-test: no Build script in '${{inputs.dir}}'; run 'perl Build.PL' and 'perl Build' first, or set dir/tool" >&2
+            exit 1
+          fi
+          # --verbose, not verbose=1: Module::Build takes either, but
+          # Module::Build::Tiny only parses --options and silently ignores
+          # verbose=1, which loses the skip/TODO counts.
+          set -- perl Build "$target" --verbose ;;
+        *)
+          echo "upstream-tests/perl-make-test: tool must be auto, make or build (got '$tool')" >&2
+          exit 1 ;;
+      esac
+      wrap=""
+      hp=""
+      if command -v timeout >/dev/null 2>&1; then
+        wrap="timeout ${{inputs.overall-timeout}}"
+        # Test::Harness runs every perl test file with $HARNESS_PERL.
+        hp=$(mktemp)
+        printf '#!/bin/sh\nexec timeout %s %s "$@"\n' "${{inputs.timeout}}" "$(command -v perl)" > "$hp"
+        chmod +x "$hp"
+        export HARNESS_PERL="$hp"
+      fi
+      export HARNESS_OPTIONS="j${{inputs.jobs}}" TEST_JOBS="${{inputs.jobs}}"
+      export NONINTERACTIVE_TESTING=1 PERL_MM_USE_DEFAULT=1
+      log=$(mktemp)
+      start=$(date +%s)
+      rc=0
+      $wrap "$@" ${{inputs.args}} > "$log" 2>&1 || rc=$?
+      duration=$(( $(date +%s) - start ))
+      # Verbose TAP has one line per subtest (50k+ for some dists). Print the
+      # log without plain passing "ok N" lines; skip/TODO lines, failures,
+      # diagnostics and the harness summary are kept.
+      awk '/^[[:space:]]*ok [0-9]+/ && tolower($0) !~ /#[[:space:]]*(skip|todo)/ { n++; next }
+        { print }
+        END { if (n) print "upstream-tests/perl-make-test: " n " passing \"ok\" lines omitted from the log above" }' "$log"
+      if [ -n "$hp" ]; then
+        rm -f "$hp"
+      fi
+
+      gate=0
+      why=""
+      # coreutils timeout exits 124; busybox timeout kills with SIGTERM, so
+      # the shell sees 143. Treat any signal exit as a timeout/abort, unless
+      # the harness got as far as its "Result:" line: `perl Build test` runs
+      # Test::Harness in-process and it dies after the summary when a file
+      # fails, which can exit 255. Failing files are judged below (so
+      # `ignore` works on the Build path too), and a non-zero exit with no
+      # failing file is still caught there.
+      if [ "$rc" -eq 124 ] || { [ "$rc" -ge 128 ] && ! grep -q '^Result: ' "$log"; }; then
+        gate=1; why="$why timed out or killed (exit $rc, limit ${{inputs.overall-timeout}}s);"
+      fi
+      if grep -qE "No rule to make target|^No action '[^']*' defined" "$log"; then
+        gate=1; why="$why missing target '$target';"
+      fi
+
+      # "Files=3, Tests=12,  0 wallclock secs (...)", once per harness run.
+      set -- $(awk '/^Files=[0-9]+, Tests=[0-9]+,/ {
+          n++; split($1, a, "="); split($2, b, "="); f += a[2]; t += b[2] }
+        END { print n + 0, f + 0, t + 0 }' "$log")
+      runs=$1 files=$2 tests=$3
+      if [ "$runs" -eq 0 ]; then
+        gate=1; why="$why no Test::Harness summary (Files=N, Tests=M) in the log: the suite did not run;"
+      fi
+      # "No tests defined for Foo extension." is also printed by MakeMaker
+      # sub-extensions (e.g. Template::Stash::XS in its own directory) while
+      # the top-level suite runs, so it only counts when no harness ran.
+      if grep -q '^Result: NOTESTS' "$log" || \
+         { [ "$runs" -eq 0 ] && grep -qE '^No tests defined for .* extension\.' "$log"; }; then
+        gate=1; why="$why no tests ran (No tests defined / Result: NOTESTS);"
+      fi
+      # Top-level TAP lines (verbose mode); subtest lines are indented.
+      skip=$(grep -ciE '^ok [0-9]+.*#[[:space:]]*skip' "$log" || true)
+      xfail=$(grep -ciE '^not ok [0-9]+.*#[[:space:]]*todo' "$log" || true)
+      if [ "$tests" -gt 0 ] && ! grep -qE '^(not )?ok [0-9]+' "$log"; then
+        echo "upstream-tests/perl-make-test: WARNING: no TAP lines in the log ($tool $target did not run verbosely?); skip and xfail counts are incomplete"
+      fi
+      skipfiles=$(grep -cE '^[^[:space:]].* \.+ skipped: ' "$log" || true)
+      # "Test Summary Report" blocks: "<file> (Wstat: N ... Tests: N Failed: N)"
+      # followed by indented detail lines. A file is failing if it has failed
+      # subtests, a non-zero wait status or a parse error; "TODO passed" alone
+      # is not a failure. Prints "<fail-count> <failed-subtests> <killed> <file>".
+      failing=$(awk '
+        function flush() {
+          if (file != "" && bad) print (nf > 0 ? nf : 1), nf, killed, file
+          file = ""; bad = 0; nf = 0; killed = 0 }
+        /^Test Summary Report/ { inblk = 1; next }
+        inblk && /^Files=[0-9]+, Tests=/ { flush(); inblk = 0; next }
+        inblk && /^[^[:space:]-].* \(Wstat: [0-9]+.*Failed: [0-9]+\)$/ {
+          flush()
+          file = $0; sub(/ +\(Wstat: .*$/, "", file)
+          w = $0; sub(/^.* \(Wstat: /, "", w); sub(/[^0-9].*$/, "", w)
+          f = $0; sub(/^.*Failed: /, "", f); sub(/\)$/, "", f)
+          nf = f + 0
+          if (nf > 0 || w + 0 != 0) bad = 1
+          if ($0 ~ /\(Signal: (TERM|KILL)\)|\(exited 124\)/) killed = 1
+          next }
+        inblk && /^[[:space:]]+(Parse errors|Non-zero (exit|wait) status|Failed tests?):/ { bad = 1 }
+        END { flush() }' "$log")
+      fail=0
+      failsub=0
+      nfail=0
+      ignored=0
+      flist=$(mktemp)
+      if [ -n "$failing" ]; then
+        printf "%s\n" "$failing" > "$flist"
+      fi
+      while read -r n nsub killed file; do
+        fail=$((fail + n))
+        failsub=$((failsub + nsub))
+        if [ "$killed" -eq 1 ]; then
+          echo "upstream-tests/perl-make-test: $file was killed (per-test timeout ${{inputs.timeout}}s?)"
+        fi
+        case "$ignore" in
+          *" $file "*|*" ${file##*/} "*)
+            echo "IGNORE ${PKG}: $file"
+            ignored=$((ignored + 1)) ;;
+          *)
+            echo "UPSTREAM-TESTS-FAIL ${PKG}: $file"
+            nfail=$((nfail + 1)) ;;
+        esac
+      done < "$flist"
+      rm -f "$flist"
+      for i in $ignore; do
+        if ! printf '%s\n' "$failing" | awk -v i="$i" '{ f = $0; sub(/^[0-9]+ [0-9]+ [01] /, "", f); b = f; sub(/^.*\//, "", b) } f == i || b == i { found = 1 } END { exit !found }'; then
+          echo "upstream-tests/perl-make-test: WARNING: ignore entry '$i' did not fail (stale exception?)"
+        fi
+      done
+      if [ "$nfail" -gt 0 ]; then
+        gate=1; why="$why $nfail non-ignored failing test file(s);"
+      fi
+      if grep -q '^Result: FAIL' "$log" && [ "$nfail" -eq 0 ] && [ "$ignored" -eq 0 ]; then
+        gate=1; why="$why Result: FAIL but no failing file found in the Test Summary Report;"
+      fi
+      if [ "$rc" -ne 0 ] && [ "$nfail" -eq 0 ] && [ "$ignored" -eq 0 ]; then
+        gate=1; why="$why $tool $target exited $rc with no test failures;"
+      fi
+      pass=$((tests - failsub - skip - xfail))
+      [ "$pass" -lt 0 ] && pass=0
+      if [ "$runs" -gt 0 ] && [ "$pass" -eq 0 ]; then
+        gate=1; why="$why no subtest passed (files=$files tests=$tests skip=$((skip + skipfiles))): the suite did not really run;"
+      fi
+      echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+      extra=""
+      [ "$xfail" -gt 0 ] && extra="$extra xfail=$xfail"
+      [ "$ignored" -gt 0 ] && extra="$extra ignored=$ignored"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$((skip + skipfiles))$extra"
+      # On failure, name perl modules that tests could not load ("Can't
+      # locate Foo/Bar.pm in @INC") and that really are missing here: they
+      # are usually the package's runtime dependencies or test-only modules
+      # (Test::Needs, Test::Fatal, ...) absent from the build environment.
+      # The package name is a guess from the module name (perl-foo-bar);
+      # it is really named after the CPAN distribution.
+      mods=""
+      if [ "$gate" -ne 0 ]; then
+        # TAP diagnostics ("# ...") are tests reporting an optional module
+        # they handled (e.g. a prereqs report), not a load failure.
+        mods=$(sed -n -E -e '/^[[:space:]]*#/d' \
+            -e "s/.*Can't locate ([A-Za-z0-9_\/]+)\.pm in @INC.*/\1/p" "$log" \
+          | awk '!seen[$0]++ { gsub(/\//, "::"); print }' \
+          | while read -r m; do
+              if ! perl -Iblib/lib -Iblib/arch -e "require $m" >/dev/null 2>&1; then
+                echo "$m"
+              fi
+            done \
+          | awk 'NR <= 10 { p = tolower($0); gsub(/::/, "-", p)
+              o = o (o ? ", " : "") $0 " (perl-" p "?)" } END { print o }' || true)
+      fi
+      if [ -n "$mods" ]; then
+        echo "upstream-tests/perl-make-test: HINT: tests could not load perl module(s) missing from the build environment: $mods; add the packages that provide them (the package's runtime dependencies and test requirements) to environment.contents.packages"
+      fi
+      # Some Makefile.PLs add the xt/ author tests when they see a git
+      # checkout (the usual stereo source) rather than a CPAN tarball.
+      if [ "$nfail" -gt 0 ] && printf '%s\n' "$failing" | awk '$4 ~ /^xt\// { f = 1 } END { exit !f }'; then
+        echo "upstream-tests/perl-make-test: HINT: xt/ author tests ran and failed (Makefile.PL in author mode, e.g. built from a git checkout); run only t/ as a CPAN install would, with args: TEST_FILES=t/*.t"
+      fi
+      rm -f "$log"
+      if [ "$gate" -ne 0 ]; then
+        echo "UPSTREAM-TESTS ${PKG}: FAILED:$why"
+        exit 1
+      fi

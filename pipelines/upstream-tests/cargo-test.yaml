@@ -1,0 +1,268 @@
+name: Cargo upstream test suite (cargo test)
+
+description: |
+  Runs a Rust package's upstream test suite (unit, integration and doc
+  tests) with `cargo test` against the freshly built tree. Use it right
+  after the main `cargo/build` step (or the `cargo auditable build` step),
+  before installing/stripping.
+
+  It reuses the build's target directory (`<dir>/target`, passed as
+  `--target-dir target` like cargo/build), profile (`--release` by default)
+  and RUSTFLAGS (empty by default, exported even when empty, exactly as
+  cargo/build does), so only the crates under test and the dev-dependencies
+  are compiled. Dev-dependencies are not downloaded by
+  `cargo build`, so the pipeline first runs `cargo fetch --locked` for the
+  host target (the same network use as the build itself; served from the
+  vendor directory when the package vendors). The tests are then compiled
+  (`cargo test --no-run`) and run with `--frozen --offline`.
+
+  The suite is a hard gate. The step fails if:
+    - a test fails (in any test binary or doc test),
+    - a test target does not compile (never ignorable),
+    - a test binary crashes or exits non-zero without a "test result" line,
+    - the suite did not actually run (no "test result" line, or zero tests
+      passed, e.g. everything #[ignore]d or filtered out),
+    - cargo test exceeds overall-timeout.
+  It runs with --no-fail-fast, so every test binary runs even after a
+  failure.
+
+  Prints the full cargo log, then summary lines:
+    UPSTREAM-TESTS-COMPILE <package>: duration=<n>s  (cargo fetch + test build)
+    UPSTREAM-TESTS <package>: duration=<n>s           (test run only)
+    UPSTREAM-TESTS-FAIL <package>: <test>     (one per failing test)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [ignored=<n>]
+  summed over every "test result:" line: pass = passed, fail = failed,
+  skip = #[ignore]d tests, ignored = tests excluded through `ignore`
+  (libtest's "filtered out").
+
+  Example:
+    - uses: cargo/build
+      with:
+        output: foo
+    - uses: upstream-tests/cargo-test
+    - uses: strip
+
+  For a workspace, or a build with non-default features (`args` should
+  select the same features as the build, or cargo recompiles the affected
+  crates):
+    - uses: upstream-tests/cargo-test
+      with:
+        args: --workspace --features pcre2
+
+  Named exceptions go in ignore: space-separated test names exactly as
+  printed in UPSTREAM-TESTS-FAIL, i.e. libtest's module path without the
+  crate name (`tests::parse_empty`, or `parse_empty` for a top-level
+  function in tests/*.rs). They become `-- --skip <name> ... --exact`, so
+  names match exactly, not as substrings, in every test binary; a name
+  that exists in several binaries is skipped in all of them. Doc test names
+  contain spaces and cannot be listed. Passing `--` options also reaches
+  custom (harness = false) test binaries, which may not accept them. Every
+  exception needs a comment in the calling package explaining why and a
+  `TODO(upstream-tests): ...` to remove it:
+    # tests::resolve_host needs network access, which the build has not.
+    # TODO(upstream-tests): drop the ignore once upstream mocks the resolver.
+    - uses: upstream-tests/cargo-test
+      with:
+        ignore: tests::resolve_host
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  dir:
+    description: |
+      Directory containing the Cargo.toml to test, relative to the
+      workspace. Matches the `modroot` default of the cargo/build pipeline.
+    default: "."
+  profile:
+    description: |
+      Cargo profile flags. Must match the build, or cargo recompiles every
+      dependency: `--release` (cargo/build's default), `--profile <name>`,
+      or empty for the dev profile.
+    default: --release
+  rustflags:
+    description: |
+      RUSTFLAGS for the test build. Always exported, even when empty, the
+      same way cargo/build does it (an empty RUSTFLAGS overrides both the
+      environment and `.cargo/config` build.rustflags). It must match the
+      build, or every dependency is recompiled with different flags and the
+      tests run against something other than what ships: with cargo/build,
+      pass the same `rustflags`; with a custom `runs:` build that inherits
+      RUSTFLAGS from `environment:`, pass that value here.
+    default: ""
+  jobs:
+    description: |
+      Parallel compile jobs (cargo test --jobs) and test threads per test
+      binary (RUST_TEST_THREADS).
+    default: "$(nproc)"
+  ignore:
+    description: |
+      Space-separated exact test names to skip (`-- --skip <name> --exact`).
+      Each one needs a comment and TODO in the caller.
+    default: ""
+  args:
+    description: |
+      Extra cargo test arguments, inserted verbatim before `--`, e.g.
+      `--workspace`, `--features foo`, `-p crate`, `--lib --tests`.
+    default: ""
+  overall-timeout:
+    description: |
+      Timeout in seconds for the test build plus the test run (libtest has
+      no per-test timeout; it only warns about tests running over 60s).
+    default: "7200"
+
+pipeline:
+  - name: upstream-tests (cargo test)
+    runs: |
+      PKG="${{package.name}}"
+      dir="${{inputs.dir}}"
+      if [ ! -f "$dir/Cargo.toml" ]; then
+        echo "upstream-tests/cargo-test: no Cargo.toml in '$dir'; set 'dir' to the cargo/build modroot" >&2
+        exit 1
+      fi
+      cd "$dir"
+      export RUSTFLAGS="${{inputs.rustflags}}"
+      export RUST_TEST_THREADS=${{inputs.jobs}}
+      export CARGO_TERM_COLOR=never
+      set -f
+      set --
+      for t in ${{inputs.ignore}}; do
+        set -- "$@" --skip "$t"
+      done
+      set +f
+      if [ $# -gt 0 ]; then
+        set -- -- "$@" --exact
+      fi
+      limit=${{inputs.overall-timeout}}
+      wrap=""
+      if command -v timeout >/dev/null 2>&1; then
+        wrap="timeout"
+      fi
+      log=$(mktemp)
+      gate=0
+      why=""
+
+      # 1. fetch dev-dependencies (cargo build skips them) and build the
+      #    test targets, timed separately from the run.
+      start=$(date +%s)
+      rc=0
+      host=$(rustc -vV | sed -n 's/^host: //p')
+      cargo fetch --locked ${host:+--target "$host"} > "$log" 2>&1 || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        ${wrap:+$wrap $limit} cargo test ${{inputs.profile}} --frozen --offline \
+          --target-dir target --no-run --jobs ${{inputs.jobs}} ${{inputs.args}} >> "$log" 2>&1 || rc=$?
+      fi
+      cdur=$(( $(date +%s) - start ))
+      cat "$log"
+      echo "UPSTREAM-TESTS-COMPILE ${PKG}: duration=${cdur}s"
+      if [ "$rc" -ne 0 ]; then
+        # "error: could not compile `foo` (test "bar") due to 2 previous errors"
+        grep -E '^error: could not compile ' "$log" \
+          | sed -E 's/^error: could not compile `([^`]*)`( \(([^)]*)\))?.*$/\1 \3/' \
+          | while read -r t; do echo "UPSTREAM-TESTS-FAIL ${PKG}: compile $t"; done || true
+        if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+          echo "UPSTREAM-TESTS ${PKG}: FAILED: test build timed out or killed (exit $rc, limit ${limit}s)"
+        else
+          echo "UPSTREAM-TESTS ${PKG}: FAILED: cargo fetch/test build exited $rc (compile errors in test targets are never ignorable)"
+        fi
+        rm -f "$log"
+        exit 1
+      fi
+      # Did the test build reuse the shipped build? Registry crates the
+      # package itself depends on (normal and build deps, not dev-deps) were
+      # compiled by the build. A profile or rustflags mismatch recompiles
+      # nearly all of them, so more than half triggers a WARNING. A few are
+      # normal: dev-dependencies can add features to a shared dependency
+      # (fd: tempfile adds rustix/fs, so rustix, terminal_size and clap are
+      # rebuilt, 8 of 54), and proc-macro dev-deps add host-only units.
+      deps=$(mktemp)
+      cargo tree --frozen --offline -e normal,build --prefix none -f '{p}' \
+        ${host:+--target "$host"} 2>/dev/null | awk '$3 !~ /^\(\// { print $1, $2 }' | sort -u > "$deps" || true
+      rebuilt=$(grep -E '^ +Compiling [^ ]+ v[^ ]+$' "$log" \
+        | awk 'NR == FNR { d[$1 " " $2] = 1; next } ($2 " " $3) in d { print $2 }' "$deps" - \
+        | sort -u | tr '\n' ' ' || true)
+      ndeps=$(wc -l < "$deps")
+      rm -f "$deps"
+      nrebuilt=$(echo $rebuilt | wc -w)
+      if [ "$nrebuilt" -gt 0 ]; then
+        echo "upstream-tests/cargo-test: the test build recompiled $nrebuilt of $ndeps build dependencies: $rebuilt"
+      fi
+      if [ "$ndeps" -gt 0 ] && [ $((nrebuilt * 2)) -gt "$ndeps" ]; then
+        echo "upstream-tests/cargo-test: WARNING: most build dependencies were recompiled for the tests ($nrebuilt of $ndeps): profile or rustflags (or features in args) differ from the build, so the tests may not exercise the shipped binary" >&2
+      fi
+
+      # 2. run the suite; everything is built, so cargo only runs binaries.
+      left=$((limit - cdur))
+      [ "$left" -gt 0 ] || left=1
+      start=$(date +%s)
+      rc=0
+      ${wrap:+$wrap $left} cargo test ${{inputs.profile}} --frozen --offline \
+        --target-dir target --no-fail-fast --jobs ${{inputs.jobs}} ${{inputs.args}} "$@" > "$log" 2>&1 || rc=$?
+      duration=$(( $(date +%s) - start ))
+      cat "$log"
+      echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+
+      # coreutils timeout exits 124; busybox timeout kills with SIGTERM (143).
+      if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+        gate=1; why="$why timed out or killed (exit $rc, limit ${limit}s);"
+      fi
+      # The run uses the same flags as the --no-run build above, so this only
+      # catches churn between the two invocations (e.g. a build script that
+      # always reruns); mismatches with the package build are checked above.
+      if grep -qE '^ +Compiling ' "$log"; then
+        echo "upstream-tests/cargo-test: WARNING: cargo recompiled crates between the test build and the test run" >&2
+      fi
+      # "test result: FAILED. 3 passed; 1 failed; 2 ignored; 0 measured; 5 filtered out; finished in 0.01s"
+      set -- $(awk '
+        /^test result: (ok|FAILED)\. / {
+          n++
+          for (i = 4; i <= NF; i++) {
+            v = $(i - 1) + 0
+            if ($i ~ /^passed;/) p += v
+            else if ($i ~ /^failed;/) f += v
+            else if ($i ~ /^ignored;/) s += v
+            else if ($i == "filtered") x += v
+          }
+          if ($3 == "FAILED.") fb++
+        }
+        END { print n + 0, p + 0, f + 0, s + 0, x + 0, fb + 0 }' "$log")
+      results=$1 pass=$2 fail=$3 skip=$4 filtered=$5 failbins=$6
+      # libtest's second "failures:" block lists the failing tests, indented
+      # by four spaces, right after the header (the first block, with the
+      # captured output, starts with a blank line).
+      awk '
+        /^failures:$/ { inlist = 1; next }
+        inlist && /^    [^ ]/ { sub(/^    /, ""); print; next }
+        { inlist = 0 }' "$log" | awk '!seen[$0]++' \
+        | while read -r t; do echo "UPSTREAM-TESTS-FAIL ${PKG}: $t"; done
+      # Binaries that failed without a FAILED result line crashed (signal,
+      # abort, custom harness exit): "error: test failed, to rerun pass `--lib`"
+      errbins=$(grep -cE '^error: (doc)?test failed, to rerun pass ' "$log" || true)
+      if [ "$errbins" -gt "$failbins" ]; then
+        sed -nE 's/^error: (doc)?test failed, to rerun pass `(.*)`$/\2/p' "$log" \
+          | while read -r b; do echo "UPSTREAM-TESTS-FAIL ${PKG}: test binary $b"; done
+        gate=1; why="$why $((errbins - failbins)) test binary(ies) exited non-zero without a FAILED result (crash?);"
+      fi
+      if [ "$fail" -gt 0 ]; then
+        gate=1; why="$why $fail failing test(s);"
+      fi
+      if [ "$rc" -ne 0 ] && [ "$fail" -eq 0 ] && [ "$errbins" -eq 0 ]; then
+        gate=1; why="$why cargo test exited $rc with no test failures;"
+      fi
+      if [ "$results" -eq 0 ]; then
+        gate=1; why="$why no 'test result' lines (no test binaries ran);"
+      elif [ "$pass" -eq 0 ]; then
+        gate=1; why="$why no test passed ($results test binaries, skip=$skip, filtered=$filtered); the suite did not really run;"
+      fi
+      if [ -n "$(echo ${{inputs.ignore}})" ] && [ "$filtered" -eq 0 ]; then
+        echo "upstream-tests/cargo-test: WARNING: ignore is set but no test was filtered out; check the names" >&2
+      fi
+      extra=""
+      [ "$filtered" -gt 0 ] && extra=" ignored=$filtered"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
+      rm -f "$log"
+      if [ "$gate" -ne 0 ]; then
+        echo "UPSTREAM-TESTS ${PKG}: FAILED:$why"
+        exit 1
+      fi

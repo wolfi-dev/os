@@ -1,0 +1,338 @@
+name: PHP extension upstream test suite (run-tests.php)
+
+description: |
+  Runs a phpize-built PHP extension's (PECL) upstream .phpt test suite with
+  `make test`, which drives PHP's run-tests.php, against the freshly built
+  tree. Use it right after the main build step (`autoconf/make`), before
+  `make install`. It runs in the build workspace and needs no network
+  (SKIP_ONLINE_TESTS=1 is set, so tests that need the network skip).
+
+  `make test` loads the extension from the build tree: it runs php with -n,
+  a copy of the installed php.ini stripped of `extension=` lines,
+  `-d extension_dir=<dir>/modules/` and `-d extension=<ext>.so`, so the
+  tests exercise the module just built, not an installed one. Needs the
+  php CLI (php-X.Y, not only php-X.Y-dev) in the build environment.
+
+  Other extensions the built one requires (e.g. igbinary for redis or
+  memcached built with igbinary support, raphf for pecl-http) are found by
+  loading the built module once and are loaded from the installed
+  extension dir (`php-config --extension-dir`) ahead of it; they must be in
+  the build environment (e.g. php-X.Y-igbinary). Optional extensions some
+  tests want go in `extensions`.
+
+  The suite is a hard gate. The step fails if:
+    - a test that is not in `ignore` fails or is borked (malformed),
+    - run-tests.php did not finish (no result summary, timeout, or make
+      failed with no test failures),
+    - the suite did not really run (zero tests found, or nothing passed
+      because everything was skipped).
+  On failure it prints `upstream-tests/php-ext-test: HINT: ...` lines for
+  common causes (missing php CLI or dependency extension, a Makefile that
+  replaces `make test`, the most common skip reasons, killed tests).
+
+  Prints the full run-tests log, then summary lines:
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS-FAIL <package>: <test>      (one per non-ignored failure)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [warn=<n>] [borked=<n>] [ignored=<n>]
+  parsed from run-tests' result summary block (Tests passed, Tests
+  failed, Tests skipped, Expected fail, Tests warned, Tests borked) and its
+  "FAILED TEST SUMMARY" / "BORKED TEST SUMMARY" blocks. fail includes
+  ignored failures; ignored = how many of those were in `ignore`. <test> is
+  the .phpt path as run-tests prints it, e.g. tests/bug002.phpt.
+
+  Example:
+    - name: Prepare build
+      runs: phpize
+    - name: Configure
+      runs: ./configure
+    - uses: autoconf/make
+    - uses: upstream-tests/php-ext-test
+    - name: Make install
+      runs: INSTALL_ROOT="${{targets.destdir}}" make install
+
+  With a subset of tests, extra run-tests.php arguments, or optional
+  extensions to load:
+    - uses: upstream-tests/php-ext-test
+      with:
+        tests: tests/unit
+        args: -d memory_limit=512M
+        extensions: igbinary msgpack
+
+  Named exceptions go in ignore: space-separated .phpt tests, as the path
+  run-tests prints (tests/foo.phpt), the file name (foo.phpt) or the bare
+  name (foo). run-tests.php has no option to skip a named test, so ignored
+  tests still run; their failures are reported as IGNORE and do not fail
+  the build. Every exception needs a comment in the calling package
+  explaining why and a `TODO(upstream-tests): ...` to remove it:
+    # tests/023.phpt needs a memcached server, which the build sandbox
+    # does not run.
+    # TODO(upstream-tests): drop the ignore once a server is started.
+    - uses: upstream-tests/php-ext-test
+      with:
+        ignore: tests/023.phpt
+
+inputs:
+  dir:
+    description: |
+      phpize build directory (with the Makefile and run-tests.php that
+      phpize generated), relative to the workspace.
+    default: "."
+  jobs:
+    description: Parallel run-tests.php workers (run-tests.php -j).
+    default: "$(nproc)"
+  tests:
+    description: |
+      Space-separated .phpt files or directories to run (make test
+      TESTS=...), relative to `dir`. Empty runs every test run-tests.php
+      finds in the source tree.
+    default: ""
+  ignore:
+    description: |
+      Space-separated .phpt tests whose failures are allowed: path as
+      printed (tests/foo.phpt), file name (foo.phpt) or bare name (foo).
+      Each one needs a comment and TODO in the caller.
+    default: ""
+  args:
+    description: |
+      Extra run-tests.php arguments, e.g. `-d memory_limit=512M`, passed
+      ahead of the tests in make test TESTS=... (not through
+      TEST_PHP_ARGS, which some suites read as php CLI arguments for the
+      servers they spawn). Arguments containing spaces are not supported.
+      Do not pass -j here; use `jobs`.
+    default: ""
+  extensions:
+    description: |
+      Space-separated installed shared extensions (names, e.g. igbinary,
+      looked up in `php-config --extension-dir`) to load ahead of the
+      built one, for tests that skip without them. Required dependencies
+      are detected and loaded automatically; list only optional ones. Each
+      must be installed in the build environment.
+    default: ""
+  timeout:
+    description: Per-test timeout in seconds (run-tests.php --set-timeout).
+    default: "300"
+  overall-timeout:
+    description: Timeout in seconds for the whole make test run.
+    default: "3600"
+
+pipeline:
+  - name: upstream-tests (php run-tests)
+    runs: |
+      PKG="${{package.name}}"
+      me="upstream-tests/php-ext-test"
+      cd "${{inputs.dir}}"
+      if [ ! -f Makefile ] || [ ! -f run-tests.php ]; then
+        echo "$me: '${{inputs.dir}}' is not a phpize build directory (no Makefile or run-tests.php); run phpize and configure first, or set 'dir'" >&2
+        exit 1
+      fi
+      if ! ls modules/*.so >/dev/null 2>&1; then
+        echo "$me: no built extension in '${{inputs.dir}}/modules'; run the build (autoconf/make) before this step" >&2
+        exit 1
+      fi
+      # make test silently does nothing ("Cannot run tests without CLI
+      # sapi") when configure found no php binary.
+      php=$(sed -n 's/^PHP_EXECUTABLE *= *//p' Makefile | head -n1 || true)
+      if [ -z "$php" ] || [ ! -x "$php" ]; then
+        echo "$me: no php CLI for make test (Makefile PHP_EXECUTABLE='$php')" >&2
+        echo "$me: HINT: add php-X.Y (the CLI, not only php-X.Y-dev) to environment.contents.packages and re-run phpize/configure" >&2
+        exit 1
+      fi
+      extdir=$(php-config --extension-dir 2>/dev/null || true)
+      # Extensions to load ahead of the built module: the optional ones
+      # from 'extensions', then required ones the built module fails to
+      # load without ("required module" or an undefined symbol that an
+      # installed extension defines), found by loading it once.
+      pre=""
+      for e in ${{inputs.extensions}}; do
+        if [ ! -f "$extdir/$e.so" ]; then
+          echo "$me: extension '$e' (from 'extensions') is not in $extdir" >&2
+          echo "$me: HINT: add php-X.Y-$e to environment.contents.packages" >&2
+          exit 1
+        fi
+        pre="$pre -d extension=$extdir/$e.so"
+      done
+      load=""
+      for m in modules/*.so; do
+        load="$load -d extension=${m##*/}"
+      done
+      missing=""
+      i=0
+      while [ "$i" -lt 8 ]; do
+        i=$((i + 1))
+        out=$("$php" -n $pre -d extension_dir="$(pwd)/modules" $load -m 2>&1 || true)
+        dep=$(echo "$out" | sed -nE 's/.*required module "([^"]+)".*/\1/p' | head -n1 || true)
+        if [ -z "$dep" ]; then
+          sym=$(echo "$out" | sed -nE 's/.*undefined symbol: ([A-Za-z0-9_]+).*/\1/p' | head -n1 || true)
+          [ -n "$sym" ] || break
+          dep=""
+          for c in $(grep -l -F "$sym" "$extdir"/*.so 2>/dev/null || true); do
+            b=${c##*/}; b=${b%.so}
+            case "$sym" in
+              "$b"_*|php_"$b"_*) dep=$b; break ;;
+            esac
+            [ -n "$dep" ] || dep=$b
+          done
+          if [ -z "$dep" ]; then
+            g=${sym#php_}
+            missing="symbol $sym (probably the ${g%%_*} extension)"
+            break
+          fi
+        fi
+        if [ ! -f "$extdir/$dep.so" ]; then
+          missing="extension $dep"
+          break
+        fi
+        case "$pre" in
+          *"/$dep.so"*) missing="extension $dep (still fails to load)"; break ;;
+        esac
+        echo "$me: loading required extension $dep from $extdir"
+        pre="$pre -d extension=$extdir/$dep.so"
+      done
+      ignore=" $(echo ${{inputs.ignore}}) "
+      # run-tests options go ahead of the tests in TESTS, not in
+      # TEST_PHP_ARGS: run-tests leaves that in the tests' environment and
+      # some suites (apcu's server_test.inc) pass it to the php servers
+      # they spawn. With no tests, run-tests still finds the whole suite.
+      set -f
+      targs=$(echo -j${{inputs.jobs}} --set-timeout ${{inputs.timeout}} \
+        --show-diff --no-color --no-progress ${{inputs.args}} ${{inputs.tests}})
+      set +f
+      set -- TESTS="$targs"
+      if [ -n "$pre" ]; then
+        # Prepend to make's own list (built extension, zend_extension).
+        own=$(make -s --no-print-directory \
+          --eval='php-ext-test-shared: ; @echo $(PHP_TEST_SHARED_EXTENSIONS)' \
+          php-ext-test-shared 2>/dev/null || true)
+        [ -n "$own" ] || own="$load"
+        set -- "$@" PHP_TEST_SHARED_EXTENSIONS="$pre $own"
+      fi
+      wrap=""
+      if command -v timeout >/dev/null 2>&1; then
+        wrap="timeout ${{inputs.overall-timeout}}"
+      fi
+      log=$(mktemp)
+      start=$(date +%s)
+      rc=0
+      unset TEST_PHP_ARGS
+      NO_INTERACTION=1 REPORT_EXIT_STATUS=1 SKIP_ONLINE_TESTS=1 \
+        $wrap make test "$@" > "$log" 2>&1 || rc=$?
+      duration=$(( $(date +%s) - start ))
+      cat "$log"
+      echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+
+      hints() {
+        if [ -n "$missing" ]; then
+          echo "$me: HINT: the built extension needs $missing, which is not installed; add the php-X.Y-<ext> package that provides it (not only its -dev) to environment.contents.packages" >&2
+        fi
+        if grep -q 'Unable to load dynamic library' "$log"; then
+          echo "$me: HINT: php could not load an extension (see 'Unable to load dynamic library' above)" >&2
+        fi
+        if grep -q "overriding recipe for target .test'" "$log"; then
+          echo "$me: HINT: the package's Makefile replaces the 'make test' target, so run-tests.php may not have run; see its upstream test instructions" >&2
+        fi
+        if grep -q 'Termsig=9' "$log"; then
+          echo "$me: HINT: tests were killed (Termsig=9), most likely out of memory; raise resources.memory or lower 'jobs'" >&2
+        fi
+      }
+
+      gate=0
+      why=""
+      # coreutils timeout exits 124; busybox timeout kills make with
+      # SIGTERM, so the shell sees 143. Treat any signal exit as a
+      # timeout/abort.
+      if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+        gate=1; why="$why timed out or killed (exit $rc, limit ${{inputs.overall-timeout}}s);"
+      fi
+      # run-tests prints its result summary block last, starting with
+      #   "Number of tests :  141               132"
+      #   "Tests passed    :  131 ( 92.9%) ( 99.2%)"
+      sl=$(grep -nE '^Number of tests +:' "$log" | tail -n1 | cut -d: -f1 || true)
+      if [ -z "$sl" ]; then
+        if grep -q '^No tests found' "$log"; then
+          why="$why no tests found (check 'tests' and 'dir');"
+        elif grep -q '^No tests were run' "$log"; then
+          why="$why run-tests ran no tests (no .phpt tests under 'dir', or none matched 'tests');"
+        fi
+        echo "UPSTREAM-TESTS ${PKG}: pass=0 fail=0 skip=0"
+        echo "UPSTREAM-TESTS ${PKG}: FAILED:$why no run-tests summary found (make test exit $rc);"
+        hints
+        rm -f "$log"
+        exit 1
+      fi
+      set -- $(tail -n +"$sl" "$log" | awk -F: '
+        function n() { split($2, a, " "); return a[1] + 0 }
+        /^Number of tests +:/{t=n()} /^Tests passed +:/{p=n()}
+        /^Tests failed +:/{f=n()} /^Tests skipped +:/{s=n()}
+        /^Tests warned +:/{w=n()} /^Tests borked +:/{b=n()}
+        /^Expected fail +:/{xf=n()}
+        END {print t+0, p+0, f+0, s+0, w+0, b+0, xf+0}')
+      total=$1 pass=$2 fail=$3 skip=$4 warn=$5 borked=$6 xfail=$7
+      # "FAILED TEST SUMMARY" / "BORKED TEST SUMMARY" blocks, one test per
+      # line: "<title> [<file>]<info>", up to the next "=====" rule.
+      names=$(tail -n +"$sl" "$log" | awk '
+        /^(FAILED|BORKED) TEST SUMMARY/ {inb=1; next}
+        inb && /^====/ {inb=0}
+        inb && !/^----/' \
+        | sed -nE 's/^.*\[([^]]+\.phpt)\].*$/\1/p' \
+        | sed -e "s|^$(pwd)/||" -e 's|^\./||' | awk '!seen[$0]++' || true)
+      ignored=0
+      nfail=0
+      for name in $names; do
+        base=${name##*/}
+        case "$ignore" in
+          *" $name "*|*" $base "*|*" ${base%.phpt} "*)
+            echo "IGNORE ${PKG}: $name"
+            ignored=$((ignored + 1))
+            ;;
+          *)
+            echo "UPSTREAM-TESTS-FAIL ${PKG}: $name"
+            nfail=$((nfail + 1))
+            ;;
+        esac
+      done
+      extra=""
+      [ "$xfail" -gt 0 ] && extra="$extra xfail=$xfail"
+      [ "$warn" -gt 0 ] && extra="$extra warn=$warn"
+      [ "$borked" -gt 0 ] && extra="$extra borked=$borked"
+      [ "$ignored" -gt 0 ] && extra="$extra ignored=$ignored"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
+
+      if [ "$nfail" -gt 0 ]; then
+        gate=1; why="$why $nfail non-ignored failing test(s);"
+      fi
+      if [ $((fail + borked)) -gt 0 ] && [ "$nfail" -eq 0 ] && [ "$ignored" -eq 0 ]; then
+        gate=1; why="$why summary reports $((fail + borked)) failed/borked test(s) but none listed;"
+      fi
+      if [ "$rc" -ne 0 ] && [ $((fail + borked)) -eq 0 ]; then
+        gate=1; why="$why make test exited $rc with no test failures;"
+      fi
+      if [ "$total" -eq 0 ]; then
+        gate=1; why="$why no tests found (check 'tests' and 'dir');"
+      elif [ $((pass + xfail)) -eq 0 ]; then
+        gate=1; why="$why no test passed (total=$total, skip=$skip); the suite did not really run;"
+      fi
+      # Ignored tests that passed: the exception may be stale.
+      for t in $ignore; do
+        hit=0
+        for name in $names; do
+          base=${name##*/}
+          case "$t" in
+            "$name"|"$base"|"${base%.phpt}") hit=1 ;;
+          esac
+        done
+        if [ "$hit" -eq 0 ]; then
+          echo "$me: WARNING: ignore entry '$t' matches no failing test" >&2
+        fi
+      done
+      if [ "$gate" -ne 0 ]; then
+        echo "UPSTREAM-TESTS ${PKG}: FAILED:$why"
+        hints
+        if [ "$skip" -gt 0 ] && [ $((pass + xfail)) -eq 0 ]; then
+          echo "$me: HINT: most common skip reasons (a service, environment variable or extension the tests need):" >&2
+          sed -n 's/^SKIP .* reason: *//p' "$log" | cut -c1-120 | sort | uniq -c \
+            | sort -rn | head -n 3 | sed "s|^|$me: HINT:   |" >&2 || true
+        fi
+        rm -f "$log"
+        exit 1
+      fi
+      rm -f "$log"

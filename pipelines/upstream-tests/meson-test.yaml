@@ -3,8 +3,10 @@ name: Meson upstream test suite (meson test)
 description: |
   Runs a Meson project's upstream test suite with `meson test` against the
   freshly built tree. Use it right after the main `meson/compile` step,
-  before `meson/install`. It runs in the build workspace and needs no
-  network.
+  before `meson/install`. It runs in the build workspace; the step itself
+  needs no network, but a test suite may (e.g. librsvg's cargo-based tests
+  fetch crates). Such tests must be exempted (see ignore and args below)
+  or the package left without this pipeline.
 
   The suite is a hard gate: any failing test (Fail, Unexpected Pass or
   Timeout in meson's summary) fails the build. It also fails if no tests
@@ -20,6 +22,15 @@ description: |
   fail = Fail + Unexpected Pass + Timeout, skip = Skipped (+ Ignored TAP
   subtests), ignored = tests excluded through `ignore`.
 
+  If meson test exits non-zero without reporting a failing test (meson
+  itself crashed, e.g. it could not exec a `#!/bin/bash` test script
+  because bash is not in the build environment), the step fails with
+    UPSTREAM-TESTS-FAIL <package>: meson-test (exit <rc>)
+  When the log points at a missing test runner or interpreter (exit
+  status 127, "<name>: not found", "can't execute", "bad interpreter", or
+  a test script meson could not exec), a HINT line names it when it can;
+  add only that package to the build environment.
+
   Example:
     - uses: meson/configure
     - uses: meson/compile
@@ -31,6 +42,16 @@ description: |
       with:
         dir: build
         args: --no-suite slow
+
+  For big suites, select or drop meson suites through args
+  (`--suite <name>` / `--no-suite <slow>`); on slow single-CPU builders
+  raise timeout-multiplier (e.g. "3") rather than ignoring tests that
+  time out.
+
+  Enabling tests can change what gets installed (installed tests, test
+  data, extra binaries). Compare the package's installed files before and
+  after enabling tests and switch off the extras in the meson/configure
+  opts, e.g. -Dinstalled_tests=false for gdk-pixbuf.
 
   Named exceptions go in ignore: space-separated test names as meson
   prints them in UPSTREAM-TESTS-FAIL ("<project>:<test>") or the bare test
@@ -90,6 +111,54 @@ pipeline:
         echo "upstream-tests/meson-test: '$dir' is not a configured meson build directory; set 'dir' to the meson/compile output-dir" >&2
         exit 1
       fi
+      # meson test exited non-zero without naming a failing test.
+      crashed() {
+        echo "UPSTREAM-TESTS-FAIL ${PKG}: meson-test (exit $rc)"
+        if [ "$rc" -ne 124 ] || [ -z "$wrap" ]; then
+          echo "upstream-tests/meson-test: meson test exited $rc with no failing tests reported (meson itself may have crashed; see the log above)" >&2
+        fi
+      }
+      # Hint at a missing test runner or interpreter: exit status 127,
+      # "<shell>: <name>: not found", "<script>: line N: <name>: not found"
+      # (busybox ash running a #!/bin/sh script file), "command not found",
+      # "can't execute", "bad interpreter", or a script meson could not exec
+      # (python's "No such file or directory: '<path>'"), whose shebang
+      # interpreter is then the missing one. "i" = command, "s" = script path.
+      hint() {
+        names=$(sed -n -E \
+          -e "s/.*can't execute '([^']+)'.*/i \1/p" \
+          -e "s/.*env: '?([^ ':]+)'?: No such file or directory.*/i \1/p" \
+          -e 's/.*: ([^ :]+): bad interpreter.*/i \1/p' \
+          -e 's/.*: ([^ :]+): command not found.*/i \1/p' \
+          -e 's/(^|.*[ /])(sh|ash|dash|bash)(: [0-9]+)?: ([^ :]+): not found.*/i \4/p' \
+          -e 's/.*: line [0-9]+: ([^ :]+): not found.*/i \1/p' \
+          -e "s/.*No such file or directory: '([^']+)'.*/s \1/p" \
+          "$log" | awk '!seen[$0]++' | while read -r kind p; do
+            f=""
+            for c in "$p" "$dir/$p"; do
+              if [ -f "$c" ]; then f="$c"; break; fi
+            done
+            if [ -n "$f" ] && [ "$(head -c 2 "$f")" = "#!" ]; then
+              p=$(head -n 1 "$f" | awk '{ sub(/^#! */, ""); i = 1
+                if ($1 ~ /(^|\/)env$/) for (i = 2; i < NF && $i ~ /^-/; i++);
+                print $i }')
+            elif [ "$kind" = s ]; then
+              continue
+            fi
+            case "$p" in
+              */*) [ -x "$p" ] && continue ;;
+              *) command -v "$p" >/dev/null 2>&1 && continue ;;
+            esac
+            printf '%s\n' "${p##*/}" | sed 's/[^A-Za-z0-9._+-]//g'
+          done | awk 'NF && !seen[$0]++ { o = o (o ? ", " : "") $0 }
+            END { print o }' || true)
+        if [ -n "$names" ]; then
+          names=" ($names)"
+        elif ! grep -q 'exit status 127' "$log"; then
+          return 0
+        fi
+        echo "upstream-tests/meson-test: HINT: a test runner or interpreter appears to be missing$names; add only that package to the build environment" >&2
+      }
       set -f
       set --
       for t in ${{inputs.ignore}}; do
@@ -141,6 +210,10 @@ pipeline:
       sl=$(grep -nE '^Ok: +[0-9]+' "$log" | tail -n1 | cut -d: -f1 || true)
       if [ -z "$sl" ]; then
         echo "upstream-tests/meson-test: no meson test summary found (exit $rc)" >&2
+        if [ "$rc" -ne 0 ]; then
+          crashed
+        fi
+        hint
         exit 1
       fi
       set -- $(tail -n +"$sl" "$log" | awk '
@@ -156,18 +229,28 @@ pipeline:
       # "Summary of Failures:" block, last in the log, one line per failing
       # test: " 3/9 [<suites> - ]<project>:<test>   FAIL   0.01s   exit status 1"
       fl=$(grep -n '^Summary of Failures:' "$log" | tail -n1 | cut -d: -f1 || true)
+      failed=""
       if [ -n "$fl" ]; then
-        awk -v a="$fl" -v b="$sl" 'NR > a && NR < b' "$log" \
+        failed=$(awk -v a="$fl" -v b="$sl" 'NR > a && NR < b' "$log" \
           | sed -nE 's/^ *[0-9]+\/[0-9]+ (.*[^ ]) +(FAIL|ERROR|INTERRUPT|TIMEOUT|UNEXPECTEDPASS) +[0-9.]+s.*$/\1/p' \
-          | sed -E 's/^[^:]* - //' | awk '!seen[$0]++' \
+          | sed -E 's/^[^:]* - //' | awk '!seen[$0]++')
+      fi
+      if [ -n "$failed" ]; then
+        printf '%s\n' "$failed" \
           | while read -r t; do echo "UPSTREAM-TESTS-FAIL ${PKG}: $t"; done
+      fi
+      if [ "$rc" -eq 0 ] && [ "$fail" -ne 0 ]; then
+        rc=1
+      fi
+      if [ "$rc" -ne 0 ] && [ "$fail" -eq 0 ] && [ -z "$failed" ]; then
+        crashed
+      fi
+      if [ "$rc" -ne 0 ] || [ $((pass + xfail)) -eq 0 ]; then
+        hint
       fi
       rm -f "$log"
       if [ $((pass + xfail)) -eq 0 ]; then
         echo "upstream-tests/meson-test: no test passed in '$dir' (all skipped?); the suite did not really run" >&2
         exit 1
-      fi
-      if [ "$rc" -eq 0 ] && [ "$fail" -ne 0 ]; then
-        rc=1
       fi
       exit $rc

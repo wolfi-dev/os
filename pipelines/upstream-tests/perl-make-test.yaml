@@ -25,7 +25,9 @@ description: |
 
   Tests run verbosely (TEST_VERBOSE=1 / --verbose) so that skipped and TODO
   subtests can be counted; Test::Harness buffers each file's output, so
-  this works with parallel jobs. Prints the log minus plain passing "ok N"
+  this works with parallel jobs. Test files run without make's MAKEFLAGS,
+  so a test that runs `make test` in a sample dist does not inherit
+  TEST_VERBOSE=1. Prints the log minus plain passing "ok N"
   lines (the count is shown), then:
     UPSTREAM-TESTS <package>: duration=<n>s
     UPSTREAM-TESTS-FAIL <package>: <file>      (one per non-ignored failing file)
@@ -39,7 +41,8 @@ description: |
   subtests; ignored = failing files that were in `ignore`.
 
   On failure, a HINT line names perl modules that tests could not load
-  ("Can't locate Foo/Bar.pm in @INC") and that are missing from the build
+  ("Can't locate Foo/Bar.pm in @INC", including the "# Error:" diagnostic
+  of a failed use_ok/require_ok) and that are missing from the build
   environment, with a guessed package name (perl-foo-bar). These are
   usually the package's runtime dependencies or test-only modules
   (Test::Needs, Test::Fatal, Test::Warnings, ...); add the packages that
@@ -148,15 +151,22 @@ pipeline:
           exit 1 ;;
       esac
       wrap=""
-      hp=""
+      tmo=""
       if command -v timeout >/dev/null 2>&1; then
         wrap="timeout ${{inputs.overall-timeout}}"
-        # Test::Harness runs every perl test file with $HARNESS_PERL.
-        hp=$(mktemp)
-        printf '#!/bin/sh\nexec timeout %s %s "$@"\n' "${{inputs.timeout}}" "$(command -v perl)" > "$hp"
-        chmod +x "$hp"
-        export HARNESS_PERL="$hp"
+        tmo="timeout ${{inputs.timeout}}"
       fi
+      # Test::Harness runs every perl test file with $HARNESS_PERL. The
+      # wrapper applies the per-test timeout and drops make's environment:
+      # make exports TEST_VERBOSE=1 from its command line to every child
+      # through MAKEFLAGS, so a test that runs `make test` in a sample dist
+      # (Dist::Zilla's t/tester.t, t/plugins/testrelease.t) would get a
+      # verbose nested harness whose TAP corrupts the parent's. Recursive
+      # makes outside the tests (MakeMaker sub-extensions) still see it.
+      hp=$(mktemp)
+      printf '#!/bin/sh\nunset MAKEFLAGS MFLAGS MAKEOVERRIDES MAKELEVEL\nexec %s %s "$@"\n' "$tmo" "$(command -v perl)" > "$hp"
+      chmod +x "$hp"
+      export HARNESS_PERL="$hp"
       export HARNESS_OPTIONS="j${{inputs.jobs}}" TEST_JOBS="${{inputs.jobs}}"
       export NONINTERACTIVE_TESTING=1 PERL_MM_USE_DEFAULT=1
       log=$(mktemp)
@@ -170,9 +180,7 @@ pipeline:
       awk '/^[[:space:]]*ok [0-9]+/ && tolower($0) !~ /#[[:space:]]*(skip|todo)/ { n++; next }
         { print }
         END { if (n) print "upstream-tests/perl-make-test: " n " passing \"ok\" lines omitted from the log above" }' "$log"
-      if [ -n "$hp" ]; then
-        rm -f "$hp"
-      fi
+      rm -f "$hp"
 
       gate=0
       why=""
@@ -289,11 +297,14 @@ pipeline:
       # it is really named after the CPAN distribution.
       mods=""
       if [ "$gate" -ne 0 ]; then
-        # TAP diagnostics ("# ...") are tests reporting an optional module
-        # they handled (e.g. a prereqs report), not a load failure.
-        mods=$(sed -n -E -e '/^[[:space:]]*#/d' \
-            -e "s/.*Can't locate ([A-Za-z0-9_\/]+)\.pm in @INC.*/\1/p" "$log" \
-          | awk '!seen[$0]++ { gsub(/\//, "::"); print }' \
+        # TAP diagnostics ("# ...") are mostly tests reporting an optional
+        # module they handled (e.g. a prereqs report), not a load failure.
+        # The exception is a failed use_ok/require_ok, which reports the
+        # error as "#     Error:  Can't locate Foo/Bar.pm in @INC ...".
+        mods=$(awk '/^[[:space:]]*#/ && !/^[[:space:]]*#[[:space:]]+Error:[[:space:]]+Can.t locate / { next }
+            match($0, /Can.t locate [A-Za-z0-9_\/]+\.pm in @INC/) {
+              m = substr($0, RSTART + 13, RLENGTH - 24); gsub(/\//, "::", m)
+              if (!seen[m]++) print m }' "$log" \
           | while read -r m; do
               if ! perl -Iblib/lib -Iblib/arch -e "require $m" >/dev/null 2>&1; then
                 echo "$m"

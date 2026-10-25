@@ -1,7 +1,7 @@
 package:
   name: superset-6.0
   version: "6.0.0"
-  epoch: 22 # CVE-2026-111497
+  epoch: 23 # CVE-2026-111497
   description: Data Visualization and Data Exploration Platform
   copyright:
     - license: Apache-2.0
@@ -16,25 +16,35 @@ package:
       - libgomp
       - libtbb
       - openssl-4.0
+      - py${{vars.python-version}}-pyarrow # Wolfi pyarrow, linked to the system libbrotlidec (CVE-2026-111497)
     provides:
       - superset
 
 environment:
   contents:
     packages:
+      - brotli-dev
       - build-base
       - busybox
       - ca-certificates-bundle
+      - freetype-dev
       - glibc-2.44-dev
+      - lcms2-dev
+      - libavif-dev
       - libjpeg-turbo-dev
+      - libwebp-dev
+      - libxcb-dev
       - mariadb-connector-c-dev
       - mariadb-dev
       - nodejs-26 # Fixes an unsupported engine error
       - npm<11.0.0 # Fixes an unsupported engine error
       - nvm
+      - openjpeg-dev
       - openldap-dev
       - patch
+      - py${{vars.python-version}}-pyarrow # Visible in the venv via --system-site-packages
       - python-${{vars.python-version}}-dev
+      - tiff-dev
       - uv
       - zlib-dev
       - zstd
@@ -71,13 +81,22 @@ pipeline:
 
   - name: Build backend
     runs: |
-      uv venv venv --python python${{vars.python-version}} --seed
+      uv venv venv --python python${{vars.python-version}} --seed --system-site-packages
       source venv/bin/activate
 
       # To install mysqlclient wheel
       export MYSQLCLIENT_CFLAGS=`mysql_config --cflags`
       export MYSQLCLIENT_LDFLAGS=`mysql_config --libs`
-      uv pip install -r requirements/base.txt
+      # CVE-2026-111497: PyPI pyarrow wheels (14.0.1 through 26.0.0) embed an
+      # unfixed Brotli decoder. Use Wolfi's py3.11-pyarrow (25.0.1, linked to
+      # the system libbrotlidec) through --system-site-packages, as
+      # superset-fips-6.1 does: drop the pyarrow pins and keep the wheel out.
+      echo pyarrow > /tmp/excludes
+      grep -q '^pyarrow==' requirements/base.txt
+      grep -q '"pyarrow' pyproject.toml
+      sed -i -E '/^pyarrow([[:space:]=<>!~].*)?$/d' requirements/base.txt
+      sed -i -E '/"pyarrow[^"]*"/d' pyproject.toml
+      uv pip install -r requirements/base.txt --excludes /tmp/excludes
 
       # To fix vulnerabilities
       uv pip install --upgrade \
@@ -103,16 +122,25 @@ pipeline:
       sed -i 's/"cryptography>=42.0.4.*"/"cryptography~=46.0.5"/' pyproject.toml
 
       # Build Apache Superset
-      uv pip install .
+      uv pip install . --excludes /tmp/excludes
 
       # Install Postgres pattern
-      uv pip install .[postgres]
+      uv pip install .[postgres] --excludes /tmp/excludes
 
       # translations for the web application, Is a non-blocking call, so errors may be ignored
       flask fab babel-compile --target superset/translations
 
       # Remove malware-scan-triggering tests folder from built package
       rm -rf venv/lib/python${{vars.python-version}}/site-packages/tests/
+
+      # Pillow's wheels bundle libbrotlidec 1.2.0 (CVE-2026-111497) in pillow.libs
+      # for FreeType's WOFF2 support. Rebuild the installed version from the sdist
+      # so it links Wolfi's freetype and the fixed system libbrotlidec.so.1.
+      pillow_version="$(uv pip show pillow | awk '/^Version:/ { print $2 }')"
+      uv pip install --no-deps --reinstall-package pillow --no-binary pillow "pillow==${pillow_version}"
+
+      # Belt and braces: pyarrow must come from py3.11-pyarrow only.
+      uv pip uninstall pyarrow || true
 
       # Remove pip from venv
       uv pip uninstall pip
@@ -188,6 +216,14 @@ test:
       with:
         bins: ecpg
     - uses: test/tw/ldd-check
+    - name: Pillow links Wolfi's FreeType and ships no bundled Brotli
+      runs: |
+        if find /usr/share/superset/venv -path '*/pillow.libs/*' -name 'libbrotli*' | grep .; then echo 'bundled libbrotli remains in pillow.libs' >&2; exit 1; fi
+        /usr/share/superset/venv/bin/python -c 'from PIL import features; missing = [f for f in ("freetype2", "littlecms2", "webp", "avif", "jpg", "jpg_2000", "zlib", "libtiff", "xcb") if not features.check(f)]; assert not missing, missing'
+    - name: pyarrow comes from Wolfi's py3.11-pyarrow (CVE-2026-111497)
+      runs: |
+        test ! -e /usr/share/superset/venv/lib/python${{vars.python-version}}/site-packages/pyarrow
+        /usr/share/superset/venv/bin/python -c 'import pyarrow; m = open("/proc/self/maps").read(); assert "/usr/share/superset/venv" not in pyarrow.__file__, pyarrow.__file__; assert "/usr/lib/libbrotlidec.so.1" in m, "pyarrow is not linked to the system libbrotlidec"'
     - uses: test/daemon-check-output
       with:
         start: |

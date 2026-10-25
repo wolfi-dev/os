@@ -1,0 +1,235 @@
+package:
+  name: verus
+  version: "0.2026.10.18"
+  epoch: 0
+  description: Verified Rust for low-level systems code
+  copyright:
+    - license: MIT
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  dependencies:
+    runtime:
+      # Pinned to the rustc and z3 releases this Verus release is built for;
+      # see the vars block.
+      - rust-${{vars.rust-version}}~${{vars.rust-toolchain}}
+      - z3-4~${{vars.z3-version}}
+  test-resources:
+    cpu: "4"
+    memory: 8Gi
+
+vars:
+  # Verus is tightly coupled to exact rust and z3 releases, and these vars are
+  # where this package pins them. Each Verus release names:
+  # - one rustc release (rust-toolchain.toml). rust_verify is a rustc driver
+  #   built against the compiler's internal crates (rust-*-rustc-dev), which
+  #   have no stable API, so it runs only on the rustc it was built against.
+  # - one z3 release (source/tools/get-z3.sh). verus refuses to verify with
+  #   any other z3 release.
+  # - one vstd crate version (source/vstd/Cargo.toml), the version consumers
+  #   must pin for `cargo verus` to accept the pair.
+  # Updating Verus means moving all of these together. The rust stream must
+  # ship a -rustc-dev subpackage, and the z3 stream for that major release
+  # (z3-4 here) must still carry the pinned release.
+  release-commit: 7d829946231d6413a398f6e4160cdfe951261dad
+  release-short-commit: 7d82994
+  rust-version: "1.99"
+  rust-toolchain: 1.99.1
+  vstd-version: 0.0.0-2026-10-18-0147
+  z3-version: 4.16.0
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cargo-auditable
+      - git
+      - glibc-2.44-dev
+      # These three are pinned as the runtime dependencies are; see the vars block.
+      - rust-${{vars.rust-version}}-rustc-dev~${{vars.rust-toolchain}}
+      - rust-${{vars.rust-version}}~${{vars.rust-toolchain}}
+      - z3-4~${{vars.z3-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/verus-lang/verus
+      tag: release/${{package.version}}.${{vars.release-short-commit}}
+      expected-commit: ${{vars.release-commit}}
+
+  # The steps follow upstream's release build (.github/workflows/build.yml).
+  - name: build verus and verify vstd
+    working-directory: source
+    runs: |
+      # source/.cargo/config.toml sets the rustflags verus needs; a RUSTFLAGS
+      # variable, even an empty one, would replace them. The profile overrides
+      # are unset as in the rust package build, so this builds what upstream
+      # releases.
+      unset RUSTFLAGS
+      unset CARGO_PROFILE_RELEASE_LTO
+      unset CARGO_PROFILE_RELEASE_OPT_LEVEL
+      unset CARGO_PROFILE_RELEASE_PANIC
+      unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+
+      # The verus and rust_verify build scripts ask rustup for the active
+      # toolchain and embed its name. This builds with the system rust, so a
+      # stand-in answers that one question.
+      mkdir -p /tmp/rustup-stand-in
+      cat > /tmp/rustup-stand-in/rustup <<EOF
+      #!/bin/sh
+      if [ "\$*" = "show active-toolchain" ]; then
+        echo "${{vars.rust-toolchain}}-${{host.triplet.rust}} (default)"
+        exit 0
+      fi
+      echo "rustup stand-in: unsupported: \$*" >&2
+      exit 1
+      EOF
+      chmod 755 /tmp/rustup-stand-in/rustup
+      export PATH="/tmp/rustup-stand-in:$PATH"
+      # rust_verify embeds VARGO_TOOLCHAIN in place of the raw rustup output,
+      # and the verus build script checks it against the stand-in's answer.
+      export VARGO_TOOLCHAIN="${{vars.rust-toolchain}}-${{host.triplet.rust}}"
+      # The vstd step runs the verus just built as the compiler wrapper; this
+      # has it run the system rust directly rather than through rustup.
+      export VERUS_USE_RUSTUP=0
+
+      # Where upstream's get-z3.sh puts the z3 the build verifies vstd with.
+      ln -s /usr/bin/z3 z3
+
+      # The release's toolchain manifest, which `cargo verus` reads to match
+      # verus with vstd.
+      cargo run -p cargo-verus-toolchains --bin create-manifest -- \
+        --write-to-dir cargo-verus/toolchain-manifests
+
+      # Two workspace tools are left out; verification runs neither.
+      # bump_crate_versions is upstream's crates.io release tool, and the one
+      # crate that links OpenSSL (through crates_io_api). verusdoc renders
+      # HTML docs, and its HTML parser stack pulls in rand 0.7.3
+      # (GHSA-cq8v-f236-94qc).
+      cargo auditable build --release --workspace \
+        --exclude bump_crate_versions \
+        --exclude verusdoc
+      # Run the built cargo-verus directly: `cargo run` would rebuild it
+      # without auditable's metadata.
+      # cargo-auditable's /usr/local/bin/cargo wrapper would add itself as the
+      # workspace rustc wrapper next to verus; cargo-verus runs $CARGO, so give
+      # it the plain cargo.
+      CARGO=/usr/bin/cargo ./target-verus/release/cargo-verus build --release --manifest-path vstd/Cargo.toml
+
+  - name: install
+    working-directory: source
+    runs: |
+      mkdir -p ${{targets.destdir}}/usr/lib/verus ${{targets.destdir}}/usr/bin
+      cp -RL target-verus/release/. ${{targets.destdir}}/usr/lib/verus/
+
+      # Cargo's intermediate build state, not part of the release.
+      cd ${{targets.destdir}}/usr/lib/verus
+      rm -rf build deps examples incremental .fingerprint .cargo-lock
+      find . -name '*.d' -delete
+
+      # verus looks for z3 next to itself.
+      rm -f z3
+      ln -s /usr/bin/z3 z3
+
+      # verus and cargo-verus find their components next to the executable,
+      # so /usr/bin holds wrappers. The wrappers also have verus run the
+      # system rust directly instead of through rustup.
+      for bin in verus cargo-verus; do
+        cat > ${{targets.destdir}}/usr/bin/$bin <<EOF
+      #!/bin/sh
+      export VERUS_USE_RUSTUP="\${VERUS_USE_RUSTUP:-0}"
+      exec /usr/lib/verus/$bin "\$@"
+      EOF
+        chmod 755 ${{targets.destdir}}/usr/bin/$bin
+      done
+
+  - uses: strip
+
+# A Verus release is tagged release/<version>.<short commit>, which the version
+# alone does not name, and it moves rust, z3 and vstd with it.
+update:
+  enabled: false
+  exclude-reason: release tags carry the commit, and each release pins exact rust, z3 and vstd versions
+
+test:
+  environment:
+    contents:
+      packages:
+        - gcc
+        - glibc-dev
+  pipeline:
+    - uses: test/tw/ldd-check
+      with:
+        files: |
+          /usr/lib/verus/verus
+          /usr/lib/verus/rust_verify
+          /usr/lib/verus/cargo-verus
+    - name: version
+      runs: |
+        verus --version | grep -F "Version: ${{package.version}}.${{vars.release-short-commit}}"
+        verus --version | grep -F "Toolchain: ${{vars.rust-toolchain}}-${{host.triplet.rust}}"
+    - name: verify a correct function and reject a wrong one
+      runs: |
+        cat > max.rs <<'EOF'
+        use vstd::prelude::*;
+
+        verus! {
+
+        fn max(a: u64, b: u64) -> (r: u64)
+            ensures
+                r >= a && r >= b,
+                r == a || r == b,
+        {
+            if a > b { a } else { b }
+        }
+
+        fn main() {}
+
+        } // verus!
+        EOF
+        verus max.rs 2>&1 | tee max.log
+        grep -E "verification results:: [1-9][0-9]* verified, 0 errors" max.log
+
+        sed 's/if a > b { a } else { b }/a/' max.rs > wrong.rs
+        if verus wrong.rs > wrong.log 2>&1; then
+          cat wrong.log
+          echo "verus accepted a function that breaks its ensures" >&2
+          exit 1
+        fi
+        grep -F "postcondition not satisfied" wrong.log
+    - name: cargo verus verifies a crate that depends on vstd
+      runs: |
+        mkdir -p smoke/src
+        cat > smoke/Cargo.toml <<'EOF'
+        [package]
+        name = "verus-smoke"
+        version = "0.1.0"
+        edition = "2021"
+
+        [dependencies]
+        vstd = "=${{vars.vstd-version}}"
+
+        [package.metadata.verus]
+        verify = true
+        EOF
+        cat > smoke/src/lib.rs <<'EOF'
+        use vstd::prelude::*;
+
+        verus! {
+
+        pub fn double(x: u32) -> (r: u32)
+            requires
+                x < 1000,
+            ensures
+                r == 2 * x,
+        {
+            x * 2
+        }
+
+        } // verus!
+        EOF
+        cd smoke
+        cargo verus verify 2>&1 | tee ../cargo.log
+        grep -E "verification results:: [1-9][0-9]* verified, 0 errors" ../cargo.log

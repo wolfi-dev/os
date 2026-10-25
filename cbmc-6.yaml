@@ -1,0 +1,169 @@
+package:
+  name: cbmc-6
+  version: "6.11.0"
+  epoch: 0
+  description: CBMC bounded model checker for C and C++ programs
+  copyright:
+    # CBMC itself, and the MiniSat and CaDiCaL solvers built into it.
+    - license: BSD-4-Clause AND MIT
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  dependencies:
+    provides:
+      - cbmc=${{package.full-version}}
+  test-resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  # The solver releases CBMC's src/solvers/CMakeLists.txt downloads at
+  # configure time.
+  minisat2-version: 2.2.1
+  cadical-version: 3.0.0
+
+environment:
+  contents:
+    packages:
+      - bash
+      - bison
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cmake
+      - flex
+      # CBMC builds with -Werror, and GCC 16 adds warnings its sources trip
+      # (-Wsfinae-incomplete in util/namespace.h).
+      - gcc-15-default
+      - glibc-2.44-dev
+      - patch
+      # library_check.sh edits its function lists with perl.
+      - perl
+      - samurai
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/diffblue/cbmc
+      tag: cbmc-${{package.version}}
+      expected-commit: 820ff0f555b43fb78e0cd9332e498461bd14244b
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/arminbiere/cadical
+      tag: rel-${{vars.cadical-version}}
+      expected-commit: 7b99c07f0bcab5824a5a3ce62c7066554017f641
+      destination: solver-sources/cadical
+
+  # blocked-no-tags: CBMC pins and patches minisat2 2.2.1, Debian's snapshot of niklasso/minisat, which tags only up to 2.2.0
+  - uses: fetch
+    with:
+      uri: http://ftp.debian.org/debian/pool/main/m/minisat2/minisat2_${{vars.minisat2-version}}.orig.tar.gz
+      expected-sha256: e54afa3c192c1753bc8075c0c7e126d5c495d9066e3f90a2588091149ac9ca40
+      extract: false
+
+  # Point CBMC's configure-time downloads at the sources above. ExternalProject
+  # copies a local directory as it would unpack an archive; CaDiCaL's archive
+  # hash gives way to the checkout's expected-commit, and CBMC still checks
+  # minisat2's MD5 as well as fetch's SHA-256.
+  - runs: |
+      sources="$(pwd)"
+      sed -i \
+        -e "s|URL http://ftp.debian.org/debian/pool/main/m/minisat2/minisat2_${{vars.minisat2-version}}.orig.tar.gz|URL file://$sources/minisat2_${{vars.minisat2-version}}.orig.tar.gz|" \
+        -e "s|URL https://github.com/arminbiere/cadical/archive/rel-${{vars.cadical-version}}.tar.gz|URL $sources/solver-sources/cadical|" \
+        -e "/URL_HASH SHA256=282b1c9422fde8631cb721b86450ae94df4e8de0545c17a69a301aaa4bf92fcf/d" \
+        src/solvers/CMakeLists.txt
+      grep -F "URL file://$sources/minisat2_${{vars.minisat2-version}}.orig.tar.gz" src/solvers/CMakeLists.txt
+      grep -F "URL $sources/solver-sources/cadical" src/solvers/CMakeLists.txt
+      if grep -F "URL_HASH SHA256=" src/solvers/CMakeLists.txt; then exit 1; fi
+
+  # library_check.sh compiles CBMC's C library models with -Wall -Werror
+  # -Wextra to check they are valid C, and discards the output. GCC 15 warns
+  # in them where the GCC upstream tests with does not (maybe-uninitialized),
+  # so the check keeps the warnings and fails only on errors.
+  - runs: |
+      sed -i 's|^    \$CC -S -Wall -Werror -pedantic -Wextra -std=gnu11 __libcheck.i \\$|    $CC -S -Wall -pedantic -Wextra -std=gnu11 __libcheck.i \\|' src/ansi-c/library_check.sh
+      grep -F -- '$CC -S -Wall -pedantic -Wextra -std=gnu11 __libcheck.i' src/ansi-c/library_check.sh
+
+  # The solver set Kani's own CBMC build uses (scripts/setup/al2/install_cbmc.sh
+  # in model-checking/kani); Kani defaults to CBMC's built-in CaDiCaL.
+  - uses: cmake/configure
+    with:
+      opts: |
+        -DWITH_JBMC=OFF \
+        -Dsat_impl="minisat2;cadical" \
+        -Denable_cbmc_tests=OFF
+
+  - uses: cmake/build
+
+  - uses: cmake/install
+
+  # CMake installs the bash completion under the prefix, as etc/bash_completion.d.
+  - runs: |
+      mkdir -p ${{targets.destdir}}/usr/share/bash-completion/completions
+      mv ${{targets.destdir}}/usr/etc/bash_completion.d/cbmc ${{targets.destdir}}/usr/share/bash-completion/completions/cbmc
+      rmdir ${{targets.destdir}}/usr/etc/bash_completion.d ${{targets.destdir}}/usr/etc
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-doc
+    description: ${{package.name}} manpages
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+update:
+  enabled: true
+  github:
+    identifier: diffblue/cbmc
+    use-tag: true
+    tag-filter-prefix: cbmc-6.
+    strip-prefix: cbmc-
+
+test:
+  environment:
+    contents:
+      packages:
+        - gcc
+        - glibc-dev
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: version
+      runs: |
+        cbmc --version | grep -F "${{package.version}}"
+        goto-cc --version
+        goto-instrument --version
+    - name: prove an assertion and refute another
+      runs: |
+        cat > ok.c <<'EOF'
+        #include <assert.h>
+        int nondet_int(void);
+        int main(void) {
+          int x = nondet_int();
+          if (x > 0 && x < 1000) {
+            assert(x * 2 > x);
+          }
+          return 0;
+        }
+        EOF
+        cbmc ok.c | tee ok.log
+        grep -F "VERIFICATION SUCCESSFUL" ok.log
+
+        cat > bad.c <<'EOF'
+        #include <assert.h>
+        int nondet_int(void);
+        int main(void) {
+          int x = nondet_int();
+          assert(x != 42);
+          return 0;
+        }
+        EOF
+        if cbmc bad.c > bad.log 2>&1; then
+          cat bad.log
+          echo "cbmc proved an assertion that fails for x == 42" >&2
+          exit 1
+        fi
+        grep -F "VERIFICATION FAILED" bad.log

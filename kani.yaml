@@ -1,0 +1,200 @@
+package:
+  name: kani
+  version: "0.68.0"
+  epoch: 0
+  description: Kani Rust Verifier, a bit-precise model checker for Rust
+  copyright:
+    - license: Apache-2.0 OR MIT
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  dependencies:
+    runtime:
+      # kani-driver runs cbmc, goto-cc and goto-instrument from PATH. It warns,
+      # but does not fail, when `cbmc --version` differs from the release this
+      # Kani release was tested with (kani-dependencies: 6.11.0).
+      - cbmc-6
+      # The external solver harnesses select with #[kani::solver(kissat)].
+      - kissat
+      # Pinned to the rustc release this package builds kani-compiler
+      # against; see the vars block.
+      - rust-${{vars.rust-version}}~${{vars.rust-toolchain}}
+  test-resources:
+    cpu: "4"
+    memory: 8Gi
+
+vars:
+  # kani-compiler is a rustc driver built against the compiler's internal
+  # crates (rust-*-rustc-dev), which have no stable API, so it runs only on
+  # the rustc it was built against, and this pins that rustc. Upstream pins a
+  # nightly instead (rust-toolchain.toml: nightly-2026-08-21 for 0.68.0); this
+  # release builds and passes its tests on the stable release below. Updating
+  # Kani means checking the release's nightly against a stable rust stream,
+  # and moving rust-version and rust-toolchain with it.
+  rust-version: "1.99"
+  rust-toolchain: 1.99.1
+  # The charon submodule commit at this Kani release. kani-compiler names it
+  # as an optional path dependency (the llbc feature, which this build leaves
+  # off), and cargo needs the path present to resolve the workspace.
+  charon-commit: b250680abd40ff1aaa07081d0497dc2755ed112e
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - glibc-2.44-dev
+      # These two are pinned as the runtime rust dependency is; see the vars
+      # block.
+      - rust-${{vars.rust-version}}-rustc-dev~${{vars.rust-toolchain}}
+      - rust-${{vars.rust-version}}~${{vars.rust-toolchain}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/model-checking/kani
+      tag: kani-${{package.version}}
+      expected-commit: 0d2328a93f0e0ff66132d6bfa1a7d884877cf862
+
+  # The submodule commit is not a tag; with a branch and expected-commit,
+  # git-checkout clones the branch and resets to the commit.
+  - uses: git-checkout
+    with:
+      repository: https://github.com/AeneasVerif/charon
+      branch: main
+      expected-commit: ${{vars.charon-commit}}
+      destination: charon
+
+  # The steps follow upstream's release bundle (tools/build-kani: `cargo
+  # bundle`), without the CBMC and kissat binaries it copies in, which come
+  # from their own packages here.
+  - name: build kani and its libraries
+    runs: |
+      # Kani's .cargo/config.toml carries the rustflags and RUSTC_BOOTSTRAP its
+      # build needs; a RUSTFLAGS variable would replace those rustflags.
+      unset RUSTFLAGS
+      unset CARGO_PROFILE_RELEASE_LTO
+      unset CARGO_PROFILE_RELEASE_OPT_LEVEL
+      unset CARGO_PROFILE_RELEASE_PANIC
+      unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+
+      # kani-compiler's build script reads these two to add a development
+      # rpath, $RUSTUP_HOME/toolchains/$RUSTUP_TOOLCHAIN/lib, next to the
+      # release one ($ORIGIN/../toolchain/lib); this keeps the development
+      # one under the root-owned install prefix. kani-driver also embeds
+      # RUSTUP_TOOLCHAIN, which only its development mode uses.
+      export RUSTUP_HOME=/usr/lib/kani
+      export RUSTUP_TOOLCHAIN="${{vars.rust-toolchain}}-${{host.triplet.rust}}"
+
+      # Builds kani-driver and kani-compiler, then has kani-compiler build
+      # Kani's libraries and its std (-Z build-std, from rust-src).
+      cargo build-dev -- --release
+      cargo build --release -p kani-cov
+
+  - name: install
+    runs: |
+      kani=${{targets.destdir}}/usr/lib/kani
+      mkdir -p $kani/bin $kani/library $kani/scripts ${{targets.destdir}}/usr/bin
+
+      install -m755 target/kani/bin/kani-driver target/kani/bin/kani-compiler target/release/kani-cov $kani/bin/
+      cp -R library/kani library/kani_macros library/std $kani/library/
+      cp -R target/kani/lib target/kani/playback target/kani/no_core $kani/
+      echo -n "${{vars.rust-toolchain}}-${{host.triplet.rust}}" > $kani/rust-toolchain-version
+      rustc --version > $kani/rustc-version
+      cp tools/build-kani/license-notes.txt $kani/
+
+      # The release layout `cargo kani setup` creates in ~/.kani/kani-<version>:
+      # kani-driver takes the directory above its bin/ as the install, and
+      # runs the rust toolchain under its toolchain/, here the system's.
+      ln -s /usr $kani/toolchain
+
+      # kani-driver acts as `kani` or `cargo-kani` by the name it is run as.
+      ln -s ../lib/kani/bin/kani-driver ${{targets.destdir}}/usr/bin/kani
+      ln -s ../lib/kani/bin/kani-driver ${{targets.destdir}}/usr/bin/cargo-kani
+
+  - uses: strip
+
+# Each Kani release pins its own nightly rust, whose fit with a stable
+# stream has to be checked by hand (see the vars block).
+update:
+  enabled: false
+  exclude-reason: each release pins a nightly rust that has to be matched to a stable stream by hand
+
+test:
+  environment:
+    contents:
+      packages:
+        - gcc
+        - glibc-dev
+  pipeline:
+    - uses: test/tw/ldd-check
+      with:
+        files: |
+          /usr/lib/kani/bin/kani-driver
+          /usr/lib/kani/bin/kani-compiler
+          /usr/lib/kani/bin/kani-cov
+    - name: version
+      runs: |
+        kani --version | grep -F "${{package.version}}"
+        cargo kani --version | grep -F "${{package.version}}"
+    - name: cargo kani proves a harness and refutes another
+      runs: |
+        mkdir -p smoke/src
+        cat > smoke/Cargo.toml <<'EOF'
+        [package]
+        name = "kani-smoke"
+        version = "0.1.0"
+        edition = "2021"
+
+        [lints.rust]
+        unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+        EOF
+        cat > smoke/src/lib.rs <<'EOF'
+        pub fn checked_double(x: u32) -> Option<u32> {
+            x.checked_mul(2)
+        }
+
+        #[cfg(kani)]
+        mod proofs {
+            #[kani::proof]
+            fn double_is_even() {
+                let x: u32 = kani::any();
+                if let Some(r) = super::checked_double(x) {
+                    assert!(r % 2 == 0);
+                    assert!(r / 2 == x);
+                }
+            }
+
+            #[kani::proof]
+            #[kani::solver(kissat)]
+            fn double_is_even_with_kissat() {
+                let x: u8 = kani::any();
+                if let Some(r) = (x as u32).checked_mul(2) {
+                    assert!(r % 2 == 0);
+                }
+            }
+        }
+        EOF
+        cd smoke
+        cargo kani 2>&1 | tee ../ok.log
+        grep -F "Complete - 2 successfully verified harnesses, 0 failures, 2 total." ../ok.log
+
+        cat >> src/lib.rs <<'EOF'
+
+        #[cfg(kani)]
+        mod refuted {
+            #[kani::proof]
+            fn double_never_overflows() {
+                let x: u32 = kani::any();
+                assert!(super::checked_double(x).is_some());
+            }
+        }
+        EOF
+        if cargo kani --harness refuted::double_never_overflows > ../bad.log 2>&1; then
+          cat ../bad.log
+          echo "kani proved a harness that fails for x >= 2^31" >&2
+          exit 1
+        fi
+        grep -F "VERIFICATION:- FAILED" ../bad.log

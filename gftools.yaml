@@ -1,7 +1,7 @@
 package:
   name: gftools
   version: "0.10.4"
-  epoch: 2 # CVE-2026-111497
+  epoch: 3 # CVE-2026-111497
   description: "Google Fonts Tools: build, fix, check and package fonts for the Google Fonts library"
   copyright:
     - license: Apache-2.0
@@ -32,18 +32,29 @@ vars:
 environment:
   contents:
     packages:
+      - brotli-dev
       - build-base
       - busybox
       - ca-certificates-bundle
       # cffsubr builds AFDKO's tx from source with cmake (see below); AFDKO
       # links libxml2 and would download its own copy if none is installed.
       - cmake
+      - freetype-dev
+      - lcms2-dev
+      - libavif-dev
       # pygit2 is built from its sdist (no prebuilt wheel) and links libgit2.
       - libgit2-dev
+      - libjpeg-turbo-dev
+      - libwebp-dev
+      - libxcb-dev
       - libxml2-dev
+      - openjpeg-dev
       - patch
+      - patchelf # repoints ots-sanitize at the system libbrotlidec (CVE-2026-111497)
       - python-${{vars.python-version}}-dev
+      - tiff-dev
       - uv
+      - zlib-dev
 
 pipeline:
   - uses: git-checkout
@@ -100,7 +111,7 @@ pipeline:
   #   abseil toolchain required; built from source to avoid the passthrough wheel.
   #
   # Taken as wheels because Chainguard Libraries builds them from source: lxml,
-  # opentype-sanitizer, ninja, brotli, pillow, regex, orjson, pynacl,
+  # opentype-sanitizer, ninja, brotli, regex, orjson, pynacl,
   # cryptography. Do not force --no-binary on these: they recompile bundled
   # C/Cython in a build env without the required dev headers (lxml needs
   # libxml2/libxslt, opentype-sanitizer's bundled woff2 does not compile under
@@ -153,10 +164,23 @@ pipeline:
 
       # CVE pins. Not via uv/bump: its trailing `uv pip check` fails on the
       # deliberately omitted nanoemoji dependency of gftools.
-      uv pip install --upgrade --only-binary :all: --no-deps \
-        pillow==13.0.0 # CVE-2026-112403
+      uv pip install --upgrade --no-deps --reinstall-package pillow --no-binary pillow \
+        pillow==13.0.0 # CVE-2026-112403; sdist build links Wolfi's freetype (CVE-2026-111497)
       uv pip install --upgrade --only-binary :all: --no-deps \
         brotli==1.2.1 # CVE-2026-111497
+
+      # CVE-2026-111497: the opentype-sanitizer 9.2.0 wheel (a Chainguard
+      # Libraries rebuild against Wolfi brotli 1.1.0-r7) grafts
+      # libbrotlidec/libbrotlicommon 1.1.0 into opentype_sanitizer.libs, and no
+      # fixed release exists. ots-sanitize calls only BrotliDecoderDecompress,
+      # so point it at the system libbrotlidec.so.1 and drop the grafted copies.
+      ots_sp="${{vars.venv-home}}/lib/python${{vars.python-version}}/site-packages"
+      grafted="$(patchelf --print-needed "$ots_sp/ots/ots-sanitize" | grep '^libbrotlidec-' || true)"
+      if [ -n "$grafted" ]; then
+        patchelf --replace-needed "$grafted" libbrotlidec.so.1 "$ots_sp/ots/ots-sanitize"
+      fi
+      rm -f "$ots_sp"/opentype_sanitizer.libs/libbrotlidec-*.so* "$ots_sp"/opentype_sanitizer.libs/libbrotlicommon-*.so*
+      patchelf --print-needed "$ots_sp/ots/ots-sanitize" | grep -Fx libbrotlidec.so.1
 
       # cffsubr's sdist builds tx by running the vendored AFDKO setup.py,
       # which uses setuptools_scm on a nameless temporary Distribution (via
@@ -375,6 +399,21 @@ test:
         gftools fix-nonhinting Test-run1.ttf Test-fixed.ttf
         test -s Test-fixed.ttf
         "$py" -c "from fontTools.ttLib import TTFont; TTFont('Test-fixed.ttf').get('name')"
+    - name: Pillow links Wolfi's FreeType and ships no bundled Brotli
+      runs: |
+        if find ${{vars.venv-home}} -path '*/pillow.libs/*' -name 'libbrotli*' | grep .; then echo 'bundled libbrotli remains in pillow.libs' >&2; exit 1; fi
+        ${{vars.venv-home}}/bin/python -c 'from PIL import features; missing = [f for f in ("freetype2", "littlecms2", "webp", "avif", "jpg", "jpg_2000", "zlib", "libtiff", "xcb") if not features.check(f)]; assert not missing, missing'
+    - name: ots-sanitize uses the system libbrotlidec (CVE-2026-111497)
+      runs: |
+        ${{vars.venv-home}}/bin/python - <<'EOF'
+        import glob, os, subprocess, sys, ots
+        d = os.path.dirname(os.path.dirname(ots.__file__))
+        if glob.glob(os.path.join(d, "opentype_sanitizer.libs", "libbrotli*")):
+            sys.exit("opentype_sanitizer.libs still bundles Brotli")
+        p = subprocess.run([ots.OTS_SANITIZE], capture_output=True, text=True)
+        if p.returncode == 127 or "error while loading shared libraries" in p.stderr:
+            sys.exit(p.stderr)
+        EOF
     - uses: xcover/stop
     - uses: xcover/ensure
       with:

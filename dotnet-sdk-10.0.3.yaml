@@ -1,7 +1,7 @@
 package:
   name: dotnet-sdk-10.0.3
   version: "10.0.303"
-  epoch: 6 # pin bootstrap to 10.0.111 (runtime 10.0.11), restore AVX2 workaround
+  epoch: 7 # CVE-2026-111497
   description: ".NET SDK ${{package.version}}"
   copyright:
     - license: MIT
@@ -20,9 +20,11 @@ package:
     memory: 1Gi
 
 vars:
-  # 1xx bootstrap that carries runtime 10.0.11, the runtime upstream pairs with
-  # SDK 10.0.303 (dotnet/core release-notes/10.0/10.0.11/10.0.303.md).
-  bootstrap-version: "10.0.111"
+  # 1xx bootstrap that carries runtime 10.0.13. Upstream pairs SDK 10.0.303
+  # with runtime 10.0.11 (dotnet/core release-notes/10.0/10.0.11/10.0.303.md),
+  # but the 10.0.11 packs compile in a Brotli copy affected by CVE-2026-111497.
+  # 10.0.113 is the first 1xx build whose packs link the system brotli.
+  bootstrap-version: "10.0.113"
   llvm-version: '23'
   openssl-version: "4.0"
   prefix: 'usr/share/dotnet'
@@ -45,11 +47,11 @@ environment:
       # Bootstrap from the 1xx band: source-build inherits the bootstrap's
       # runtime as BundledNETCoreAppPackageVersion. Every entry pinned with
       # ~${{vars.bootstrap-version}} below (aspnet-*, dotnet-*, dotnet-sdk-*.0.1*)
-      # is part of the bootstrap and must stay on the 1xx patch that matches what
-      # upstream pairs with SDK 10.0.303 (runtime 10.0.11). If these float, each
-      # rebuild picks up the newest 1xx and this SDK bundles a newer runtime than
-      # upstream (10.0.12 after the 10.0.112 release). The runtime packages must
-      # be pinned too because the bootstrap's own deps on them are unversioned.
+      # is part of the bootstrap and must stay on the same 1xx patch
+      # (vars.bootstrap-version). If these float, each rebuild picks up the
+      # newest 1xx and the bundled runtime moves with it. The runtime packages
+      # must be pinned too because the bootstrap's own deps on them are
+      # unversioned.
       - aspnet-${{vars.major-version}}-runtime~${{vars.bootstrap-version}}
       - aspnet-${{vars.major-version}}-targeting-pack~${{vars.bootstrap-version}}
       - bash
@@ -176,6 +178,11 @@ subpackages:
           tar xf ./artifacts/assets/Release/Private.SourceBuilt.Artifacts.*.tar.gz \
               -C ${{targets.contextdir}}/${{vars.prefix}}/artifacts
     test:
+      environment:
+        contents:
+          packages:
+            - busybox
+            - unzip
       pipeline:
         - runs: |
             artifacts="$(find /${{vars.prefix}} -name '*.tar.gz')"
@@ -184,6 +191,50 @@ subpackages:
               exit 1
             fi
             echo "Found SDK artifacts"
+        - name: Runtime packs in the artifacts use the system brotli
+          runs: |
+            a=/${{vars.prefix}}/artifacts
+            rc=0
+            check() {
+              pack=$1 lib=$2
+              if [ ! -f "$pack" ]; then
+                echo "FAIL: expected exactly one nupkg, got: $pack" >&2
+                rc=1
+                return 0
+              fi
+              rm -rf nupkg-check
+              mkdir nupkg-check
+              unzip -q -o "$pack" "runtimes/*/native/*" -d nupkg-check
+              f=$(echo nupkg-check/runtimes/*/native/"$lib")
+              if [ ! -f "$f" ]; then
+                echo "FAIL: ${pack##*/} has no runtimes/*/native/$lib" >&2
+                rc=1
+              elif ! grep -q libbrotlidec.so.1 "$f"; then
+                echo "FAIL: ${pack##*/}: $lib does not link libbrotlidec.so.1 (vendored Brotli; the build used an unfixed dotnet-sdk-10.0.1-artifacts)" >&2
+                rc=1
+              fi
+              for g in nupkg-check/runtimes/*/native/*; do
+                case "${g##*/}" in
+                  libbrotli*)
+                    echo "FAIL: ${pack##*/} ships the vendored ${g##*/}" >&2
+                    rc=1
+                    ;;
+                esac
+                if grep -aq _ERROR_FORMAT_EXUBERANT_NIBBLE "$g"; then
+                  echo "FAIL: ${pack##*/}: ${g##*/} contains an unfixed Brotli decoder" >&2
+                  rc=1
+                fi
+              done
+            }
+            check "$(echo $a/Microsoft.NETCore.App.Runtime.wolfi.*[0-9].nupkg)" libSystem.IO.Compression.Native.so
+            check "$(echo $a/Microsoft.NETCore.App.Runtime.NativeAOT.wolfi.*[0-9].nupkg)" libSystem.IO.Compression.Native.so
+            check "$(echo $a/Microsoft.NETCore.App.Host.wolfi.*[0-9].nupkg)" singlefilehost
+            check "$(echo $a/runtime.wolfi.*.Microsoft.NETCore.DotNetAppHost.*[0-9].nupkg)" singlefilehost
+            rm -rf nupkg-check
+            if [ "$rc" -ne 0 ]; then
+              exit 1
+            fi
+            echo "runtime packs link the system brotli"
 
 test:
   environment:

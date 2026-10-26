@@ -1,0 +1,92 @@
+name: Check that bundled CA files link to the system bundle
+
+description: |
+  Fails unless every given file is a symlink to the system CA bundle, the
+  link resolves to a non-empty file, and the package declares a runtime
+  dependency on ca-certificates-bundle. Pairs with
+  ca-certificates/use-system-bundle.
+
+  The dependency is read from the apk database rather than inferred from the
+  link resolving, because the bundle often arrives transitively (wolfi-base
+  pulls in apk-tools, which depends on it) and would hide a missing
+  dependency.
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  files:
+    description: |
+      Whitespace-separated list of installed paths to check. Shell globs are
+      allowed.
+    required: true
+  bundle:
+    description: |
+      Path of the system CA bundle that the links must point to.
+    default: /etc/ssl/certs/ca-certificates.crt
+  package:
+    description: |
+      Package that must declare the runtime dependency on
+      ca-certificates-bundle.
+    default: ${{context.name}}
+
+# USAGE EXAMPLE:
+#
+#   - uses: test/uses-system-ca-bundle
+#     with:
+#       files: /usr/lib/python3.12/site-packages/httplib2/cacerts.txt
+#
+pipeline:
+  - name: Check bundled CA files link to the system bundle
+    runs: |
+      bundle="${{inputs.bundle}}"
+      # Assign first: a multi-line list substituted into the for line is a syntax error.
+      files="${{inputs.files}}"
+      checked=0
+      set -f
+      for pattern in $files; do
+        set +f
+        set -- $pattern
+        set -f
+        if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+          echo "No file matches $pattern"
+          exit 1
+        fi
+        for file in "$@"; do
+          if [ ! -L "$file" ]; then
+            echo "$file is not a symlink"
+            exit 1
+          fi
+          target="$(readlink "$file")"
+          if [ "$target" != "$bundle" ]; then
+            echo "$file links to $target, not $bundle"
+            exit 1
+          fi
+          if [ ! -s "$file" ]; then
+            echo "$file links to $bundle, which is missing or empty; does the package depend on ca-certificates-bundle?"
+            exit 1
+          fi
+          checked=$((checked + 1))
+        done
+      done
+      set +f
+      echo "Checked $checked link(s) to $bundle"
+
+  - name: Check the package depends on ca-certificates-bundle
+    runs: |
+      pkg="${{inputs.package}}"
+      # Read the apk database with awk: apk-tools would pull the bundle in.
+      if ! awk -v p="$pkg" -v d=ca-certificates-bundle '
+        /^P:/ { cur = substr($0, 3) }
+        cur == p && /^D:/ {
+          sub(/^D:/, "")
+          for (i = 1; i <= NF; i++)
+            if ($i == d || (index($i, d) == 1 && substr($i, length(d) + 1, 1) ~ /[<>=~]/)) found = 1
+        }
+        END { exit !found }
+      ' /lib/apk/db/installed; then
+        echo "$pkg has no runtime dependency on ca-certificates-bundle"
+        exit 1
+      fi
+      echo "$pkg depends on ca-certificates-bundle"

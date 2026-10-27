@@ -2,7 +2,7 @@
 package:
   name: python-3.14
   version: "3.14.8_git20261021"
-  epoch: 2 # run upstream ssl/hashlib/hmac/http test subset
+  epoch: 3
   description: "the Python programming language (metapackage)"
   copyright:
     - license: PSF-2.0
@@ -69,6 +69,8 @@ vars:
     --with-wheel-pkg-dir=/usr/share/python-wheels
   config-opts-gil: --enable-optimizations
   config-opts-freethreading: --disable-gil --enable-optimizations
+  # Experimental JIT support
+  #
   # --enable-optimizations with clang requires PGO support (in particular,
   # we're missing libclang_rt.profile). This build configuration won't be
   # optimal and might not produce any performance gains.
@@ -96,10 +98,6 @@ var-transforms:
     match: python-(.*)
     replace: '$1'
     to: pyversion
-  - from: ${{vars.pyversion}}
-    match: (.*)
-    replace: '${1}t'
-    to: pyversion-t
   - from: ${{package.version}}
     match: (.*)_git.*
     replace: '$1'
@@ -110,6 +108,8 @@ data:
   - name: variants
     items:
       "": ${{vars.config-opts-gil}}
+      t: ${{vars.config-opts-freethreading}}
+      -jit: ${{vars.config-opts-jit}}
 
 pipeline:
   - uses: git-checkout
@@ -150,12 +150,6 @@ pipeline:
     with:
       patches: gh-127301.patch
 
-  - name: Clone patched source for no-GIL and JIT builds
-    runs: |
-      mkdir no-gil build-jit
-      tar -cf - --exclude=no-gil --exclude=build-jit . | tar -xC no-gil
-      tar -cf - --exclude=no-gil --exclude=build-jit . | tar -xC build-jit
-
 subpackages:
   - range: variants
     name: "${{package.name}}${{range.key}}-runtime"
@@ -164,236 +158,120 @@ subpackages:
       runtime:
         - ${{package.name}}${{range.key}}-base=${{package.full-version}}
     pipeline:
-      - uses: autoconf/configure
-        with:
-          opts: |
-            ${{range.value}} \
-            ${{vars.config-opts-common}}
-      - uses: autoconf/make
-      - uses: upstream-tests/python-regrtest
-      - uses: autoconf/make-install
-      - runs: |
-          find ${{targets.contextdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
-          find ${{targets.contextdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
-          find ${{targets.contextdir}}/usr/lib -type d -name 'tests' -exec rm -rf '{}' +
-          find ${{targets.contextdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
+      - name: Copy the patched source for this build
+        runs: |
+          mkdir -p variants/build${{range.key}}
+          tar -cf - --exclude=./variants . | tar -xC variants/build${{range.key}}
+      - working-directory: variants/build${{range.key}}
+        pipeline:
+          - uses: autoconf/configure
+            with:
+              opts: |
+                ${{range.value}} \
+                ${{vars.config-opts-common}}
+          - uses: autoconf/make
+          - uses: upstream-tests/python-regrtest
+          - uses: autoconf/make-install
+          - runs: |
+              find ${{targets.contextdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
+              find ${{targets.contextdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
+              find ${{targets.contextdir}}/usr/lib -type d -name 'tests' -exec rm -rf '{}' +
+              find ${{targets.contextdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
 
-          cd ${{targets.contextdir}}/usr/bin
-          rm -f idle3* 2to3*
-          rm ${{targets.contextdir}}/usr/lib/libpython3.so
+              cd ${{targets.contextdir}}/usr/bin
+              rm -f idle3* 2to3*
+              rm ${{targets.contextdir}}/usr/lib/libpython3.so
 
-          # add dubious python -> python3 link
-          ln -s python3 ${{targets.contextdir}}/usr/bin/python
+              # add dubious python -> python3 link
+              ln -s python3 ${{targets.contextdir}}/usr/bin/python
 
-          # Drop site-packages README.txt to avoid SCA dep on python3~3.M
-          cd ${{targets.contextdir}}/usr/lib/python3.*
-          rm site-packages/README.txt
-          rmdir site-packages
-      - runs: |
-          rm -R "${{targets.contextdir}}"/usr/lib/python3.*/idlelib
+              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
+              cd ${{targets.contextdir}}/usr/lib/python3.*
+              rm site-packages/README.txt
+              rmdir site-packages
 
-          rm -R "${{targets.contextdir}}"/usr/lib/python3.*/ensurepip/_bundled/
+              # The man page is identical in every build. Only the
+              # default build ships it, in ${{package.name}}-doc.
+              if [ -n "${{range.key}}" ]; then
+                rm -R ${{targets.contextdir}}/usr/share
+              fi
+          - runs: |
+              rm -R "${{targets.contextdir}}"/usr/lib/python3.*/idlelib
 
-          find ${{targets.contextdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
-          find ${{targets.contextdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+              rm -R "${{targets.contextdir}}"/usr/lib/python3.*/ensurepip/_bundled/
 
-          export LD_LIBRARY_PATH="${{targets.contextdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-          ${{targets.contextdir}}/usr/bin/${{vars.python}} -B -m compileall -f --invalidation-mode=unchecked-hash \
-              -r100 ${{targets.contextdir}}/usr/lib/
-      - uses: strip
+              find ${{targets.contextdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
+              find ${{targets.contextdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
+
+              export LD_LIBRARY_PATH="${{targets.contextdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+              ${{targets.contextdir}}/usr/bin/${{vars.python}} -B -m compileall -f --invalidation-mode=unchecked-hash \
+                  -r100 ${{targets.contextdir}}/usr/lib/
+          - uses: strip
     test:
       pipeline:
         - uses: test/tw/ldd-check
         - uses: test/tw/symlink-check
 
   - name: "${{package.name}}t"
-    description: "Python with the GIL disabled (free threading)"
+    description: "Python with the GIL disabled (free threading) (metapackage)"
     dependencies:
       provides:
         - python3t=${{package.full-version}}
         - python-3t=${{package.full-version}}
       runtime:
-        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
-        # which is provided by tk.  melange SCA does not find this dependency.
-        - tk
-    pipeline:
-      - working-directory: no-gil
-        pipeline:
-          - uses: autoconf/configure
-            with:
-              opts: |
-                ${{vars.config-opts-freethreading}} \
-                ${{vars.config-opts-common}}
-          - uses: autoconf/make
-          - uses: autoconf/make-install
-          - name: "Clean out base items"
-            runs: |
-              find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
-              find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
-              find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
-
-              cd ${{targets.subpkgdir}}/usr/bin
-              rm idle3*
-              rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
-
-              # add dubious python -> python3 link
-              ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
-
-              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
-              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/site-packages
-
-              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/idlelib
-              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python-t}}/ensurepip/_bundled/
-
-              rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
-              rm -R ${{targets.subpkgdir}}/usr/share
-          # AFAIK the .pyc/.pyo files are compatible between GIL/no-GIL builds, but
-          # the .so files are not, so we include everything in here out of an
-          # abundance of caution.
-          - name: "Precompile .py files"
-            runs: |
-              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
-              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
-
-              export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-              ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -B -m compileall -f --invalidation-mode=unchecked-hash \
-                  -r100 ${{targets.subpkgdir}}/usr/lib/
-          - uses: strip
+        - ${{package.name}}t-runtime=${{package.full-version}}
+        - ${{package.name}}t-tk=${{package.full-version}}
     test:
       pipeline:
-        - working-directory: no-gil
-          pipeline:
-            - uses: test/tw/ldd-check
-            - uses: test/tw/symlink-check
-            - uses: test/tw/ver-check
-              with:
-                bins: python ${{vars.python}} ${{vars.python-t}}
-                version: ${{vars.upstreamversion}}
-            - uses: test/tw/help-check
-              with:
-                bins: python ${{vars.python}} ${{vars.python-t}}
-            - name: Verify no-GIL build
-              runs: |
-                ${{vars.python-t}} -c 'import sysconfig; assert(sysconfig.get_config_var("Py_GIL_DISABLED"))'
-            - uses: test/python/interpreter/version
-              with:
-                python: ${{vars.python-t}}
-                version: ${{vars.upstreamversion}}
-            - uses: test/python/interpreter/jit
-              with:
-                python: ${{vars.python-t}}
-                available: false
-                enabled: false
-
-  - name: "${{package.name}}t-dev"
-    description: "${{package.name}}t development headers"
-    dependencies:
-      runtime:
-        - ${{package.name}}t=${{package.full-version}}
-    pipeline:
-      - runs: |
-          fromd="${{targets.outdir}}/${{package.name}}t"
-          tod="${{targets.contextdir}}"
-
-          mkdir -p "$tod/usr/bin" "$tod/usr/lib/${{vars.python-t}}"
-          mv -v "$fromd/usr/include" "$tod/usr/"
-          # python3-config and python3.M-config are symlinks to python3.Mt-config
-          mv -v "$fromd"/usr/bin/python*-config "$tod/usr/bin/"
-          mv -v "$fromd/usr/lib/pkgconfig" "$tod/usr/lib/"
-          mv -v "$fromd/usr/lib/libpython${{vars.pyversion-t}}.so" "$tod/usr/lib/"
-          mv -v "$fromd"/usr/lib/${{vars.python-t}}/config-${{vars.pyversion-t}}* \
-             "$tod/usr/lib/${{vars.python-t}}/"
-    test:
-      pipeline:
-        - uses: test/pkgconf
-        - uses: test/tw/devpackage
-        - name: Verify the dev files point at the free-threaded build
+        - uses: test/metapackage
+        - uses: test/tw/ver-check
+          with:
+            bins: python ${{vars.python}} ${{vars.python-t}}
+            version: ${{vars.upstreamversion}}
+        - uses: test/tw/help-check
+          with:
+            bins: python ${{vars.python}} ${{vars.python-t}}
+        - name: Verify no-GIL build
           runs: |
-            for c in ${{vars.python-t}}-config ${{vars.python}}-config python3-config; do
-              $c --includes | grep -F "/usr/include/${{vars.python-t}}"
-            done
-            pkgconf --cflags python3 | grep -F "/usr/include/${{vars.python-t}}"
-            grep -F '#define Py_GIL_DISABLED 1' /usr/include/${{vars.python-t}}/pyconfig.h
-            test -L /usr/lib/libpython${{vars.pyversion-t}}.so
-        - uses: test/python/interpreter/c-ext
+            ${{vars.python-t}} -c 'import sysconfig; assert(sysconfig.get_config_var("Py_GIL_DISABLED"))'
+        - uses: test/python/interpreter/jit
           with:
             python: ${{vars.python-t}}
+            available: false
+            enabled: false
+        - uses: test/python/interpreter/version
+          with:
+            python: ${{vars.python-t}}
+            version: ${{vars.upstreamversion}}
 
   - name: "${{package.name}}-jit"
-    description: "Python with experimental JIT support"
+    description: "Python with experimental JIT support (metapackage)"
     dependencies:
       provides:
         - python3-jit=${{package.full-version}}
         - python-3-jit=${{package.full-version}}
       runtime:
-        # 'import _tkinter' will fail with ImportError on 'libtcl9tk9.0.so'
-        # which is provided by tk.  melange SCA does not find this dependency.
-        - tk
-    pipeline:
-      - working-directory: build-jit
-        pipeline:
-          # Experimental JIT support
-          - uses: autoconf/configure
-            with:
-              opts: |
-                ${{vars.config-opts-jit}} \
-                ${{vars.config-opts-common}}
-          - uses: autoconf/make
-          - uses: autoconf/make-install
-          - name: "Clean out base items"
-            runs: |
-              find ${{targets.subpkgdir}}/usr/lib -type f -name 'libpython*.a' -exec rm -rf '{}' +
-              find ${{targets.subpkgdir}}/usr/lib -type d -name 'test' -exec rm -rf '{}' +
-              find ${{targets.subpkgdir}}/usr/lib -type d -name 'idle_test' -exec rm -rf '{}' +
-
-              cd ${{targets.subpkgdir}}/usr/bin
-              rm idle3*
-              rm ${{targets.subpkgdir}}/usr/lib/libpython3.so
-
-              # add dubious python -> python3 link
-              ln -s python3 ${{targets.subpkgdir}}/usr/bin/python
-
-              # Drop site-packages README.txt to avoid SCA dep on python3~3.M
-              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python}}/site-packages
-
-              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python}}/idlelib
-              rm -R ${{targets.subpkgdir}}/usr/lib/${{vars.python}}/ensurepip/_bundled/
-
-              rm ${{targets.subpkgdir}}/usr/bin/pydoc3*
-              rm -R ${{targets.subpkgdir}}/usr/include
-              rm -R ${{targets.subpkgdir}}/usr/share
-              rm ${{targets.subpkgdir}}/usr/lib/pkgconfig/python-${{vars.pyversion}}-*.pc ${{targets.subpkgdir}}/usr/lib/pkgconfig/python3-*.pc
-          - name: "Precompile .py files"
-            runs: |
-              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyc' -exec rm -rf '{}' +
-              find ${{targets.subpkgdir}}/usr/lib -type f -name '*.pyo' -exec rm -rf '{}' +
-
-              export LD_LIBRARY_PATH="${{targets.subpkgdir}}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-              ${{targets.subpkgdir}}/usr/bin/${{vars.python}} -B -m compileall -f --invalidation-mode=unchecked-hash \
-                  -r100 ${{targets.subpkgdir}}/usr/lib/
-          - uses: strip
+        - ${{package.name}}-jit-runtime=${{package.full-version}}
+        - ${{package.name}}-jit-tk=${{package.full-version}}
     test:
       pipeline:
-        - working-directory: build-jit
-          pipeline:
-            - uses: test/tw/ldd-check
-            - uses: test/tw/symlink-check
-            - uses: test/tw/ver-check
-              with:
-                bins: python ${{vars.python}}
-                version: ${{vars.upstreamversion}}
-            - uses: test/tw/help-check
-              with:
-                bins: python ${{vars.python}}
-            - uses: test/python/interpreter/jit
-              with:
-                python: ${{vars.python}}
-                available: true
-                enabled: true
-            - uses: test/python/interpreter/version
-              with:
-                python: ${{vars.python}}
-                version: ${{vars.upstreamversion}}
+        - uses: test/metapackage
+        - uses: test/tw/ver-check
+          with:
+            bins: python ${{vars.python}}
+            version: ${{vars.upstreamversion}}
+        - uses: test/tw/help-check
+          with:
+            bins: python ${{vars.python}}
+        - uses: test/python/interpreter/jit
+          with:
+            python: ${{vars.python}}
+            available: true
+            enabled: true
+        - uses: test/python/interpreter/version
+          with:
+            python: ${{vars.python}}
+            version: ${{vars.upstreamversion}}
 
   - range: variants
     name: "${{package.name}}${{range.key}}-base"
@@ -490,6 +368,7 @@ subpackages:
 
   - range: variants
     name: "${{package.name}}${{range.key}}-tk"
+    description: "${{package.name}}${{range.key}} tkinter module"
     dependencies:
       provides:
         - py${{vars.pyversion}}${{range.key}}-tkinter=${{package.full-version}}
@@ -516,13 +395,12 @@ subpackages:
             python: python${{vars.pyversion}}
             import: tkinter
 
-  - range: variants
-    name: "${{package.name}}${{range.key}}-doc"
-    description: "${{package.name}}${{range.key}} documentation"
+  - name: "${{package.name}}-doc"
+    description: "${{package.name}} documentation"
     pipeline:
       - uses: split/manpages
         with:
-          package: ${{package.name}}${{range.key}}-runtime
+          package: ${{package.name}}-runtime
     test:
       pipeline:
         - uses: test/docs
@@ -535,7 +413,7 @@ subpackages:
         - python3${{range.key}}-dev=0
         - python-3${{range.key}}-dev=0
       runtime:
-        - ${{package.name}}${{range.key}}=${{package.full-version}}
+        - ${{package.name}}${{range.key}}-runtime=${{package.full-version}}
         - ${{package.name}}${{range.key}}-base-dev=${{package.full-version}}
     pipeline:
       - runs: |
@@ -551,13 +429,20 @@ subpackages:
     test:
       pipeline:
         - uses: test/pkgconf
+        - name: Verify the dev files point at this build's headers
+          runs: |
+            include=$(${{vars.python}} -c 'import sysconfig; print(sysconfig.get_path("include"))')
+            for c in python3-config ${{vars.python}}-config; do
+              $c --includes | tr ' ' '\n' | grep -Fx -- "-I$include"
+            done
+            pkgconf --cflags python3 | tr ' ' '\n' | grep -Fx -- "-I$include"
         - uses: test/python/interpreter/c-ext
           with:
             python: ${{vars.python}}
 
   - range: variants
     name: "${{package.name}}${{range.key}}-base-dev"
-    description: "python3 development headers"
+    description: "${{package.name}}${{range.key}}-base development headers"
     dependencies:
       runtime:
         - ${{package.name}}${{range.key}}-base=${{package.full-version}}

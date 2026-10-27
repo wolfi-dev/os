@@ -1,0 +1,94 @@
+name: LTO bytecode check for static archives
+
+description: |
+  Checks that the static archives (*.a) a package ships hold machine code
+  and no GCC LTO bytecode, so that any compiler and linker can use them,
+  not only the GCC release that built them.
+
+  Objects built with -flto carry GCC's bytecode in .gnu.lto_* sections.
+  Slim objects, which plain -flto produces (meson's b_lto, CMake's
+  INTERPROCEDURAL_OPTIMIZATION), carry nothing else: their .text is empty
+  and they define the __gnu_lto_slim marker. An archive of slim objects
+  passes test/tw/staticpackage, which only looks at the file layout, and
+  links on the build host, where the matching GCC and its plugin are at
+  hand, but fails for everyone else. pixman-static and cairo-static
+  shipped like that for several epochs before anyone noticed.
+
+  Use it in the test of every -static or -dev subpackage of a package
+  built with LTO:
+
+    test:
+      pipeline:
+        - uses: test/tw/staticpackage
+        - uses: test/lto-bytecode-check
+
+  By default it checks the archives owned by the package under test. The
+  build-side fix is -ffat-lto-objects in the compiler flags plus the
+  strip-lto-bytecode pipeline on the split archives.
+
+needs:
+  packages:
+    - binutils
+
+inputs:
+  paths:
+    description: |
+      Archives or directories to check, space-separated; directories are
+      searched recursively for *.a files. Defaults to the *.a files owned
+      by the package under test.
+    required: false
+
+pipeline:
+  - runs: |
+      list=$(mktemp)
+      paths="${{inputs.paths}}"
+      if [ -z "$paths" ]; then
+        apk info -qL "${{context.name}}" | sed -n 's#^\(.*\.a\)$#/\1#p' > "$list"
+      else
+        for p in $paths; do
+          if ! [ -e "$p" ]; then
+            echo "lto-bytecode-check: $p does not exist" >&2
+            exit 1
+          fi
+        done
+        for p in $paths; do
+          if [ -d "$p" ]; then
+            find "$p" -type f -name '*.a'
+          else
+            echo "$p"
+          fi
+        done | sort > "$list"
+      fi
+      if ! [ -s "$list" ]; then
+        echo "lto-bytecode-check: no static archive to check" >&2
+        exit 1
+      fi
+
+      failed=0
+      while read -r a; do
+        ok=1
+        sections=$(readelf -S -W "$a")
+        # grep without -q reads its whole input, so no SIGPIPE under pipefail.
+        if printf '%s\n' "$sections" | grep '\.gnu\.lto_' > /dev/null; then
+          echo "FAIL: $a carries GCC LTO bytecode (.gnu.lto_* sections)" >&2
+          ok=0
+        fi
+        if readelf -s -W "$a" | grep '__gnu_lto_slim' > /dev/null; then
+          echo "FAIL: $a consists of slim LTO objects (__gnu_lto_slim marker)" >&2
+          ok=0
+        fi
+        # The Size column of every .text* section; at least one must be non-zero.
+        if ! printf '%s\n' "$sections" \
+            | sed -nE 's/^ *\[ *[0-9]+\] +\.text[^ ]* +PROGBITS +[0-9a-f]+ +[0-9a-f]+ +([0-9a-f]+) .*/\1/p' \
+            | grep -E '[1-9a-f]' > /dev/null; then
+          echo "FAIL: $a contains no machine code (every .text section is empty)" >&2
+          ok=0
+        fi
+        if [ "$ok" -eq 1 ]; then
+          echo "OK: $a"
+        else
+          failed=1
+        fi
+      done < "$list"
+      rm -f "$list"
+      [ "$failed" -eq 0 ]

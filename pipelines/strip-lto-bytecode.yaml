@@ -1,0 +1,85 @@
+name: Drop GCC LTO bytecode from static archives
+
+description: |
+  Removes GCC's link-time-optimisation bytecode from every static archive
+  (*.a) under a directory, leaving ordinary relocatable objects that any
+  linker, and any compiler release, can use.
+
+  Objects compiled with -flto -ffat-lto-objects carry their machine code
+  and, next to it, GCC's LTO bytecode: the .gnu.lto_* and .gnu.debuglto_*
+  sections and the __gnu_lto_v1 marker symbol. The bytecode can only be
+  consumed by the exact GCC release that wrote it, with its linker plugin
+  loaded, and it roughly doubles the size of an archive, so a shipped
+  archive should not carry it. Shared libraries and executables are not
+  touched: their LTO link has already happened and they contain no
+  bytecode.
+
+  Use it in the subpackage that ships the archives, after they have been
+  split out of the main package:
+
+    - uses: split/static
+    - uses: strip-lto-bytecode
+
+  Plain -flto (meson's b_lto, CMake's INTERPROCEDURAL_OPTIMIZATION, most
+  --enable-lto switches) produces slim objects, which hold bytecode and no
+  machine code at all. Those cannot be repaired here: the pipeline fails
+  and the build needs -ffat-lto-objects added to its compiler flags. It
+  also fails when it finds no archive, or no bytecode to remove, so that a
+  step that does nothing is noticed instead of kept. test/lto-bytecode-check
+  is the matching check for the package's tests.
+
+needs:
+  packages:
+    - binutils
+
+inputs:
+  dir:
+    description: |
+      Directory searched recursively for *.a archives.
+    default: ${{targets.contextdir}}
+
+pipeline:
+  - runs: |
+      dir="${{inputs.dir}}"
+      list=$(mktemp)
+      find "$dir" -type f -name '*.a' | sort > "$list"
+      if ! [ -s "$list" ]; then
+        echo "strip-lto-bytecode: no static archive under $dir" >&2
+        exit 1
+      fi
+
+      failed=0
+      stripped=0
+      while read -r a; do
+        # grep -c reads its whole input, so no SIGPIPE under pipefail.
+        lto=$(readelf -S -W "$a" | grep -c '\.gnu\.lto_' || true)
+        if [ "$lto" -eq 0 ]; then
+          echo "strip-lto-bytecode: $a: no LTO bytecode, left alone"
+          continue
+        fi
+        slim=$(readelf -s -W "$a" | grep -c '__gnu_lto_slim' || true)
+        if [ "$slim" -gt 0 ]; then
+          echo "strip-lto-bytecode: $a: slim LTO objects (bytecode without machine code);" \
+            "compile with -ffat-lto-objects" >&2
+          failed=1
+          continue
+        fi
+        before=$(stat -c %s "$a")
+        strip -p -R '.gnu.lto_*' -R '.gnu.debuglto_*' -N '__gnu_lto_v1' "$a"
+        left=$(readelf -S -W "$a" | grep -c '\.gnu\.lto_' || true)
+        if [ "$left" -gt 0 ]; then
+          echo "strip-lto-bytecode: $a: $left .gnu.lto_* sections left after strip" >&2
+          failed=1
+          continue
+        fi
+        echo "strip-lto-bytecode: $a: $before -> $(stat -c %s "$a") bytes"
+        stripped=$((stripped + 1))
+      done < "$list"
+      rm -f "$list"
+
+      [ "$failed" -eq 0 ] || exit 1
+      if [ "$stripped" -eq 0 ]; then
+        echo "strip-lto-bytecode: no archive under $dir carried LTO bytecode;" \
+          "either LTO is not enabled or this step is not needed" >&2
+        exit 1
+      fi

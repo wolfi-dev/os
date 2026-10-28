@@ -1,7 +1,7 @@
 package:
   name: rust-1.99
   version: "1.99.1"
-  epoch: 1 # rustc-dev subpackage
+  epoch: 2 # profiler runtime from system compiler-rt
   description: "Empowering everyone to build reliable and efficient software."
   copyright:
     - license: Apache-2.0 AND MIT
@@ -35,6 +35,7 @@ environment:
       - ca-certificates-bundle
       - clang-${{vars.llvm-version}}
       - cmake
+      - compiler-rt-${{vars.llvm-version}}
       - coreutils
       - curl
       - curl-dev
@@ -97,6 +98,14 @@ pipeline:
       deny-warnings = false
       EOF
 
+      # The profiler runtime has to match the LLVM major used for codegen: the
+      # raw profile layout can change between majors, and a mismatch makes
+      # -Cinstrument-coverage binaries segfault writing the .profraw at exit.
+      # Without a path, bootstrap builds the runtime from the vendored
+      # src/llvm-project, whose major need not match the system LLVM.
+      PROFILER_RT=/usr/lib/llvm-${{vars.llvm-version}}/lib/clang/${{vars.llvm-version}}/lib/${ARCH}/libclang_rt.profile.a
+      test -r "$PROFILER_RT"
+
       ./configure \
         --host="${ARCH}" \
         --target="${ARCH}" \
@@ -123,6 +132,7 @@ pipeline:
         --set="target.${ARCH}.crt-static=false" \
         --set="target.${ARCH}.musl-root=/usr" \
         --set="target.${ARCH}.crt-static=false" \
+        --set="target.${ARCH}.profiler=$PROFILER_RT" \
         --set="build.cargo=$TOOLCHAIN_BIN_DIR/cargo" \
         --set="build.rustc=$TOOLCHAIN_BIN_DIR/rustc"
 
@@ -257,4 +267,17 @@ test:
         cargo new hello_cargo --bin
         cd hello_cargo
         cargo run | grep -qF "Hello, world!"
+    - name: Coverage-instrumented binary writes its profile at exit
+      runs: |
+        cat <<'EOF' > probe.rs
+        pub fn a(x: fn() -> u32) -> u32 { x() }
+        fn main() {
+          let f: fn() -> u32 = || 7;
+          println!("got: {}", a(f));
+        }
+        EOF
+        rustc -Cinstrument-coverage probe.rs -o probe
+        LLVM_PROFILE_FILE=probe.profraw ./probe > probe.out
+        grep -qF "got: 7" probe.out
+        test -s probe.profraw
     - uses: test/tw/ldd-check

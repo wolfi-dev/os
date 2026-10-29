@@ -2,7 +2,7 @@
 package:
   name: ascan
   version: "2.13.0"
-  epoch: 0 # rust: 1.98->1.99
+  epoch: 1 # CVE-2026-111943
   description: "Open-source malware detection for the AI age"
   copyright:
     - license: Apache-2.0
@@ -44,6 +44,55 @@ pipeline:
     with:
       deps: |-
         tract-onnx@0.22.3
+
+  # CVE-2026-111943: bump fails with "crate is absent from the index but is not a
+  # known workspace member: cleave (dependent of reqwest)" because webpki-roots
+  # is reached through reqwest from the git-sourced cleave and fletch crates, so
+  # pin the lock. 1.0.11 drops the emSign roots.
+  - runs: |
+      cargo update -p 'webpki-roots@1' --precise 1.0.11
+
+  # rust-fs-squashfs 0.4.0 requires lru ^0.12 directly, which carries
+  # GHSA-rhfx-m35p-ff5j (fixed in 0.16.3) and adds a second lru copy next to the
+  # 0.18 ascan uses. 0.4.0 is the crate's only release, so patch in the published
+  # crate with lru relaxed to 0.18. It only uses LruCache::new, len, cap, get and
+  # put. Use the published crate and not its git repo, whose Cargo.toml has a
+  # `../rust-fs-core` path dependency. Drop this once a release of rust-fs-squashfs
+  # moves off lru 0.12.
+  - runs: |
+      mkdir -p /tmp/rust-fs-squashfs-patched
+
+  # blocked-custom-format: the published crate has a normalized manifest; the git repo's Cargo.toml has a ../rust-fs-core path dependency
+  - uses: fetch
+    with:
+      uri: https://static.crates.io/crates/rust-fs-squashfs/rust-fs-squashfs-0.4.0.crate
+      expected-sha256: 071f8b8b71735397efcb72bcaf45ec57e5239ed5a1f3471ab5623581943ee92b
+      directory: /tmp/rust-fs-squashfs-patched
+
+  # The crate's manifest has exactly one `version = "0.12"` line, the lru requirement.
+  - uses: sed
+    with:
+      path: /tmp/rust-fs-squashfs-patched/Cargo.toml
+      pattern: |-
+        ^version = "0\.12"$
+      replacement: |-
+        version = "0.18"
+
+  # Cargo.toml already has a [patch.crates-io] table, so add the entry to it.
+  - uses: sed
+    with:
+      path: Cargo.toml
+      pattern: |-
+        ^\[patch\.crates-io\]$
+      replacement: |-
+        [patch.crates-io]\nrust-fs-squashfs = { path = "/tmp/rust-fs-squashfs-patched" }
+
+  - runs: |
+      cargo update -p rust-fs-squashfs
+      if grep -A1 '^name = "lru"' Cargo.lock | grep -qE 'version = "0\.([0-9]|1[0-5])\.|version = "0\.16\.[0-2]"'; then
+        echo "lru below 0.16.3 still in Cargo.lock"
+        exit 1
+      fi
 
   # Model bundle (azoth): ensemble layout (general/ + config.json +
   # route_policies.json + per-filetype/-filegroup specialists). Baked in and

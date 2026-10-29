@@ -3,7 +3,7 @@ package:
   name: ingress-nginx-controller-1.15
   version: "1.15.12"
   # There are manual changes to review between each package update. See 'vars:' section.
-  epoch: 0 # toolchain rebuild for  go-1.27-1.27.3
+  epoch: 1 # pin opentelemetry-cpp for the otel module and test it at runtime (ZD12482)
   description: "Ingress-NGINX Controller for Kubernetes"
   copyright:
     - license: Apache-2.0
@@ -116,7 +116,7 @@ environment:
       - openssh-client
       - openssl
       - openssl-${{vars.openssl-version}}-dev
-      - opentelemetry-cpp-dev
+      - opentelemetry-cpp-dev~${{vars.opentelemetry-cpp-version}}
       - patch
       - pcre-dev
       - perl-dev
@@ -140,6 +140,13 @@ vars:
   llvm-version: "23"
   go-version: "1.27"
   grpc-version: "1.84"
+  # The otel module links libopentelemetry_*.so.1, whose soname does not change
+  # between opentelemetry-cpp minors even though the SDK ABI does. Building
+  # against one minor and running on another corrupts the heap in every nginx
+  # child process (ZD12482: built against 1.29, shipped with 1.30). Pin the
+  # build headers and the runtime library to the same minor, and bump this
+  # (with an epoch bump) to move to a new opentelemetry-cpp minor.
+  opentelemetry-cpp-version: "1.30"
   openssl-version: "4.0"
   # These environment variables need updated for each new release. Retrieve their
   # correct values from here, replacing <package-version> with the package version.
@@ -713,6 +720,8 @@ subpackages:
         - ingress-nginx-opentelemetry-plugin=${{package.full-version}}
       runtime:
         - grpc
+        # Same minor the module was built against; see vars.opentelemetry-cpp-version.
+        - libopentelemetry-cpp1~${{vars.opentelemetry-cpp-version}}
         - wolfi-baselayout
     pipeline:
       - name: Validate Open Telemetry version
@@ -769,7 +778,9 @@ subpackages:
       environment:
         contents:
           packages:
+            - ${{package.name}}
             - binutils
+            - curl
             - posix-libc-utils
       pipeline:
         - uses: test/tw/ldd-check
@@ -843,6 +854,86 @@ subpackages:
             fi
 
             echo "PASS: $module resolves a single version of every SONAME"
+        - name: Run nginx with the otel module enabled and check no child process crashes
+          runs: |
+            # Symbol resolution (above) cannot see SDK layout changes between
+            # opentelemetry-cpp minors: every symbol resolves, then each worker,
+            # cache manager and cache loader aborts with "double free or
+            # corruption" during startup (ZD12482). Run the module for real.
+            set -eu
+            # The test environment has only packages: no www-data user (nginx is built
+            # with --user=www-data; the image adds that account) and none of nginx's
+            # compiled-in state directories. Run workers as root and create them.
+            mkdir -p /var/lib/nginx /var/log/nginx /run
+            d=$(mktemp -d)
+            cat > "$d/otel.toml" <<EOF
+            exporter = "otlp"
+            processor = "batch"
+
+            [exporters.otlp]
+            host = "127.0.0.1"
+            port = 4317
+
+            [processors.batch]
+            max_queue_size = 2048
+            schedule_delay_millis = 1000
+            max_export_batch_size = 512
+
+            [service]
+            name = "nginx"
+
+            [sampler]
+            name = "AlwaysOn"
+            EOF
+            cat > "$d/nginx.conf" <<EOF
+            load_module /etc/nginx/modules/otel_ngx_module.so;
+            user root root;
+            daemon off;
+            worker_processes 2;
+            error_log $d/error.log notice;
+            pid $d/nginx.pid;
+            events { worker_connections 1024; }
+            http {
+                opentelemetry_config $d/otel.toml;
+                access_log off;
+                client_body_temp_path $d/cb;
+                proxy_temp_path $d/pt;
+                fastcgi_temp_path $d/ft;
+                proxy_cache_path $d/cache levels=1:2 keys_zone=c:10m max_size=100m inactive=1m;
+                server {
+                    listen 127.0.0.1:18080;
+                    location / {
+                        opentelemetry on;
+                        opentelemetry_propagate;
+                        proxy_cache c;
+                        proxy_pass http://127.0.0.1:18081;
+                    }
+                }
+                server {
+                    listen 127.0.0.1:18081;
+                    location / { opentelemetry off; return 200 "ok\n"; }
+                }
+            }
+            EOF
+            /usr/bin/nginx -t -c "$d/nginx.conf"
+            /usr/bin/nginx -c "$d/nginx.conf" &
+            sleep 3
+            i=0
+            while [ "$i" -lt 200 ]; do
+              curl -s -o /dev/null "http://127.0.0.1:18080/p$((i % 20))" || true
+              i=$((i + 1))
+            done
+            sleep 10
+            kill -QUIT "$(cat "$d/nginx.pid")" || true
+            sleep 2
+            crashes=$(grep -cE "exited on signal|double free|corruption" "$d/error.log" || true)
+            if [ "$crashes" -gt 0 ]; then
+              grep -m 5 -E "exited on signal|double free|corruption" "$d/error.log"
+              echo "FAIL: $crashes crash lines from nginx child processes with the otel module loaded"
+              exit 1
+            fi
+            workers=$(grep -c "start worker process" "$d/error.log" || true)
+            echo "PASS: no child process crashes with the otel module loaded ($workers workers started)"
 
   - name: ingress-nginx-custom-error-pages-${{vars.nginx-ingress-major-minor}}
     description: Custom error pages for ingress nginx controller ${{vars.nginx-ingress-major-minor}}

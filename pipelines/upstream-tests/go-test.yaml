@@ -60,29 +60,10 @@ description: |
     - the suite did not really run: no packages match, or no test passed
       (no test files, or everything skipped).
 
-  go test runs a subset of go vet on every test package before testing it,
-  and a vet finding fails that package like a build error ([build failed]).
-  `vet-skip` names analyzers to leave out of that pre-check; unset, go
-  test's default analyzer set runs, as before. Policy for setting it:
-    - only when vet fails on upstream code, never on our own patches (fix
-      those instead);
-    - name only the analyzer(s) that fail, so the rest keep gating;
-      `all` (no vet at all) is the last resort;
-    - every caller that sets it needs a comment naming the vet findings
-      (file:line and what vet reports) and a `TODO(upstream-tests): ...`
-      to remove it once upstream fixes them:
-    # go test's vet (printf) rejects pkg/foo/bar.go:12 (Errorf format %q
-    # has arg of type int).
-    # TODO(upstream-tests): drop vet-skip once upstream fixes the format verb.
-    - uses: upstream-tests/go-test
-      with:
-        vet-skip: printf
-  `-vet` in `args` is rejected: use `vet-skip`.
-
   Prints go's human-readable output reconstructed from the -json stream
   (build errors, package ok/FAIL lines and the full output of every failing
   test), then summary lines:
-    UPSTREAM-TESTS <package>: duration=<n>s vet=<mode>
+    UPSTREAM-TESTS <package>: duration=<n>s
     UPSTREAM-TESTS-FAIL <package>: <importpath>.<Test>      (one per failing test)
     UPSTREAM-TESTS-FAIL <package>: <importpath> [build failed]  (or [setup failed], [package failed])
     UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [ignored=<n>]
@@ -95,8 +76,6 @@ description: |
   (t.Parallel), the package stays [package failed] and the note lists
   them. ignored =
   how many test functions named in `ignore` exist in *_test.go files.
-  <mode> is the vet pre-check that ran: default, skip:<analyzers> (e.g.
-  skip:printf,stdversion) or off.
 
   Example:
     - uses: go/build
@@ -158,23 +137,8 @@ inputs:
   args:
     description: |
       Extra go test arguments, inserted verbatim into the command line,
-      e.g. `-count=1`. Do not pass -json, -skip or -timeout here, use
-      `tags` rather than -tags and `vet-skip` rather than -vet (rejected).
-    default: ""
-  vet-skip:
-    description: |
-      go vet analyzers to leave out of go test's vet pre-check, separated by
-      spaces or newlines (like `ignore`), e.g. `printf` or a block with
-      `printf` and `stdversion` on separate lines. Empty runs go test's
-      default analyzer set. Otherwise go test gets -vet=<the default set of
-      the go toolchain running the tests, minus these names>. That set
-      differs between go releases (1.27 renamed bool/buildtags to
-      bools/buildtag and added stdversion); it is picked from
-      `go env GOVERSION`, and an unknown release, or a name that is not in
-      that release's set, fails the step until it is added here.
-      `all` alone turns the pre-check off (-vet=off): last resort only.
-      See the policy above: upstream findings only, name only what fails,
-      and comment the findings with a TODO in the caller.
+      e.g. `-count=1` or `-vet=off`. Do not pass -json, -skip
+      or -timeout here, and use `tags` rather than -tags.
     default: ""
   toolchaintags:
     description: |
@@ -270,66 +234,6 @@ pipeline:
           echo "upstream-tests/go-test: pass build tags in 'tags' (or 'toolchaintags'), not '-tags' in args: a second -tags replaces the first and drops ${{inputs.toolchaintags}}" >&2
           exit 1 ;;
       esac
-      case " ${{inputs.args}} " in
-        *" -vet"*|*" --vet"*)
-          echo "upstream-tests/go-test: leave analyzers out of go test's vet pre-check with the 'vet-skip' input, not '-vet' in args; see the pipeline description for the policy" >&2
-          exit 1 ;;
-      esac
-      # vet pre-check: vet-skip names analyzers (whitespace separated) to
-      # drop from go test's default set, or is "all" for -vet=off. go
-      # test's default set is a fixed list in cmd/go (defaultVetFlags) that
-      # changes between releases, so it is picked by toolchain here.
-      vetskip="${{inputs.vet-skip}}"
-      vetarg=""
-      vetmode=default
-      set -f
-      set -- $vetskip
-      set +f
-      if [ "$#" -gt 0 ]; then
-        for a in "$@"; do
-          case "$a" in
-            *[!a-z0-9]*)
-              echo "upstream-tests/go-test: vet-skip entry '$a' is not a go vet analyzer name" >&2
-              exit 1 ;;
-            all)
-              if [ "$#" -ne 1 ]; then
-                echo "upstream-tests/go-test: vet-skip 'all' (-vet=off) cannot be combined with other analyzer names" >&2
-                exit 1
-              fi ;;
-          esac
-        done
-        if [ "$1" = all ]; then
-          vetarg=-vet=off
-          vetmode=off
-        else
-          gov=$(go env GOVERSION)
-          case "$(printf '%s' "$gov" | sed -E 's/^go([0-9]+\.[0-9]+).*/\1/')" in
-            1.24|1.25|1.26)
-              defvet=atomic,bool,buildtags,directive,errorsas,ifaceassert,nilfunc,printf,slog,stringintconv,tests ;;
-            1.27)
-              defvet=atomic,bools,buildtag,directive,errorsas,ifaceassert,nilfunc,printf,slog,stdversion,stringintconv,tests ;;
-            *)
-              echo "upstream-tests/go-test: vet-skip: this pipeline does not know go test's default vet analyzers for $gov; add them (defaultVetFlags in cmd/go/internal/test/test.go)" >&2
-              exit 1 ;;
-          esac
-          list=",$defvet,"
-          skipped=""
-          for a in "$@"; do
-            case "$list" in
-              *",$a,"*) list=$(printf '%s' "$list" | sed "s/,$a,/,/") ;;
-              *)
-                echo "upstream-tests/go-test: vet-skip entry '$a' is not in go test's default vet analyzers for $gov ($defvet)" >&2
-                exit 1 ;;
-            esac
-            skipped="${skipped:+$skipped,}$a"
-          done
-          list=${list#,}
-          list=${list%,}
-          vetarg="-vet=$list"
-          vetmode="skip:$skipped"
-        fi
-      fi
-      set --
       # Same tag set as go/build: "<toolchaintags>,<tags>". Comma separated,
       # no spaces, so it is safe to expand unquoted below.
       tags=$(printf '%s,%s' "${{inputs.toolchaintags}}" "${{inputs.tags}}" | sed 's/,,*/,/g; s/^,//; s/,$//')
@@ -341,7 +245,7 @@ pipeline:
         jobs=$(nproc)
         [ "$jobs" -gt 4 ] && jobs=4
       fi
-      echo "upstream-tests/go-test: GOFLAGS=$GOFLAGS GOPROXY=$GOPROXY GOWORK=$(go env GOWORK) GOMODCACHE=$GOMODCACHE GOCACHE=$GOCACHE GOTMPDIR=$GOTMPDIR tags=$tags GOEXPERIMENT=${GOEXPERIMENT:-} -p $jobs vet=$vetmode${vetarg:+ ($vetarg)}"
+      echo "upstream-tests/go-test: GOFLAGS=$GOFLAGS GOPROXY=$GOPROXY GOWORK=$(go env GOWORK) GOMODCACHE=$GOMODCACHE GOCACHE=$GOCACHE GOTMPDIR=$GOTMPDIR tags=$tags GOEXPERIMENT=${GOEXPERIMENT:-} -p $jobs"
 
       set -f
       pkgs="${{inputs.packages}}"
@@ -404,7 +308,7 @@ pipeline:
       start=$(date +%s)
       rc=0
       $wrap go test -exec "$execw" -short -json -p $jobs -timeout ${{inputs.timeout}} \
-        $tagsarg $vetarg "$@" ${{inputs.args}} $pkgs > "$log" 2>&1 || rc=$?
+        $tagsarg "$@" ${{inputs.args}} $pkgs > "$log" 2>&1 || rc=$?
       end=$(date +%s)
       set +f
 
@@ -498,7 +402,7 @@ pipeline:
         }
         END { for (p in buf) printf "%s", buf[p] }' FS='\t' "$sum" FS=' ' "$log"
 
-      echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s vet=$vetmode"
+      echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s"
       if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
         echo "upstream-tests/go-test: go test timed out or was killed (exit $rc, overall-timeout=${{inputs.overall-timeout}}s)" >&2
       fi

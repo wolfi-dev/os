@@ -20,6 +20,20 @@ Once the PR merges, the
 withdraws the packages, usually within a few minutes. There is no workflow
 to run by hand.
 
+## After the PR merges
+
+To confirm the withdrawal applied, see
+[Verifying a withdrawal or restore](https://github.com/chainguard-dev/mono/blob/main/bots/apk-withdraw-restore/README.md#verifying-a-withdrawal-or-restore)
+in mono's `bots/apk-withdraw-restore/README.md`. The reconciler logs
+`applied <commit sha>` for the root once the batch is done, and warns about
+any entry it could not withdraw.
+
+Failures alert #eng-os-prod-alerts, not #chainguard-images-alerts as the
+old workflows did. To re-apply a batch, raise a new PR that changes
+`withdrawn-packages.txt` and lists the entries again. The guarded-os team can
+pause the reconciler; see
+[Operating](https://github.com/chainguard-dev/mono/blob/main/bots/apk-withdraw-restore/README.md#operating).
+
 ## Technical details
 
 `withdrawn-packages.txt` is a command log, not a record of everything ever

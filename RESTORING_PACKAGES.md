@@ -34,6 +34,20 @@ the same commit is ambiguous, so the reconciler applies neither action to
 it and the restore does not happen. Removing it also stops a later
 withdrawal batch from withdrawing it again.
 
+## After the PR merges
+
+To confirm the restore applied, see
+[Verifying a withdrawal or restore](https://github.com/chainguard-dev/mono/blob/main/bots/apk-withdraw-restore/README.md#verifying-a-withdrawal-or-restore)
+in mono's `bots/apk-withdraw-restore/README.md`. The reconciler logs
+`applied <commit sha>` for the root once the batch is done, and warns about
+any entry it could not restore.
+
+Failures alert #eng-os-prod-alerts, not #chainguard-images-alerts as the
+old workflows did. To re-apply a batch, raise a new PR that changes
+`restored-packages.txt` and lists the entries again. The guarded-os team can
+pause the reconciler; see
+[Operating](https://github.com/chainguard-dev/mono/blob/main/bots/apk-withdraw-restore/README.md#operating).
+
 ## Technical details
 
 `restored-packages.txt` is a command log: each merged commit that changes

@@ -1,0 +1,154 @@
+package:
+  name: py3-pytest-localserver
+  version: "0.10.0"
+  epoch: 0
+  description: pytest plugin that runs local HTTP and HTTPS servers as test fixtures
+  copyright:
+    - license: MIT
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: pytest-localserver
+  import: pytest_localserver
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - py3-supported-build-base-dev
+      - py3-supported-setuptools-scm
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/pytest-dev/pytest-localserver
+      tag: v${{package.version}}
+      expected-commit: d79c1108a0238a2cf6d7d6f2687b5e74d10f4113
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      # The optional "smtp" extra (aiosmtpd) is not packaged, so the
+      # smtpserver fixture is unavailable; HTTP/HTTPS fixtures work.
+      runtime:
+        - py${{range.key}}-pytest
+        - py${{range.key}}-werkzeug
+      provides:
+        - py3-${{vars.pypi-package}}
+      provider-priority: ${{range.value}}
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              from pytest_localserver.http import ContentServer
+              from pytest_localserver.https import SecureContentServer
+        - name: Fixtures serve HTTP and HTTPS through the auto-loaded plugin
+          runs: |
+            mkdir -p /tmp/localserver-test
+            cd /tmp/localserver-test || exit 1
+            # No -p flag: the fixtures must resolve via the pytest11 entry point.
+            cat > test_localserver.py <<'EOF'
+            import ssl
+            import urllib.error
+            import urllib.request
+
+            import pytest
+
+
+            def test_http_content_and_request_log(httpserver):
+                httpserver.serve_content("hello localserver", code=200, headers={"X-Test": "yes"})
+                with urllib.request.urlopen(httpserver.url + "/hello?x=1") as r:
+                    assert r.status == 200
+                    assert r.read() == b"hello localserver"
+                    assert r.headers["X-Test"] == "yes"
+                assert len(httpserver.requests) == 1
+                req = httpserver.requests[0]
+                assert req.method == "GET"
+                assert req.path == "/hello"
+                assert req.args["x"] == "1"
+
+
+            def test_http_error_status(httpserver):
+                httpserver.serve_content("missing", code=404)
+                with pytest.raises(urllib.error.HTTPError) as exc:
+                    urllib.request.urlopen(httpserver.url)
+                assert exc.value.code == 404
+
+
+            def test_https_self_signed(httpsserver):
+                assert httpsserver.url.startswith("https://")
+                httpsserver.serve_content("secure content")
+                # The bundled certificate is self-signed, so verification is disabled.
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(httpsserver.url, context=ctx) as r:
+                    assert r.read() == b"secure content"
+            EOF
+            python${{range.key}} -m pytest -p no:cacheprovider test_localserver.py > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -F "3 passed" out.txt
+        - name: ContentServer works outside pytest
+          runs: |
+            python${{range.key}} <<'EOF'
+            import urllib.request
+            from pytest_localserver.http import ContentServer
+
+            server = ContentServer()
+            server.start()
+            try:
+                server.serve_content("direct api", code=201)
+                with urllib.request.urlopen(server.url) as r:
+                    assert r.status == 201, r.status
+                    body = r.read()
+                    assert body == b"direct api", body
+            finally:
+                server.stop()
+            print("ContentServer OK:", body.decode())
+            EOF
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  # Upstream publishes PEP 440 ".postN" tags (e.g. v0.10.0.post0), which are not valid APK versions.
+  ignore-regex-patterns:
+    - '.*\.post.*'
+  github:
+    identifier: pytest-dev/pytest-localserver
+    strip-prefix: v

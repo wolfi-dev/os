@@ -1,7 +1,7 @@
 package:
   name: py3-pip
   version: "26.2.2" # IF the next version fixes CVEs, check the idna/urllib3 surgery below!
-  epoch: 1 # CVE-2026-114613
+  epoch: 2 # CVE-2026-111943
   description: The PyPA recommended tool for installing Python packages.
   copyright:
     - license: MIT
@@ -12,6 +12,7 @@ package:
     memory: 6Gi
 
 vars:
+  certifi-version: "2026.10.23" # 2026.10.23 or higher for CVE-2026-111943 (drops the emSign Root CA - C1 and emSign ECC Root CA - C3 roots)
   msgpack-version: "1.2.3" # 1.2.3 or higher for GHSA-j586-36cw-2gc2 (CVE-2026-114613), also covers GHSA-6v7p-g79w-8964 (CVE-2026-57585)
   pypi-package: pip
   urllib3-version: "2.8.0" # 2.8.0 or higher for GHSA-8988-9cw3-xx77 (CVE-2026-97687), GHSA-gh4c-6fx4-qh6g, GHSA-vxq7-64xx-v4gw (also covers GHSA-mf9v-mfxr-j63j, GHSA-qccp-gfcp-xxvc)
@@ -62,6 +63,14 @@ pipeline:
       tag: v${{vars.msgpack-version}}
       destination: msgpack
 
+  # IF the next version pulls in certifi >= 2026.10.23, remove this:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/certifi/python-certifi
+      expected-commit: b60466c9f2882d9cf088943c650b0faac06c080c
+      tag: ${{vars.certifi-version}}
+      destination: certifi
+
   - name: "Build urrlib3 to generate version data"
     working-directory: urllib3
     runs: |
@@ -86,10 +95,19 @@ pipeline:
             msgpack/COPYING \
             "$VENDOR_DIR/msgpack/"
 
-      rm -r urllib3 msgpack
+      # Only the CA bundle and the version string change between certifi
+      # releases. Copy just those two files so pip's vendoring rewrites
+      # (pip._vendor.certifi imports in core.py, __main__.py and tests) stay.
+      cp -v certifi/certifi/__init__.py \
+            certifi/certifi/cacert.pem \
+            "$VENDOR_DIR/certifi/"
+
+      rm -r urllib3 msgpack certifi
 
       sed -i -E "s/urllib3==2.[0-9]+.[0-9]+/urllib3==${{vars.urllib3-version}}/" "$VENDOR_DIR/vendor.txt"
       sed -i -E "s/msgpack==1.[0-9]+.[0-9]+/msgpack==${{vars.msgpack-version}}/" "$VENDOR_DIR/vendor.txt"
+      sed -i -E "s/certifi==[0-9]+.[0-9]+.[0-9]+/certifi==${{vars.certifi-version}}/" "$VENDOR_DIR/vendor.txt"
+      grep -q "certifi==${{vars.certifi-version}}" "$VENDOR_DIR/vendor.txt"
 
       # pip also ships a CycloneDX SBOM of its vendored deps. Rewrite every
       # component whose version no longer matches vendor.txt, otherwise
@@ -272,6 +290,19 @@ subpackages:
                   print("FAIL: stale pip/_vendor/bom.cdx.json in wheel:\n  " + "\n  ".join(bad))
                   sys.exit(1)
               print("PASS: wheel bom.cdx.json matches vendor.txt")
+        - name: "Wheel's vendored certifi bundle drops the CVE-2026-111943 roots"
+          uses: py/one-python
+          with:
+            content: |
+              #!/usr/bin/env python3
+              import sys, zipfile
+              z = zipfile.ZipFile("/usr/share/python-wheels/pip-${{package.version}}-py3-none-any.whl")
+              pem = z.read("pip/_vendor/certifi/cacert.pem").decode()
+              bad = [r for r in ("emSign Root CA - C1", "emSign ECC Root CA - C3", "emSign ECC Root CA - G3", "AAA Certificate Services") if r in pem]
+              if bad:
+                  print(f"FAIL: wheel's pip/_vendor/certifi/cacert.pem still has {bad}")
+                  sys.exit(1)
+              print("PASS: wheel's vendored certifi bundle is clean")
 
 test:
   pipeline:
@@ -313,18 +344,31 @@ test:
           #!/usr/bin/env python3
           import json, pathlib, re, sys
           import pip
-          from pip._vendor import idna, msgpack, urllib3
+          from pip._vendor import certifi, idna, msgpack, urllib3
           vendor = pathlib.Path(pip.__file__).parent / "_vendor"
           norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
           pins = {norm(m[1]): m[2] for m in re.finditer(r"^\s*([A-Za-z0-9._-]+)==(\S+)", (vendor / "vendor.txt").read_text(), re.M)}
           bom = {norm(c["name"]): c["version"] for c in json.loads((vendor / "bom.cdx.json").read_text())["components"] if "version" in c}
-          code = {"idna": idna.__version__, "msgpack": ".".join(map(str, msgpack.version)), "urllib3": urllib3.__version__}
+          code = {"certifi": certifi.__version__, "idna": idna.__version__, "msgpack": ".".join(map(str, msgpack.version)), "urllib3": urllib3.__version__}
           bad = [f"{n}: bom {v} != vendor.txt {pins[n]}" for n, v in bom.items() if n in pins and pins[n] != v]
           bad += [f"{n}: bom {bom.get(n)} != code {v}" for n, v in code.items() if bom.get(n) != v]
           if bad:
               print("FAIL: stale pip/_vendor/bom.cdx.json:\n  " + "\n  ".join(bad))
               sys.exit(1)
           print(f"PASS: bom.cdx.json matches vendor.txt and code ({code})")
+    - name: "Vendored certifi bundle drops the CVE-2026-111943 roots"
+      uses: py/one-python
+      with:
+        content: |
+          #!/usr/bin/env python3
+          import sys
+          from pip._vendor import certifi
+          pem = certifi.contents()
+          bad = [r for r in ("emSign Root CA - C1", "emSign ECC Root CA - C3", "emSign ECC Root CA - G3", "AAA Certificate Services") if r in pem]
+          if bad:
+              print(f"FAIL: {certifi.where()} still has {bad}")
+              sys.exit(1)
+          print(f"PASS: {certifi.where()} is clean (certifi {certifi.__version__})")
 
 update:
   ignore-regex-patterns:

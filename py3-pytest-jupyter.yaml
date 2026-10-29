@@ -1,0 +1,146 @@
+package:
+  name: py3-pytest-jupyter
+  version: "0.11.0"
+  epoch: 0
+  description: A pytest plugin providing fixtures for testing Jupyter core libraries, kernels, clients and servers.
+  copyright:
+    - license: BSD-3-Clause
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: pytest-jupyter
+  import: pytest_jupyter
+  # Single Python version for the top-level jupyter_server test; 3.13 is the
+  # newest supported version.
+  python-version: "3.13"
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - py3-supported-build-base
+      - py3-supported-hatchling
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 48bb422027d1170afc7935141360e7fbf4356462
+      repository: https://github.com/jupyter-server/pytest-jupyter
+      tag: v${{package.version}}
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}
+      # Only the hard pyproject dependencies; the client/server extras
+      # (jupyter_client, jupyter_server, nbformat, ipykernel) are left to
+      # consumers, which are mostly those same packages.
+      runtime:
+        - py${{range.key}}-pytest
+        - py${{range.key}}-jupyter-core
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              import ${{vars.import}}.jupyter_core
+        - name: jupyter_core plugin fixtures isolate the Jupyter dirs
+          runs: |
+            mkdir -p /tmp/pj-core
+            cd /tmp/pj-core || exit 1
+            cat > conftest.py <<'EOF'
+            pytest_plugins = ["pytest_jupyter.jupyter_core"]
+            EOF
+            cat > test_core.py <<'EOF'
+            import os
+            from jupyter_core.paths import jupyter_data_dir, jupyter_runtime_dir
+
+            def test_isolated_dirs(jp_environ, jp_home_dir, jp_data_dir, jp_runtime_dir, tmp_path):
+                assert os.environ["HOME"] == str(jp_home_dir)
+                assert jupyter_data_dir() == str(jp_data_dir)
+                assert jupyter_runtime_dir() == str(jp_runtime_dir)
+                assert str(jp_data_dir).startswith(str(tmp_path))
+            EOF
+            python${{range.key}} -m pytest -p no:cacheprovider -rA test_core.py 2>&1 | tee result.txt
+            grep -F "PASSED test_core.py::test_isolated_dirs" result.txt
+            grep -F "1 passed" result.txt
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+update:
+  enabled: true
+  github:
+    identifier: jupyter-server/pytest-jupyter
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        # The server plugin needs the [server] extra, which the subpackages
+        # leave to consumers; py3-ipykernel has no 3.10 build, so this runs on
+        # one Python version only.
+        - py${{vars.python-version}}-${{vars.pypi-package}}
+        - py${{vars.python-version}}-ipykernel
+        - py${{vars.python-version}}-jupyter-server
+  pipeline:
+    - uses: test/tw/byproductpackage
+    - name: jupyter_server plugin lists its fixtures
+      runs: |
+        mkdir -p /tmp/pj-fixtures
+        cd /tmp/pj-fixtures || exit 1
+        python${{vars.python-version}} -m pytest -p no:cacheprovider --fixtures -p pytest_jupyter.jupyter_server 2>&1 | tee fixtures.txt
+        grep -F "jp_fetch" fixtures.txt
+        grep -F "jp_ws_fetch" fixtures.txt
+        grep -F "jp_server_config" fixtures.txt
+    - name: jp_fetch talks to a temporary Jupyter Server
+      runs: |
+        mkdir -p /tmp/pj-server
+        cd /tmp/pj-server || exit 1
+        cat > conftest.py <<'EOF'
+        pytest_plugins = ["pytest_jupyter.jupyter_server"]
+        EOF
+        # Bare async test functions rely on the bundled pytest_tornasync runner.
+        cat > test_server.py <<'EOF'
+        import json
+
+        async def test_api_version(jp_fetch):
+            r = await jp_fetch("api", method="GET")
+            assert r.code == 200
+            assert "version" in json.loads(r.body.decode())
+        EOF
+        python${{vars.python-version}} -m pytest -p no:cacheprovider -rA test_server.py 2>&1 | tee result.txt
+        grep -F "PASSED test_server.py::test_api_version" result.txt
+        grep -F "1 passed" result.txt

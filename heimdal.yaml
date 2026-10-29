@@ -1,7 +1,7 @@
 package:
   name: heimdal
   version: 7.8.0
-  epoch: 54 # split su into heimdal-su
+  epoch: 55 # LMDB HDB backend; detect the resolver on glibc 2.28
   description: "Implementation of Kerberos 5"
   copyright:
     - license: BSD-3-Clause
@@ -27,6 +27,7 @@ environment:
       - gdbm-dev
       - glibc-2.44-dev
       - libtool
+      - lmdb-dev # HDB backend for the default (prefix-less) database
       - ncurses-dev
       - perl
       - perl-json
@@ -47,11 +48,23 @@ pipeline:
         # needed for GCC > 13
         master/323d555c82f16f8ace3dce45c91cc8a2d25ea0aa: cf: Do not use headers and argument lists in AC_FIND_FUNC_NO_LIBS2
 
+  # The GCC > 13 cherry-pick above makes AC_FIND_FUNC link without headers,
+  # so on glibc < 2.34 (the eco-2-28 toolchain), where res_search,
+  # res_nsearch and dn_expand exist only as <resolv.h> macros for __res_*,
+  # configure missed the resolver and roken built its stub (no DNS KDC
+  # discovery, and parse_reply-test cannot link). The patch probes through
+  # <resolv.h>; no change on newer glibc.
   - uses: patch
     with:
       patches: |
         CVE-2022-45142.patch
+        resolv-glibc-2.28.patch
 
+  # LMDB is the HDB backend for database names without a "type:" prefix,
+  # including the default /var/heimdal/heimdal that kadmin and the KDC open;
+  # without one they fail with "No database support". sqlite stays available
+  # as "sqlite:<path>". OTP stays disabled as before: with a db type set,
+  # configure would enable it, and libotp needs an NDBM/DB1/DB3 library.
   - uses: autoconf/configure
     with:
       opts: |
@@ -63,12 +76,23 @@ pipeline:
         --with-readline-include=/usr/include/readline \
         --with-sqlite3=/usr \
         --without-openssl \
-        --with-db-type-preference= \
+        --with-db-type-preference=lmdb \
+        --disable-otp \
         --sbindir=/usr/bin
 
   - uses: autoconf/make
 
   - uses: autoconf/make-install
+
+  # Run the upstream suite after make-install, so nothing `make check`
+  # rebuilds or relinks in the build tree can reach the installed files
+  # (libtool relinks in the build tree are picked up by a later install).
+  - uses: upstream-tests/make-check
+    with:
+      # The tests in each directory share one database (current-db) and
+      # are not safe to run in parallel; upstream CI runs `make check`
+      # serially too.
+      jobs: 1
 
   - uses: strip
 
@@ -205,6 +229,16 @@ test:
       runs: |
         # string2key converts a password to a Kerberos key - verify it runs
         string2key --help 2>&1 | grep -iF "key"
+    - name: kadmin can create and use the default database
+      runs: |
+        # dbname not set, so kadmin -l uses the default HDB_DEFAULT_DB
+        # (/var/heimdal/heimdal), which needs a compiled-in default backend.
+        mkdir -p /var/heimdal
+        printf '[libdefaults]\n\tdefault_realm = EXAMPLE.COM\n' > krb5.conf
+        export KRB5_CONFIG=$PWD/krb5.conf
+        kadmin -l init --realm-max-ticket-life=1d --realm-max-renewable-life=1w EXAMPLE.COM
+        kadmin -l add --random-key --use-defaults host/test.example.com
+        kadmin -l list '*' | grep -F host/test.example.com
     - name: Test hxtool certificate operations
       runs: |
         # Generate a self-signed certificate using hxtool

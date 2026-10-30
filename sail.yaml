@@ -1,0 +1,252 @@
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: sail
+  version: "0.20.3"
+  epoch: 0
+  description: Sail, a language for describing instruction set architecture semantics
+  copyright:
+    # Sail, and Isla's plugin (isla-sail).
+    - license: BSD-2-Clause
+    # The OCaml libraries opam builds and the binary links: linksem
+    # (BSD-2-Clause, above); lem, yojson and linenoise; menhirLib, pprint and
+    # zarith; dune-site; omd and base64 (in backend plugins); lem's LGPL
+    # parts. Sail's own sources add BSD-3-Clause (the CIL-derived visitors)
+    # and MIT (cJSON, installed in /usr/share/sail/lib).
+    - license: BSD-3-Clause
+    - license: LGPL-2.0-only WITH OCaml-LGPL-linking-exception
+    - license: MIT
+    - license: ISC
+    - license: LGPL-2.1-or-later
+  dependencies:
+    runtime:
+      # The type checker hands constraints it cannot solve itself to z3.
+      - z3
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  test-resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  # Sail's OCaml dependencies (lem, linksem, ott, menhir, pprint, yojson,
+  # zarith, dune-site, ...) are not Wolfi packages; opam builds them from
+  # this opam-repository commit.
+  opam-repository-commit: 87e0994133211eadc3cad1b4b7ba8f318b84f8bb
+  # Isla's Sail plugin (isla-sail), which compiles Sail models into the IR
+  # Isla reads. Sail has no stable plugin API, and the plugin links against
+  # the libsail built here, so it is built with this Sail. Keep this commit
+  # the one isla.yaml builds, so the plugin writes the IR that isla reads.
+  isla-commit: e9b5d945394277656593a0d429466d7fa0a2b4b3
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - curl
+      - git
+      - glibc-2.44-dev
+      - gmp-dev
+      - m4
+      - ocaml
+      - ocaml-compiler-libs
+      - ocaml-dev
+      - opam
+      - patch
+      - pkgconf
+      - rsync
+      - unzip
+      - wolfi-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rems-project/sail
+      tag: ${{package.version}}
+      expected-commit: 3df54034910b31a1e00d948ee965b2e9603d68e0
+      destination: sail
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/ocaml/opam-repository
+      branch: master
+      expected-commit: ${{vars.opam-repository-commit}}
+      destination: opam-repository
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rems-project/isla
+      branch: master
+      expected-commit: ${{vars.isla-commit}}
+      destination: isla
+
+  - name: install the OCaml dependencies with opam
+    runs: |
+      export OPAMROOT="$(pwd)/.opam" OPAMYES=1 OPAMCONFIRMLEVEL=unsafe-yes
+      # No bubblewrap sandbox in the build, and no apk calls for depexts:
+      # the environment above carries the system dependencies.
+      opam init --bare --disable-sandboxing --no-setup --disable-shell-hook \
+        default "$(pwd)/opam-repository"
+      opam option --global depext=false
+      # Wolfi's OCaml, so the binaries link the system runtime. The system
+      # compiler's ld.conf does not name the switch's stub libraries, which
+      # lem's bytecode tests load (dllzarith.so).
+      opam switch create build ocaml-system
+      eval "$(opam env --switch=build --set-switch)"
+      export CAML_LD_LIBRARY_PATH="$OPAM_SWITCH_PREFIX/lib/stublibs:/usr/lib/ocaml/stublibs"
+      # The non-dev dependencies of the checkout's *.opam files. Pinning the
+      # checkout instead would make opam treat it as a dev version and add
+      # its dev tools, among them bisect_ppx, whose ppxlib bound (< 0.36)
+      # opam cannot meet on OCaml 5.5.
+      opam install "dune>=3.21" "dune-site>=3.0.2" "menhir>=20240715" "ott>=0.28" \
+        "lem>=2018-12-14" "linksem>=0.3" conf-gmp "yojson>=1.6.0" "pprint>=20220103" \
+        "linenoise>=1.1.0" "omd>=1.3.1" "omd<1.4.0" "base64>=3.1.0"
+
+  - name: build sail and isla-sail
+    runs: |
+      export OPAMROOT="$(pwd)/.opam"
+      eval "$(opam env --switch=build --set-switch)"
+      # The plugin as a directory of this dune workspace, so it links the
+      # libsail built here. Its install stanza is dropped: installed into
+      # libsail's plugin directory, sail would load it on every run, and
+      # build scripts that pass it with -plugin would load it twice.
+      cp -R isla/isla-sail sail/src/sail_isla_backend
+      rm sail/src/sail_isla_backend/dune-project
+      sed -i '/^(install/,$d' sail/src/sail_isla_backend/dune
+      if grep -F install sail/src/sail_isla_backend/dune; then exit 1; fi
+      cd sail
+      dune build -j$(nproc) \
+        -p sail,libsail,sail_maker,sail_c_backend,sail_smt_backend,sail_ocaml_backend,sail_lem_backend,sail_coq_backend,sail_lean_backend,sail_sv_backend,sail_latex_backend,sail_doc_backend,sail_output \
+        @install ./src/sail_isla_backend/sail_plugin_isla.cmxs
+
+  - name: install
+    runs: |
+      export OPAMROOT="$(pwd)/.opam"
+      eval "$(opam env --switch=build --set-switch)"
+      cd sail
+      # The binary finds its library as ../share/sail from itself, and dune
+      # writes the backend plugins' directory (/usr/share/libsail/plugins)
+      # into it at install.
+      dune install --prefix=/usr --destdir="${{targets.destdir}}" \
+        sail libsail sail_c_backend sail_smt_backend sail_ocaml_backend sail_lem_backend \
+        sail_coq_backend sail_lean_backend sail_sv_backend sail_latex_backend sail_doc_backend \
+        sail_output
+      install -Dm644 _build/default/src/sail_isla_backend/sail_plugin_isla.cmxs \
+        "${{targets.destdir}}"/usr/lib/isla-sail/plugin.cmxs
+      # libsail's OCaml interfaces and objects: no use without the opam
+      # libraries they were compiled against, which stay in the build. And
+      # each opam package's README, LICENSE and CHANGELOG; the licence is
+      # also in /usr/share/sail.
+      cd "${{targets.destdir}}"/usr
+      rm -rf lib/libsail lib/sail lib/sail_* doc
+      # The bytecode plugins: the native sail loads only .cmxs.
+      rm -f share/libsail/plugins/*.cma
+      # isla-sail as upstream's wrapper (isla-sail/isla-sail) runs it.
+      cat > bin/isla-sail <<'EOF'
+      #!/bin/sh
+      exec sail -plugin /usr/lib/isla-sail/plugin.cmxs -isla "$@"
+      EOF
+      chmod 755 bin/isla-sail
+
+  - uses: strip
+
+subpackages:
+  - name: isla-sail
+    description: Isla's Sail plugin (isla-sail), which compiles Sail models into Isla's IR
+    dependencies:
+      runtime:
+        - sail=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/lib "${{targets.contextdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/lib/isla-sail "${{targets.contextdir}}"/usr/lib/
+          mv "${{targets.destdir}}"/usr/bin/isla-sail "${{targets.contextdir}}"/usr/bin/
+          rmdir "${{targets.destdir}}"/usr/lib
+    test:
+      pipeline:
+        - name: compile a model to Isla IR
+          runs: |
+            # The plugin keeps what Isla's entry points (isla_footprint and
+            # its variants) reach, and drops the rest.
+            cat > model.sail <<'EOF'
+            default Order dec
+            $include <prelude.sail>
+            register R : bits(64)
+            val add_one : bits(64) -> bits(64)
+            function add_one(x) = x + 0x0000000000000001
+            val unreachable : bits(64) -> bits(64)
+            function unreachable(x) = x
+            val isla_footprint : bits(32) -> bool
+            function isla_footprint(opcode) = {
+              R = add_one(R);
+              true
+            }
+            EOF
+            sail -plugin /usr/lib/isla-sail/plugin.cmxs -isla -o model model.sail
+            grep -F 'register zR : %bv64' model.ir
+            grep -F 'fn zadd_one(zx)' model.ir
+            grep -F 'fn zisla_footprint(zopcode)' model.ir
+            if grep -F zunreachable model.ir; then
+              echo "isla-sail kept a function no entry point reaches" >&2
+              exit 1
+            fi
+            # The wrapper, as Isla's README runs it.
+            isla-sail -o wrapped model.sail
+            cmp model.ir wrapped.ir
+
+update:
+  enabled: true
+  github:
+    identifier: rems-project/sail
+    use-tag: true
+    # Upstream also tags its binary-release commits (0.20.3-binary,
+    # 0.20-linux-binary).
+    tag-filter-prefix: "0."
+  ignore-regex-patterns:
+    - -binary$
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: version
+      runs: |
+        sail --version | grep -F "${{package.version}}"
+        # The library directory, found relative to the binary.
+        test "$(cd "$(sail -dir)" && pwd -P)" = /usr/share/sail
+        test -s /usr/share/sail/lib/prelude.sail
+    - name: type-check a model and reject an ill-typed one
+      runs: |
+        cat > ok.sail <<'EOF'
+        default Order dec
+        $include <prelude.sail>
+        val double : forall 'n, 0 <= 'n <= 100. int('n) -> int(2 * 'n)
+        function double(n) = n + n
+        EOF
+        sail ok.sail
+
+        cat > bad.sail <<'EOF'
+        default Order dec
+        $include <prelude.sail>
+        val double : forall 'n, 0 <= 'n <= 100. int('n) -> int(2 * 'n)
+        function double(n) = n + 1
+        EOF
+        if sail bad.sail > bad.log 2>&1; then
+          cat bad.log
+          echo "sail accepted double(n) = n + 1 at type int(2 * 'n)" >&2
+          exit 1
+        fi
+        grep -iF 'type error' bad.log
+    - name: the C backend plugin loads and translates a model to C
+      runs: |
+        cat > hello.sail <<'EOF'
+        default Order dec
+        $include <prelude.sail>
+        val main : unit -> unit
+        function main() = print_endline("hello from sail")
+        EOF
+        sail -c hello.sail -o hello
+        grep -F 'hello from sail' hello.c
+        grep -F '#include "sail.h"' hello.c

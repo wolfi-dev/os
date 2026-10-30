@@ -1,0 +1,121 @@
+#nolint:valid-pipeline-git-checkout-tag
+package:
+  name: isla
+  # Upstream's last release tag is v0.1.0 (2021; the other tag, esop22,
+  # marks a paper's artifact). Cargo.toml already says 0.2.0, but a
+  # 0.2.0_git version would sort above a later v0.2.0 tag.
+  version: 0.1.0_git20260923
+  epoch: 0
+  description: Symbolic execution engine for Sail instruction set architecture specifications
+  copyright:
+    - license: BSD-2-Clause
+    # herdtools' cos.cat and stdlib.cat, which isla-cat and isla-mml embed
+    # (include_str!) in isla-axiomatic.
+    - license: CeCILL-B
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  test-resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  # The version in Cargo.toml, which `--version` prints.
+  cargo-version: 0.2.0
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - glibc-2.44-dev
+      - rust
+      - z3-4-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rems-project/isla
+      branch: master
+      expected-commit: e9b5d945394277656593a0d429466d7fa0a2b4b3
+
+  # Links the system libz3; ISLA_STATIC_Z3 would download and build its own.
+  # Every binary of the root crate (isla-axiomatic among them); the pipeline
+  # installs one, the step after it the rest.
+  - uses: cargo/build
+    with:
+      opts: --release --locked --bins
+      output: isla-footprint
+
+  - runs: |
+      for b in isla-preprocess isla-preprocess129 isla-property isla-property129 \
+          isla-execute-function isla-client isla-litmus-dump isla-axiomatic zencode; do
+        install -Dm755 target/release/$b "${{targets.destdir}}"/usr/bin/$b
+      done
+      # Isla's configuration files: register defaults and memory layout per
+      # model (armv8p5, armv9p3 and armv9p4 match the isla-snapshots models).
+      # Loading one resolves its toolchain (aarch64-linux-gnu-as and the
+      # rest) on PATH, even when only opcodes are given, so callers without
+      # a cross toolchain point those entries at `true`, as the tests do.
+      mkdir -p "${{targets.destdir}}"/usr/share/isla
+      cp -R configs "${{targets.destdir}}"/usr/share/isla/
+
+  - uses: strip
+
+update:
+  enabled: true
+  git: {}
+  schedule:
+    period: monthly
+    reason: Upstream releases by commit; the last tag is v0.1.0 from 2021.
+
+test:
+  environment:
+    contents:
+      packages:
+        - isla-snapshots-armv8p5
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: version
+      runs: |
+        # Options are checked before --version, so it needs an instruction.
+        # --version prints to stderr: the Cargo version and the libz3 linked.
+        isla-footprint --version -i 0 2>&1 | grep -F "v${{vars.cargo-version}}/z3-4."
+        isla-axiomatic --version 2>&1 | grep -F "v${{vars.cargo-version}}/z3-4."
+    - name: svc in the Armv8.5-A model enters EL1 with the immediate in ESR_EL1
+      runs: |
+        # The configuration's toolchain must resolve on PATH (see the install
+        # step); -x passes the opcode in memory order.
+        sed 's/^\(assembler\|objdump\|nm\|linker\) = .*/\1 = "true"/' \
+          /usr/share/isla/configs/armv8p5.toml > armv8p5.toml
+        footprint() {
+          isla-footprint -A /usr/share/isla-snapshots/armv8p5.ir -C armv8p5.toml \
+            -R PSTATE.EL=0b00 -R PSTATE.nRW=0b0 -R SCR_EL3=0x0000000000000401 \
+            -R _PC=undefined:%bv64 -R VBAR_EL1=undefined:%bv64 -R VBAR_EL2=undefined:%bv64 \
+            -s -x -i "$1"
+        }
+        # svc #0 (d4000001) from EL0: exception class 0x15, IL set, imm16 0.
+        footprint 010000d4 > svc0.trace
+        grep -F '(write-reg |ESR_EL1| nil #x56000000)' svc0.trace
+        grep -F '(write-reg |ELR_EL1|' svc0.trace
+        grep -F '(read-reg |VBAR_EL1|' svc0.trace
+        # svc #1 (d4000021) carries its immediate instead.
+        footprint 210000d4 > svc1.trace
+        grep -F '(write-reg |ESR_EL1| nil #x56000001)' svc1.trace
+        if grep -F '#x56000000)' svc1.trace; then
+          echo "svc #1 traced with the ESR of svc #0" >&2
+          exit 1
+        fi
+    - name: serialize the model and trace from the serialized form
+      runs: |
+        sed 's/^\(assembler\|objdump\|nm\|linker\) = .*/\1 = "true"/' \
+          /usr/share/isla/configs/armv8p5.toml > armv8p5.toml
+        isla-preprocess -A /usr/share/isla-snapshots/armv8p5.ir -C armv8p5.toml -o armv8p5
+        test -s armv8p5.irx
+        isla-footprint -A armv8p5.irx -C armv8p5.toml \
+          -R PSTATE.EL=0b00 -R PSTATE.nRW=0b0 -R SCR_EL3=0x0000000000000401 \
+          -R _PC=undefined:%bv64 -R VBAR_EL1=undefined:%bv64 -R VBAR_EL2=undefined:%bv64 \
+          -s -x -i 010000d4 > svc0.trace
+        grep -F '(write-reg |ESR_EL1| nil #x56000000)' svc0.trace

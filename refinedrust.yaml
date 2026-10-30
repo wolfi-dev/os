@@ -1,0 +1,322 @@
+package:
+  name: refinedrust
+  version: "0_git20260929"
+  epoch: 0
+  description: RefinedRust, a framework for verifying safe and unsafe Rust code in Rocq and Iris
+  copyright:
+    # RefinedRust's theories and stdlib, stdpp, Iris, iris-contrib and the
+    # lifetime logic
+    - license: BSD-3-Clause
+    # The frontend: code taken from rustc (MIT) and Prusti (MPL-2.0)
+    - license: MIT
+    - license: MPL-2.0
+    # Equations, in refinedrust-theories
+    - license: LGPL-2.1-only
+  resources:
+    cpu: "8"
+    memory: 24Gi
+  dependencies:
+    runtime:
+      # The frontend writes Rocq code that `dune build` checks against
+      # these libraries.
+      - ${{package.name}}-stdlib
+      - ${{package.name}}-theories
+      - ocaml-dune
+      # refinedrust-rustc is a rustc driver built against the compiler's
+      # internal crates (rust-*-rustc-dev), which have no stable API, so it
+      # runs only on the rustc it was built against; see the vars block.
+      - rust-${{vars.rust-version}}~${{vars.rust-toolchain}}
+  test-resources:
+    cpu: "4"
+    memory: 8Gi
+
+vars:
+  # Upstream pins a nightly (rr_frontend/rust-toolchain.toml:
+  # nightly-2026-08-28 at this commit); this build uses the stable release
+  # below, with rustc-1.99.patch for the two compiler APIs that changed
+  # between them. Updating RefinedRust means checking its nightly against
+  # a stable rust stream, and moving rust-version and rust-toolchain with it.
+  rust-version: "1.99"
+  rust-toolchain: 1.99.1
+  rocq-version: 9.2.0
+  rocq-stdlib-version: 9.1.0
+  # The Rocq libraries RefinedRust builds against are pinned by commit in
+  # theories/refinedrust.opam (pin-depends) and by release in its depends;
+  # none of them is packaged on its own, so they ship in
+  # refinedrust-theories, at exactly those revisions.
+  stdpp-commit: 729c671ed573749588f699138e306dbae880f3e1
+  iris-commit: 4a6add171278417fec6da7c490fe487e502326f0
+  iris-contrib-commit: 0ed8e45b554b2c7f7b9102818bc3ee27d8fa18b8
+  lambda-rust-commit: 0a062fb1eb68f9a6ac38412347117b294fc7746b
+  equations-tag: v1.3.2-9.2
+  equations-commit: 80195d4db7de6544dddde9d03f583b42497cc846
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - glibc-2.44-dev
+      - ocaml
+      - ocaml-compiler-libs
+      - ocaml-dune
+      - ocaml-findlib
+      - ocamlfind
+      - rocq-stdlib~${{vars.rocq-stdlib-version}}
+      - rocq~${{vars.rocq-version}}
+      # Pinned as the runtime rust dependency is; see the vars block.
+      - rust-${{vars.rust-version}}-rustc-dev~${{vars.rust-toolchain}}
+      - rust-${{vars.rust-version}}~${{vars.rust-toolchain}}
+
+pipeline:
+  # Upstream has no releases; the version is the commit date.
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.mpi-sws.org/lgaeher/refinedrust-dev.git
+      branch: main
+      expected-commit: 5846daaff196fbf29260b1876bd8d0549f1d6035
+
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.mpi-sws.org/iris/stdpp.git
+      branch: master
+      expected-commit: ${{vars.stdpp-commit}}
+      destination: deps/stdpp
+
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.mpi-sws.org/iris/iris.git
+      branch: master
+      expected-commit: ${{vars.iris-commit}}
+      destination: deps/iris
+
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.mpi-sws.org/iris/iris-contrib.git
+      branch: main
+      expected-commit: ${{vars.iris-contrib-commit}}
+      destination: deps/iris-contrib
+
+  - uses: git-checkout
+    with:
+      repository: https://gitlab.mpi-sws.org/iris/lambda-rust.git
+      branch: master
+      expected-commit: ${{vars.lambda-rust-commit}}
+      destination: deps/lambda-rust
+
+  - uses: git-checkout
+    with:
+      repository: https://github.com/mattam82/Coq-Equations
+      tag: ${{vars.equations-tag}}
+      expected-commit: ${{vars.equations-commit}}
+      destination: deps/equations
+
+  - uses: patch
+    with:
+      patches: rustc-1.99.patch
+
+  - uses: patch
+    working-directory: deps/equations
+    with:
+      patches: ../../equations-dune-3.24.patch
+
+  # Each library installs into the destdir, where the next ones find it:
+  # Rocq reads ROCQPATH for libraries and findlib reads OCAMLPATH for the
+  # Equations plugin.
+  - name: Rocq libraries
+    runs: |
+      ucontrib=/usr/lib/ocaml/coq/user-contrib
+      export ROCQPATH="${{targets.destdir}}$ucontrib"
+      export OCAMLPATH="${{targets.destdir}}/usr/lib/ocaml"
+      mkdir -p "$ROCQPATH"
+
+      # The opam packages rocq-stdpp, rocq-stdpp-bitvector,
+      # rocq-stdpp-unstable, rocq-iris and coq-lifetime-logic, built as
+      # their opam files do; `rocq makefile` installs under DESTDIR.
+      cd deps/stdpp
+      for p in stdpp stdpp_bitvector stdpp_unstable; do
+        ./make-package $p -j$(nproc)
+        ./make-package $p install DESTDIR="${{targets.destdir}}"
+      done
+      cd ../iris
+      ./make-package iris -j$(nproc)
+      ./make-package iris install DESTDIR="${{targets.destdir}}"
+      cd ../iris-contrib
+      make -j$(nproc)
+      make install DESTDIR="${{targets.destdir}}"
+      cd ../lambda-rust
+      ./make-package lifetime -j$(nproc)
+      ./make-package lifetime install DESTDIR="${{targets.destdir}}"
+
+      cd ../equations
+      dune build -p rocq-equations -j$(nproc) @install
+      dune install -p rocq-equations --prefix /usr --libdir /usr/lib/ocaml --docdir /usr/share/doc --destdir "${{targets.destdir}}"
+
+      # RefinedRust's own theories (refinedrust, lithium, radium) and its
+      # specifications of the Rust standard library (rrstd), which the
+      # frontend's translations import.
+      cd ../../theories
+      dune build -p refinedrust -j$(nproc) @install
+      dune install -p refinedrust --prefix /usr --libdir /usr/lib/ocaml --datadir /usr/share --docdir /usr/share/doc --destdir "${{targets.destdir}}"
+      # refinedrust-stdlib ships the translations upstream generated with
+      # its frontend and committed (stdlib/*/output). opam's build
+      # regenerates them first (make generate_stdlib); this build checks
+      # the committed ones instead of regenerating them with the frontend
+      # built here.
+      cd ../stdlib
+      dune build -p refinedrust-stdlib -j$(nproc) @install
+      dune install -p refinedrust-stdlib --prefix /usr --libdir /usr/lib/ocaml --datadir /usr/share --docdir /usr/share/doc --destdir "${{targets.destdir}}"
+
+  - name: frontend
+    runs: |
+      cd rr_frontend
+      # build.rs puts the toolchain channel into `--version`.
+      sed -i 's/^channel = .*/channel = "${{vars.rust-toolchain}}"/' rust-toolchain.toml
+      # .cargo/config.toml carries the frontend's rustflags; a RUSTFLAGS
+      # variable would replace them.
+      unset RUSTFLAGS
+      # rustc_private crates need a nightly compiler, or this.
+      export RUSTC_BOOTSTRAP=1
+      cargo build --release --locked
+      install -Dm755 target/release/cargo-refinedrust target/release/refinedrust-rustc -t "${{targets.destdir}}/usr/bin/"
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-theories
+    description: The Rocq libraries of RefinedRust, with the Iris, stdpp, lifetime logic and Equations revisions it is built against
+    dependencies:
+      runtime:
+        # Compiled .vo files load only into the Rocq that compiled them.
+        - rocq-stdlib~${{vars.rocq-stdlib-version}}
+        - rocq~${{vars.rocq-version}}
+    pipeline:
+      - runs: |
+          ucontrib=usr/lib/ocaml/coq/user-contrib
+          mkdir -p "${{targets.contextdir}}/$ucontrib" "${{targets.contextdir}}/usr/lib/ocaml"
+          for d in stdpp iris iris_contrib lrust Equations refinedrust lithium radium; do
+            mv "${{targets.destdir}}/$ucontrib/$d" "${{targets.contextdir}}/$ucontrib/"
+          done
+          # findlib and dune metadata, and the Equations plugin.
+          for d in rocq-equations refinedrust; do
+            mv "${{targets.destdir}}/usr/lib/ocaml/$d" "${{targets.contextdir}}/usr/lib/ocaml/"
+          done
+          for d in refinedrust rocq-equations; do
+            if [ -d "${{targets.destdir}}/usr/share/doc/$d" ]; then
+              mkdir -p "${{targets.contextdir}}/usr/share/doc"
+              mv "${{targets.destdir}}/usr/share/doc/$d" "${{targets.contextdir}}/usr/share/doc/"
+            fi
+          done
+    test:
+      pipeline:
+        - name: prove a RefinedRust lemma
+          runs: |
+            cat > T.v <<'EOF'
+            From refinedrust Require Import typing.
+            From iris.proofmode Require Import proofmode.
+            From Equations Require Import Equations.
+            Lemma sep_comm_example `{!refinedrustGS Σ} (P Q : iProp Σ) : P ∗ Q ⊢ Q ∗ P.
+            Proof. iIntros "[HP HQ]". iFrame. Qed.
+            EOF
+            rocq c -w -notation-overridden T.v
+            test -f T.vo
+
+  - name: ${{package.name}}-stdlib
+    description: RefinedRust's specifications and proofs of the Rust standard library (rrstd), for the frontend's lib_load_paths
+    dependencies:
+      runtime:
+        - ${{package.name}}-theories
+    pipeline:
+      - runs: |
+          ucontrib=usr/lib/ocaml/coq/user-contrib
+          mkdir -p "${{targets.contextdir}}/$ucontrib" "${{targets.contextdir}}/usr/share" "${{targets.contextdir}}/usr/lib/ocaml"
+          mv "${{targets.destdir}}/$ucontrib/rrstd" "${{targets.contextdir}}/$ucontrib/"
+          mv "${{targets.destdir}}/usr/lib/ocaml/refinedrust-stdlib" "${{targets.contextdir}}/usr/lib/ocaml/"
+          mv "${{targets.destdir}}/usr/share/refinedrust-stdlib" "${{targets.contextdir}}/usr/share/"
+          if [ -d "${{targets.destdir}}/usr/share/doc/refinedrust-stdlib" ]; then
+            mkdir -p "${{targets.contextdir}}/usr/share/doc"
+            mv "${{targets.destdir}}/usr/share/doc/refinedrust-stdlib" "${{targets.contextdir}}/usr/share/doc/"
+          fi
+          # Leave the main package only the frontend in /usr/bin.
+          rmdir -p "${{targets.destdir}}/usr/lib/ocaml/coq/user-contrib" "${{targets.destdir}}/usr/share/doc" 2>/dev/null || true
+    test:
+      pipeline:
+        - runs: |
+            find /usr/share/refinedrust-stdlib -name interface.rrlib | grep -q ptr
+            echo 'From rrstd.ptr.ptr.generated Require Import generated_specs_ptr.' > T.v
+            rocq c -w -notation-overridden T.v
+
+update:
+  enabled: false
+  exclude-reason: upstream has no releases, and each commit pins a nightly rust that has to be matched to a stable stream by hand
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+        - glibc-dev
+  pipeline:
+    - uses: test/tw/ldd-check
+      with:
+        files: |
+          /usr/bin/cargo-refinedrust
+          /usr/bin/refinedrust-rustc
+    - name: version
+      runs: |
+        cargo refinedrust --version | grep -F "RefinedRust 0.1.0 for ${{vars.rust-toolchain}}"
+        cargo refinedrust --version | grep -F "rustc ${{vars.rust-toolchain}} "
+        refinedrust-rustc --version | grep -F "rustc ${{vars.rust-toolchain}} "
+    - name: cargo refinedrust proves a function and refutes a wrong specification
+      runs: |
+        mkdir -p smoke/src
+        cat > smoke/Cargo.toml <<'EOF'
+        [package]
+        name = "rrsmoke"
+        version = "0.1.0"
+        edition = "2024"
+        EOF
+        cat > smoke/RefinedRust.toml <<'EOF'
+        output_dir = "output"
+        lib_load_paths = ["/usr/share/refinedrust-stdlib"]
+        EOF
+        cat > smoke/src/lib.rs <<'EOF'
+        #![feature(register_tool)]
+        #![register_tool(rr)]
+        #![feature(custom_inner_attributes)]
+        #![rr::package("rrsmoke")]
+
+        #[rr::params("x" : "Z")]
+        #[rr::args("x")]
+        #[rr::requires("(x + 1 ≤ MaxInt U32)%Z")]
+        #[rr::returns("(x + 1)%Z")]
+        pub fn incr(x: u32) -> u32 {
+            x + 1
+        }
+        EOF
+        cd smoke
+        # The rr tool attributes need #![feature]s, which this stable
+        # rustc accepts only with RUSTC_BOOTSTRAP.
+        export RUSTC_BOOTSTRAP=1
+        cargo refinedrust
+        # output/ holds a dune project; the workspace file makes it the root.
+        echo '(lang dune 3.21)' > output/dune-workspace
+        if ! (cd output && dune build --display short) > ../ok.log 2>&1; then
+          cat ../ok.log
+          exit 1
+        fi
+        ls output/_build/default/rrsmoke/proofs/proof_incr.vo
+
+        sed -i 's/#\[rr::returns("(x + 1)%Z")\]/#[rr::returns("(x + 2)%Z")]/' src/lib.rs
+        rm -rf output
+        cargo refinedrust
+        echo '(lang dune 3.21)' > output/dune-workspace
+        if (cd output && dune build --display short) > ../bad.log 2>&1; then
+          cat ../bad.log
+          echo "refinedrust proved x + 1 = x + 2" >&2
+          exit 1
+        fi
+        grep -F "Attempt to save an incomplete proof" ../bad.log

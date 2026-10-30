@@ -1,0 +1,121 @@
+package:
+  name: rocq
+  version: "9.2.0"
+  epoch: 0
+  description: "The Rocq Prover (formerly Coq), an interactive theorem prover"
+  copyright:
+    - license: LGPL-2.1-only
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  dependencies:
+    runtime:
+      # rocq compiles plugins and `rocq makefile` projects with the OCaml
+      # toolchain and findlib it was built with.
+      - ocaml
+      - ocaml-zarith
+      - ocamlfind
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - glibc-2.44-dev
+      - gmp-dev
+      - ocaml
+      - ocaml-compiler-libs
+      - ocaml-dune
+      - ocaml-findlib
+      - ocaml-zarith
+      - ocamlfind
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/rocq-prover/rocq
+      tag: V${{package.version}}
+      expected-commit: adfbf1855c348766beb4b790dcc8ebc02f908f63
+
+  - uses: patch
+    with:
+      patches: dune-3.24.patch
+
+  # The opam packages rocq-runtime and rocq-core, built the way their opam
+  # files do, except that opam configures a -relocatable install. Here
+  # -libdir is the Rocq library (coqlib): the prelude and user-contrib/,
+  # where Rocq libraries install, sit next to the OCaml libraries findlib
+  # knows about.
+  - name: configure
+    runs: |
+      ./configure -release -prefix /usr -libdir /usr/lib/ocaml/coq -native-compiler no
+
+  - name: rocq-runtime
+    runs: |
+      dune build -p rocq-runtime -j$(nproc) --promote-install-files=false @install
+      dune install -p rocq-runtime --prefix /usr --libdir /usr/lib/ocaml --mandir /usr/share/man --docdir /usr/share/doc --destdir "${{targets.contextdir}}"
+
+  # rocq-core's theories are built by the rocq-runtime just installed into
+  # the destdir.
+  - name: rocq-core
+    runs: |
+      export PATH="${{targets.contextdir}}/usr/bin:$PATH"
+      export OCAMLPATH="${{targets.contextdir}}/usr/lib/ocaml"
+      make dunestrap COQ_SPLIT=1 "DUNESTRAPOPT=-p rocq-core"
+      dune build -p rocq-core -j$(nproc) --promote-install-files=false @install
+      dune install -p rocq-core --prefix /usr --libdir /usr/lib/ocaml --mandir /usr/share/man --docdir /usr/share/doc --destdir "${{targets.contextdir}}"
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-doc
+    description: Documentation for ${{package.name}}
+    pipeline:
+      - uses: split/alldocs
+    test:
+      pipeline:
+        - uses: test/docs
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/no-docs
+    - name: version
+      runs: |
+        # Rocq prints major.minor: 9.2 for 9.2.0.
+        v="${{package.version}}"
+        rocq --print-version | grep "^${v%.*} "
+        rocq c -where | grep -Fx /usr/lib/ocaml/coq
+    - name: check a proof and reject a wrong one
+      runs: |
+        cat > Ok.v <<'EOF'
+        Theorem add_comm_example : forall n m : nat, n + m = m + n.
+        Proof.
+          intros n m. induction n as [|n IH]; simpl.
+          - rewrite <- plus_n_O. reflexivity.
+          - rewrite IH. apply plus_n_Sm.
+        Qed.
+        Print Assumptions add_comm_example.
+        EOF
+        rocq c -R . Test Ok.v | tee ok.log
+        grep -F "Closed under the global context" ok.log
+        test -f Ok.vo
+        rocqchk -silent -R . Test Test.Ok
+
+        cat > Bad.v <<'EOF'
+        Theorem wrong : forall n : nat, n + 1 = n.
+        Proof. intros n. reflexivity. Qed.
+        EOF
+        if rocq c Bad.v > bad.log 2>&1; then
+          echo "rocq accepted a false theorem" >&2
+          exit 1
+        fi
+        grep -F "Error" bad.log
+
+# Rocq libraries load only into the Rocq that compiled them: rocq-stdlib
+# and refinedrust pin this release, and need rebuilding with any rebuild of
+# this package. RefinedRust requires rocq-core 9.2.0 exactly.
+update:
+  enabled: false
+  exclude-reason: rocq-stdlib and refinedrust are compiled against this exact release and pin it; RefinedRust requires rocq-core 9.2.0

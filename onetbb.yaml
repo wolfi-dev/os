@@ -2,7 +2,7 @@
 package:
   name: onetbb
   version: "2023.2.0"
-  epoch: 0 # glibc: 2.43->2.44
+  epoch: 1 # tbbmalloc: build without _GLIBCXX_ASSERTIONS (undefined libstdc++ symbol)
   description: oneAPI Threading Building Blocks
   copyright:
     - license: Apache-2.0
@@ -31,6 +31,19 @@ pipeline:
       repository: https://github.com/oneapi-src/oneTBB
       tag: v${{package.version}}
 
+  - uses: patch
+    with:
+      # Our toolchain's -fhardened defines _GLIBCXX_ASSERTIONS, which left
+      # libtbbmalloc.so.2 (linked as C, without libstdc++) with an undefined
+      # std::__glibcxx_assert_fail. Final diff of upstream
+      # https://github.com/uxlfoundation/oneTBB/pull/2239 (approved); drop on
+      # the first release that contains it.
+      patches: tbbmalloc-no-glibcxx-assertions.patch
+
+  # TODO(upstream-tests): gate on upstream-tests/ctest (TBB_TEST=ON, after
+  # cmake/install) once the eco-2.28 build's exception-test aborts are
+  # understood (findings register F-143), with test_limiter_node ignored for
+  # its known aarch64 hang (uxlfoundation/oneTBB#342).
   - uses: cmake/configure
     with:
       opts: |
@@ -73,6 +86,29 @@ subpackages:
             EOF
             g++ threading_test.cpp -o threading_test -ltbb
             ./threading_test
+        - name: Link and run a pure C program against libtbbmalloc
+          runs: |
+            # libtbbmalloc is linked as C and must not need libstdc++.
+            cat <<'EOF' > malloc_test.c
+            #include <tbb/scalable_allocator.h>
+            #include <stdio.h>
+            #include <string.h>
+            int main(void) {
+                char *p = scalable_malloc(4096);
+                if (!p) return 1;
+                memset(p, 0x5a, 4096);
+                p = scalable_realloc(p, 1 << 20);
+                if (!p || p[4095] != 0x5a) return 1;
+                scalable_free(p);
+                puts("tbbmalloc pure C test passed");
+                return 0;
+            }
+            EOF
+            gcc malloc_test.c -o malloc_test -ltbbmalloc
+            ./malloc_test
+            if nm -D --undefined-only /usr/lib/libtbbmalloc.so.2 | grep -F __glibcxx_assert_fail; then
+              echo "libtbbmalloc.so.2 references a libstdc++ symbol"; exit 1
+            fi
         - uses: test/tw/ldd-check
 
   - name: libtbb-dev

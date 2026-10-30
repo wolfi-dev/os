@@ -6,9 +6,15 @@ description: |
   the system bundle. The package then follows ca-certificates updates instead
   of keeping a copy frozen at build time.
 
-  Every pattern must match at least one file, and every match must be a PEM
-  file or already link to the system bundle, so the step fails when upstream
-  moves or renames the file instead of silently doing nothing.
+  With files, every pattern must match at least one file, and every match
+  must be a PEM file or already link to the system bundle, so the step fails
+  when upstream moves or renames the file instead of silently doing nothing.
+
+  Without files, the step searches path for copies instead. A file is a copy
+  when at least min-certs of its certificates are also in the system bundle,
+  so private CAs and test certificates are kept, while old copies that share
+  only some roots with the current bundle are still found. The step fails if
+  it links nothing.
 
   The package must depend on ca-certificates-bundle at runtime, or the links
   dangle in images that don't otherwise install it. Check the result with
@@ -16,18 +22,38 @@ description: |
 
   Not for Java keystores (use java-cacerts), files covered by an application's
   own integrity check (Nextcloud, WordPress), or root lists compiled into a
-  binary (Go, Rust, Node, Chromium).
+  binary (Go, Rust, Node, Chromium). Files inside archives (jars, wheels) are
+  not searched.
 
 needs:
   packages:
     - busybox
+    - ca-certificates-bundle
 
 inputs:
   files:
     description: |
       Whitespace-separated list of files to replace, usually under
-      ${{targets.contextdir}}. Shell globs are allowed.
-    required: true
+      ${{targets.contextdir}}. Shell globs are allowed. Leave empty to search
+      path for copies of the system bundle instead.
+    required: false
+    default: ""
+  path:
+    description: |
+      Directory to search for copies of the system bundle when files is
+      empty.
+    default: ${{targets.contextdir}}
+  min-certs:
+    description: |
+      When searching, the number of certificates a file must share with the
+      system bundle to count as a copy of it.
+    default: "10"
+  exclude:
+    description: |
+      When searching, whitespace-separated shell patterns of paths to leave
+      alone, such as "*/tests/*".
+    required: false
+    default: ""
   bundle:
     description: |
       Path of the system CA bundle that the links point to.
@@ -39,12 +65,20 @@ inputs:
 #     with:
 #       files: ${{targets.contextdir}}/usr/lib/python3.12/site-packages/httplib2/cacerts.txt
 #
+# Or search the package for copies of the system bundle:
+#
+#   - uses: ca-certificates/use-system-bundle
+#
 pipeline:
   - name: Link bundled CA files to the system bundle
     runs: |
       bundle="${{inputs.bundle}}"
       # Assign first: a multi-line list substituted into the for line is a syntax error.
       files="${{inputs.files}}"
+      if [ -z "$files" ]; then
+        echo "No files given; searching ${{inputs.path}} instead"
+        exit 0
+      fi
       linked=0
       set -f
       for pattern in $files; do
@@ -82,3 +116,71 @@ pipeline:
       done
       set +f
       echo "Linked $linked file(s) to $bundle"
+
+  - name: Find copies of the system bundle and link them to it
+    runs: |
+      files="${{inputs.files}}"
+      if [ -n "$files" ]; then
+        exit 0
+      fi
+      bundle="${{inputs.bundle}}"
+      search="${{inputs.path}}"
+      min_certs="${{inputs.min-certs}}"
+      exclude="${{inputs.exclude}}"
+      if [ ! -s "$bundle" ]; then
+        echo "$bundle is missing or empty"
+        exit 1
+      fi
+
+      # One line per PEM file: certificates also in the bundle, total
+      # certificates, path. Certificates are compared by their base64 body.
+      found="$(mktemp)"
+      find "$search" -type f -exec grep -l -- '-----BEGIN CERTIFICATE-----' {} + |
+        while IFS= read -r file; do
+          awk -v file="$file" '
+            /-----BEGIN CERTIFICATE-----/ { inside = 1; body = ""; next }
+            /-----END CERTIFICATE-----/ {
+              inside = 0
+              if (FILENAME == ARGV[1]) known[body] = 1
+              else { total++; if (body in known) shared++ }
+              next
+            }
+            inside { gsub(/[ \t\r]/, ""); body = body $0 }
+            END { print shared + 0, total + 0, file }
+          ' "$bundle" "$file"
+        done > "$found"
+
+      linked=0
+      set -f
+      while read -r shared total file; do
+        # Source files can name the PEM marker without holding certificates.
+        if [ "$total" -eq 0 ]; then
+          continue
+        fi
+        skip=
+        for pattern in $exclude; do
+          case "$file" in
+            $pattern) skip=1 ;;
+          esac
+        done
+        if [ -n "$skip" ]; then
+          echo "Excluded $file ($shared of $total certificates in $bundle)"
+          continue
+        fi
+        if [ "$shared" -lt "$min_certs" ]; then
+          echo "Kept $file: only $shared of $total certificates are in $bundle"
+          continue
+        fi
+        rm -f "$file"
+        ln -s "$bundle" "$file"
+        echo "Linked $file -> $bundle ($shared of $total certificates in it)"
+        linked=$((linked + 1))
+      done < "$found"
+      set +f
+      rm -f "$found"
+
+      echo "Linked $linked file(s) to $bundle"
+      if [ "$linked" -eq 0 ]; then
+        echo "Found no copies of $bundle under $search; drop this step or pass files"
+        exit 1
+      fi

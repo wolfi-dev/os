@@ -6,6 +6,10 @@ description: |
   dependency on ca-certificates-bundle. Pairs with
   ca-certificates/use-system-bundle.
 
+  Without files, it checks every file the package installs instead: none may
+  share min-certs or more certificates with the system bundle, and at least
+  one must link to it.
+
   The dependency is read from the apk database rather than inferred from the
   link resolving, because the bundle often arrives transitively (wolfi-base
   pulls in apk-tools, which depends on it) and would hide a missing
@@ -19,8 +23,20 @@ inputs:
   files:
     description: |
       Whitespace-separated list of installed paths to check. Shell globs are
-      allowed.
-    required: true
+      allowed. Leave empty to check every file the package installs.
+    required: false
+    default: ""
+  min-certs:
+    description: |
+      Without files, the number of certificates a file may share with the
+      system bundle before it counts as a copy that should be a link.
+    default: "10"
+  exclude:
+    description: |
+      Without files, whitespace-separated shell patterns of installed paths
+      to leave alone.
+    required: false
+    default: ""
   bundle:
     description: |
       Path of the system CA bundle that the links must point to.
@@ -37,12 +53,19 @@ inputs:
 #     with:
 #       files: /usr/lib/python3.12/site-packages/httplib2/cacerts.txt
 #
+# Or check every file the package installs:
+#
+#   - uses: test/uses-system-ca-bundle
+#
 pipeline:
   - name: Check bundled CA files link to the system bundle
     runs: |
       bundle="${{inputs.bundle}}"
       # Assign first: a multi-line list substituted into the for line is a syntax error.
       files="${{inputs.files}}"
+      if [ -z "$files" ]; then
+        exit 0
+      fi
       checked=0
       set -f
       for pattern in $files; do
@@ -90,3 +113,76 @@ pipeline:
         exit 1
       fi
       echo "$pkg depends on ca-certificates-bundle"
+
+  - name: Check the package ships no copies of the system bundle
+    runs: |
+      files="${{inputs.files}}"
+      if [ -n "$files" ]; then
+        exit 0
+      fi
+      pkg="${{inputs.package}}"
+      bundle="${{inputs.bundle}}"
+      min_certs="${{inputs.min-certs}}"
+      exclude="${{inputs.exclude}}"
+      if [ ! -s "$bundle" ]; then
+        echo "$bundle is missing or empty"
+        exit 1
+      fi
+
+      # List the package's files from the apk database, then keep those with
+      # PEM certificates. grep follows links, so links to the bundle are kept.
+      owned="$(mktemp)"
+      awk -v p="$pkg" '
+        /^P:/ { cur = substr($0, 3); dir = "" }
+        cur == p && /^F:/ { dir = substr($0, 3) "/" }
+        cur == p && /^R:/ { print "/" dir substr($0, 3) }
+      ' /lib/apk/db/installed > "$owned"
+      candidates="$(mktemp)"
+      tr '\n' '\0' < "$owned" | xargs -0 -r grep -l -s -- '-----BEGIN CERTIFICATE-----' > "$candidates" || true
+
+      links=0
+      copies=0
+      set -f
+      while IFS= read -r file; do
+        if [ -L "$file" ]; then
+          if [ "$(readlink "$file")" = "$bundle" ]; then
+            links=$((links + 1))
+          fi
+          continue
+        fi
+        skip=
+        for pattern in $exclude; do
+          case "$file" in
+            $pattern) skip=1 ;;
+          esac
+        done
+        if [ -n "$skip" ]; then
+          continue
+        fi
+        shared="$(awk '
+          /-----BEGIN CERTIFICATE-----/ { inside = 1; body = ""; next }
+          /-----END CERTIFICATE-----/ {
+            inside = 0
+            if (FILENAME == ARGV[1]) known[body] = 1
+            else if (body in known) shared++
+            next
+          }
+          inside { gsub(/[ \t\r]/, ""); body = body $0 }
+          END { print shared + 0 }
+        ' "$bundle" "$file")"
+        if [ "$shared" -ge "$min_certs" ]; then
+          echo "$file is a copy of $bundle ($shared certificates in common), not a link to it"
+          copies=$((copies + 1))
+        fi
+      done < "$candidates"
+      set +f
+      rm -f "$owned" "$candidates"
+
+      if [ "$copies" -gt 0 ]; then
+        exit 1
+      fi
+      if [ "$links" -eq 0 ]; then
+        echo "$pkg has no links to $bundle"
+        exit 1
+      fi
+      echo "$pkg has $links link(s) to $bundle and no copies of it"

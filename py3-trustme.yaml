@@ -1,0 +1,267 @@
+package:
+  name: py3-trustme
+  version: "1.3.0"
+  epoch: 0
+  description: trustme is a small Python library that sets up a fake certificate authority (CA) for test suites, issuing TLS certificates signed by it so tests can make real, validated TLS connections to themselves.
+  copyright:
+    - license: MIT OR Apache-2.0
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: trustme
+  import: trustme
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - py3-supported-build-base
+      - py3-supported-hatchling
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/python-trio/trustme
+      tag: v${{package.version}}
+      expected-commit: ac8482fe98029a5c8566eb49ef1590b6af280e4d
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      runtime:
+        - py${{range.key}}-cryptography
+        - py${{range.key}}-idna
+      provides:
+        - py3-${{vars.pypi-package}}
+      provider-priority: ${{range.value}}
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      # The trustme console script moves to -bin so the per-version library
+      # subpackages can be co-installed.
+      - runs: |
+          mkdir -p ./cleanup/${{range.key}}/
+          mv ${{targets.contextdir}}/usr/bin ./cleanup/${{range.key}}/
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+        - name: Issue certificates and complete a verified TLS handshake
+          runs: |
+            python${{range.key}} <<'EOF'
+            import ssl
+            import trustme
+            from cryptography import x509
+
+            ca = trustme.CA()
+            server_cert = ca.issue_cert("test.example", "127.0.0.1")
+
+            leaf = x509.load_pem_x509_certificate(server_cert.cert_chain_pems[0].bytes())
+            ca_cert = x509.load_pem_x509_certificate(ca.cert_pem.bytes())
+            assert leaf.issuer == ca_cert.subject, (leaf.issuer, ca_cert.subject)
+            san = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            assert "test.example" in san.get_values_for_type(x509.DNSName), san
+            print("SAN:", san)
+
+            # Drive both TLS endpoints through in-memory BIOs so the handshake
+            # needs no sockets; each side is pumped until both report done.
+            def handshake(client_ctx, server_ctx, hostname):
+                c_in, c_out, s_in, s_out = (ssl.MemoryBIO() for _ in range(4))
+                client = client_ctx.wrap_bio(c_in, c_out, server_hostname=hostname)
+                server = server_ctx.wrap_bio(s_in, s_out, server_side=True)
+                c_done = s_done = False
+                for _ in range(20):
+                    if not c_done:
+                        try:
+                            client.do_handshake()
+                            c_done = True
+                        except ssl.SSLWantReadError:
+                            pass
+                    s_in.write(c_out.read())
+                    if not s_done:
+                        try:
+                            server.do_handshake()
+                            s_done = True
+                        except ssl.SSLWantReadError:
+                            pass
+                    c_in.write(s_out.read())
+                    if c_done and s_done:
+                        break
+                assert c_done and s_done, "handshake did not finish"
+                client.write(b"ping")
+                s_in.write(c_out.read())
+                assert server.read(4) == b"ping"
+                return client.getpeercert()
+
+            server_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            server_cert.configure_cert(server_ctx)
+
+            client_ctx = ssl.create_default_context()
+            ca.configure_trust(client_ctx)
+            peer = handshake(client_ctx, server_ctx, "test.example")
+            print("peer:", peer["subjectAltName"])
+            assert ("DNS", "test.example") in peer["subjectAltName"]
+
+            # A client trusting an unrelated CA must reject the server.
+            other_ctx = ssl.create_default_context()
+            trustme.CA().configure_trust(other_ctx)
+            try:
+                handshake(other_ctx, server_ctx, "test.example")
+                raise SystemExit("untrusted CA was accepted")
+            except ssl.SSLCertVerificationError as e:
+                print("untrusted CA rejected:", e.verify_message)
+
+            # A hostname absent from the certificate must be rejected.
+            try:
+                handshake(client_ctx, server_ctx, "wrong.example")
+                raise SystemExit("hostname mismatch was accepted")
+            except ssl.SSLCertVerificationError as e:
+                print("hostname mismatch rejected:", e.verify_message)
+            EOF
+        - name: python -m trustme writes usable PEM files
+          runs: |
+            workdir=$(mktemp -d)
+            cd "$workdir" || exit 1
+            python${{range.key}} -m trustme > out.txt
+            cat out.txt
+            grep -F "server.pem" out.txt
+            grep -F "server.key" out.txt
+            grep -F "client.pem" out.txt
+            python${{range.key}} <<'EOF'
+            import ssl
+            from cryptography import x509
+
+            server_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            server_ctx.load_cert_chain("server.pem", "server.key")
+            client_ctx = ssl.create_default_context(cafile="client.pem")
+            assert client_ctx.get_ca_certs(), "client.pem holds no CA"
+
+            leaf = x509.load_pem_x509_certificate(open("server.pem", "rb").read())
+            san = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            print("SAN:", san)
+            assert "localhost" in san.get_values_for_type(x509.DNSName)
+            ips = [str(ip) for ip in san.get_values_for_type(x509.IPAddress)]
+            assert "127.0.0.1" in ips and "::1" in ips, ips
+            EOF
+
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: trustme command line tool installed for python${{range.key}}
+    dependencies:
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+      provides:
+        - py3-${{vars.pypi-package}}-bin
+      provider-priority: ${{range.value}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/
+          mv ./cleanup/${{range.key}}/bin ${{targets.contextdir}}/usr/
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: test/tw/help-check
+          with:
+            bins: trustme
+        - name: trustme CLI writes certificates for custom identities
+          runs: |
+            outdir=$(mktemp -d)
+            trustme -d "$outdir" -i cli.example 10.0.0.1 > out.txt
+            cat out.txt
+            grep -F "$outdir/server.pem" out.txt
+            grep -F "$outdir/client.pem" out.txt
+            for f in server.key server.pem client.pem; do
+              if ! [ -s "$outdir/$f" ]; then
+                echo "ERROR: $outdir/$f missing or empty"
+                exit 1
+              fi
+            done
+            grep -F "BEGIN CERTIFICATE" "$outdir/server.pem"
+            grep -F "PRIVATE KEY" "$outdir/server.key"
+            python${{range.key}} - "$outdir" <<'EOF'
+            import sys
+            from cryptography import x509
+
+            d = sys.argv[1]
+            leaf = x509.load_pem_x509_certificate(open(f"{d}/server.pem", "rb").read())
+            ca = x509.load_pem_x509_certificate(open(f"{d}/client.pem", "rb").read())
+            assert leaf.issuer == ca.subject, (leaf.issuer, ca.subject)
+            san = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            print("SAN:", san)
+            assert san.get_values_for_type(x509.DNSName) == ["cli.example"]
+            assert [str(i) for i in san.get_values_for_type(x509.IPAddress)] == ["10.0.0.1"]
+            EOF
+        - name: trustme --quiet suppresses output but still writes files
+          runs: |
+            outdir=$(mktemp -d)
+            out=$(trustme -q -d "$outdir")
+            if [ -n "$out" ]; then
+              echo "ERROR: --quiet printed: $out"
+              exit 1
+            fi
+            ls -l "$outdir"
+            test -s "$outdir/server.pem"
+            test -s "$outdir/server.key"
+            test -s "$outdir/client.pem"
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+        - name: trustme imports under every installed python interpreter
+          runs: |
+            # Discover interpreters pulled in by the metapackage instead of
+            # listing versions, so the range in data: stays the only source.
+            found=0
+            for py in /usr/bin/python3.*; do
+              # Skip python3.X-config and similar, keeping only python3.<digits>.
+              case "${py##*/}" in
+                python3.*[!0-9]*) continue ;;
+              esac
+              [ -x "$py" ] || continue
+              found=1
+              "$py" -c 'import ${{vars.import}}; print(${{vars.import}}.__file__); ${{vars.import}}.CA().issue_cert("meta.example")' > out.txt
+              cat out.txt
+              grep -F "site-packages/${{vars.import}}" out.txt
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "ERROR: no python3.X interpreter installed"
+              exit 1
+            fi
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: python-trio/trustme
+    strip-prefix: v

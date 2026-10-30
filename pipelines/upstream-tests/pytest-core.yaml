@@ -1,0 +1,1382 @@
+name: Python upstream test suite (pytest), shared core
+
+description: |
+  INTERNAL: do not call this from a package; use upstream-tests/pytest.
+  The implementation behind upstream-tests/pytest (build stage), kept
+  separate so that the test stage (test/upstream-tests/pytest, a
+  follow-up) can share it: the inline pytest plugin (result recording,
+  network guard, import pinning, test-module finders, stand-ins for absent
+  plugins' options, ini keys and markers), the network namespace, named
+  exceptions, timeouts, runner: unittest, the destdir snapshot, the
+  import-origin check, the hard-gate rules (including min-run-percent) and
+  the UPSTREAM-TESTS summary lines. The wrapper passes
+  stage, caller and destdir; the other inputs are documented there.
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  stage:
+    description: build (only stage so far).
+    required: true
+  caller:
+    description: Calling pipeline, the prefix of messages.
+    required: true
+  destdir:
+    description: Install root under test (build stage, targets.contextdir).
+    required: true
+  python:
+    description: See upstream-tests/pytest.
+    default: DEFAULT
+  dir:
+    description: See upstream-tests/pytest.
+    default: "."
+  paths:
+    description: See upstream-tests/pytest.
+    default: ""
+  args:
+    description: See upstream-tests/pytest.
+    default: ""
+  markers:
+    description: See upstream-tests/pytest.
+    default: ""
+  ignore:
+    description: See upstream-tests/pytest.
+    default: ""
+  ignore-files:
+    description: See upstream-tests/pytest.
+    default: ""
+  import-mode:
+    description: See upstream-tests/pytest.
+    default: auto
+  clear-addopts:
+    description: See upstream-tests/pytest.
+    default: "false"
+  jobs:
+    description: See upstream-tests/pytest.
+    default: "1"
+  timeout:
+    description: See upstream-tests/pytest.
+    default: "600"
+  overall-timeout:
+    description: See upstream-tests/pytest.
+    default: "3600"
+  runner:
+    description: See upstream-tests/pytest.
+    default: pytest
+  extensions:
+    description: See upstream-tests/pytest.
+    default: auto
+  min-run-percent:
+    description: See upstream-tests/pytest.
+    default: "5"
+
+pipeline:
+  - name: upstream-tests (pytest)
+    runs: |
+      PKG="${{context.name}}"
+      ws="$PWD"
+      me="${{inputs.caller}}"
+      # Only the build stage so far; the test stage
+      # (test/upstream-tests/pytest) comes with its own branches.
+      if [ "${{inputs.stage}}" != build ]; then
+        echo "$me: stage must be build (got '${{inputs.stage}}')" >&2
+        exit 1
+      fi
+      dest="${{inputs.destdir}}"
+      if [ -z "$dest" ]; then
+        echo "$me: destdir is empty (the build stage passes targets.contextdir)" >&2
+        exit 1
+      fi
+      # Where the caller adds test requirements (named in messages).
+      envpkgs=environment.contents.packages
+      py="${{inputs.python}}"
+      if [ "$py" = DEFAULT ]; then
+        if p=$(command -v python3); then
+          py=$(readlink -f "$p")
+        else
+          set -- /usr/bin/python3.[0-9] /usr/bin/python3.[0-9][0-9]
+          found=""
+          for p in "$@"; do [ -x "$p" ] && found="$found $p"; done
+          set -- $found
+          if [ "$#" -ne 1 ]; then
+            echo "$me: set 'python': found $# interpreters:$found" >&2
+            exit 1
+          fi
+          py=$1
+        fi
+      fi
+      if ! command -v "$py" >/dev/null 2>&1; then
+        echo "$me: interpreter '$py' not found" >&2
+        exit 1
+      fi
+      if [ ! -d "${{inputs.dir}}" ]; then
+        echo "$me: dir '${{inputs.dir}}' does not exist" >&2
+        exit 1
+      fi
+      minrun="${{inputs.min-run-percent}}"
+      if ! printf '%s\n' "$minrun" | grep -Eq '^([0-9]+([.][0-9]*)?|[.][0-9]+)$' || ! awk -v m="$minrun" 'BEGIN { exit !(m <= 100) }'; then
+        echo "$me: min-run-percent must be a number from 0 to 100 (got '$minrun')" >&2
+        exit 1
+      fi
+      case "${{inputs.runner}}" in pytest|unittest) ;; *)
+        echo "$me: runner must be pytest or unittest (got '${{inputs.runner}}')" >&2
+        exit 1 ;;
+      esac
+      # The code under test is imported from the destdir ("installed").
+      from=installed
+      mode="${{inputs.import-mode}}"
+      [ "$mode" = auto ] && mode=append
+      sp=$("$py" -c 'import site; print(site.getsitepackages()[0])')
+      dsp="$dest$sp"
+      if [ "$from" = installed ] && [ ! -d "$dsp" ]; then
+        echo "$me: nothing installed in $dsp; run this after py/pip-build-install (with the same python) and before strip" >&2
+        exit 1
+      fi
+      # pytest may depend on the package under test (exceptiongroup, pluggy,
+      # iniconfig, packaging, ...), and py/pip-build-install uninstalls the
+      # build environment's copy of the package it installs (pip
+      # --force-reinstall --root): then pytest only imports with the destdir
+      # on the path, which is how the suite runs anyway.
+      chkpath=""
+      [ "$from" = installed ] && chkpath="$dsp"
+      if [ "${{inputs.runner}}" = pytest ] && ! err=$(cd / && PYTHONPATH="$chkpath" "$py" -c 'import pytest' 2>&1); then
+        echo "$me: pytest is not importable with $py ($(printf '%s\n' "$err" | tail -n 1)); add py3-supported-pytest (or py3.X-pytest) to $envpkgs" >&2
+        exit 1
+      fi
+
+      # Scratch space on the disk-backed melange cache (/tmp is a small
+      # tmpfs in the qemu guest), removed when the step ends.
+      mkdir -p /var/cache/melange/upstream-tests-pytest
+      scratch=$(mktemp -d /var/cache/melange/upstream-tests-pytest/run.XXXXXX)
+      pth=""
+      cleanup() {
+        [ -n "$pth" ] && rm -f "$pth"
+        rm -rf "$scratch"
+      }
+      trap cleanup EXIT
+      mkdir -p "$scratch/home" "$scratch/out" "$scratch/plugin"
+
+      # The suite runs in a scratch copy of the workspace, minus
+      # melange-out/ and .wheels/.
+      run="$scratch/ws"
+      mkdir -p "$run"
+      for e in "$ws"/* "$ws"/.[!.]* "$ws"/..?*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        case "${e##*/}" in melange-out|.wheels) continue ;; esac
+        cp -a "$e" "$run"/
+      done
+      cd "$run/${{inputs.dir}}"
+      src="$PWD"
+      # The project's pytest settings this step needs to know about:
+      # testpaths, and whether it sets python_files.
+      ini=$("$py" -I - <<'UT_INI'
+      import configparser, os
+      KEYS = ("testpaths", "python_files")
+      def ini(f, sec):
+          c = configparser.ConfigParser(interpolation=None)
+          try:
+              c.read(f)
+          except Exception:
+              return None
+          if not c.has_section(sec):
+              return None
+          return {k: c.get(sec, k) for k in KEYS if c.has_option(sec, k)}
+      def main():
+          for f in ("pytest.ini", ".pytest.ini"):
+              if os.path.isfile(f):
+                  return ini(f, "pytest") or {}
+          if os.path.isfile("pyproject.toml"):
+              try:
+                  import tomllib
+              except ImportError:
+                  try:
+                      import tomli as tomllib
+                  except ImportError:
+                      tomllib = None
+              if tomllib:
+                  try:
+                      t = tomllib.load(open("pyproject.toml", "rb")).get("tool", {}).get("pytest", {})
+                  except Exception:
+                      t = {}
+                  if t:
+                      o = t.get("ini_options", t)
+                      return {k: (" ".join(o[k]) if isinstance(o[k], list) else str(o[k])) for k in KEYS if k in o}
+          for f, sec in (("tox.ini", "pytest"), ("setup.cfg", "tool:pytest")):
+              if os.path.isfile(f):
+                  v = ini(f, sec)
+                  if v is not None:
+                      return v
+          return {}
+      d = main()
+      print(" ".join(d.get("testpaths", "").split()))
+      print("set" if "python_files" in d else "unset")
+      UT_INI
+      ) || ini=""
+      tp=$(printf '%s\n' "$ini" | sed -n 1p)
+      pyfiles=$(printf '%s\n' "$ini" | sed -n 2p)
+
+      # Test paths: the input, else the project's testpaths, else tests/ or
+      # test/ if there is one (recursing from the project root collects
+      # examples, docs, benchmarks and vendored trees too).
+      paths="${{inputs.paths}}"
+      if [ -z "$paths" ] && [ -z "$tp" ]; then
+        for c in tests test testing; do
+          # only a directory that holds Python test modules (tests/ is
+          # sometimes C/C++ or data); otherwise pytest recurses from dir.
+          if [ -d "$c" ] && [ -n "$(find "$c" \( -name 'test_*.py' -o -name '*_test.py' -o -name test.py -o -name tests.py \) -print 2>/dev/null | head -n 1)" ]; then
+            paths=$c
+            echo "$me: no testpaths configured; running $c/"
+            break
+          fi
+        done
+      fi
+
+      # The plugin: result recording, network guard, sys.path ordering and
+      # the import-origin record. Loaded with -p in the pytest process and
+      # (through the same command line) in xdist workers.
+      cat > "$scratch/plugin/upstream_tests_pytest.py" <<'UT_PLUGIN'
+      import errno, glob, importlib.util, json, os, re, socket, sys
+      try:
+          import pytest
+          hookimpl = pytest.hookimpl
+      except ImportError:  # loaded by the unittest runner without pytest
+          pytest = None
+          hookimpl = lambda **k: (lambda f: f)
+
+      OUT = os.environ["UT_OUT"]
+      DSP = os.environ.get("UT_DSP", "")
+      FROM = os.environ.get("UT_FROM", "installed")
+      SRC = os.environ.get("UT_SRC", "")
+      results, collect_errors, deselected, skips = {}, [], [], {}
+      RANK = {"passed": 0, "skipped": 1, "xfailed": 2, "failed": 4, "error": 5}
+
+      if FROM == "installed" and DSP:
+          import site
+          site.addsitedir(DSP)  # .pth files
+
+      def _front():
+          # The destdir goes first, ahead of the project's pytest
+          # `pythonpath` entries (inserted before pytest_configure).
+          if FROM == "installed" and DSP:
+              while DSP in sys.path:
+                  sys.path.remove(DSP)
+              sys.path.insert(0, DSP)
+
+      TESTISH = re.compile(r"^(_?tests?|testing|unittests?|conftest|test_.*|.*_tests?)$")
+
+      def testish(name):
+          # A module that only exists for the test suite: some dotted component
+          # is tests/test/testing/conftest, test_*, *_test or *_tests.
+          return any(TESTISH.match(p) for p in name.split(".")[1:])
+
+      class _PinInstalled(object):
+          """First finder (installed mode) for the package's own top-level
+          modules: they always resolve to the destdir, even when a test or
+          conftest puts the source tree first on sys.path (a common upstream
+          habit), or import-mode is prepend. Their submodules follow the
+          package's __path__ (the destdir). Namespace packages (no __init__.py)
+          are left alone, so other distributions' portions stay importable."""
+          tops = set()
+
+          @classmethod
+          def setup(cls):
+              if not (DSP and os.path.isdir(DSP)):
+                  return
+              for e in os.listdir(DSP):
+                  if e.endswith((".dist-info", ".egg-info", ".pth", ".data")) or e.startswith(("__pycache__", "_distutils_hack")):
+                      continue
+                  p = os.path.join(DSP, e)
+                  if os.path.isdir(p) and not os.path.isfile(os.path.join(p, "__init__.py")):
+                      continue
+                  if not os.path.isdir(p) and not e.endswith((".py", ".so", ".pyd")):
+                      continue
+                  name = e.split(".")[0]
+                  if name not in ("tests", "test", "testing", "conftest", "docs", "benchmarks", "examples"):
+                      cls.tops.add(name)
+              if cls.tops:
+                  sys.meta_path.insert(0, cls())
+
+          def find_spec(self, fullname, path=None, target=None):
+              if fullname not in self.tops:
+                  return None
+              import importlib.machinery
+              return importlib.machinery.PathFinder.find_spec(fullname, [DSP])
+
+      TESTPKG = re.compile(r"^(_?tests?|unittests?|testsuite|test_.*|.*_tests?)$")
+
+      class _SourceTestPkgs(object):
+          """Front finder (installed mode, right after the destdir pin) for the
+          project's own test packages: dotted names with a tests/test/_tests
+          component or a test_*/*_test leaf are loaded from the source tree when
+          the source has them, even if the wheel ships a copy too. The tests then
+          run as collected (no import-file mismatch), files they write next to
+          themselves land in the scratch tree, not in the package, and data the
+          wheel does not ship is found; the code under test still comes from the
+          destdir (the top-level package is pinned there). `testing` modules are
+          not included: they are often public API (numpy.testing)."""
+
+          def __init__(self, roots):
+              self.roots = roots
+
+          def find_spec(self, fullname, path=None, target=None):
+              parts = fullname.split(".")
+              root = self.roots.get(parts[0])
+              if len(parts) < 2 or not root or not any(TESTPKG.match(p) for p in parts[1:]):
+                  return None
+              base = os.path.join(root, *parts[1:])
+              if os.path.isfile(os.path.join(base, "__init__.py")):
+                  return importlib.util.spec_from_file_location(
+                      fullname, os.path.join(base, "__init__.py"), submodule_search_locations=[base])
+              if os.path.isfile(base + ".py"):
+                  # Let pytest's assertion rewriter handle test modules.
+                  for f in sys.meta_path:
+                      if type(f).__name__ == "AssertionRewritingHook":
+                          try:
+                              sp = f.find_spec(fullname, [os.path.dirname(base)])
+                          except Exception:
+                              sp = None
+                          if sp is not None and os.path.realpath(sp.origin or "") == os.path.realpath(base + ".py"):
+                              return sp
+                  return importlib.util.spec_from_file_location(fullname, base + ".py")
+              return None
+
+      class _SourceTests(object):
+          """Last-resort finder (installed mode) for test-only submodules of the
+          package under test that the wheel does not ship (foo/tests/ excluded
+          from the wheel): foo is imported from the destdir, and foo.tests (and
+          only test-ish names) from the source tree. Installed modules always
+          win, as this finder runs after the normal ones."""
+          roots = {}
+
+          @classmethod
+          def setup(cls):
+              if not (DSP and SRC and os.path.isdir(DSP)):
+                  return
+              skip = {"melange-out", ".wheels", ".git", "build", "node_modules", ".tox", ".venv"}
+              for top in os.listdir(DSP):
+                  if not os.path.isdir(os.path.join(DSP, top)) or top.endswith((".dist-info", ".egg-info", ".data")) or top == "__pycache__":
+                      continue
+                  found = None
+                  for depth in range(0, 3):
+                      pats = [os.path.join(SRC, *(["*"] * depth), top)]
+                      for pat in pats:
+                          for c in sorted(glob.glob(pat)):
+                              rel = os.path.relpath(c, SRC).split(os.sep)
+                              if os.path.isdir(c) and not (set(rel) & skip):
+                                  found = c
+                                  break
+                          if found:
+                              break
+                      if found:
+                          break
+                  if found:
+                      cls.roots[top] = found
+              if cls.roots:
+                  sys.meta_path.append(cls())
+                  pos = 1 if sys.meta_path and isinstance(sys.meta_path[0], _PinInstalled) else 0
+                  sys.meta_path.insert(pos, _SourceTestPkgs(cls.roots))
+
+          def find_spec(self, fullname, path=None, target=None):
+              parts = fullname.split(".")
+              root = self.roots.get(parts[0])
+              if len(parts) < 2 or not root or not testish(fullname):
+                  return None
+              base = os.path.join(root, *parts[1:])
+              if os.path.isfile(os.path.join(base, "__init__.py")):
+                  return importlib.util.spec_from_file_location(
+                      fullname, os.path.join(base, "__init__.py"), submodule_search_locations=[base])
+              if os.path.isfile(base + ".py"):
+                  return importlib.util.spec_from_file_location(fullname, base + ".py")
+              return None
+
+          def find_module(self, fullname, path=None):  # pragma: no cover (py2-style API)
+              return None
+
+      def _no(path, err, why):
+          NOTES.append("import of %s (%s) not retried: %s" % (path, err, why))
+          return None
+
+      def _collision_retry(path, err):
+          # A source-tree test package whose top-level name is taken by
+          # something outside the source tree (the stdlib's `test`, a stray
+          # top-level `tests` package some wheel installed): append mode finds
+          # the other one first ("'test' is not a package", "No module named
+          # 'tests.test_x'"). Import it with its root first, for this import
+          # only, as prepend mode would. Never for the package under test.
+          try:
+              import importlib
+              srcr = os.path.realpath(SRC) + os.sep if SRC else None
+              want = os.path.realpath(str(path))
+              if not srcr or not want.startswith(srcr):
+                  return _no(path, err, "not in the source tree")
+              parts = []
+              d = os.path.dirname(want)
+              if os.path.basename(want) != "__init__.py":
+                  parts.append(os.path.splitext(os.path.basename(want))[0])
+              while os.path.isfile(os.path.join(d, "__init__.py")):
+                  parts.insert(0, os.path.basename(d))
+                  d = os.path.dirname(d)
+              if len(parts) < 2 or parts[0] in _PinInstalled.tops:
+                  return _no(path, err, "not a dotted test package name (%s)" % ".".join(parts))
+              top, name, root = parts[0], ".".join(parts), d
+              missing = getattr(err, "name", None) or ""
+              if "is not a package" not in str(err) and not (missing and (name == missing or name.startswith(missing + "."))):
+                  return None  # an ordinary missing dependency, not a name collision
+              other = sys.modules.get(top)
+              of = os.path.realpath(getattr(other, "__file__", "") or "") if other else ""
+              if other is not None and of.startswith(srcr):
+                  return _no(path, err, "%r already comes from the source tree (%s)" % (top, of))
+              saved = {k: v for k, v in sys.modules.items() if k == top or k.startswith(top + ".")}
+              for k_ in saved:
+                  del sys.modules[k_]
+              sys.path.insert(0, root)
+              try:
+                  importlib.invalidate_caches()
+                  mod = importlib.import_module(name)
+              finally:
+                  sys.path.remove(root)
+              if os.path.realpath(getattr(mod, "__file__", "") or "") == want:
+                  NOTES.append("%s: imported with its root first (top-level %r was %s)" % (name, top, of or "unset"))
+                  return mod
+              NOTES.append("%s: retry imported %s, not %s" % (name, getattr(mod, "__file__", None), want))
+              sys.modules.update(saved)
+          except Exception as x:
+              NOTES.append("import of %s (%s) not retried: %r" % (path, err, x))
+              return None
+          NOTES.append("import of %s (%s) not retried" % (path, err))
+          return None
+
+      def _accept_installed_copy():
+          """Tests shipped in the wheel (foo/tests/): pytest imports the source
+          tree's foo/tests/test_x.py as foo.tests.test_x, which resolves to the
+          destdir copy, and stops with an "import file mismatch". When the two
+          files are byte-identical, use the installed module: the same test code,
+          importing the installed package. Different content is still an error."""
+          try:
+              import _pytest.pathlib as pl
+          except Exception:
+              return
+          orig = pl.import_path
+
+          def same(a, b):
+              try:
+                  with open(a, "rb") as x, open(b, "rb") as y:
+                      return x.read() == y.read()
+              except OSError:
+                  return False
+
+          def import_path(path, *a, **k):
+              try:
+                  return orig(path, *a, **k)
+              except pl.ImportPathMismatchError as e:
+                  name, modfile, want = (list(e.args) + [None, None, None])[:3]
+                  modfile = os.path.realpath(str(modfile))
+                  if DSP and modfile.startswith(os.path.realpath(DSP) + os.sep) and same(modfile, str(want)) and name in sys.modules:
+                      return sys.modules[name]
+                  # The other direction: pytest collects the destdir copy (`--pyargs`,
+                  # testpaths into the package) while the test package was loaded from
+                  # the source tree: identical files, same test code.
+                  if DSP and SRC and os.path.realpath(str(want)).startswith(os.path.realpath(DSP) + os.sep) and modfile.startswith(os.path.realpath(SRC) + os.sep) and same(modfile, str(want)) and name in sys.modules:
+                      return sys.modules[name]
+                  # Two source-tree files with the same top-level name (conftest.py in
+                  # directories without __init__.py, test_utils.py twice): append mode
+                  # adds each directory at the end of sys.path, so the first one always
+                  # wins. Import the wanted one with its directory first, for this import
+                  # only (what prepend mode does); the package under test stays pinned.
+                  srcr = os.path.realpath(SRC) + os.sep if SRC else None
+                  wantr = os.path.realpath(str(want))
+                  if srcr and "." not in str(name) and modfile.startswith(srcr) and wantr.startswith(srcr):
+                      d = os.path.dirname(wantr)
+                      old_mod = sys.modules.pop(name, None)
+                      sys.path.insert(0, d)
+                      try:
+                          import importlib
+                          importlib.invalidate_caches()
+                          mod = importlib.import_module(name)
+                      finally:
+                          sys.path.remove(d)
+                      if os.path.realpath(getattr(mod, "__file__", "") or "") == wantr:
+                          return mod
+                      if old_mod is not None:
+                          sys.modules[name] = old_mod
+                  raise
+              except ImportError as e:
+                  m = _collision_retry(path, e)
+                  if m is None:
+                      raise
+                  return m
+
+          for mname, m in list(sys.modules.items()):
+              if (mname == "_pytest" or mname.startswith("_pytest.")) and getattr(m, "import_path", None) is orig:
+                  m.import_path = import_path
+
+      if FROM == "installed":
+          _accept_installed_copy()
+          # At import (-p loads this plugin before any conftest), so that a
+          # root conftest that puts the source tree on sys.path is covered too.
+          _PinInstalled.setup()
+          _SourceTests.setup()
+
+      _names = []
+
+      def _local_names():
+          # The local hostname and FQDN, looked up once with the real functions
+          # before the guard replaces them (getfqdn calls gethostbyaddr).
+          if not _names:
+              n = set()
+              for f in (socket.gethostname, socket.getfqdn):
+                  try:
+                      n.add(f())
+                  except Exception:
+                      pass
+              _names.append(n)
+          return _names[0]
+
+      def _local(host):
+          if host in (None, "", "localhost", "localhost.localdomain", "ip6-localhost"):
+              return True
+          if isinstance(host, bytes):
+              host = host.decode("ascii", "replace")
+          h = str(host).split("%")[0]
+          if h.startswith("127.") or h in ("::1", "0.0.0.0", "::"):
+              return True
+          return h in _local_names()
+
+      def _guard():
+          if os.environ.get("UT_NONET") != "1":
+              return
+          import weakref
+          _local_names()
+          real_connect = socket.socket.connect
+          real_connect_ex = socket.socket.connect_ex
+          real_gai = socket.getaddrinfo
+          real_ghbn, real_ghbn_ex = socket.gethostbyname, socket.gethostbyname_ex
+          real_ghba, real_gni = socket.gethostbyaddr, socket.getnameinfo
+          real_send, real_sendto = socket.socket.send, socket.socket.sendto
+          real_sendall, real_sendmsg = socket.socket.sendall, getattr(socket.socket, "sendmsg", None)
+          remote_dgram = weakref.WeakSet()
+
+          def is_ip(h):
+              for fam in (socket.AF_INET, socket.AF_INET6):
+                  try:
+                      socket.inet_pton(fam, str(h).split("%")[0])
+                      return True
+                  except (OSError, ValueError):
+                      pass
+              return False
+
+          def check(sock, addr):
+              # None if allowed, else the exception a host without network gives.
+              if getattr(socket, "AF_UNIX", None) == sock.family or not isinstance(addr, tuple) or _local(addr[0]):
+                  return None
+              if not is_ip(addr[0]):
+                  # A name: the resolver fails first, as it would offline.
+                  return socket.gaierror(socket.EAI_NONAME, "upstream-tests: network disabled (%r)" % (addr[0],))
+              return OSError(errno.ENETUNREACH, "upstream-tests: network disabled (%r)" % (addr,))
+
+          def connect(self, addr):
+              e = check(self, addr)
+              if e is not None:
+                  if self.type == socket.SOCK_DGRAM and not isinstance(e, socket.gaierror):
+                      # UDP connect() sends nothing; it is the usual way to find
+                      # the local address (connect to 8.8.8.8, getsockname()).
+                      # Sending through such a socket is refused below.
+                      r = real_connect(self, addr)
+                      remote_dgram.add(self)
+                      return r
+                  raise e
+              return real_connect(self, addr)
+
+          def connect_ex(self, addr):
+              e = check(self, addr)
+              if e is not None:
+                  if self.type == socket.SOCK_DGRAM and not isinstance(e, socket.gaierror):
+                      remote_dgram.add(self)
+                      return real_connect_ex(self, addr)
+                  return errno.ENETUNREACH if not isinstance(e, socket.gaierror) else e.errno
+              return real_connect_ex(self, addr)
+
+          def send(self, data, *a):
+              if self in remote_dgram:
+                  raise OSError(errno.ENETUNREACH, "upstream-tests: network disabled (UDP send)")
+              return real_send(self, data, *a)
+
+          def sendto(self, data, *a):
+              addr = a[-1] if a else None
+              if self in remote_dgram or (addr is not None and check(self, addr) is not None):
+                  raise OSError(errno.ENETUNREACH, "upstream-tests: network disabled (%r)" % (addr,))
+              return real_sendto(self, data, *a)
+
+          def sendall(self, data, *a):
+              if self in remote_dgram:
+                  raise OSError(errno.ENETUNREACH, "upstream-tests: network disabled (UDP sendall)")
+              return real_sendall(self, data, *a)
+
+          def sendmsg(self, buffers, *a):
+              addr = a[2] if len(a) > 2 else None
+              if self in remote_dgram or (addr is not None and check(self, addr) is not None):
+                  raise OSError(errno.ENETUNREACH, "upstream-tests: network disabled (%r)" % (addr,))
+              return real_sendmsg(self, buffers, *a)
+
+          def noname(host):
+              return socket.gaierror(socket.EAI_NONAME, "upstream-tests: network disabled (%r)" % (host,))
+
+          # Every resolver entry point of the socket module refuses names and
+          # addresses other than loopback and the local hostname, as a host
+          # without network would (gaierror EAI_NONAME; herror HOST_NOT_FOUND
+          # for gethostbyaddr), so well-behaved suites skip.
+          def getaddrinfo(host, *a, **k):
+              if not _local(host):
+                  raise noname(host)
+              return real_gai(host, *a, **k)
+
+          def gethostbyname(host):
+              if not _local(host):
+                  raise noname(host)
+              return real_ghbn(host)
+
+          def gethostbyname_ex(host):
+              if not _local(host):
+                  raise noname(host)
+              return real_ghbn_ex(host)
+
+          def gethostbyaddr(host):
+              if not _local(host):
+                  raise socket.herror(1, "upstream-tests: network disabled (%r)" % (host,))
+              return real_ghba(host)
+
+          def getnameinfo(sockaddr, flags):
+              # NI_NUMERICHOST only formats the address (no lookup).
+              host = sockaddr[0] if isinstance(sockaddr, tuple) and sockaddr else None
+              if not _local(host) and not flags & socket.NI_NUMERICHOST:
+                  raise noname(host)
+              return real_gni(sockaddr, flags)
+
+          socket.socket.connect = connect
+          socket.socket.connect_ex = connect_ex
+          socket.socket.send = send
+          socket.socket.sendto = sendto
+          socket.socket.sendall = sendall
+          if real_sendmsg is not None:
+              socket.socket.sendmsg = sendmsg
+          socket.getaddrinfo = getaddrinfo
+          socket.gethostbyname = gethostbyname
+          socket.gethostbyname_ex = gethostbyname_ex
+          socket.gethostbyaddr = gethostbyaddr
+          socket.getnameinfo = getnameinfo
+
+      # Options that upstream addopts commonly pass to plugins a build gate does
+      # not need (coverage, benchmarks, linters, reporting) or that this step
+      # replaces (xdist, timeout). When the plugin is not installed, the option is
+      # accepted and ignored instead of failing with "unrecognized arguments".
+      # Only options that actually appear on the command line/addopts are added.
+      STUBBED = []
+      NOTES = []
+      STUB_OPTS = {
+          "pytest_cov": (["--cov", "--cov-report", "--cov-config", "--cov-fail-under", "--cov-context", "--cov-precision"],
+                         ["--cov-branch", "--no-cov", "--no-cov-on-fail", "--cov-append", "--cov-reset"]),
+          "xdist": (["-n", "--numprocesses", "--dist", "--maxprocesses", "--max-worker-restart", "--maxschedchunk"], ["--looponfail"]),
+          "pytest_timeout": (["--timeout", "--timeout-method"], []),
+          "pytest_benchmark": (["--benchmark-columns", "--benchmark-sort", "--benchmark-group-by", "--benchmark-min-rounds",
+                                "--benchmark-max-time", "--benchmark-warmup", "--benchmark-storage", "--benchmark-save",
+                                "--benchmark-json", "--benchmark-histogram", "--benchmark-timer", "--benchmark-calibration-precision",
+                                "--benchmark-min-time", "--benchmark-warmup-iterations", "--benchmark-name", "--benchmark-cprofile"],
+                               ["--benchmark-skip", "--benchmark-disable", "--benchmark-only", "--benchmark-autosave",
+                                "--benchmark-enable", "--benchmark-disable-gc", "--benchmark-verbose", "--benchmark-quiet"]),
+          "pytest_html": (["--html", "--css"], ["--self-contained-html"]),
+          "pytest_flake8": ([], ["--flake8"]),
+          "pytest_mypy": ([], ["--mypy", "--mypy-ignore-missing-imports"]),
+          "pytest_black": ([], ["--black"]),
+          "pytest_isort": ([], ["--isort"]),
+          "pytest_pylint": ([], ["--pylint"]),
+          "pytest_ruff": ([], ["--ruff", "--ruff-format"]),
+          "pytest_pycodestyle": ([], ["--pycodestyle"]),
+          "pytest_checkdocs": ([], ["--checkdocs"]),
+          "pytest_instafail": ([], ["--instafail"]),
+          "pytest_sugar": ([], ["--force-sugar"]),
+          "pytest_rerunfailures": (["--reruns", "--reruns-delay", "--only-rerun"], []),
+          "pytest_randomly": (["--randomly-seed"], ["--randomly-dont-reorganize", "--randomly-dont-reset-seed"]),
+          "pytest_forked": ([], ["--forked"]),
+          "pytest_remotedata": (["--remote-data"], []),
+          "pytest_asyncio": (["--asyncio-mode", "--asyncio-debug"], []),
+          "syrupy": (["--snapshot-default-extension", "--snapshot-dirname", "--snapshot-patch-pycharm-diff"], ["--snapshot-update", "--snapshot-warn-unused", "--snapshot-details"]),
+          "pytest_mpl": (["--mpl-baseline-path", "--mpl-generate-path", "--mpl-results-path", "--mpl-hash-library", "--mpl-default-style", "--mpl-default-tolerance"], ["--mpl", "--mpl-generate-summary"]),
+          "pytest_django": (["--ds", "--dc"], ["--reuse-db", "--create-db", "--nomigrations", "--migrations", "--no-migrations"]),
+          "pytest_socket": (["--allow-hosts"], ["--disable-socket", "--allow-unix-socket"]),
+      }
+
+      # ini keys of plugins that are not installed: unknown keys are a
+      # PytestConfigWarning, which upstream filterwarnings=error/--strict-config
+      # turn into an internal error before anything runs ("Unknown config
+      # option: asyncio_mode"). Registered, they are inert; the tests that need
+      # the plugin then fail on their own, visibly.
+      STUB_INI = {
+          "pytest_asyncio": ["asyncio_mode", "asyncio_default_fixture_loop_scope", "asyncio_default_test_loop_scope"],
+          "pytest_mock": ["mock_use_standalone_module", "mock_traceback_monkeypatch"],
+          "pytest_trio": ["trio_mode", "trio_run"],
+          "pytest_env": ["env"],
+          "pytest_django": ["DJANGO_SETTINGS_MODULE", "django_find_project"],
+      }
+
+      def pytest_addoption(parser):
+          import importlib.util as iu
+          for mod, keys in STUB_INI.items():
+              try:
+                  if iu.find_spec(mod) is not None:
+                      continue
+              except Exception:
+                  pass
+              for k in keys:
+                  try:
+                      parser.addini(k, "(registered by upstream-tests/pytest; %s is not installed)" % mod, default=None)
+                  except Exception:
+                      pass
+
+      @hookimpl(tryfirst=True)
+      def pytest_load_initial_conftests(early_config, parser, args):
+          import importlib.util as iu
+          seen = {a.split("=", 1)[0] for a in args if isinstance(a, str) and a.startswith("-")}
+          if any(isinstance(a, str) and re.match(r"^-n(\d+|auto|logical)$", a) for a in args):
+              seen.add("-n")  # -n8, -nauto
+          stubbed = []
+          # _addoption: pytest reserves lowercase short options (-n) for itself
+          # in addoption(); plugins such as xdist register them this way.
+          grp_ = parser.getgroup("upstream-tests")
+          for mod, (valued, flags) in STUB_OPTS.items():
+              try:
+                  sp_ = iu.find_spec(mod)
+                  if sp_ is not None and "/stubs/" not in (sp_.origin or ""):
+                      continue
+              except Exception:
+                  pass
+              for o in valued + flags:
+                  if o not in seen:
+                      continue
+                  try:
+                      if o in valued:
+                          grp_._addoption(o, dest="ut_stub_" + o.strip("-").replace("-", "_"), nargs="?", const=True,
+                                           action="append" if o.startswith("--cov") else "store", help="(ignored: %s is not installed)" % mod)
+                      else:
+                          grp_._addoption(o, dest="ut_stub_" + o.strip("-").replace("-", "_"), action="store_true",
+                                           help="(ignored: %s is not installed)" % mod)
+                      stubbed.append(o)
+                  except Exception:
+                      pass
+          STUBBED.extend(stubbed)
+
+      running = [None]
+
+      def _dump(exitstatus, collected, killed=None):
+          with open(os.path.join(OUT, "results.json"), "w") as fh:
+              json.dump({"results": results, "collect_errors": collect_errors,
+                         "deselected": deselected, "skips": skips,
+                         "collected": collected, "killed_during": killed, "why": why_failed,
+                         "exitstatus": int(exitstatus), "stubbed": STUBBED, "notes": NOTES[:50]}, fh)
+
+      def _on_term(signum, frame):
+          # overall-timeout: keep what ran so far and say which test was running.
+          try:
+              _dump_mods("main")
+              _dump(128 + signum, len(results), running[0] or "(between tests)")
+          finally:
+              os._exit(128 + signum)
+
+      def pytest_runtest_logstart(nodeid, location):
+          running[0] = nodeid
+
+      def pytest_runtest_logfinish(nodeid, location):
+          running[0] = None
+
+      RESOURCE_DIRS = {"resources", "resource", "data", "testdata", "test_data", "fixtures", "samples", "sample", "examples", "example", "files", "corpus"}
+
+      def pytest_collect_file(file_path, parent):
+          # Unittest-style suites often keep everything in test.py/tests.py,
+          # which pytest's default python_files does not match. Collect such a
+          # file when it looks like a test module (imports unittest/pytest or
+          # defines test functions/classes) and does not live in a data
+          # directory (py3-puremagic-2 has test/resources/system/test.py as a
+          # sample file). Only when the project does not set python_files.
+          if os.environ.get("UT_EXTRA_TESTFILES") != "1" or file_path.name not in ("test.py", "tests.py"):
+              return None
+          if RESOURCE_DIRS & set(p.lower() for p in file_path.parent.parts):
+              return None
+          try:
+              head = file_path.read_text(errors="replace")[:200000]
+          except OSError:
+              return None
+          if not re.search(r"^\s*(import unittest|from unittest|import pytest|from pytest|def test_?\w*\(|class Test\w*)", head, re.M):
+              return None
+          for pat in parent.config.getini("python_files"):
+              if file_path.match(pat):
+                  return None  # pytest collects it already
+          return pytest.Module.from_parent(parent, path=file_path)
+
+      def pytest_configure(config):
+          _guard()
+          _front()
+          # Markers of plugins that are not installed (flaky reruns, ordering,
+          # repeat, ...): under --strict-markers an unregistered marker is a
+          # collection error. Registered, they are inert (a flaky test runs once).
+          known = set(m.split(":")[0].split("(")[0].strip() for m in config.getini("markers"))
+          for m in ("flaky", "repeat", "order", "run", "dependency", "xdist_group", "timeout", "asyncio", "anyio", "trio", "benchmark", "forked", "no_cover", "randomize", "mypy_testing"):
+              if m not in known:
+                  config.addinivalue_line("markers", "%s: (registered by upstream-tests/pytest; plugin not installed)" % m)
+          if not hasattr(config, "workerinput"):
+              import signal
+              signal.signal(signal.SIGTERM, _on_term)
+
+      def pytest_collection(session):
+          _front()
+
+      def pytest_deselected(items):
+          deselected.extend(i.nodeid for i in items)
+
+      def pytest_collectreport(report):
+          # One entry per node id (--doctest-modules collects a file twice).
+          if report.failed and (report.nodeid or "<session>") not in [n for n, _ in collect_errors]:
+              collect_errors.append((report.nodeid or "<session>", str(report.longrepr)[-4000:]))
+
+      def _set(nodeid, outcome):
+          if RANK[outcome] >= RANK.get(results.get(nodeid), -1):
+              results[nodeid] = outcome
+
+      finished, occ, cur, why_failed = set(), {}, {}, {}
+
+      def pytest_runtest_logreport(report):
+          if report.outcome == "rerun":
+              return
+          # Some suites generate the same node id twice (duplicate
+          # parametrize ids); count each run, as pytest's summary does.
+          n = report.nodeid
+          if report.when == "setup":
+              if n in finished:
+                  occ[n] = occ.get(n, 1) + 1
+                  finished.discard(n)
+              cur[n] = n if n not in occ else "%s#%d" % (n, occ[n])
+          k = cur.get(n, n)
+          if report.when == "teardown":
+              finished.add(n)
+          xf = hasattr(report, "wasxfail")
+          if report.when == "call":
+              if report.passed:
+                  _set(k, "passed")
+              elif report.failed:
+                  _set(k, "failed")
+              elif report.skipped:
+                  _set(k, "xfailed" if xf else "skipped")
+          elif report.failed:
+              _set(k, "error")
+          elif report.when == "setup" and report.skipped:
+              _set(k, "xfailed" if xf else "skipped")
+          if report.failed and k not in why_failed:
+              rc_ = getattr(getattr(report, "longrepr", None), "reprcrash", None)
+              why_failed[k] = (getattr(rc_, "message", None) or str(report.longrepr).strip().splitlines()[-1:] or [""])
+              if isinstance(why_failed[k], list):
+                  why_failed[k] = why_failed[k][0] if why_failed[k] else ""
+              why_failed[k] = " ".join(str(why_failed[k]).split())[:300]
+          if report.skipped and not xf and isinstance(report.longrepr, tuple):
+              r = str(report.longrepr[2])
+              skips[r] = skips.get(r, 0) + 1
+
+      def _dump_mods(wid):
+          mods = {}
+          # Every module with a file (dotted names too, so namespace
+          # packages such as jaraco.* are seen through their submodules).
+          for name, m in list(sys.modules.items()):
+              f = getattr(m, "__file__", None)
+              if isinstance(f, str):
+                  mods[name] = os.path.realpath(f)
+          with open(os.path.join(OUT, "modules-%s.json" % wid), "w") as fh:
+              json.dump(mods, fh)
+
+      def pytest_sessionfinish(session, exitstatus):
+          wid = getattr(session.config, "workerinput", {}).get("workerid", "main")
+          _dump_mods(wid)
+          if wid != "main":
+              return
+          _dump(exitstatus, session.testscollected)
+      UT_PLUGIN
+
+      set -f
+      # --continue-on-collection-errors: a module that fails to import is
+      # still a failure (recorded below), but the rest of the suite runs,
+      # so one log shows every problem.
+      set -- -q -rfE --tb=short -o cache_dir="$scratch/pytest-cache" -p upstream_tests_pytest \
+        --continue-on-collection-errors \
+        --rootdir="$src" --confcutdir="$src" --import-mode="$mode" \
+        --ignore="$ws/melange-out" --ignore="$ws/.wheels" \
+        --ignore="$src/melange-out" --ignore="$src/.wheels"
+      [ "${{inputs.clear-addopts}}" = true ] && set -- "$@" -o addopts=
+      # test.py/tests.py modules: see pytest_collect_file in the plugin.
+      [ "$pyfiles" = set ] || export UT_EXTRA_TESTFILES=1
+      for f in ${{inputs.ignore-files}}; do
+        [ -e "$f" ] || echo "$me: WARNING: ignore-files entry '$f' does not exist" >&2
+        set -- "$@" --ignore="$f"
+        echo "IGNORE ${PKG}: $f (not collected)"
+      done
+      for t in ${{inputs.ignore}}; do
+        set -- "$@" --deselect="$t"
+      done
+      [ -n "${{inputs.markers}}" ] && set -- "$@" -m "${{inputs.markers}}"
+      jobs="${{inputs.jobs}}"
+      if [ "$jobs" = auto ]; then
+        jobs=$(nproc)
+        [ "$jobs" -gt 4 ] && jobs=4
+      fi
+      if [ "$jobs" != 1 ]; then
+        if ! "$py" -c 'import xdist' 2>/dev/null; then
+          echo "$me: jobs=${{inputs.jobs}} needs pytest-xdist; add py3-supported-pytest-xdist to $envpkgs or set jobs: 1" >&2
+          exit 1
+        fi
+        set -- "$@" -n "$jobs"
+      fi
+      if [ "${{inputs.timeout}}" != 0 ]; then
+        if "$py" -c 'import pytest_timeout' 2>/dev/null; then
+          # signal method: a hung test fails and the run goes on. The thread
+          # method (some upstream configs choose it) dumps stacks and exits the
+          # whole process, so nothing after the hung test runs or is recorded.
+          set -- "$@" --timeout="${{inputs.timeout}}" --timeout-method=signal
+        else
+          set -- "$@" -o faulthandler_timeout="${{inputs.timeout}}"
+        fi
+      fi
+      set +f
+
+      export UT_OUT="$scratch/out" UT_FROM="$from" UT_NONET=1 UT_SRC="$src"
+      # No bytecode next to the sources (the destdir must not change).
+      # PYTHONPYCACHEPREFIX would keep sys.dont_write_bytecode False for
+      # children, but it also moves the pyc files that installers/compileall
+      # tests expect in __pycache__ (installer's own suite fails with it).
+      export PYTHONDONTWRITEBYTECODE=1 HOME="$scratch/home" XDG_CACHE_HOME="$scratch/home/.cache"
+      export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 all_proxy=http://127.0.0.1:9
+      export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$all_proxy
+      export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+      export LANG="${LANG:-C.UTF-8}"
+      # SOURCE_DATE_EPOCH is for reproducible build output; upstream suites
+      # run without it, and some (zipfile/tarfile/wheel timestamps) behave
+      # differently with it set.
+      unset SOURCE_DATE_EPOCH
+      # `python` and `python3` on PATH are the interpreter under test (tests
+      # and scripts spawn them by name; in a multi-version build python3
+      # would otherwise be another version, and `python` may not exist).
+      mkdir -p "$scratch/bin"
+      ln -s "$(command -v "$py")" "$scratch/bin/python"
+      ln -s "$(command -v "$py")" "$scratch/bin/python3"
+      export PATH="$scratch/bin:$PATH"
+      # Children started with -I/-E (CPython test.support's script_helper,
+      # hardened entry points) ignore PYTHONPATH and would not see the build;
+      # a .pth file in the build environment's site-packages (removed again
+      # when the step ends) makes the destdir importable for them too, after
+      # the interpreter's own site-packages.
+      if [ "$from" = installed ] && [ -w "$sp" ]; then
+        pth="$sp/zz-upstream-tests-pytest-$$.pth"
+        printf '%s\n' "$dsp" > "$pth"
+      fi
+      # Shared libraries the build installed, in this subpackage or a sibling
+      # built earlier in the same run (pyarrow needs libarrow.so from the
+      # main package): the tests load them from there, not from the system.
+      libs=""
+      for d in "$dest" "$ws"/melange-out/*; do
+        for l in usr/lib usr/lib64 usr/local/lib; do
+          [ -d "$d/$l" ] && [ -n "$(find "$d/$l" -maxdepth 1 -name '*.so*' -print 2>/dev/null | head -n 1)" ] && libs="$libs${libs:+:}$d/$l"
+        done
+      done
+      [ -n "$libs" ] && export LD_LIBRARY_PATH="$libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      if [ "$from" = installed ]; then
+        export UT_DSP="$dsp" PYTHONSAFEPATH=1
+        export PYTHONPATH="$dsp:$scratch/plugin${PYTHONPATH:+:$PYTHONPATH}"
+        export PATH="$dest/usr/bin:$PATH"
+      fi
+      # The __main__ guard matters: multiprocessing's spawn start method re-imports
+      # the main module in each child.
+      printf '%s\n' 'import sys, pytest' 'if __name__ == "__main__":' '    sys.exit(pytest.main(sys.argv[1:]))' > "$scratch/plugin/run_pytest.py"
+      cat > "$scratch/plugin/run_unittest.py" <<'UT_UNITTEST'
+      import os, sys, traceback, unittest
+      import upstream_tests_pytest as ut  # network guard, destdir pin, test-module finders
+
+      class Result(unittest.TextTestResult):
+          def _why(self, err):
+              try:
+                  return " ".join(traceback.format_exception_only(err[0], err[1])[-1].split())[:300]
+              except Exception:
+                  return ""
+          def addSuccess(self, test):
+              super().addSuccess(test)
+              ut._set(test.id(), "passed")
+          def addFailure(self, test, err):
+              super().addFailure(test, err)
+              ut._set(test.id(), "failed")
+              ut.why_failed.setdefault(test.id(), self._why(err))
+          def addError(self, test, err):
+              super().addError(test, err)
+              name = type(test).__name__
+              if name in ("_FailedTest", "ModuleImportFailure"):
+                  # a module that failed to import: a collection error
+                  ut.collect_errors.append((test.id().replace("unittest.loader._FailedTest.", ""), "".join(traceback.format_exception(*err))[-4000:]))
+              else:
+                  ut._set(test.id(), "error")
+                  ut.why_failed.setdefault(test.id(), self._why(err))
+          def addSkip(self, test, reason):
+              super().addSkip(test, reason)
+              ut._set(test.id(), "skipped")
+              ut.skips[reason] = ut.skips.get(reason, 0) + 1
+          def addExpectedFailure(self, test, err):
+              super().addExpectedFailure(test, err)
+              ut._set(test.id(), "xfailed")
+          def addUnexpectedSuccess(self, test):
+              super().addUnexpectedSuccess(test)  # strict, like pytest's xfail_strict
+              ut._set(test.id(), "failed")
+              ut.why_failed.setdefault(test.id(), "unexpected success")
+          def addSubTest(self, test, subtest, err):
+              super().addSubTest(test, subtest, err)
+              if err is not None:
+                  ut._set(test.id(), "failed")
+                  ut.why_failed.setdefault(test.id(), self._why(err))
+
+      if __name__ == "__main__":
+          ut._guard()
+          ut._front()
+          import signal
+          signal.signal(signal.SIGTERM, ut._on_term)
+          prog = unittest.main(module=None, argv=["python -m unittest"] + sys.argv[1:], exit=False,
+                               testRunner=unittest.TextTestRunner(resultclass=Result, verbosity=1, stream=sys.stdout))
+          res = prog.result
+          rc = 0 if res.wasSuccessful() else 1
+          if res.testsRun == 0:
+              rc = 5
+          ut._dump_mods("main")
+          ut._dump(rc, res.testsRun)
+          sys.exit(rc)
+      UT_UNITTEST
+      # A new, empty network namespace with only loopback up, for the whole
+      # test process tree: children that ignore the proxy variables (raw
+      # sockets, nc, ssh, c-ares, -I/-E interpreters) cannot reach anything
+      # either. Plain Python (unshare(2) and the SIOCSIFFLAGS ioctl), so no
+      # util-linux or iproute2 in the build environment; it needs
+      # CAP_SYS_ADMIN (the build runs as root in melange's VM). `probe`
+      # checks it in a throwaway process; `exec` enters it and runs argv.
+      cat > "$scratch/plugin/ut_netns.py" <<'UT_NETNS'
+      import errno, fcntl, os, socket, struct, sys
+      CLONE_NEWNET, SIOCGIFFLAGS, SIOCSIFFLAGS, IFF_UP = 0x40000000, 0x8913, 0x8914, 0x1
+
+      def unshare_net():
+          if hasattr(os, "unshare"):  # 3.12+
+              try:
+                  os.unshare(CLONE_NEWNET)
+              except OSError as e:
+                  raise OSError(e.errno, "unshare(CLONE_NEWNET): " + (e.strerror or ""))
+              return
+          import ctypes
+          libc = ctypes.CDLL(None, use_errno=True)
+          if libc.unshare(CLONE_NEWNET) != 0:
+              e = ctypes.get_errno()
+              raise OSError(e, "unshare(CLONE_NEWNET): " + os.strerror(e))
+
+      def lo_up():
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          try:
+              flags = struct.unpack("16sH22x", fcntl.ioctl(s, SIOCGIFFLAGS, struct.pack("16sH22x", b"lo", 0)))[1]
+              fcntl.ioctl(s, SIOCSIFFLAGS, struct.pack("16sH22x", b"lo", flags | IFF_UP))
+          finally:
+              s.close()
+
+      def v6_loopback():
+          try:
+              with socket.socket(socket.AF_INET6) as s:
+                  s.bind(("::1", 0))
+              return True
+          except OSError:
+              return False
+
+      def check(v6):
+          names = sorted(n for _, n in socket.if_nameindex())
+          if names != ["lo"]:
+              raise RuntimeError("interfaces in the new namespace: %s" % " ".join(names))
+          for fam, addr in [(socket.AF_INET, "127.0.0.1")] + ([(socket.AF_INET6, "::1")] if v6 else []):
+              with socket.socket(fam) as srv:
+                  srv.bind((addr, 0))
+                  srv.listen(1)
+                  with socket.create_connection(srv.getsockname()[:2], timeout=5) as c:
+                      a, _ = srv.accept()
+                      c.sendall(b"x")
+                      ok = a.recv(1) == b"x"
+                      a.close()
+                  if not ok:
+                      raise RuntimeError("no loopback round trip on %s" % addr)
+          with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+              try:
+                  u.connect(("192.0.2.1", 9))  # TEST-NET-1: must have no route
+              except OSError as e:
+                  if e.errno != errno.ENETUNREACH:
+                      raise
+              else:
+                  raise RuntimeError("192.0.2.1 is routable inside the namespace")
+
+      mode = sys.argv[1]
+      try:
+          v6 = v6_loopback()
+          unshare_net()
+          lo_up()
+          check(v6)
+      except Exception as e:
+          if mode == "probe":
+              print(" ".join(str(e).split()) or type(e).__name__)
+              sys.exit(1)
+          sys.stderr.write("upstream-tests: cannot enter an isolated network namespace: %s\n" % e)
+          sys.exit(70)
+      if mode == "probe":
+          sys.exit(0)
+      os.execvp(sys.argv[2], sys.argv[2:])
+      UT_NETNS
+      netns=unavailable
+      ns=""
+      if why=$("$py" -I "$scratch/plugin/ut_netns.py" probe 2>&1); then
+        netns=isolated
+        ns="$py -I $scratch/plugin/ut_netns.py exec"
+        netns_note=isolated
+      else
+        netns_note="unavailable ($(printf '%s\n' "$why" | tail -n 1); the in-process guard and proxy variables only)"
+      fi
+      # `-p pytest_cov` in upstream addopts fails before any plugin hook can
+      # help; without pytest-cov, an empty stand-in module (on PYTHONPATH after
+      # everything else) lets it load, and its --cov* options are ignored as above.
+      if ! "$py" -c 'import pytest_cov' 2>/dev/null; then
+        mkdir -p "$scratch/stubs"
+        echo '__upstream_tests_stub__ = True' > "$scratch/stubs/pytest_cov.py"
+        export PYTHONPATH="$PYTHONPATH:$scratch/stubs"
+      fi
+
+      # Snapshot the package before the run: the tests must not change it.
+      snap='import os, sys
+      for d, dirs, files in os.walk(sys.argv[1]):
+          for n in sorted(dirs + files):
+              p = os.path.join(d, n); st = os.lstat(p)
+              # directories: mode only (their size/mtime change whenever an
+              # entry is created and removed again; entries are compared
+              # themselves); files and links: size, mtime, mode.
+              d_ = os.path.isdir(p) and not os.path.islink(p)
+              print("%s %d %d %o" % (os.path.relpath(p, sys.argv[1]), 0 if d_ else st.st_size, 0 if d_ else st.st_mtime_ns, st.st_mode))'
+      "$py" -I -c "$snap" "$dest" | sort > "$scratch/before"
+      wrap=""
+      command -v timeout >/dev/null 2>&1 && wrap="timeout ${{inputs.overall-timeout}}"
+      echo "$me: $("$py" -c 'import sys, pytest; print("python", sys.version.split()[0], "pytest", pytest.__version__)') import-from=$from import-mode=$mode jobs=$jobs netns=$netns_note cwd=$src"
+      echo "$me: pytest $* ${{inputs.args}} $paths"
+      start=$(date +%s)
+      rc=0
+      set -f
+      # In its own process group, so that what the tests leave behind
+      # (servers, compilers, grandchildren of a killed run) can be killed
+      # afterwards; a leftover holding stdout would hang the build.
+      grp=""
+      command -v setsid >/dev/null 2>&1 && grp=setsid
+      if [ "${{inputs.runner}}" = unittest ]; then
+        ustart="$paths"
+        [ -z "$ustart" ] && ustart=$(printf '%s\n' $tp | head -n 1)
+        [ -z "$ustart" ] && ustart=.
+        # -t (top level = the project) only when the start directory is a
+        # package; a plain directory is its own top level (its modules import
+        # each other by basename), as `python -m unittest discover` does.
+        top=""
+        [ -f "$ustart/__init__.py" ] && top="-t $src"
+        echo "$me: python -m unittest discover -s $ustart $top ${{inputs.args}}"
+        $grp $wrap $ns "$py" "$scratch/plugin/run_unittest.py" discover -s "$ustart" $top ${{inputs.args}} </dev/null &
+      else
+        $grp $wrap $ns "$py" "$scratch/plugin/run_pytest.py" "$@" ${{inputs.args}} $paths </dev/null &
+      fi
+      pid=$!
+      wait $pid || rc=$?
+      if [ -n "$grp" ]; then
+        # Kill what the tests left behind in their process group (servers,
+        # grandchildren). The group is usually gone already.
+        kill -KILL -- "-$pid" 2>/dev/null || echo "$me: no leftover processes in the test process group"
+      fi
+      set +f
+      end=$(date +%s)
+      "$py" -I -c "$snap" "$dest" | sort > "$scratch/after"
+
+      echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s netns=$netns"
+
+      set +e
+      UT_PKG="$PKG" UT_RC="$rc" UT_ME="$me" UT_IGNORE="${{inputs.ignore}}" UT_SRC="$src" \
+      UT_SNAP="$scratch" UT_DEST="$dest" UT_LIMIT="${{inputs.overall-timeout}}" UT_EXT="${{inputs.extensions}}" \
+      UT_ENVPKGS="$envpkgs" UT_MINRUN="$minrun" \
+        "$py" -I - <<'UT_REPORT'
+      import collections, glob, json, os, re, sys
+      E = os.environ
+      TESTISH = re.compile(r"^(_?tests?|testing|unittests?|conftest|test_.*|.*_tests?)$")
+      TESTPKG = re.compile(r"^(_?tests?|unittests?|testsuite|test_.*|.*_tests?)$")
+      def testish(name):
+          return any(TESTISH.match(p) for p in name.split(".")[1:])
+      pkg, me, rc = E["UT_PKG"], E["UT_ME"], int(E["UT_RC"])
+      out, dsp, src = E["UT_OUT"], E.get("UT_DSP", ""), os.path.realpath(E["UT_SRC"])
+      why = []
+      try:
+          r = json.load(open(os.path.join(out, "results.json")))
+      except Exception:
+          r = None
+      if r is None:
+          print("UPSTREAM-TESTS %s: pass=unknown fail=unknown skip=unknown" % pkg)
+          if rc == 124 or rc >= 128:
+              why.append("pytest timed out or was killed (exit %d, overall-timeout=%ss)" % (rc, E["UT_LIMIT"]))
+          else:
+              why.append("pytest did not start a session (exit %d): bad arguments, an unknown option in addopts, or a conftest import error; see the output above" % rc)
+          print("UPSTREAM-TESTS %s: FAILED: %s" % (pkg, "; ".join(why)))
+          sys.exit(1)
+      for n_ in r.get("notes") or []:
+          print("%s: note: %s" % (me, n_))
+      if r.get("stubbed"):
+          print("%s: ignored options of plugins that are not installed: %s" % (me, " ".join(r["stubbed"])))
+      res, cerr = r["results"], r["collect_errors"]
+      c = collections.Counter(res.values())
+      fail = c["failed"] + c["error"] + len(cerr)
+      ign = [t for t in E.get("UT_IGNORE", "").split() if t]
+      ignored = 0
+      for t in ign:
+          n = sum(1 for d in r["deselected"] if d == t or d.startswith(t + "::") or d.startswith(t + "["))
+          ignored += n
+          if n:
+              print("IGNORE %s: %s (deselected %d)" % (pkg, t, n))
+          else:
+              print("%s: WARNING: ignore entry '%s' matches no collected test" % (me, t), file=sys.stderr)
+      if r["skips"]:
+          print("%s: most common skip reasons:" % me)
+          for reason, n in sorted(r["skips"].items(), key=lambda x: -x[1])[:10]:
+              print("  %5d  %s" % (n, reason[:200]))
+      wf = r.get("why") or {}
+      if cerr or wf:
+          print("%s: failure reasons (first 40):" % me)
+          for nodeid, why_ in cerr[:40]:
+              lines_ = [l.strip() for l in why_.splitlines() if l.strip()]
+              e_ = [l for l in lines_ if l.startswith("E ")]
+              print("  %s: %s" % (nodeid, " ".join((e_[-1] if e_ else (lines_[-1] if lines_ else "")).split())[:300]))
+          for nodeid in sorted(wf)[:max(0, 40 - len(cerr))]:
+              print("  %s: %s" % (nodeid, wf[nodeid]))
+      for nodeid, why_ in cerr:
+          print("UPSTREAM-TESTS-FAIL %s: %s [collection]" % (pkg, nodeid))
+      for nodeid in sorted(res):
+          if res[nodeid] == "failed":
+              print("UPSTREAM-TESTS-FAIL %s: %s" % (pkg, nodeid))
+          elif res[nodeid] == "error":
+              print("UPSTREAM-TESTS-FAIL %s: %s [error]" % (pkg, nodeid))
+      line = "UPSTREAM-TESTS %s: pass=%d fail=%d skip=%d" % (pkg, c["passed"], fail, c["skipped"])
+      if c["xfailed"]:
+          line += " xfail=%d" % c["xfailed"]
+      if ignored:
+          line += " ignored=%d" % ignored
+      print(line)
+      if rc == 124 or rc >= 128:
+          why.append("pytest timed out or was killed (exit %d, overall-timeout=%ss)%s" % (rc, E["UT_LIMIT"], " while running %s" % r["killed_during"] if r.get("killed_during") else ""))
+      if fail:
+          why.append("%d failing test(s)/collection error(s)" % fail)
+      # Under xdist the controller's count can lag; any recorded outcome
+      # means something was collected.
+      collected = max(r["collected"], len(res))
+      if collected == 0 or rc == 5:
+          why.append("no tests collected; the suite did not run (check dir, paths, markers, ignore)")
+      elif c["passed"] == 0:
+          why.append("no test passed (everything skipped, xfailed or deselected); the suite did not really run")
+      else:
+          # min-run-percent: the share of the selected tests that actually
+          # executed. ran = passed (including non-strict XPASS) + xfailed +
+          # failed + errored; selected = ran + skipped, i.e. every test that
+          # was collected and not deselected (ignore, markers, -k in args).
+          # ignore-files are never collected, so named exceptions do not
+          # count against the package.
+          ran = c["passed"] + c["xfailed"] + c["failed"] + c["error"]
+          sel = ran + c["skipped"]
+          if sel and ran * 100 < float(E["UT_MINRUN"]) * sel:
+              why.append("only %d of %d collected tests ran (%.1f%%), below min-run-percent=%s; the rest were skipped (reasons above). If that is upstream's default, set min-run-percent lower in the caller with a comment and a TODO(upstream-tests)" % (
+                  ran, sel, 100.0 * ran / sel, E["UT_MINRUN"]))
+      if rc not in (0, 1, 5, 124) and rc < 128:
+          why.append("pytest exited %d (2 interrupted, 3 internal error, 4 usage error)" % rc)
+      if rc == 1 and not fail:
+          why.append("pytest exited 1 without a recorded failure")
+      if dsp:
+          # Which top-level modules does the package ship, and where were
+          # they imported from (pytest process and every xdist worker)?
+          own = set()
+          for e in os.listdir(dsp) if os.path.isdir(dsp) else []:
+              if e.endswith((".dist-info", ".egg-info", ".pth")) or e.startswith(("_distutils_hack", "__pycache__")):
+                  continue
+              own.add(re.split(r"[.]", e)[0])
+          # A stray top-level tests/ in the wheel is a packaging bug of its
+          # own; the source tree's copy is not "the package under test".
+          own -= {"tests", "test", "testing", "conftest", "docs", "benchmarks", "examples"}
+          dsp_r = os.path.realpath(dsp)
+          hit, shadow = set(), set()
+          for f in glob.glob(os.path.join(out, "modules-*.json")):
+              for name, path in json.load(open(f)).items():
+                  top = name.split(".")[0]
+                  if top not in own:
+                      continue
+                  if path.startswith(dsp_r + os.sep):
+                      hit.add(top)
+                  elif path.startswith(src + os.sep):
+                      # Test-only submodules (foo.tests, not in the wheel) come
+                      # from the source tree by design; anything else is the
+                      # source tree shadowing (or standing in for) the build.
+                      rel = os.path.join(dsp, *name.split("."))
+                      strict = any(TESTPKG.match(p_) for p_ in name.split(".")[1:])
+                      if not strict and (not testish(name) or os.path.exists(rel + ".py") or os.path.exists(os.path.join(rel, "__init__.py"))):
+                          shadow.add("%s (%s)" % (name, path))
+          if shadow:
+              why.append("the package under test was imported from the source tree, not the destdir: %s; check the project's pytest 'pythonpath' setting and import-mode" % ", ".join(sorted(shadow)))
+          elif own and not hit and fail == 0:
+              why.append("none of the installed modules (%s) was imported from %s: the suite did not test the build" % (", ".join(sorted(own)), dsp))
+      # Native extensions: list what the destdir ships, and warn when the
+      # source tree has extension sources but nothing compiled was installed
+      # (an optional C/Cython extension that failed to build is otherwise
+      # silent: setup falls back to pure Python and the suite may still pass).
+      if dsp and os.path.isdir(dsp):
+          sos = []
+          for d_, _, fs in os.walk(dsp):
+              sos += [os.path.relpath(os.path.join(d_, f_), dsp) for f_ in fs if re.search(r"\.(so|pyd)$", f_)]
+          skipd = {"tests", "test", "testing", "docs", "doc", "benchmarks", "bench", "examples", "vendor", "third_party", "thirdparty", "melange-out", ".wheels", ".git", "build"}
+          csrc = []
+          for d_, dn, fs in os.walk(src):
+              dn[:] = [x for x in dn if x not in skipd and not x.startswith(".")]
+              csrc += [os.path.relpath(os.path.join(d_, f_), src) for f_ in fs if f_.endswith((".pyx", ".c", ".cpp", ".cc"))]
+              if len(csrc) > 200:
+                  break
+          setup_ext = False
+          for f_ in ("setup.py", "build.py"):
+              try:
+                  setup_ext = setup_ext or bool(re.search(r"\bExtension\(|ext_modules|cythonize\(", open(os.path.join(src, f_), errors="replace").read()))
+              except OSError:
+                  pass
+          print("%s: compiled extensions installed: %d%s" % (me, len(sos), (" (" + ", ".join(sorted(sos)[:8]) + (", ..." if len(sos) > 8 else "") + ")") if sos else ""))
+          ext_mode = E.get("UT_EXT", "auto")
+          if ext_mode == "required" and not sos:
+              why.append("extensions: required, but no compiled extension was installed (an optional extension failed to build?)")
+          if ext_mode == "auto" and not sos and (setup_ext or any(c.endswith(".pyx") for c in csrc)):
+              print("UPSTREAM-TESTS-WARN %s: the source has extension modules (%s) but no compiled extension was installed; an optional extension may have failed to build (look for 'Python.h: No such file' or 'Skipping optional' above)" % (
+                  pkg, "setup.py ext_modules" if setup_ext else ", ".join(sorted(c for c in csrc if c.endswith(".pyx"))[:5])))
+      # Compare the destdir snapshots (path size mtime mode) taken around
+      # the run (busybox has no normal-format diff, so do it here).
+      before = set(open(os.path.join(E["UT_SNAP"], "before")).read().splitlines())
+      after = set(open(os.path.join(E["UT_SNAP"], "after")).read().splitlines())
+      if before != after:
+          bp = {l.rsplit(" ", 3)[0] for l in before}
+          ap = {l.rsplit(" ", 3)[0] for l in after}
+          ch = ["added: " + x for x in sorted(ap - bp)] + ["removed: " + x for x in sorted(bp - ap)]
+          ch += ["changed: " + x for x in sorted({l.rsplit(" ", 3)[0] for l in after - before} & bp)]
+          why.append("the run changed the installed package in %s (bytecode, caches or files written by tests): %s" % (
+              E.get("UT_DEST", ""), "; ".join(ch[:20])))
+      if why:
+          missing = set()
+          blobs = [w for _, w in cerr] + list(r["skips"])
+          for b in blobs:
+              missing.update(re.findall(r"No module named '([A-Za-z0-9_]+)", b))
+              missing.update(re.findall(r"could not import '([A-Za-z0-9_]+)", b))
+          if missing:
+              print("%s: HINT: tests could not import: %s; add the packages that provide them (guess: %s) to %s, or name the files in ignore-files" % (
+                  me, " ".join(sorted(missing)),
+                  " ".join("py3-supported-" + m.lower().replace("_", "-") for m in sorted(missing)), E["UT_ENVPKGS"]))
+          print("UPSTREAM-TESTS %s: FAILED: %s" % (pkg, "; ".join(why)))
+          sys.exit(1)
+      UT_REPORT
+      status=$?
+      set -e
+      exit $status

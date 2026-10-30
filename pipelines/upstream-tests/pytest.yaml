@@ -1,0 +1,308 @@
+name: Python upstream test suite (pytest)
+
+description: |
+  Runs a Python project's upstream pytest suite against the package that
+  was just installed into the current (sub)package. Use it after the step
+  that installs the build output (`py/pip-build-install`, or the last step
+  that writes into ${{targets.contextdir}}), before `strip`. Run it after
+  install, so the package holds only what the build produced: the suite
+  runs in the same tree the install step copies from, and a test target
+  that rebuilds or writes something there would otherwise be shipped. In a
+  multi-version package, call it in each `py${{range.key}}-*` subpackage's
+  pipeline with `python: python${{range.key}}`, right after that
+  subpackage's py/pip-build-install. Each version subpackage is its own
+  artifact (compiled extensions differ per ABI, and the version-specific
+  code paths differ), so test every version by default; most suites take
+  seconds. For a suite that takes minutes, run it in the newest version
+  only and say so in a comment:
+      - if: "'${{range.key}}' == '3.13'"   # the quotes are required
+        uses: upstream-tests/pytest
+        with:
+          python: python${{range.key}}
+
+  Use this pipeline when the suite only needs Python test requirements.
+  Suites that need a service (a database, sshd, memcached), system tools,
+  locales, /etc configuration or test-time installs must not pull those
+  into the build environment: they use the test stage,
+  test/upstream-tests/pytest (coming in a follow-up), instead. Never both
+  for one package. If only a few tests need a service, keep this build
+  stage and name those tests in `ignore:` (with a comment and a TODO); if
+  the service is core to the suite, use the test stage. Never split one
+  suite across the two stages with `paths`.
+
+  The implementation is in upstream-tests/pytest-core (internal, to be
+  shared with the test stage); this pipeline passes its inputs and the
+  destdir on.
+
+  What is tested: the tests come from the source tree, but the code under
+  test is imported from the subpackage's destdir
+  (${{targets.contextdir}}/usr/lib/pythonX.Y/site-packages, put first on
+  sys.path and PYTHONPATH, with its .pth files processed; its usr/bin is
+  put first on PATH). pytest runs with --import-mode=append so a
+  flat-layout checkout (package dir at the repo root) cannot shadow the
+  installed copy, and with PYTHONSAFEPATH=1 (3.11+) so `python -m`/`-c`
+  children do not put the cwd first either. After the run the step checks
+  where the package's own top-level modules were imported from (in the
+  pytest process and every xdist worker): the step fails if none was
+  imported from the destdir, or if one was imported from the source tree
+  instead.
+  Tests that live inside the package:
+    - shipped in the wheel (foo/tests/ installed): pytest imports the
+      source tree's foo/tests/test_x.py as foo.tests.test_x, which resolves
+      to the installed copy; when the two files are byte-identical, the
+      installed module is used (instead of stopping with an "import file
+      mismatch"). Node ids stay source-tree paths. A test file whose
+      installed copy differs is still an error.
+    - not shipped (excluded from the wheel): foo comes from the destdir and
+      only the test-only submodules (dotted names with a tests/test/
+      testing/conftest/test_*/*_test(s) component) are loaded from the
+      source tree, after every installed module has been tried.
+  Options of plugins a build gate does not need, passed by upstream addopts
+  (pytest-cov --cov*, pytest-benchmark --benchmark-*, linters such as
+  --flake8/--mypy, pytest-html, rerunfailures, randomly) or replaced by this
+  step (xdist -n/--dist, pytest-timeout --timeout), are accepted and
+  ignored when the plugin is not installed, and listed in the output; so
+  clear-addopts is only needed for other addopts.
+
+  Isolation: the workspace, minus melange-out/ and .wheels/, is copied to
+  a scratch directory on disk under /var/cache/melange/upstream-tests-pytest
+  and the suite runs there. Files the tests write cannot reach the next
+  version's build in the same workspace, and the installed melange-out/
+  trees (which pytest would otherwise walk and collect when it recurses
+  from the repo root) are not in the copy. The step fails if the
+  run added, removed or changed any file in ${{targets.contextdir}}
+  (bytecode, caches, files written by tests); PYTHONDONTWRITEBYTECODE=1
+  keeps the interpreter from writing __pycache__/ into the package, and
+  pytest's cache goes to the scratch directory (-o cache_dir=...). HOME and
+  XDG_CACHE_HOME point into a scratch directory.
+
+  Network: none at test time, in two layers. (1) The test process tree
+  runs in a new, empty network namespace with only loopback up (127.0.0.1
+  and ::1, so loopback test servers work), set up with unshare(2) from
+  Python, no extra packages. Nothing can leave it: not Python, not
+  children that ignore proxies (nc, ssh, c-ares, -I/-E interpreters). It
+  needs CAP_SYS_ADMIN, which the build has as root in melange's VM; where
+  that fails, the step goes on without it and says so (netns=unavailable
+  and the reason on the configuration line). (2) A small pytest plugin
+  shipped inline in this step refuses socket connections, sends
+  (send/sendall/sendto/sendmsg) and name lookups (getaddrinfo,
+  gethostbyname(_ex), gethostbyaddr, getnameinfo) for anything other than
+  loopback, unix sockets and the local hostname, with the errors a host
+  without network gives (OSError ENETUNREACH, socket.gaierror EAI_NONAME,
+  socket.herror), so well-written suites skip; and http(s)_proxy point at
+  a closed loopback port so that child processes using proxies fail fast.
+  Without the namespace, (2) is best effort: it covers in-process Python
+  only, and child processes are only proxy-redirected. Tests that still
+  need the network go in `markers` (e.g. "not network") or `ignore`.
+
+  pytest and the test requirements are not pulled in by this pipeline:
+  the caller adds py3-supported-pytest, the project's test requirements
+  (py3-supported-pytest-mock, ...) and its runtime dependencies (which are
+  not otherwise in the build environment) to environment.contents.packages,
+  each marked `# upstream-tests:`. jobs > 1 needs
+  py3-supported-pytest-xdist; a per-test timeout needs
+  py3-supported-pytest-timeout (without it the step falls back to
+  faulthandler_timeout, which dumps stacks but does not kill, and relies on
+  overall-timeout).
+
+  The suite is a hard gate, run once: there are no retries (tests must be
+  deterministic). Do not add pytest-rerunfailures or pytest-flaky; without
+  them, upstream --reruns options and @flaky markers are accepted but
+  inert. The step fails if:
+    - a test fails or errors (call failure, setup/teardown error, strict
+      XPASS), or a test module fails to collect (import error, syntax
+      error, missing test dependency),
+    - pytest exits non-zero for any other reason (interrupted, internal
+      error, usage error such as an unknown option in addopts), or
+      overall-timeout hits,
+    - the suite did not really run: nothing collected (exit 5), no test
+      passed (everything skipped, xfailed or deselected), or fewer than
+      min-run-percent (default 5) of the selected tests ran. Ran = passed
+      + xfailed + failed + errored; selected = ran + skipped, i.e. every
+      collected test not deselected by `ignore`, `markers` or -k, so named
+      exceptions do not count against the package (ignore-files are not
+      collected at all). A suite where 1 test passes and 2000 skip fails.
+      A package whose upstream suite mostly skips by default sets
+      min-run-percent lower, with a comment and a TODO(upstream-tests);
+      the default may be raised later.
+    - the package under test was never imported from the destdir, or was
+      imported from the source tree,
+    - the run changed ${{targets.contextdir}}.
+
+  Prints pytest's output (-q -rfE --tb=short), the ten most common skip
+  reasons, then summary lines:
+    UPSTREAM-TESTS <package>: duration=<n>s netns=<isolated|unavailable>
+    UPSTREAM-TESTS-FAIL <package>: <nodeid>                (one per failing test)
+    UPSTREAM-TESTS-FAIL <package>: <nodeid> [error]        (setup/teardown error)
+    UPSTREAM-TESTS-FAIL <package>: <path> [collection]     (module failed to collect)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>]
+    UPSTREAM-TESTS-WARN <package>: ...   (not a failure: e.g. extension
+      sources in the tree but no compiled extension installed)
+    UPSTREAM-TESTS <package>: FAILED: <reasons>   (when the gate fails)
+  Counts come from the step's own plugin (pytest_runtest_logreport and
+  pytest_collectreport, so they do not depend on the terminal output or
+  on addopts): one outcome per test run (a test that passes and then
+  errors in teardown counts once, as a failure); fail = failed + errored tests +
+  collection errors; xfail = expected failures; ignored = tests
+  deselected by `ignore`. On failure, a HINT line names modules that
+  tests could not import (ModuleNotFoundError, pytest.importorskip) with a
+  guessed package name (py3-supported-<name>).
+
+  Examples:
+    - range: py-versions
+      name: py${{range.key}}-${{vars.pypi-package}}
+      pipeline:
+        - uses: py/pip-build-install
+          with:
+            python: python${{range.key}}
+        - uses: upstream-tests/pytest
+          with:
+            python: python${{range.key}}
+        - uses: strip
+
+    # Upstream addopts loads pytest-cov (--cov), which is not needed here.
+    - uses: upstream-tests/pytest
+      with:
+        python: python${{range.key}}
+        paths: tests
+        clear-addopts: true
+        markers: not network and not slow
+        jobs: auto
+
+  Named exceptions go in ignore: space-separated pytest node ids, deselected
+  with --deselect (a prefix such as tests/test_net.py::TestDNS deselects the
+  whole class), and in ignore-files: paths passed to --ignore (not
+  collected at all, for modules that fail to import). Every exception
+  needs a comment in the calling package explaining why and a
+  `TODO(upstream-tests): ...` to remove it:
+    # test_fetch_remote downloads from example.org; the build has no network.
+    # TODO(upstream-tests): mark it @pytest.mark.network upstream.
+    - uses: upstream-tests/pytest
+      with:
+        python: python${{range.key}}
+        ignore: tests/test_client.py::test_fetch_remote
+        # tests/test_trio.py needs trio, which is not packaged.
+        # TODO(upstream-tests): package py3-trio and drop it.
+        ignore-files: tests/test_trio.py
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  python:
+    description: |
+      Interpreter to run pytest with, e.g. python${{range.key}} or
+      python3.13. DEFAULT resolves it the same way py/pip-build-install
+      does (python3, or the single /usr/bin/python3.X).
+    default: DEFAULT
+  dir:
+    description: |
+      Project directory (where pyproject.toml / setup.cfg / tox.ini /
+      pytest.ini live), relative to the workspace. pytest runs from here
+      and it is the rootdir.
+    default: "."
+  paths:
+    description: |
+      Space-separated test paths or node ids, or `--pyargs <module>`.
+      Empty uses the project's testpaths; if the project sets none, tests/
+      (or test/, testing/) when it holds Python test modules, else pytest
+      recurses from dir.
+    default: ""
+  args:
+    description: |
+      Extra pytest arguments, inserted verbatim, e.g. `-p no:randomly` or
+      `-W ignore::DeprecationWarning`. Do not pass -m, -n, --deselect,
+      --ignore, --timeout or --import-mode here; use the inputs.
+    default: ""
+  markers:
+    description: |
+      Marker expression for -m, e.g. "not network and not slow". Empty
+      leaves -m unset (the project's addopts may set one).
+    default: ""
+  ignore:
+    description: |
+      Space-separated pytest node ids (or node id prefixes) to deselect.
+      Each one needs a comment and TODO in the caller.
+    default: ""
+  ignore-files:
+    description: |
+      Space-separated paths (files or directories, relative to dir) not to
+      collect (--ignore). Each one needs a comment and TODO in the caller.
+    default: ""
+  import-mode:
+    description: |
+      pytest --import-mode. auto is append (see the description).
+    default: auto
+  clear-addopts:
+    description: |
+      true to drop the project's addopts (-o addopts=), for example when
+      they load plugins that are not packaged (--cov, --benchmark-*) or set
+      -n. Say which option is unwanted in a comment.
+    default: "false"
+  jobs:
+    description: |
+      Parallel workers (pytest-xdist -n). 1 runs serially without xdist;
+      auto is min(nproc, 4). Anything else than 1 needs
+      py3-supported-pytest-xdist in the environment.
+    default: "1"
+  timeout:
+    description: |
+      Per-test timeout in seconds (pytest-timeout --timeout, if installed;
+      faulthandler_timeout otherwise). 0 disables it.
+    default: "600"
+  overall-timeout:
+    description: Wall-clock limit for the whole run, in seconds.
+    default: "3600"
+  runner:
+    description: |
+      pytest (default) or unittest. unittest runs `python -m unittest
+      discover` (for suites written for unittest's loader: load_tests,
+      abstract base TestCases, unittest-only layouts) with the same
+      isolation, network guard, import pinning, origin check, destdir
+      snapshot, hard-gate rules and summary lines. `paths` is the start
+      directory (default: testpaths/tests/test/.), `args` is passed to
+      discover (e.g. `-p "Test*.py"`); markers, ignore, ignore-files, jobs
+      and clear-addopts do not apply.
+    default: pytest
+  extensions:
+    description: |
+      Compiled-extension expectation for the installed package. auto
+      (default): list what is installed and print UPSTREAM-TESTS-WARN if
+      the source tree has extension modules but nothing compiled was
+      installed. required: that case fails the step (use it for packages
+      whose extension must not silently fall back to pure Python, e.g.
+      wrapt, pyyaml's libyaml binding, setproctitle). none: the package is
+      pure Python by design for this version (say why in a comment); no
+      warning.
+    default: auto
+  min-run-percent:
+    description: |
+      Minimum share of the selected tests that must actually run, in
+      percent (see "the suite did not really run" in the description).
+      A package whose upstream suite mostly skips by default sets it lower,
+      with a comment and a TODO(upstream-tests). The default may be raised
+      later.
+    default: "5"
+
+pipeline:
+  - uses: upstream-tests/pytest-core
+    with:
+      stage: build
+      caller: upstream-tests/pytest
+      destdir: ${{targets.contextdir}}
+      python: ${{inputs.python}}
+      dir: ${{inputs.dir}}
+      paths: ${{inputs.paths}}
+      args: ${{inputs.args}}
+      markers: ${{inputs.markers}}
+      ignore: ${{inputs.ignore}}
+      ignore-files: ${{inputs.ignore-files}}
+      import-mode: ${{inputs.import-mode}}
+      clear-addopts: ${{inputs.clear-addopts}}
+      jobs: ${{inputs.jobs}}
+      timeout: ${{inputs.timeout}}
+      overall-timeout: ${{inputs.overall-timeout}}
+      runner: ${{inputs.runner}}
+      extensions: ${{inputs.extensions}}
+      min-run-percent: ${{inputs.min-run-percent}}

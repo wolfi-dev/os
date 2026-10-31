@@ -1,0 +1,200 @@
+package:
+  name: py3-google-cloud-testutils
+  version: "1.10.1"
+  epoch: 0
+  description: System-test utilities (the test_utils module) shared by the google-cloud-* Python client libraries
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: google-cloud-testutils
+  import: test_utils
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - py3-supported-build-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/googleapis/google-cloud-python
+      tag: ${{vars.pypi-package}}-v${{package.version}}
+      expected-commit: 69401247a72c0f0786741ac937c3c5aa2afc8ead
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}
+      runtime:
+        - py${{range.key}}-click
+        - py${{range.key}}-google-auth
+        - py${{range.key}}-packaging
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+        working-directory: packages/${{vars.pypi-package}}
+      # lower-bound-checker moves to -bin so the per-version library subpackages can be co-installed.
+      - name: move usr/bin executables for -bin
+        runs: |
+          mkdir -p ./cleanup/${{range.key}}/
+          mv ${{targets.contextdir}}/usr/bin ./cleanup/${{range.key}}/
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              from test_utils.prefixer import Prefixer
+              from test_utils.retry import RetryErrors, RetryResult, RetryInstanceState
+              from test_utils.system import unique_resource_id
+              from test_utils.lower_bound_checker import lower_bound_checker
+        - name: Prefixer creates and recognises timestamped resource names
+          runs: |
+            python${{range.key}} <<'EOF'
+            from test_utils.prefixer import Prefixer
+
+            # Separators in repo and relative_dir are normalised to "_".
+            p = Prefixer("python-storage", "tests/system")
+            name = p.create_prefix()
+            print(name)
+            assert isinstance(name, str), type(name)
+            assert name.startswith("python_storage_tests_system_"), name
+            assert not p.should_cleanup(name), name
+            # Names older than the default one-day cleanup_age get cleaned up.
+            assert p.should_cleanup("python_storage_tests_system_20000101000000_abc")
+            assert not p.should_cleanup("other_repo_20000101000000_abc")
+
+            dashed = Prefixer("repo", "rel", separator="-").create_prefix()
+            assert dashed.startswith("repo-rel-"), dashed
+            print("prefixer ok")
+            EOF
+        - name: Retry helpers retry until success and re-raise when exhausted
+          runs: |
+            python${{range.key}} <<'EOF'
+            from test_utils.retry import RetryErrors, RetryResult
+
+            calls = {"n": 0}
+
+            @RetryErrors(ValueError, max_tries=4, delay=0)
+            def flaky():
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise ValueError("not yet")
+                return "done"
+
+            assert flaky() == "done"
+            assert calls["n"] == 3, calls
+
+            @RetryErrors(KeyError, max_tries=2, delay=0)
+            def always_fails():
+                raise KeyError("boom")
+
+            try:
+                always_fails()
+            except KeyError:
+                pass
+            else:
+                raise AssertionError("RetryErrors swallowed the final error")
+
+            results = iter([0, 0, 7])
+
+            @RetryResult(lambda r: r == 7, max_tries=5, delay=0)
+            def eventually():
+                return next(results)
+
+            assert eventually() == 7
+            print("retry ok")
+            EOF
+        - name: unique_resource_id uses the requested delimiter
+          runs: |
+            python${{range.key}} -c 'from test_utils.system import unique_resource_id; r = unique_resource_id("-"); print(r); assert r.startswith("-") and len(r) > 1, r'
+
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: lower-bound-checker executable for ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}-bin
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/
+          mv ./cleanup/${{range.key}}/bin ${{targets.contextdir}}/usr/
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+        - uses: test/tw/contains-files
+          with:
+            files: /usr/bin/lower-bound-checker
+        - uses: test/tw/help-check
+          with:
+            bins: lower-bound-checker
+            expect-contains: check update
+        - name: lower-bound-checker update pins lower bounds and check accepts them
+          working-directory: /tmp/lbc-update
+          runs: |
+            # The checker reads the installed google-cloud-testutils metadata and
+            # writes one ==<lower bound> pin per install_requires entry.
+            : > constraints.txt
+            lower-bound-checker update --package-name google-cloud-testutils --constraints-file constraints.txt
+            cat constraints.txt
+            grep -E '^google-auth==' constraints.txt
+            grep -E '^packaging==' constraints.txt
+            grep -E '^click==' constraints.txt
+            lower-bound-checker check --package-name google-cloud-testutils --constraints-file constraints.txt
+        - name: lower-bound-checker check rejects a constraints file missing a requirement
+          working-directory: /tmp/lbc-reject
+          runs: |
+            printf 'google-auth==2.14.1\nclick==7.0.0\n' > constraints.txt
+            if lower-bound-checker check --package-name google-cloud-testutils --constraints-file constraints.txt > out.txt 2>&1; then
+              cat out.txt
+              echo "FAIL: check accepted a constraints file without packaging"
+              exit 1
+            fi
+            cat out.txt
+            grep -F "packaging" out.txt
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: googleapis/google-cloud-python
+    strip-prefix: google-cloud-testutils-v
+    use-tag: true
+    tag-filter-prefix: google-cloud-testutils-v

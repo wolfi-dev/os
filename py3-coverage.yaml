@@ -1,0 +1,210 @@
+package:
+  name: py3-coverage
+  version: "7.17.0"
+  epoch: 0
+  description: Code coverage measurement for Python, with a C tracer extension
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: coverage
+  import: coverage
+
+data:
+  - name: py-versions
+    items:
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - py3-supported-build-base-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/nedbat/coveragepy
+      tag: ${{package.version}}
+      expected-commit: 393ac715ddae841a85452d97edeedd8be8f0cda8
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - name: verify C tracer extension was built
+        runs: |
+          # setup.py silently falls back to a pure-Python install when the
+          # coverage.tracer extension fails to compile.
+          find ${{targets.contextdir}}/usr/lib/python${{range.key}}/site-packages/coverage -name 'tracer*.so' | grep -q .
+      - name: move usr/bin executables for -bin
+        runs: |
+          mkdir -p ./cleanup/${{range.key}}/
+          mv ${{targets.contextdir}}/usr/bin ./cleanup/${{range.key}}/
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: test/tw/ldd-check
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              from coverage.tracer import CTracer
+        - name: C tracer smoke test (upstream tests/smoke.py)
+          runs: |
+            python${{range.key}} -c 'from coverage.tracer import CTracer; assert hasattr(CTracer(), "start"); print("CTracer OK!")' > smoke.out
+            cat smoke.out
+            grep -F "CTracer OK!" smoke.out
+        - name: debug sys reports the packaged version
+          runs: |
+            python${{range.key}} -m coverage debug sys > sys.out
+            cat sys.out
+            grep -E "coverage_version: +${{package.version}}" sys.out
+        - name: run, report, json, xml and html via python -m coverage
+          runs: |
+            work=$(mktemp -d)
+            cd "$work" || exit 1
+            # classify(1) never reaches line 4, so 4 of 5 statements run and
+            # the "if" on line 2 is a partial branch (1 of 2 arcs taken).
+            cat > sample.py <<'EOF'
+            def classify(n):
+                if n > 0:
+                    return "positive"
+                return "non-positive"
+
+            print(classify(1))
+            EOF
+
+            python${{range.key}} -m coverage run --branch sample.py > run.out
+            grep -Fx "positive" run.out
+            stat .coverage
+
+            python${{range.key}} -m coverage report -m > report.out
+            cat report.out
+            grep -E "^sample.py +5 +1 +2 +1 +71% +4" report.out
+            grep -E "^TOTAL" report.out
+
+            python${{range.key}} -m coverage json -o cov.json
+            python${{range.key}} - <<'EOF'
+            import json
+            f = json.load(open("cov.json"))["files"]["sample.py"]
+            s = f["summary"]
+            assert f["missing_lines"] == [4], f["missing_lines"]
+            assert s["num_statements"] == 5, s
+            assert s["num_branches"] == 2, s
+            assert s["num_partial_branches"] == 1, s
+            print("json report OK")
+            EOF
+
+            python${{range.key}} -m coverage xml -o cov.xml
+            grep -F 'filename="sample.py"' cov.xml
+
+            python${{range.key}} -m coverage html -d htmlcov
+            grep -F "sample.py" htmlcov/index.html
+
+            python${{range.key}} -m coverage erase
+            test ! -e .coverage
+        - name: running a missing file fails
+          runs: |
+            work=$(mktemp -d)
+            cd "$work" || exit 1
+            if python${{range.key}} -m coverage run missing.py > err.out 2>&1; then
+              echo "FAIL: coverage run of a missing file exited 0"
+              exit 1
+            fi
+            cat err.out
+            grep -F "No file to run" err.out
+
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: Executable binaries for ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}-bin
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/
+          mv ./cleanup/${{range.key}}/bin ${{targets.contextdir}}/usr/
+    test:
+      environment:
+        contents:
+          packages:
+            - busybox
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              coverage
+              coverage3
+              coverage-${{range.key}}
+        - uses: test/tw/help-check
+          with:
+            bins: coverage
+        - name: console script reports the C extension
+          runs: |
+            coverage --version > ver.out
+            cat ver.out
+            grep -F "with C extension" ver.out
+        - name: coverage run and coverage report
+          runs: |
+            work=$(mktemp -d)
+            cd "$work" || exit 1
+            cat > hello.py <<'EOF'
+            import sys
+            if len(sys.argv) > 1:
+                print("args")
+            print("hello")
+            EOF
+            coverage run hello.py > run.out
+            grep -Fx "hello" run.out
+            coverage report > report.out
+            cat report.out
+            grep -E "^hello.py +4 +1 +75%" report.out
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - 'a\d'
+    - 'b\d'
+    - 'rc\d'
+  git: {}

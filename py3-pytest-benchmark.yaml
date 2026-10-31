@@ -1,0 +1,204 @@
+package:
+  name: py3-pytest-benchmark
+  # v5.3.0 replaced py-cpuinfo with the py-cpuinfo2 fork, which has no GitHub upstream.
+  version: "5.2.3"
+  epoch: 0
+  description: pytest fixture for benchmarking code; benchmark tests can also run once as normal tests with --benchmark-disable.
+  copyright:
+    - license: BSD-2-Clause
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: pytest-benchmark
+  import: pytest_benchmark
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - py3-supported-build-base-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/ionelmc/pytest-benchmark
+      tag: v${{package.version}}
+      expected-commit: b857483dd8e8a875f3aa040bd0054847ad657291
+
+  # The pytest in os (9.2) no longer has Node._nodeid, so the fixture raises
+  # AttributeError at setup. Backport of upstream 9f669a3 (unreleased as of
+  # 5.3.0); drop this once a release contains it.
+  - uses: patch
+    with:
+      patches: fix-pytest-nodeid.patch
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      runtime:
+        - py${{range.key}}-pytest
+        - py${{range.key}}-py-cpuinfo
+      provides:
+        - py3-${{vars.pypi-package}}
+      provider-priority: ${{range.value}}
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              from pytest_benchmark.fixture import BenchmarkFixture
+        - name: Plugin registers its options with pytest
+          runs: |
+            python${{range.key}} -m pytest --help > /tmp/pytest-help.txt
+            grep -F -- "--benchmark-disable" /tmp/pytest-help.txt
+            grep -F -- "--benchmark-save" /tmp/pytest-help.txt
+            grep -F -- "--benchmark-compare" /tmp/pytest-help.txt
+        - name: benchmark fixture runs as a normal test with --benchmark-disable
+          runs: |
+            mkdir -p /tmp/disabled
+            cd /tmp/disabled || exit 1
+            cat > test_disabled.py <<'EOF'
+            def test_sum(benchmark):
+                assert benchmark(sum, range(100)) == 4950
+            EOF
+            python${{range.key}} -m pytest -p no:cacheprovider --benchmark-disable test_disabled.py > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -F "1 passed" out.txt
+        - name: benchmark fixture times rounds and writes JSON stats
+          runs: |
+            mkdir -p /tmp/timed
+            cd /tmp/timed || exit 1
+            cat > test_timed.py <<'EOF'
+            def test_join(benchmark):
+                assert benchmark(",".join, ["a", "b", "c"]) == "a,b,c"
+
+            def test_pedantic(benchmark):
+                calls = []
+                benchmark.pedantic(calls.append, args=(1,), rounds=5, iterations=2)
+                # 5 rounds x 2 iterations, plus the one extra call pedantic makes
+                # to capture a return value when iterations > 1.
+                assert len(calls) == 11, len(calls)
+            EOF
+            python${{range.key}} -m pytest -p no:cacheprovider --benchmark-json=/tmp/timed/out.json test_timed.py > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -F "2 passed" out.txt
+            grep -F "test_join" out.txt
+            python${{range.key}} - <<'EOF'
+            import json
+            data = json.load(open("/tmp/timed/out.json"))
+            by_name = {b["name"]: b for b in data["benchmarks"]}
+            assert set(by_name) == {"test_join", "test_pedantic"}, by_name
+            assert by_name["test_pedantic"]["stats"]["rounds"] == 5
+            assert by_name["test_pedantic"]["stats"]["iterations"] == 2
+            assert by_name["test_join"]["stats"]["mean"] > 0
+            EOF
+        - name: Failing assertion inside a benchmark fails the run
+          runs: |
+            mkdir -p /tmp/failing
+            cd /tmp/failing || exit 1
+            cat > test_failing.py <<'EOF'
+            def test_bad(benchmark):
+                assert benchmark(sum, [1, 2]) == 4
+            EOF
+            if python${{range.key}} -m pytest -p no:cacheprovider --benchmark-disable test_failing.py > out.txt 2>&1; then
+              cat out.txt
+              echo "pytest unexpectedly passed"
+              exit 1
+            fi
+            cat out.txt
+            grep -F "1 failed" out.txt
+
+  # The pytest-benchmark and py.test-benchmark console scripts are split out so
+  # the per-version library subpackages can be co-installed.
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: pytest-benchmark CLI for python${{range.key}}
+    dependencies:
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+      provides:
+        - py3-${{vars.pypi-package}}-bin
+      provider-priority: ${{range.value}}
+    pipeline:
+      - uses: split/bin
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              pytest-benchmark
+              py.test-benchmark
+            help-flag: --help
+            expect-contains: compare
+        - name: Save a run, then list and compare it with the CLI
+          runs: |
+            mkdir -p /tmp/cli
+            cd /tmp/cli || exit 1
+            cat > test_cli.py <<'EOF'
+            def test_sorted(benchmark):
+                assert benchmark(sorted, [3, 1, 2]) == [1, 2, 3]
+            EOF
+            python${{range.key}} -m pytest --benchmark-save=baseline test_cli.py > run.txt 2>&1 || { cat run.txt; exit 1; }
+            cat run.txt
+            grep -F "1 passed" run.txt
+
+            pytest-benchmark list > list.txt
+            cat list.txt
+            grep -F "0001_baseline.json" list.txt
+
+            pytest-benchmark compare 0001 > compare.txt
+            cat compare.txt
+            grep -F "test_sorted" compare.txt
+
+            py.test-benchmark compare 0001 > compare-legacy.txt
+            grep -F "test_sorted" compare-legacy.txt
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+        - name: Every supported python version imports the plugin
+          runs: |
+            for v in 3.10 3.11 3.12 3.13; do
+              python$v -c "import ${{vars.import}}; print(${{vars.import}}.__file__)" | grep -F "python$v/site-packages/${{vars.import}}/"
+            done
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: ionelmc/pytest-benchmark
+    strip-prefix: v

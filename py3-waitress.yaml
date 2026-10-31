@@ -1,0 +1,184 @@
+package:
+  name: py3-waitress
+  version: "3.0.2"
+  epoch: 0
+  description: Waitress is a production-quality, pure-Python WSGI server with no dependencies outside the Python standard library.
+  copyright:
+    - license: ZPL-2.1
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: waitress
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - py3-supported-pip
+      - py3-supported-setuptools
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/Pylons/waitress
+      tag: v${{package.version}}
+      expected-commit: b11ae729cc51ca2998a1ad9b4992b34f34ac95e7
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - name: "move usr/bin executables for -bin"
+        runs: |
+          mkdir -p ./cleanup/${{range.key}}/
+          mv ${{targets.contextdir}}/usr/bin ./cleanup/${{range.key}}/
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import waitress
+              from waitress.server import create_server
+        - name: Serve an inline WSGI app on loopback and fetch it
+          runs: |
+            python${{range.key}} <<'EOF'
+            import threading
+            import urllib.request
+
+            from waitress.server import create_server
+
+            def app(environ, start_response):
+                payload = environ["wsgi.input"].read().decode()
+                body = "%s %s %s" % (environ["REQUEST_METHOD"], environ["PATH_INFO"], payload)
+                body = body.encode()
+                start_response("200 OK", [
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", str(len(body))),
+                ])
+                return [body]
+
+            # Port 0 lets the kernel pick a free port; effective_port reports it.
+            # TcpWSGIServer fills it from getnameinfo(NI_NUMERICSERV), so it is a str.
+            server = create_server(app, host="127.0.0.1", port=0)
+            port = int(server.effective_port)
+            assert port > 0, port
+            threading.Thread(target=server.run, daemon=True).start()
+            base = "http://127.0.0.1:%d" % port
+            # An http_proxy in the test VM would otherwise intercept loopback requests.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            with opener.open(base + "/hello", timeout=10) as resp:
+                assert resp.status == 200, resp.status
+                assert "waitress" in resp.headers["Server"], resp.headers["Server"]
+                got = resp.read().decode()
+                assert got == "GET /hello ", repr(got)
+
+            req = urllib.request.Request(base + "/echo", data=b"ping", method="POST")
+            with opener.open(req, timeout=10) as resp:
+                got = resp.read().decode()
+                assert got == "POST /echo ping", repr(got)
+
+            server.close()
+            print("waitress served GET and POST on port", port)
+            EOF
+
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: waitress-serve executable for ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+      provides:
+        - py3-${{vars.pypi-package}}-bin
+      provider-priority: ${{range.value}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/
+          mv ./cleanup/${{range.key}}/bin ${{targets.contextdir}}/usr/
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+            - wait-for-it
+      pipeline:
+        # The -bin package ships no site-packages for auto-detection to key on.
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: test/tw/help-check
+          with:
+            bins: waitress-serve
+            help-flag: --help
+            expect-contains: "MODULE:OBJECT"
+        - name: waitress-serve serves myapp:wsgifunc with --url-scheme=https
+          uses: test/daemon-check-output
+          with:
+            setup: |
+              mkdir -p /tmp/wsgiapp
+              cat > /tmp/wsgiapp/myapp.py <<'EOF'
+              def wsgifunc(environ, start_response):
+                  body = environ["wsgi.url_scheme"].encode()
+                  start_response("200 OK", [("Content-Type", "text/plain")])
+                  return [body]
+              EOF
+            # start is word-split, not shell-parsed, so env carries PYTHONPATH to expose myapp.
+            start: env PYTHONPATH=/tmp/wsgiapp /usr/bin/waitress-serve --listen=127.0.0.1:8041 --url-scheme=https myapp:wsgifunc
+            expected_output: Serving on
+            error_strings: |
+              Traceback
+              Bad module
+              Address already in use
+            post: |
+              set -euo pipefail
+              wait-for-it 127.0.0.1:8041 -t 15
+              body=$(curl -sf --noproxy '*' http://127.0.0.1:8041/)
+              echo "response body: $body"
+              [ "$body" = "https" ]
+              curl -sf --noproxy '*' -D - -o /dev/null http://127.0.0.1:8041/ | grep -iF "server: waitress"
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    # The origin package ships no files and pulls in no python, so the import
+    # and serve checks live in the py3.X-waitress subpackage tests.
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: Pylons/waitress
+    strip-prefix: v

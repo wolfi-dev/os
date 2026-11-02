@@ -1,0 +1,173 @@
+package:
+  name: py3.14-pytest-asyncio
+  version: "1.4.1"
+  epoch: 0
+  description: pytest plugin that runs asyncio coroutines as tests and fixtures
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      # Upstream needs backports.asyncio.runner only on python<3.11 and
+      # typing-extensions only on python<3.13, so 3.14 needs just pytest.
+      - py${{vars.python-version}}-pytest
+
+vars:
+  pypi-package: pytest-asyncio
+  import: pytest_asyncio
+  python-version: "3.14"
+
+environment:
+  contents:
+    packages:
+      - py${{vars.python-version}}-build-base
+  environment:
+    SETUPTOOLS_SCM_PRETEND_VERSION: ${{package.version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/pytest-dev/pytest-asyncio
+      tag: v${{package.version}}
+      expected-commit: 6af7f5c9a8c77fe5040b9d368b9ed01837c25652
+
+  - uses: py/pip-build-install
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: strip
+
+test:
+  environment:
+    contents:
+      packages:
+        - busybox
+  pipeline:
+    - uses: test/tw/pip-check
+      with:
+        python: python${{vars.python-version}}
+    - uses: python/import
+      with:
+        python: python${{vars.python-version}}
+        imports: |
+          import ${{vars.import}}
+          from ${{vars.import}} import fixture, is_async_test
+    - name: strict/auto modes, async fixtures, loop_scope, explicit plugin load
+      runs: |
+        work=$(mktemp -d)
+        cd "$work" || exit 1
+        cat > test_strict.py <<'PY'
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        events = []
+
+
+        @pytest_asyncio.fixture
+        async def resource():
+            events.append("setup")
+            await asyncio.sleep(0)
+            yield 42
+            events.append("teardown")
+
+
+        @pytest.mark.asyncio
+        async def test_sleep():
+            await asyncio.sleep(0)
+
+
+        @pytest.mark.asyncio
+        async def test_fixture(resource):
+            assert resource == 42
+            assert asyncio.get_running_loop().is_running()
+
+
+        # Runs after test_fixture in file order, proving the async generator
+        # fixture's teardown half was driven to completion.
+        def test_teardown_ran():
+            assert events == ["setup", "teardown"]
+        PY
+        cat > test_auto.py <<'PY'
+        import asyncio
+
+        import pytest
+
+
+        @pytest.fixture
+        async def value():
+            await asyncio.sleep(0)
+            return "ok"
+
+
+        async def test_unmarked(value):
+            assert value == "ok"
+
+
+        async def test_gather():
+            assert await asyncio.gather(asyncio.sleep(0, 1), asyncio.sleep(0, 2)) == [1, 2]
+        PY
+        cat > test_loop_scope.py <<'PY'
+        import asyncio
+
+        import pytest
+
+        loops = []
+
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_first():
+            loops.append(asyncio.get_running_loop())
+
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_second():
+            assert asyncio.get_running_loop() is loops[0]
+        PY
+        cat > test_explicit.py <<'PY'
+        import asyncio
+
+        import pytest
+
+
+        @pytest.mark.asyncio
+        async def test_x():
+            await asyncio.sleep(0)
+        PY
+
+        py=python${{vars.python-version}}
+        run() {
+          # run <expected-summary> <pytest args...>
+          want="$1"
+          shift
+          if ! "$py" -m pytest -p no:cacheprovider "$@" > out.txt 2>&1; then
+            cat out.txt
+            echo "FAIL: $py -m pytest $*"
+            exit 1
+          fi
+          cat out.txt
+          grep -qF "$want" out.txt
+        }
+
+        echo "== strict mode: marked coroutine tests and async generator fixtures"
+        run "3 passed" test_strict.py
+        grep -qE "^plugins:.*asyncio-" out.txt
+        grep -qiE "mode=(Mode\.)?strict" out.txt
+
+        echo "== auto mode: unmarked coroutine tests and async fixtures"
+        run "2 passed" --asyncio-mode=auto test_auto.py
+        grep -qiE "mode=(Mode\.)?auto" out.txt
+
+        echo "== module loop_scope shares one event loop across tests"
+        run "2 passed" test_loop_scope.py
+
+        echo "== plugin loads explicitly with entry-point autoload disabled"
+        export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+        run "1 passed" -p pytest_asyncio.plugin test_explicit.py
+        unset PYTEST_DISABLE_PLUGIN_AUTOLOAD
+
+update:
+  enabled: true
+  github:
+    identifier: pytest-dev/pytest-asyncio
+    strip-prefix: v

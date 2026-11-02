@@ -1,7 +1,7 @@
 package:
   name: nodejs-24
-  version: "24.22.1" # On update, please check if -fdelete-null-pointer-checks is still required
-  epoch: 2 # use system brotli BLOCK_SWITCH error code
+  version: "24.22.2" # On update, please check if -fdelete-null-pointer-checks is still required
+  epoch: 0
   description: "JavaScript runtime built on V8 engine"
   dependencies:
     provides:
@@ -21,10 +21,11 @@ vars:
   # SHA256 of docker-entrypoint.sh from nodejs/docker-node
   docker-entrypoint-hash: a15ac9589c04baf9da95b08e0e79b5cf1d75ab8dc64e06a5e68e4ceb0ad7c8ea
   # configure.py flags shared by the node, -minimal and -libnode builds.
-  # LTO off: with --enable-lto (GCC: -flto=4 -ffat-lto-objects) the build of
-  # 24.22.1 fails early, exactly like 26.12.1 does, because V8's build-time
-  # generator gen-regexp-special-case, itself compiled with LTO, aborts with
-  # "Check failed: ch <= 0xffff".
+  # No --enable-lto yet: a 24.22.1 LTO attempt aborted in V8's
+  # gen-regexp-special-case with "Check failed: ch <= 0xffff", but that
+  # abort comes from ICU 79, hits non-LTO builds too, and is fixed by
+  # v8-regexp-special-case-icu79.patch. LTO has not been retried since.
+  # https://linear.app/chainguard/issue/OS-5265
   configure-flags: >-
     --prefix=/usr --shared-brotli --shared-zlib --shared-openssl --shared-cares --shared-nghttp2 --shared-libuv --ninja --openssl-use-def-ca-store --with-icu-default-data-dir=$(icu-config --icudatadir) --with-intl=system-icu --openssl-conf-name=openssl_conf
   openssl-version: "4.0"
@@ -62,13 +63,21 @@ pipeline:
     with:
       repository: https://github.com/nodejs/node.git
       tag: v${{package.version}}
-      expected-commit: ce7aaf1cee78b8cf0ce17364260535c418d3ed26
+      expected-commit: f7f273a9bb6445f6f7fb6349105e7532972045fb
 
   # Keep PBKDF2 matching Chainguard's PKCS5_PBKDF2_HMAC() under OpenSSL 4:
   # pass pkcs5=1 so non-approved parameters still work under FIPS
   - uses: patch
     with:
       patches: ncrypto-pbkdf2-pkcs5.patch
+
+  # Backport of V8 f607706154ea for ICU 79, which adds U+1DF95 to the case
+  # closure of U+00DF/U+1E9E: fixes the "Check failed: ch <= 0xffff" abort in
+  # gen-regexp-special-case and makes U+00DF/U+1E9E match U+1DF95 under /iu
+  # and /iv. Drop once deps/v8 contains that commit.
+  - uses: patch
+    with:
+      patches: v8-regexp-special-case-icu79.patch
 
   - name: Configure and build
     runs: |
@@ -134,6 +143,26 @@ test:
         console.log(new Intl.NumberFormat('de-DE').format(1234.56));
         EOF
         node testIntl.js | grep '1,234.56' && node testIntl.js | grep '1.234,56' || exit 1
+    - name: Regexp case equivalents of U+1DF95 (v8-regexp-special-case-icu79.patch)
+      runs: |
+        cat <<'EOF' > testCaseFold.js
+        const assert = require('node:assert');
+        const S = '\u{1DF95}';
+        // Fails if the system ICU lacks Unicode 18 case data, which would
+        // make the checks below vacuous.
+        assert.strictEqual(S.toUpperCase(), 'SS');
+        assert.ok(/^\u00df$/iu.test(S));
+        assert.ok(/^\u1e9e$/iu.test(S));
+        assert.ok(new RegExp('^' + S + '$', 'iu').test('\u00df'));
+        assert.ok(/^[\u00df]$/iu.test(S));
+        assert.ok(/^\u00df$/iu.test('\u1e9e'));
+        // /i compares UTF-16 code units: no supplementary matches, and
+        // U+00DF/U+1E9E and U+017F/s stay distinct (generated IgnoreSet).
+        assert.ok(!/^\u00df$/i.test(S));
+        assert.ok(!/^\u00df$/i.test('\u1e9e'));
+        assert.ok(!/^s$/i.test('\u017f'));
+        EOF
+        node testCaseFold.js
 
 subpackages:
   - name: ${{package.name}}-minimal

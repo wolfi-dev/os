@@ -3,14 +3,13 @@ name: Config Package Check
 description: |
   Validates that a configuration package contains non-empty configuration
   files in the expected location. Configuration packages install runtime
-  configuration under /etc/ or a specified directory. Uses the 'file'
-  command to verify that config files are text-based rather than binary
-  blobs, catching accidental packaging of compiled objects or archives
-  as configuration files.
+  configuration under /etc/ or a specified directory. Only files owned by
+  the package under test are checked, as listed by 'apk info -L', so files
+  installed by other packages in the test environment do not count.
 
 needs:
   packages:
-    - file
+    - apk-tools
 
 inputs:
   dir:
@@ -29,25 +28,34 @@ pipeline:
       pkg="${{inputs.package}}"
       dir="${{inputs.dir}}"
 
-      # Remove starting '/' from path if used
-      # This provides compat with packages that
-      # currently override the dir
-      if [[ "${dir:0:1}" == "/" ]]; then
-        dir="${dir:1}"
-      fi
+      # apk lists paths without a leading '/'; strip one so callers can
+      # pass either form.
+      dir="${dir#/}"
 
-      tmpd=$(mktemp -d)
-      trap "rm -Rf '${tmpd}'" EXIT
-      file_list="${tmpd}/files"
-
-      apk info --quiet -L "$pkg" > "$file_list" || {
-        echo "failed to list contents of $pkg"
-        exit 1
-      }
-
-      config_files="$(grep ^$dir $file_list)"
-      if [ -z "$config_files" ]; then
-        echo "$pkg does not contain config files in $dir!"
+      if ! file_list=$(apk info --quiet -L "${pkg}"); then
+        echo "FAIL: failed to list contents of [${pkg}]" >&2
         exit 1
       fi
-      echo -e "Config files found:\n$config_files"
+
+      # Match dir as a literal prefix rather than a regex.
+      config_files=$(printf '%s\n' "${file_list}" | awk -v d="${dir}" 'index($0, d) == 1')
+      if [ -z "${config_files}" ]; then
+        echo "FAIL: [${pkg}] does not contain config files in [${dir}]" >&2
+        exit 1
+      fi
+
+      nonempty=0
+      while IFS= read -r f; do
+        if [ -f "/${f}" ] && [ -s "/${f}" ]; then
+          nonempty=$((nonempty + 1))
+        fi
+      done <<CONFIG_FILES
+      ${config_files}
+      CONFIG_FILES
+      if [ "${nonempty}" -eq 0 ]; then
+        echo "FAIL: [${pkg}] has no non-empty regular files in [${dir}]" >&2
+        exit 1
+      fi
+
+      printf 'Config files found:\n%s\n' "${config_files}"
+      echo "PASS: [${pkg}] has ${nonempty} non-empty config file(s) in [${dir}]"

@@ -2,7 +2,7 @@
 package:
   name: cleave
   version: "2.12.1"
-  epoch: 0 # rust: 1.98->1.99
+  epoch: 1 # CVE-2026-111943
   description: "Atomic-level static analysis across binaries and source."
   copyright:
     - license: Apache-2.0
@@ -32,8 +32,71 @@ pipeline:
       tag: v${{package.version}}
       expected-commit: af5baf135f0a92aed33482ae1c492c00882dbc34
 
-  # The lru bump for GHSA-rhfx-m35p-ff5j is no longer needed: 2.4.0 locks
-  # lru 0.18.1, which already contains the fix.
+  # am-fs-squashfs 0.1.5 has been removed from crates.io, so v2.12.1 no longer
+  # resolves. Backport upstream 1f6380a141cc, which switches to rust-fs-squashfs
+  # and rust-fs-core. They expose the same fs_squashfs and fs_core lib names and
+  # API, so no source changes are needed. Drop this once a release includes it.
+  - uses: patch
+    with:
+      patches: rust-fs-squashfs.patch
+
+  # rust-fs-squashfs 0.4.0 requires lru ^0.12 directly, which carries
+  # GHSA-rhfx-m35p-ff5j (fixed in 0.16.3) and adds a second lru copy next to the
+  # 0.18 cleave uses. 0.4.0 is the crate's only release, so patch in the
+  # published crate with lru relaxed to 0.18. It only uses LruCache::new, len,
+  # cap, get and put. Use the published crate and not its git repo, whose
+  # Cargo.toml has a `../rust-fs-core` path dependency. Drop this once a release
+  # of rust-fs-squashfs moves off lru 0.12.
+  - runs: |
+      mkdir -p /tmp/rust-fs-squashfs-patched
+
+  # blocked-custom-format: the published crate has a normalized manifest; the git repo's Cargo.toml has a ../rust-fs-core path dependency
+  - uses: fetch
+    with:
+      uri: https://static.crates.io/crates/rust-fs-squashfs/rust-fs-squashfs-0.4.0.crate
+      expected-sha256: 071f8b8b71735397efcb72bcaf45ec57e5239ed5a1f3471ab5623581943ee92b
+      directory: /tmp/rust-fs-squashfs-patched
+
+  # The crate's manifest has exactly one `version = "0.12"` line, the lru requirement.
+  - uses: sed
+    with:
+      path: /tmp/rust-fs-squashfs-patched/Cargo.toml
+      pattern: |-
+        ^version = "0\.12"$
+      replacement: |-
+        version = "0.18"
+
+  # Cargo.toml already has a [patch.crates-io] table, so add the entry to it.
+  - uses: sed
+    with:
+      path: Cargo.toml
+      pattern: |-
+        ^\[patch\.crates-io\]$
+      replacement: |-
+        [patch.crates-io]\nrust-fs-squashfs = { path = "/tmp/rust-fs-squashfs-patched" }
+
+  # Drop the am-fs-* lock entries and resolve the new crates, keeping every
+  # other locked version.
+  - runs: |
+      cargo update -p am-fs-squashfs -p am-fs-core
+      if grep -q '^name = "am-fs-' Cargo.lock; then
+        echo "am-fs-* crates still in Cargo.lock"
+        exit 1
+      fi
+      if grep -A1 '^name = "lru"' Cargo.lock | grep -qE 'version = "0\.([0-9]|1[0-5])\.|version = "0\.16\.[0-2]"'; then
+        echo "lru below 0.16.3 still in Cargo.lock"
+        exit 1
+      fi
+
+  # CVE-2026-111943: 1.0.11 drops the emSign roots.
+  # yara-x 1.22 adds the uint64() function used by cleave-traits since 0.0.0_git20261030.
+  - uses: bump
+    with:
+      language: rust
+      deps: |-
+        webpki-roots@1.0.11
+        yara-x@1.22.1
+
   - uses: cargo/build
     with:
       output: cleave

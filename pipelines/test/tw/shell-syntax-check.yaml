@@ -5,8 +5,10 @@ description: |
   by a package, using each shell's built-in parse-only mode.
 
   When the optional "files" input is specified (space-separated list of
-  paths), only those files are checked. Otherwise, all shell files
-  installed by the package are found automatically.
+  paths), only those files are checked. Otherwise, the shell files
+  installed by the package are found automatically from its file list
+  ('apk info -L'), so files from other packages in the test environment
+  are not checked.
 
   Completion files are detected by install location (shebangs not required,
   these files are sourced rather than executed directly):
@@ -34,9 +36,14 @@ inputs:
       automatically.
     required: false
     default: ""
+  package:
+    description: |
+      Package whose installed files are checked when "files" is not set.
+    default: ${{context.name}}
 
 needs:
   packages:
+    - apk-tools
     - bash
     - fish
     - zsh
@@ -48,20 +55,27 @@ pipeline:
       set -euo pipefail
       total=0
 
+      syntax_error() {
+        echo "ERROR: syntax check failed: $1"
+        exit 1
+      }
+
       # check_by_shebang: read shebang, pick checker, run it.
       # Returns 0 if the file was recognised and checked, 1 if skipped.
+      # Callers use it as an if condition, where set -e does not apply,
+      # so a failed check exits here rather than returning.
       check_by_shebang() {
         local f="$1" shebang
         shebang=$(head -1 "$f" 2>/dev/null) || return 1
         case "$shebang" in
           "#!/bin/bash"*|"#!/usr/bin/bash"*|"#!/usr/bin/env bash"*)
-            bash --norc -n "$f" ;;
+            bash --norc -n "$f" || syntax_error "$f" ;;
           "#!/bin/sh"*|"#!/usr/bin/env sh"*|"#!/bin/dash"*|"#!/usr/bin/env dash"*|"#!/usr/bin/ash"*|"#!/usr/bin/env ash"*|"#!/bin/busybox"*|"#!/usr/bin/busybox"*)
-            sh -n "$f" ;;
+            sh -n "$f" || syntax_error "$f" ;;
           "#!/bin/zsh"*|"#!/usr/bin/zsh"*|"#!/usr/bin/env zsh"*)
-            zsh -n "$f" ;;
+            zsh -n "$f" || syntax_error "$f" ;;
           "#!/usr/bin/fish"*|"#!/usr/bin/env fish"*)
-            fish --no-execute "$f" ;;
+            fish --no-execute "$f" || syntax_error "$f" ;;
           *) return 1 ;;
         esac
         return 0
@@ -96,32 +110,33 @@ pipeline:
           check_file "$f"
         done
       else
-        # Auto-detection: find all shell files installed by the package.
+        # Auto-detection: check the shell files the package installs, as
+        # listed by apk, so files from other packages in the test
+        # environment are not counted.
+        pkg="${{inputs.package}}"
+        if ! file_list=$(apk info --quiet -L "$pkg"); then
+          echo "ERROR: failed to list contents of $pkg"
+          exit 1
+        fi
 
-        # Bash completion files (location-based, no shebang required)
-        while IFS= read -r -d '' f; do
-          bash --norc -n "$f"
-          total=$((total + 1))
-        done < <(find /usr/share/bash-completion/completions -type f ! -name '.*' -print0 2>/dev/null)
-
-        # Zsh completion files (location-based)
-        while IFS= read -r -d '' f; do
-          zsh -n "$f"
-          total=$((total + 1))
-        done < <(find /usr/share/zsh/site-functions -type f -print0 2>/dev/null)
-
-        # Fish completion files (location-based)
-        while IFS= read -r -d '' f; do
-          fish --no-execute "$f"
-          total=$((total + 1))
-        done < <(find /usr/share/fish/vendor_completions.d -type f -name '*.fish' -print0 2>/dev/null)
-
-        # Executable shell scripts (shebang-based), skips binaries automatically
-        while IFS= read -r -d '' f; do
-          if check_by_shebang "$f"; then
-            total=$((total + 1))
+        while IFS= read -r f; do
+          f="/$f"
+          # Regular files only, as find -type f did: symlinks are checked
+          # through the package that owns their target.
+          if [ ! -f "$f" ] || [ -L "$f" ]; then
+            continue
           fi
-        done < <(find /usr/bin /usr/sbin /usr/libexec -type f -executable -print0 2>/dev/null)
+          case "$f" in
+            /usr/share/bash-completion/completions/.*) ;;
+            /usr/share/bash-completion/completions/*|/usr/share/zsh/site-functions/*|/usr/share/fish/vendor_completions.d/*.fish)
+              check_file "$f" ;;
+            /usr/bin/*|/usr/sbin/*|/usr/libexec/*)
+              # Shell scripts are recognised by shebang; binaries are skipped.
+              if [ -x "$f" ] && check_by_shebang "$f"; then
+                total=$((total + 1))
+              fi ;;
+          esac
+        done <<< "$file_list"
       fi
 
       if [ "$total" -eq 0 ]; then

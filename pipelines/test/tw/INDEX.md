@@ -6,6 +6,7 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 
 | Pipeline | Purpose | Required Inputs |
 |----------|---------|-----------------|
+| `configpackage` | Validate configuration packages contain config files | none |
 | `contains-files` | Verify package contains expected files | `files` or `dir`+`name` |
 | `debugpackage` | Validate debug symbol packages | none |
 | `devpackage` | Validate development packages | none |
@@ -16,12 +17,15 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 | `header-check` | Verify C/C++ headers compile | none |
 | `help-check` | Verify binaries respond to --help | `bins` |
 | `ldd-check` | Check for missing shared libraries | none |
+| `soversion-check` | Check library SONAMEs match the package name | none |
 | `lua-syntax-check` | Find and compile all installed Lua files with LuaJIT | none |
 | `metapackage` | Validate meta-packages (deps only) | none |
 | `no-docs` | Ensure package has no documentation | none |
 | `pip-check` | Validate Python package dependencies | none |
 | `shell-deps.check` | Check shell scripts for missing commands | `files` |
 | `shell-deps-check-packages` | Check package shell scripts for deps | `package` |
+| `shell-syntax-check` | Syntax-check shell completions and scripts | none |
+| `srcpackage` | Validate source packages contain source files | none |
 | `staticpackage` | Validate static library packages | none |
 | `symlink-check` | Verify symlinks are valid | none |
 | `byproductpackage` | Validate by-product packages | none |
@@ -34,6 +38,17 @@ This directory contains test pipelines for validating Wolfi packages. Use this i
 ## Package Type Validation
 
 Use these pipelines to validate that packages conform to expected structural patterns for their type.
+
+### `configpackage`
+Validates that a configuration package installs non-empty files under the expected directory. Only files owned by the package are checked.
+
+**When to use:** For `-config` packages that install runtime configuration files.
+
+**Inputs:**
+- `dir` (optional, default: `etc/`) - Directory to search for config files; a leading `/` is ignored
+- `package` (optional, default: `${{context.name}}`) - Package whose files are checked
+
+---
 
 ### `docs`
 Validates documentation packages contain only documentation files under a specified path prefix.
@@ -51,6 +66,17 @@ Validates development packages contain headers, static libraries, and developmen
 **When to use:** For `-dev` or `-devel` packages.
 
 **Inputs:** None
+
+---
+
+### `srcpackage`
+Validates source packages contain actual source code files in the expected directory.
+
+**When to use:** For `-src` packages that install source code.
+
+**Inputs:**
+- `dir` (optional, default: `/usr/src/`) - Directory to search for source files
+- `name` (optional, default: `*`) - File name pattern (find syntax)
 
 ---
 
@@ -181,6 +207,18 @@ Checks binaries for missing runtime library dependencies using `ldd`.
 
 ---
 
+### `soversion-check`
+Checks that library SONAMEs and `so:` provides match the soversion in the package name.
+
+**When to use:** For soname-versioned library subpackages such as `libfoo2` or `libfoo-2`.
+
+**Inputs:**
+- `packages` (optional, default: `${{context.name}}`) - Packages to check
+
+**Dependencies:** soversion-check
+
+---
+
 ### `pip-check`
 Validates Python package dependencies using `pip check`.
 
@@ -224,6 +262,19 @@ Checks installed package shell scripts for dependency issues.
 **Dependencies:** tw
 
 **Uses:** `tw shell-deps check-package`
+
+---
+
+### `shell-syntax-check`
+Checks the syntax of the shell completion files and executable shell scripts a package installs, using each shell's parse-only mode.
+
+**When to use:** For packages that ship bash, zsh or fish completions, or shell scripts in `usr/bin`, `usr/sbin` or `usr/libexec`.
+
+**Inputs:**
+- `files` (optional) - Space-separated list of files to check instead of auto-detecting
+- `package` (optional, default: `${{context.name}}`) - Package whose files are auto-detected when `files` is not set
+
+**Dependencies:** apk-tools, bash, fish, zsh
 
 ---
 

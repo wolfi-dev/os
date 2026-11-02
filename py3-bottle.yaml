@@ -1,0 +1,233 @@
+package:
+  name: py3-bottle
+  version: "0.13.4"
+  epoch: 0
+  description: Fast, simple and lightweight single-file WSGI micro web-framework for Python
+  copyright:
+    - license: MIT
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: bottle
+  import: bottle
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - py3-supported-pip
+      - py3-supported-python
+      # The 0.13.4 tag builds from setup.py; flit_core/pyproject.toml exist only on master.
+      - py3-supported-setuptools
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: b0a0a1014f7a7e6f6b7c193886a0913f46ee3ee6
+      repository: https://github.com/bottlepy/bottle
+      tag: ${{package.version}}
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: python${{range.key}} version of ${{vars.pypi-package}}
+    dependencies:
+      provider-priority: ${{range.value}}
+      provides:
+        - py3-${{vars.pypi-package}}
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      # setup.py installs the `bottle` console script and a `bottle.py` script copy
+      # into usr/bin; move them to the -bin subpackage so versions can co-install.
+      - name: move usr/bin executables for -bin
+        runs: |
+          mkdir -p ./cleanup/${{range.key}}/
+          mv ${{targets.contextdir}}/usr/bin ./cleanup/${{range.key}}/
+      - uses: strip
+    test:
+      pipeline:
+        - uses: test/tw/pip-check
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              from ${{vars.import}} import Bottle, request, response, template
+        - name: Route, template, JSON and error handling through the WSGI interface
+          runs: |
+            python${{range.key}} <<'EOF'
+            import io
+            import json
+            import bottle
+            from wsgiref.util import setup_testing_defaults
+
+            assert bottle.__version__ == "${{package.version}}", bottle.__version__
+
+            app = bottle.Bottle()
+
+            @app.route("/hello/<name>")
+            def hello(name):
+                return bottle.template("Hello {{name}}!", name=name)
+
+            @app.post("/echo")
+            def echo():
+                return {"msg": bottle.request.json["msg"], "x": bottle.request.query.get("x")}
+
+            # Drive the app as a WSGI server would, without opening a socket.
+            def call(method, path, body=b"", query="", ctype=""):
+                env = {}
+                setup_testing_defaults(env)
+                env.update(REQUEST_METHOD=method, PATH_INFO=path, QUERY_STRING=query,
+                           CONTENT_LENGTH=str(len(body)), CONTENT_TYPE=ctype)
+                env["wsgi.input"] = io.BytesIO(body)
+                seen = []
+                out = b"".join(app(env, lambda s, h, e=None: seen.append((s, dict(h)))))
+                return seen[0][0], seen[0][1], out
+
+            status, headers, body = call("GET", "/hello/world")
+            assert status == "200 OK", status
+            assert body == b"Hello world!", body
+
+            # SimpleTemplate {{...}} must HTML-escape its input.
+            status, headers, body = call("GET", "/hello/<b>")
+            assert body == b"Hello &lt;b&gt;!", body
+
+            status, headers, body = call("POST", "/echo", json.dumps({"msg": "hi"}).encode(),
+                                         "x=42", "application/json")
+            assert status == "200 OK", status
+            assert headers["Content-Type"].startswith("application/json"), headers
+            assert json.loads(body) == {"msg": "hi", "x": "42"}, body
+
+            status, headers, body = call("GET", "/missing")
+            assert status.startswith("404"), status
+
+            status, headers, body = call("GET", "/echo")
+            assert status.startswith("405"), status
+            print("bottle WSGI checks passed")
+            EOF
+        - name: Serve an app on loopback with bottle.run
+          runs: |
+            python${{range.key}} <<'EOF'
+            import threading
+            import time
+            import urllib.error
+            import urllib.request
+            import bottle
+
+            app = bottle.Bottle()
+
+            @app.get("/ping")
+            def ping():
+                return "pong"
+
+            # bottle.run blocks, so serve from a daemon thread that dies with the script.
+            threading.Thread(target=bottle.run, daemon=True,
+                             kwargs=dict(app=app, host="127.0.0.1", port=8081, quiet=True)).start()
+
+            for _ in range(50):
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:8081/ping", timeout=2) as r:
+                        body = r.read()
+                        break
+                except urllib.error.URLError:
+                    time.sleep(0.2)
+            else:
+                raise SystemExit("bottle server never answered on 127.0.0.1:8081")
+
+            assert body == b"pong", body
+            try:
+                urllib.request.urlopen("http://127.0.0.1:8081/nope", timeout=2)
+                raise SystemExit("expected HTTP 404 for unknown route")
+            except urllib.error.HTTPError as e:
+                assert e.code == 404, e.code
+            print("bottle loopback server checks passed")
+            EOF
+
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}-bin
+    description: Executable scripts for ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      runtime:
+        - py${{range.key}}-${{vars.pypi-package}}
+      provides:
+        - py3-${{vars.pypi-package}}-bin
+      provider-priority: ${{range.value}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/
+          mv ./cleanup/${{range.key}}/bin ${{targets.contextdir}}/usr/
+    test:
+      environment:
+        contents:
+          packages:
+            - curl
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: test/tw/ver-check
+          with:
+            bins: bottle
+            version-flag: --version
+        - uses: test/tw/help-check
+          with:
+            bins: bottle
+        - uses: test/daemon-check-output
+          with:
+            # The bottle CLI puts "." on sys.path, so the app module goes in the working directory.
+            setup: |
+              cat > bottle_test_app.py <<'EOF'
+              import bottle
+              app = bottle.Bottle()
+
+              @app.route("/hello/<name>")
+              def hello(name):
+                  return "Hello %s" % name
+              EOF
+            start: bottle --bind 127.0.0.1:8080 bottle_test_app:app
+            expected_output: |
+              server starting up
+              Listening on http
+              Hit Ctrl-C to quit
+            error_strings: |
+              Traceback.*most.recent.call
+              Error:
+              Address already in use
+            post: |
+              set -euo pipefail
+              curl -sf http://127.0.0.1:8080/hello/world | grep -F "Hello world"
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/missing)
+              [ "$code" = "404" ]
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: bottlepy/bottle
+    use-tag: true

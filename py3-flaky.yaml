@@ -1,0 +1,189 @@
+package:
+  name: py3-flaky
+  version: "3.8.1"
+  epoch: 0
+  description: Plugin for pytest that automatically reruns flaky tests.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    provider-priority: 0
+
+vars:
+  pypi-package: flaky
+  import: flaky
+
+data:
+  - name: py-versions
+    items:
+      3.10: '310'
+      3.11: '311'
+      3.12: '312'
+      3.13: '313'
+
+environment:
+  contents:
+    packages:
+      - py3-supported-build-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/box/flaky
+      tag: v${{package.version}}
+      expected-commit: fe6233f8ccb6473fc2243736b1a86870db6baad1
+
+  # setup.py imports setuptools.command.test (removed in setuptools 72) for an
+  # unused tox "test" command; drop it so the build works with current setuptools.
+  - runs: |
+      grep -q '^from setuptools.command.test import test as TestCommand$' setup.py
+      grep -q "cmdclass={'test': Tox}," setup.py
+      sed -i \
+        -e 's/^from setuptools.command.test import test as TestCommand$/TestCommand = object/' \
+        -e "/cmdclass={'test': Tox},/d" \
+        -e "/tests_require=\['tox'\],/d" \
+        -e "/test_suite='test',/d" \
+        setup.py
+      ! grep -q 'setuptools.command.test' setup.py
+
+subpackages:
+  - range: py-versions
+    name: py${{range.key}}-${{vars.pypi-package}}
+    description: ${{vars.pypi-package}} installed for python${{range.key}}
+    dependencies:
+      provides:
+        - py3-${{vars.pypi-package}}
+      provider-priority: ${{range.value}}
+    pipeline:
+      - uses: py/pip-build-install
+        with:
+          python: python${{range.key}}
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - py${{range.key}}-pytest
+      pipeline:
+        - uses: test/tw/pip-check
+          with:
+            python: python${{range.key}}
+        - uses: python/import
+          with:
+            python: python${{range.key}}
+            imports: |
+              import ${{vars.import}}
+              from flaky import flaky
+              from flaky.flaky_pytest_plugin import FlakyPlugin
+        - name: Plugin auto-registers via pytest11 and -p no:flaky disables it
+          runs: |
+            mkdir -p /tmp/flaky-reg
+            cd /tmp/flaky-reg || exit 1
+            cat > test_reg.py <<'EOF'
+            def test_flaky_registered(pytestconfig):
+                assert pytestconfig.pluginmanager.hasplugin("flaky")
+            EOF
+            python${{range.key}} -m pytest -p no:cacheprovider test_reg.py > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -F "1 passed" out.txt
+            rc=0
+            python${{range.key}} -m pytest -p no:cacheprovider -p no:flaky test_reg.py > out-noflaky.txt 2>&1 || rc=$?
+            cat out-noflaky.txt
+            [ "$rc" -eq 1 ]
+            grep -F "1 failed" out-noflaky.txt
+        - name: Decorated test that fails once is rerun and passes
+          runs: |
+            mkdir -p /tmp/flaky-test
+            cd /tmp/flaky-test || exit 1
+            # The module-level counter survives reruns because flaky reruns in-process.
+            cat > test_flaky.py <<'EOF'
+            from flaky import flaky
+
+            calls = {"n": 0}
+
+
+            @flaky(max_runs=3)
+            def test_fails_once():
+                calls["n"] += 1
+                assert calls["n"] > 1, "first run fails on purpose"
+            EOF
+            python${{range.key}} -m pytest -p no:cacheprovider test_flaky.py > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -F "1 passed" out.txt
+            grep -F "===Flaky Test Report===" out.txt
+            grep -F "test_fails_once failed (" out.txt
+
+            # Without the plugin the same test must fail, proving flaky did the rerun.
+            rc=0
+            python${{range.key}} -m pytest -p no:cacheprovider -p no:flaky test_flaky.py > out-noflaky.txt 2>&1 || rc=$?
+            cat out-noflaky.txt
+            [ "$rc" -eq 1 ]
+            grep -F "1 failed" out-noflaky.txt
+        - name: Marker, min_passes and --force-flaky behave as documented
+          runs: |
+            mkdir -p /tmp/flaky-opts
+            cd /tmp/flaky-opts || exit 1
+            cat > test_opts.py <<'EOF'
+            import pytest
+
+            state = {"marker": 0, "forced": 0}
+
+
+            @pytest.mark.flaky(max_runs=2, min_passes=1)
+            def test_marker_fails_once():
+                state["marker"] += 1
+                assert state["marker"] >= 2
+
+
+            @pytest.mark.flaky(max_runs=2, min_passes=2)
+            def test_needs_two_passes_but_always_fails():
+                assert False
+
+
+            def test_undecorated_fails_once():
+                state["forced"] += 1
+                assert state["forced"] >= 2
+            EOF
+            rc=0
+            python${{range.key}} -m pytest -p no:cacheprovider test_opts.py > out.txt 2>&1 || rc=$?
+            cat out.txt
+            [ "$rc" -eq 1 ]
+            grep -F "1 passed" out.txt
+            grep -F "2 failed" out.txt
+
+            # --force-flaky makes every test flaky, so the undecorated one now passes on rerun.
+            python${{range.key}} -m pytest -p no:cacheprovider --force-flaky --max-runs 2 \
+              -k test_undecorated_fails_once test_opts.py > forced.txt 2>&1 || { cat forced.txt; exit 1; }
+            cat forced.txt
+            grep -F "1 passed" forced.txt
+
+            # --no-flaky-report suppresses the summary block.
+            python${{range.key}} -m pytest -p no:cacheprovider --no-flaky-report \
+              -k test_marker_fails_once test_opts.py > noreport.txt 2>&1 || { cat noreport.txt; exit 1; }
+            cat noreport.txt
+            grep -F "1 passed" noreport.txt
+            if grep -F "===Flaky Test Report===" noreport.txt; then
+              echo "flaky report printed despite --no-flaky-report"
+              exit 1
+            fi
+
+  - name: py3-supported-${{vars.pypi-package}}
+    description: meta package providing ${{vars.pypi-package}} for supported python versions.
+    dependencies:
+      runtime:
+        - py3.10-${{vars.pypi-package}}
+        - py3.11-${{vars.pypi-package}}
+        - py3.12-${{vars.pypi-package}}
+        - py3.13-${{vars.pypi-package}}
+    test:
+      pipeline:
+        - uses: test/tw/metapackage
+
+test:
+  pipeline:
+    - uses: test/tw/byproductpackage
+
+update:
+  enabled: true
+  github:
+    identifier: box/flaky
+    strip-prefix: v

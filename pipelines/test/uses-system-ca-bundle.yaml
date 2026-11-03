@@ -6,6 +6,12 @@ description: |
   dependency on ca-certificates-bundle. Pairs with
   ca-certificates/use-system-bundle.
 
+  Without files, it checks every file the package installs instead: no text
+  file whose name matches names may share min-certs or more certificates with
+  the system bundle, and at least one file must link to it. Links count when
+  they resolve to the bundle, so relative links and links through
+  /etc/ssl/cert.pem are fine.
+
   The dependency is read from the apk database rather than inferred from the
   link resolving, because the bundle often arrives transitively (wolfi-base
   pulls in apk-tools, which depends on it) and would hide a missing
@@ -19,8 +25,27 @@ inputs:
   files:
     description: |
       Whitespace-separated list of installed paths to check. Shell globs are
-      allowed.
-    required: true
+      allowed. Leave empty to check every file the package installs.
+    required: false
+    default: ""
+  min-certs:
+    description: |
+      Without files, the number of certificates a file may share with the
+      system bundle before it counts as a copy that should be a link.
+    default: "10"
+  names:
+    description: |
+      Without files, whitespace-separated shell patterns of file names to
+      check for copies. Use the same patterns as in
+      ca-certificates/use-system-bundle.
+    default: "*.pem *.crt *.cer *.txt"
+  exclude:
+    description: |
+      Without files, whitespace-separated shell patterns of installed paths
+      to leave alone, such as "/usr/lib/foo/*" or "*/tests/*". Use the same
+      patterns as in ca-certificates/use-system-bundle.
+    required: false
+    default: ""
   bundle:
     description: |
       Path of the system CA bundle that the links must point to.
@@ -37,12 +62,19 @@ inputs:
 #     with:
 #       files: /usr/lib/python3.12/site-packages/httplib2/cacerts.txt
 #
+# Or check every file the package installs:
+#
+#   - uses: test/uses-system-ca-bundle
+#
 pipeline:
   - name: Check bundled CA files link to the system bundle
     runs: |
       bundle="${{inputs.bundle}}"
       # Assign first: a multi-line list substituted into the for line is a syntax error.
       files="${{inputs.files}}"
+      if [ -z "$files" ]; then
+        exit 0
+      fi
       checked=0
       set -f
       for pattern in $files; do
@@ -90,3 +122,88 @@ pipeline:
         exit 1
       fi
       echo "$pkg depends on ca-certificates-bundle"
+
+  - name: Check the package ships no copies of the system bundle
+    runs: |
+      files="${{inputs.files}}"
+      if [ -n "$files" ]; then
+        exit 0
+      fi
+      pkg="${{inputs.package}}"
+      bundle="${{inputs.bundle}}"
+      min_certs="${{inputs.min-certs}}"
+      names="${{inputs.names}}"
+      exclude="${{inputs.exclude}}"
+      if [ ! -s "$bundle" ]; then
+        echo "$bundle is missing or empty"
+        exit 1
+      fi
+      resolved_bundle="$(readlink -f "$bundle")"
+
+      # List the package's files from the apk database, then keep those with
+      # PEM certificates. grep follows links, so links to the bundle are kept.
+      owned="$(mktemp)"
+      awk -v p="$pkg" '
+        /^P:/ { cur = substr($0, 3); dir = "" }
+        cur == p && /^F:/ { dir = substr($0, 3) "/" }
+        cur == p && /^R:/ { print "/" dir substr($0, 3) }
+      ' /lib/apk/db/installed > "$owned"
+      candidates="$(mktemp)"
+      tr '\n' '\0' < "$owned" | xargs -0 -r grep -l -s -- '-----BEGIN CERTIFICATE-----' > "$candidates" || true
+
+      links=0
+      copies=0
+      set -f
+      while IFS= read -r file; do
+        if [ -L "$file" ]; then
+          if [ "$(readlink -f "$file")" = "$resolved_bundle" ]; then
+            links=$((links + 1))
+          fi
+          continue
+        fi
+        wanted=
+        for name in $names; do
+          case "${file##*/}" in
+            $name) wanted=1 ;;
+          esac
+        done
+        for pattern in $exclude; do
+          case "$file" in
+            $pattern) wanted= ;;
+          esac
+        done
+        if [ -z "$wanted" ]; then
+          continue
+        fi
+        # Binaries can embed PEM roots (libnode, gocertifi); they aren't copies.
+        if ! tr -d '\000' < "$file" | cmp -s - "$file"; then
+          continue
+        fi
+        shared="$(awk '
+          /^-----BEGIN CERTIFICATE-----[ \t\r]*$/ { inside = 1; body = ""; next }
+          inside && /^-----END CERTIFICATE-----[ \t\r]*$/ {
+            inside = 0
+            if (FILENAME == ARGV[1]) known[body] = 1
+            else if (body in known) shared++
+            next
+          }
+          inside && /^[A-Za-z0-9+\/=]+[ \t\r]*$/ { sub(/[ \t\r]+$/, ""); body = body $0; next }
+          { inside = 0 }
+          END { print shared + 0 }
+        ' "$bundle" "$file")"
+        if [ "$shared" -ge "$min_certs" ]; then
+          echo "$file is a copy of $bundle ($shared certificates in common), not a link to it"
+          copies=$((copies + 1))
+        fi
+      done < "$candidates"
+      set +f
+      rm -f "$owned" "$candidates"
+
+      if [ "$copies" -gt 0 ]; then
+        exit 1
+      fi
+      if [ "$links" -eq 0 ]; then
+        echo "$pkg has no links to $bundle"
+        exit 1
+      fi
+      echo "$pkg has $links link(s) to $bundle and no copies of it"

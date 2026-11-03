@@ -5,7 +5,7 @@ vars:
 package:
   name: apr-util
   version: "1.6.6"
-  epoch: 0 # upstream-tests/make-check
+  epoch: 1
   description: The Apache Portable Runtime Utility Library
   copyright:
     # Some files also contain RSA-MD.
@@ -46,7 +46,7 @@ pipeline:
 
   - uses: autoconf/configure
     with:
-      opts: --with-apr=/usr/bin/apr-1-config --with-ldap --with-openssl --with-crypto
+      opts: --with-apr=/usr/bin/apr-1-config --with-ldap --with-openssl --with-crypto --with-pgsql --with-sqlite3
 
   - uses: autoconf/make
 
@@ -94,32 +94,249 @@ subpackages:
   - name: apr-util-dbd_pgsql
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/lib
-          mv "${{targets.destdir}}"/usr/lib/apr-util-1/apr_dbd_pgsql* "${{targets.subpkgdir}}"/usr/lib
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/apr-util-1
+          mv "${{targets.destdir}}"/usr/lib/apr-util-1/apr_dbd_pgsql* "${{targets.subpkgdir}}"/usr/lib/apr-util-1
     description: The Apache Portable Runtime Utility Library - Database driver for PostgreSQL
     test:
+      environment:
+        contents:
+          packages:
+            - apr-util-dbd_pgsql
+            - apr-util-dev
+            - build-base
       pipeline:
         - uses: test/tw/ldd-check
+        - name: Load pgsql DBD driver
+          # Exercises the DSO load path for /usr/lib/apr-util-1/apr_dbd_pgsql-1.so
+          # without needing a running PostgreSQL server.
+          runs: |
+            tee test_pgsql.c <<'EOF'
+            #include <stdio.h>
+            #include <string.h>
+            #include <apr.h>
+            #include <apr_pools.h>
+            #include <apr_dbd.h>
+
+            int main(void) {
+                apr_pool_t *pool;
+                const apr_dbd_driver_t *driver;
+                apr_status_t rv;
+                const char *name;
+
+                apr_initialize();
+                apr_pool_create(&pool, NULL);
+
+                rv = apr_dbd_init(pool);
+                if (rv != APR_SUCCESS) {
+                    fprintf(stderr, "apr_dbd_init failed: %d\n", rv);
+                    return 1;
+                }
+
+                rv = apr_dbd_get_driver(pool, "pgsql", &driver);
+                if (rv != APR_SUCCESS) {
+                    fprintf(stderr, "failed to load pgsql driver: %d\n", rv);
+                    return 1;
+                }
+
+                name = apr_dbd_name(driver);
+                if (!name || strcmp(name, "pgsql") != 0) {
+                    fprintf(stderr, "unexpected driver name: %s\n",
+                            name ? name : "(null)");
+                    return 1;
+                }
+
+                apr_pool_destroy(pool);
+                apr_terminate();
+                return 0;
+            }
+            EOF
+
+            gcc test_pgsql.c $(apu-1-config --includes --link-ld) $(apr-1-config --includes --link-ld) -o test_pgsql
+            ./test_pgsql
 
   - name: apr-util-dbd_sqlite3
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/lib
-          mv "${{targets.destdir}}"/usr/lib/apr-util-1/apr_dbd_sqlite3* "${{targets.subpkgdir}}"/usr/lib
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/apr-util-1
+          mv "${{targets.destdir}}"/usr/lib/apr-util-1/apr_dbd_sqlite3* "${{targets.subpkgdir}}"/usr/lib/apr-util-1
     description: The Apache Portable Runtime Utility Library - Database driver for SQLite3
     test:
+      environment:
+        contents:
+          packages:
+            - apr-util-dbd_sqlite3
+            - apr-util-dev
+            - build-base
       pipeline:
         - uses: test/tw/ldd-check
+        - name: Exercise sqlite3 DBD driver
+          # Loads the DSO, opens an in-memory SQLite database, and round-trips
+          # a value through CREATE/INSERT/SELECT via the DBD abstraction.
+          runs: |
+            tee test_sqlite3.c <<'EOF'
+            #include <stdio.h>
+            #include <string.h>
+            #include <apr.h>
+            #include <apr_pools.h>
+            #include <apr_dbd.h>
+
+            int main(void) {
+                apr_pool_t *pool;
+                const apr_dbd_driver_t *driver;
+                apr_dbd_t *handle;
+                apr_dbd_results_t *res = NULL;
+                apr_dbd_row_t *row = NULL;
+                const char *v;
+                int nrows, qrv;
+                apr_status_t rv;
+
+                apr_initialize();
+                apr_pool_create(&pool, NULL);
+
+                rv = apr_dbd_init(pool);
+                if (rv != APR_SUCCESS) {
+                    fprintf(stderr, "apr_dbd_init failed: %d\n", rv);
+                    return 1;
+                }
+
+                rv = apr_dbd_get_driver(pool, "sqlite3", &driver);
+                if (rv != APR_SUCCESS) {
+                    fprintf(stderr, "failed to load sqlite3 driver: %d\n", rv);
+                    return 1;
+                }
+
+                rv = apr_dbd_open(driver, pool, ":memory:", &handle);
+                if (rv != APR_SUCCESS) {
+                    fprintf(stderr, "failed to open sqlite3 in-memory db: %d\n", rv);
+                    return 1;
+                }
+
+                qrv = apr_dbd_query(driver, handle, &nrows,
+                                    "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+                if (qrv != 0) {
+                    fprintf(stderr, "CREATE TABLE: %s\n",
+                            apr_dbd_error(driver, handle, qrv));
+                    return 1;
+                }
+
+                qrv = apr_dbd_query(driver, handle, &nrows,
+                                    "INSERT INTO t (v) VALUES ('hello')");
+                if (qrv != 0) {
+                    fprintf(stderr, "INSERT: %s\n",
+                            apr_dbd_error(driver, handle, qrv));
+                    return 1;
+                }
+
+                qrv = apr_dbd_select(driver, pool, handle, &res,
+                                     "SELECT v FROM t WHERE id = 1", 0);
+                if (qrv != 0) {
+                    fprintf(stderr, "SELECT: %s\n",
+                            apr_dbd_error(driver, handle, qrv));
+                    return 1;
+                }
+
+                qrv = apr_dbd_get_row(driver, pool, res, &row, -1);
+                if (qrv != 0) {
+                    fprintf(stderr, "get_row failed: %d\n", qrv);
+                    return 1;
+                }
+
+                v = apr_dbd_get_entry(driver, row, 0);
+                if (!v || strcmp(v, "hello") != 0) {
+                    fprintf(stderr, "unexpected value: %s\n", v ? v : "(null)");
+                    return 1;
+                }
+
+                apr_dbd_close(driver, handle);
+                apr_pool_destroy(pool);
+                apr_terminate();
+                return 0;
+            }
+            EOF
+
+            gcc test_sqlite3.c $(apu-1-config --includes --link-ld) $(apr-1-config --includes --link-ld) -o test_sqlite3
+            ./test_sqlite3
 
   - name: apr-util-ldap
     pipeline:
       - runs: |
-          mkdir -p "${{targets.subpkgdir}}"/usr/lib
-          mv "${{targets.destdir}}"/usr/lib/apr-util-1/apr_ldap* "${{targets.subpkgdir}}"/usr/lib
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/apr-util-1
+          mv "${{targets.destdir}}"/usr/lib/apr-util-1/apr_ldap* "${{targets.subpkgdir}}"/usr/lib/apr-util-1
     description: The Apache Portable Runtime Utility Library - LDAP driver
     test:
+      environment:
+        contents:
+          packages:
+            - apr-util-dev
+            - apr-util-ldap
+            - build-base
       pipeline:
         - uses: test/tw/ldd-check
+        - name: Load LDAP driver and parse URL
+          # apr_ldap_info forces the apr_ldap-1.so DSO to load through the
+          # libaprutil-1 stub; the url_parse call then exercises a real
+          # LDAP-provided code path on top of it.
+          runs: |
+            tee test_ldap.c <<'EOF'
+            #include <stdio.h>
+            #include <string.h>
+            #include <apr.h>
+            #include <apr_pools.h>
+            #include <apr_ldap.h>
+
+            #if !APR_HAS_LDAP
+            #error "APR_HAS_LDAP is not set; LDAP support not compiled in"
+            #endif
+
+            int main(void) {
+                apr_pool_t *pool;
+                apr_ldap_err_t *err = NULL;
+                apr_ldap_url_desc_t *url = NULL;
+                int rv;
+
+                apr_initialize();
+                apr_pool_create(&pool, NULL);
+
+                rv = apr_ldap_info(pool, &err);
+                if (rv != APR_SUCCESS) {
+                    fprintf(stderr, "apr_ldap_info failed: %s\n",
+                            err && err->reason ? err->reason : "unknown");
+                    return 1;
+                }
+                if (!err || !err->reason) {
+                    fprintf(stderr, "apr_ldap_info returned no reason string\n");
+                    return 1;
+                }
+                printf("LDAP SDK: %s\n", err->reason);
+
+                err = NULL;
+                rv = apr_ldap_url_parse(pool,
+                                        "ldap://ldap.example.com:389/dc=example,dc=com",
+                                        &url, &err);
+                if (rv != APR_SUCCESS) {
+                    fprintf(stderr, "apr_ldap_url_parse failed: %s\n",
+                            err && err->reason ? err->reason : "unknown");
+                    return 1;
+                }
+                /* Some apr-util/LDAP-SDK combinations leave the ":port" suffix
+                 * on lud_host even though lud_port is set, so match a prefix. */
+                if (!url || !url->lud_host ||
+                    strstr(url->lud_host, "ldap.example.com") != url->lud_host ||
+                    url->lud_port != 389) {
+                    fprintf(stderr, "unexpected URL parse: host=%s port=%d\n",
+                            url && url->lud_host ? url->lud_host : "(null)",
+                            url ? url->lud_port : -1);
+                    return 1;
+                }
+
+                apr_pool_destroy(pool);
+                apr_terminate();
+                return 0;
+            }
+            EOF
+
+            gcc test_ldap.c $(apu-1-config --includes --link-ld) $(apr-1-config --includes --link-ld) -o test_ldap
+            ./test_ldap
 
 update:
   enabled: true

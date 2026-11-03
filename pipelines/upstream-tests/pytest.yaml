@@ -30,9 +30,11 @@ description: |
   the service is core to the suite, use the test stage. Never split one
   suite across the two stages with `paths`.
 
-  The implementation is in upstream-tests/pytest-core (internal, to be
-  shared with the test stage); this pipeline passes its inputs and the
-  destdir on.
+  The implementation is tw-upstream-pytest (the tw-upstream-pytest
+  subpackage of os/tw.yaml; `tw-upstream-pytest --help`), called by
+  upstream-tests/pytest-core (internal, to be shared with the test stage);
+  this pipeline passes its inputs and the destdir on, each to the tool's
+  option of the same name.
 
   What is tested: the tests come from the source tree, but the code under
   test is imported from the subpackage's destdir
@@ -59,10 +61,11 @@ description: |
       source tree, after every installed module has been tried.
   Options of plugins a build gate does not need, passed by upstream addopts
   (pytest-cov --cov*, pytest-benchmark --benchmark-*, linters such as
-  --flake8/--mypy, pytest-html, rerunfailures, randomly) or replaced by this
-  step (xdist -n/--dist, pytest-timeout --timeout), are accepted and
-  ignored when the plugin is not installed, and listed in the output; so
-  clear-addopts is only needed for other addopts.
+  --flake8/--mypy, pytest-html, randomly) or replaced by this step (xdist
+  -n/--dist, pytest-timeout --timeout), are accepted and ignored when the
+  plugin is not installed, and listed in the output; so clear-addopts is
+  only needed for other addopts. The test-retry plugins (rerunfailures,
+  flaky) are always disabled, installed or not (see the hard gate below).
 
   Isolation: the workspace, minus melange-out/ and .wheels/, is copied to
   a scratch directory on disk under /var/cache/melange/upstream-tests-pytest
@@ -84,7 +87,7 @@ description: |
   needs CAP_SYS_ADMIN, which the build has as root in melange's VM; where
   that fails, the step goes on without it and says so (netns=unavailable
   and the reason on the configuration line). (2) A small pytest plugin
-  shipped inline in this step refuses socket connections, sends
+  shipped in tw-upstream-pytest refuses socket connections, sends
   (send/sendall/sendto/sendmsg) and name lookups (getaddrinfo,
   gethostbyname(_ex), gethostbyaddr, getnameinfo) for anything other than
   loopback, unix sockets and the local hostname, with the errors a host
@@ -100,15 +103,19 @@ description: |
   (py3-supported-pytest-mock, ...) and its runtime dependencies (which are
   not otherwise in the build environment) to environment.contents.packages,
   each marked `# upstream-tests:`. jobs > 1 needs
-  py3-supported-pytest-xdist; a per-test timeout needs
-  py3-supported-pytest-timeout (without it the step falls back to
-  faulthandler_timeout, which dumps stacks but does not kill, and relies on
-  overall-timeout).
+  py3-supported-pytest-xdist; a non-zero `timeout` (the default is 600)
+  needs py3-supported-pytest-timeout (or py3.X-pytest-timeout): the step
+  fails before running the suite if pytest-timeout is not importable.
+  There is no fallback to faulthandler_timeout, which only dumped stacks
+  and left a hung test running until overall-timeout. timeout: 0 does not
+  need it.
 
   The suite is a hard gate, run once: there are no retries (tests must be
-  deterministic). Do not add pytest-rerunfailures or pytest-flaky; without
-  them, upstream --reruns options and @flaky markers are accepted but
-  inert. The step fails if:
+  deterministic). The test-retry plugins are always disabled (-p
+  no:rerunfailures -p no:flaky), even when installed: upstream --reruns
+  options and @flaky markers are accepted but inert, so a test that only
+  passes on a retry fails the gate. Do not add pytest-rerunfailures or
+  pytest-flaky. The step fails if:
     - a test fails or errors (call failure, setup/teardown error, strict
       XPASS), or a test module fails to collect (import error, syntax
       error, missing test dependency),
@@ -170,10 +177,15 @@ description: |
         jobs: auto
 
   Named exceptions go in ignore: space-separated pytest node ids, deselected
-  with --deselect (a prefix such as tests/test_net.py::TestDNS deselects the
-  whole class), and in ignore-files: paths passed to --ignore (not
-  collected at all, for modules that fail to import). Every exception
-  needs a comment in the calling package explaining why and a
+  by exact node-id boundary: an entry matches that node id and the ids
+  that continue it with `::` or `[`, so tests/test_net.py::TestDNS
+  deselects the whole class and tests/test_x.py::test_y its parametrized
+  cases, but test_y does not deselect test_y_regression (pytest's own
+  --deselect would, as a plain prefix). A directory in ignore matches
+  nothing and only warns, so its tests run. ignore-files: paths (files or
+  whole directories) passed to --ignore (not collected at all, for
+  modules that fail to import or directories to skip). Every
+  exception needs a comment in the calling package explaining why and a
   `TODO(upstream-tests): ...` to remove it:
     # test_fetch_remote downloads from example.org; the build has no network.
     # TODO(upstream-tests): mark it @pytest.mark.network upstream.
@@ -211,7 +223,8 @@ inputs:
     default: ""
   args:
     description: |
-      Extra pytest arguments, inserted verbatim, e.g. `-p no:randomly` or
+      Extra pytest arguments, parsed once as shell words (quotes work,
+      nothing is expanded twice), e.g. `-p no:randomly`, `-k 'not slow'` or
       `-W ignore::DeprecationWarning`. Do not pass -m, -n, --deselect,
       --ignore, --timeout or --import-mode here; use the inputs.
     default: ""
@@ -222,8 +235,14 @@ inputs:
     default: ""
   ignore:
     description: |
-      Space-separated pytest node ids (or node id prefixes) to deselect.
-      Each one needs a comment and TODO in the caller.
+      Space-separated pytest node ids to deselect. An entry also covers
+      the ids that continue it with `::` or `[` (a file's or class's
+      tests, parametrized cases), but not test_x_regression for test_x.
+      A directory entry such as tests/integration matches nothing here
+      (its ids continue with `/`), so its tests still run and the step
+      only prints a WARNING on stderr; pytest's prefix --deselect used to
+      drop them. Put whole directories in ignore-files instead (or leave
+      them out of paths). Each one needs a comment and TODO in the caller.
     default: ""
   ignore-files:
     description: |
@@ -248,8 +267,10 @@ inputs:
     default: "1"
   timeout:
     description: |
-      Per-test timeout in seconds (pytest-timeout --timeout, if installed;
-      faulthandler_timeout otherwise). 0 disables it.
+      Per-test timeout in seconds (pytest-timeout --timeout, signal
+      method). Non-zero needs py3-supported-pytest-timeout (or
+      py3.X-pytest-timeout) in the environment, or the step fails; there is
+      no faulthandler_timeout fallback. 0 disables it.
     default: "600"
   overall-timeout:
     description: Wall-clock limit for the whole run, in seconds.
@@ -262,8 +283,11 @@ inputs:
       isolation, network guard, import pinning, origin check, destdir
       snapshot, hard-gate rules and summary lines. `paths` is the start
       directory (default: testpaths/tests/test/.), `args` is passed to
-      discover (e.g. `-p "Test*.py"`); markers, ignore, ignore-files, jobs
-      and clear-addopts do not apply.
+      discover (e.g. `-p "Test*.py"`). unittest discover cannot deselect,
+      filter collection, select markers, run workers or time out a test, so
+      ignore, ignore-files, markers, jobs and timeout are rejected (the
+      step fails) unless left at their defaults; clear-addopts does not
+      apply. The suite is bounded by overall-timeout only.
     default: pytest
   extensions:
     description: |

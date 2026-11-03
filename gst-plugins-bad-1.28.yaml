@@ -1,10 +1,12 @@
 package:
   name: gst-plugins-bad-1.28
   version: "1.28.8"
-  epoch: 0
+  epoch: 1 # enable aom and x265 plugins
   description: GStreamer streaming media framework bad plug-ins
   copyright:
     - license: LGPL-2.1
+    # x265 plugin (-x265 subpackage) links GPL libx265
+    - license: GPL-2.0-or-later
   dependencies:
     provides:
       - gst-plugins-bad=${{package.full-version}}
@@ -25,6 +27,7 @@ environment:
   contents:
     packages:
       - alsa-lib-dev
+      - aom-dev # needed for av1enc/av1dec plugins
       - build-base
       - busybox
       - ca-certificates-bundle
@@ -60,6 +63,7 @@ environment:
       - orc-dev
       - perl
       - python3
+      - x265-dev # needed for x265enc plugin
 
 pipeline:
   - uses: git-checkout
@@ -79,11 +83,52 @@ pipeline:
             -Dintrospection=enabled \
             -Dsctp=enabled \
             -Dsrt=enabled \
+            -Daom=enabled \
+            -Dgpl=enabled \
+            -Dx265=enabled \
+            -Ddts=disabled \
+            -Dfaad=disabled \
+            -Diqa=disabled \
+            -Dmpeg2enc=disabled \
+            -Dmplex=disabled \
+            -Dresindvd=disabled \
       - uses: meson/compile
       - uses: meson/install
       - uses: strip
 
 subpackages:
+  - name: ${{package.name}}-x265
+    description: GStreamer x265 HEVC encoder plug-in
+    dependencies:
+      runtime:
+        - ${{package.name}}
+      provides:
+        - gst-plugins-bad-x265=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/lib/gstreamer-1.0
+          mv ${{targets.destdir}}/usr/lib/gstreamer-1.0/libgstx265.so \
+            ${{targets.contextdir}}/usr/lib/gstreamer-1.0/
+    test:
+      pipeline:
+        - name: Encode raw video to an HEVC elementary stream
+          runs: |
+            gst-inspect-1.0 x265enc | grep -F "H265 Encoder"
+            gst-launch-1.0 -e \
+              videotestsrc num-buffers=30 \
+              ! video/x-raw,format=I420,width=320,height=240,framerate=30/1 \
+              ! x265enc speed-preset=ultrafast \
+              ! h265parse ! video/x-h265,stream-format=byte-stream \
+              ! filesink location=/tmp/out.h265
+            test -s /tmp/out.h265
+            # Annex B stream must carry VPS (type 32) and SPS (type 33) NAL units
+            head -c 64 /tmp/out.h265 | od -An -tx1 | tr -d ' \n' > /tmp/hdr.hex
+            grep -F 000000014001 /tmp/hdr.hex
+            grep -F 000000014201 /tmp/hdr.hex
+        - uses: test/tw/ldd-check
+          with:
+            packages: ${{subpkg.name}}
+
   - name: ${{package.name}}-dev
     dependencies:
       runtime:
@@ -153,4 +198,22 @@ test:
         ls -l /tmp/srt-in.bin /tmp/srt-out.bin
         # Every byte of the real payload must arrive intact and in order
         cmp -n 131600 /tmp/srt-in.bin /tmp/srt-out.bin
+    - name: Verify the x265 encoder is only in the -x265 subpackage
+      runs: |
+        if gst-inspect-1.0 x265enc; then
+          echo "x265enc must ship in ${{package.name}}-x265"
+          exit 1
+        fi
+    - name: Round-trip video through the AV1 encoder and decoder
+      runs: |
+        gst-inspect-1.0 aom | grep -E "^\s+av1enc:"
+        gst-inspect-1.0 aom | grep -E "^\s+av1dec:"
+        gst-launch-1.0 -e \
+          videotestsrc num-buffers=10 \
+          ! video/x-raw,format=I420,width=64,height=64,framerate=30/1 \
+          ! av1enc cpu-used=8 usage-profile=realtime \
+          ! av1dec ! video/x-raw,format=I420,width=64,height=64 \
+          ! filesink location=/tmp/av1-out.yuv
+        # 10 decoded 64x64 I420 frames are 6144 bytes each
+        test "$(wc -c < /tmp/av1-out.yuv)" -eq 61440
     - uses: test/tw/ldd-check

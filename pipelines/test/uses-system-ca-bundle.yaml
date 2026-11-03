@@ -6,9 +6,11 @@ description: |
   dependency on ca-certificates-bundle. Pairs with
   ca-certificates/use-system-bundle.
 
-  Without files, it checks every file the package installs instead: none may
-  share min-certs or more certificates with the system bundle, and at least
-  one must link to it.
+  Without files, it checks every file the package installs instead: no text
+  file whose name matches names may share min-certs or more certificates with
+  the system bundle, and at least one file must link to it. Links count when
+  they resolve to the bundle, so relative links and links through
+  /etc/ssl/cert.pem are fine.
 
   The dependency is read from the apk database rather than inferred from the
   link resolving, because the bundle often arrives transitively (wolfi-base
@@ -31,6 +33,12 @@ inputs:
       Without files, the number of certificates a file may share with the
       system bundle before it counts as a copy that should be a link.
     default: "10"
+  names:
+    description: |
+      Without files, whitespace-separated shell patterns of file names to
+      check for copies. Use the same patterns as in
+      ca-certificates/use-system-bundle.
+    default: "*.pem *.crt *.cer *.txt"
   exclude:
     description: |
       Without files, whitespace-separated shell patterns of installed paths
@@ -124,11 +132,13 @@ pipeline:
       pkg="${{inputs.package}}"
       bundle="${{inputs.bundle}}"
       min_certs="${{inputs.min-certs}}"
+      names="${{inputs.names}}"
       exclude="${{inputs.exclude}}"
       if [ ! -s "$bundle" ]; then
         echo "$bundle is missing or empty"
         exit 1
       fi
+      resolved_bundle="$(readlink -f "$bundle")"
 
       # List the package's files from the apk database, then keep those with
       # PEM certificates. grep follows links, so links to the bundle are kept.
@@ -146,29 +156,39 @@ pipeline:
       set -f
       while IFS= read -r file; do
         if [ -L "$file" ]; then
-          if [ "$(readlink "$file")" = "$bundle" ]; then
+          if [ "$(readlink -f "$file")" = "$resolved_bundle" ]; then
             links=$((links + 1))
           fi
           continue
         fi
-        skip=
-        for pattern in $exclude; do
-          case "$file" in
-            $pattern) skip=1 ;;
+        wanted=
+        for name in $names; do
+          case "${file##*/}" in
+            $name) wanted=1 ;;
           esac
         done
-        if [ -n "$skip" ]; then
+        for pattern in $exclude; do
+          case "$file" in
+            $pattern) wanted= ;;
+          esac
+        done
+        if [ -z "$wanted" ]; then
+          continue
+        fi
+        # Binaries can embed PEM roots (libnode, gocertifi); they aren't copies.
+        if ! tr -d '\000' < "$file" | cmp -s - "$file"; then
           continue
         fi
         shared="$(awk '
-          /-----BEGIN CERTIFICATE-----/ { inside = 1; body = ""; next }
-          /-----END CERTIFICATE-----/ {
+          /^-----BEGIN CERTIFICATE-----[ \t\r]*$/ { inside = 1; body = ""; next }
+          inside && /^-----END CERTIFICATE-----[ \t\r]*$/ {
             inside = 0
             if (FILENAME == ARGV[1]) known[body] = 1
             else if (body in known) shared++
             next
           }
-          inside { gsub(/[ \t\r]/, ""); body = body $0 }
+          inside && /^[A-Za-z0-9+\/=]+[ \t\r]*$/ { sub(/[ \t\r]+$/, ""); body = body $0; next }
+          { inside = 0 }
           END { print shared + 0 }
         ' "$bundle" "$file")"
         if [ "$shared" -ge "$min_certs" ]; then

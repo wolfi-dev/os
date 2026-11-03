@@ -10,11 +10,15 @@ description: |
   must be a PEM file or already link to the system bundle, so the step fails
   when upstream moves or renames the file instead of silently doing nothing.
 
-  Without files, the step searches path for copies instead. A file is a copy
-  when at least min-certs of its certificates are also in the system bundle,
-  so private CAs and test certificates are kept, while old copies that share
-  only some roots with the current bundle are still found. The step fails if
-  it links nothing.
+  Without files, the step searches path for copies instead. Only text files
+  whose name matches names are considered, so binaries and source files that
+  embed PEM roots (libnode, a bundle in a .py string) are never replaced. A
+  file is a copy when at least min-certs of its certificates are also in the
+  system bundle, so private CAs and test certificates are kept, while old
+  copies that share only some roots with the current bundle are still found.
+  The count can't tell drift from additions: a copy with a private root
+  appended is linked too, and the private root is lost. Use exclude for such
+  files. The step fails if it links nothing.
 
   The package must depend on ca-certificates-bundle at runtime, or the links
   dangle in images that don't otherwise install it. Check the result with
@@ -48,6 +52,11 @@ inputs:
       When searching, the number of certificates a file must share with the
       system bundle to count as a copy of it.
     default: "10"
+  names:
+    description: |
+      When searching, whitespace-separated shell patterns of file names to
+      consider.
+    default: "*.pem *.crt *.cer *.txt"
   exclude:
     description: |
       When searching, whitespace-separated shell patterns of installed paths
@@ -128,6 +137,7 @@ pipeline:
       bundle="${{inputs.bundle}}"
       search="${{inputs.path}}"
       min_certs="${{inputs.min-certs}}"
+      names="${{inputs.names}}"
       exclude="${{inputs.exclude}}"
       contextdir="${{targets.contextdir}}"
       if [ ! -s "$bundle" ]; then
@@ -135,28 +145,52 @@ pipeline:
         exit 1
       fi
 
+      # Build the find arguments: -name a -o -name b ...
+      set -f
+      set --
+      for name in $names; do
+        if [ "$#" -gt 0 ]; then
+          set -- "$@" -o
+        fi
+        set -- "$@" -name "$name"
+      done
+      set +f
+      if [ "$#" -eq 0 ]; then
+        echo "names is empty"
+        exit 1
+      fi
+
       # One line per PEM file: certificates also in the bundle, total
       # certificates, path. Certificates are compared by their base64 body.
+      # Markers must start a line and a block ends at the first line that
+      # isn't base64, so indented or quoted PEM text doesn't count.
       found="$(mktemp)"
-      find "$search" -type f -exec grep -l -- '-----BEGIN CERTIFICATE-----' {} + |
+      find "$search" -type f \( "$@" \) -exec grep -l -- '-----BEGIN CERTIFICATE-----' {} + |
         while IFS= read -r file; do
-          awk -v file="$file" '
-            /-----BEGIN CERTIFICATE-----/ { inside = 1; body = ""; next }
-            /-----END CERTIFICATE-----/ {
+          # Binaries can embed PEM roots (libnode, gocertifi); never replace them.
+          if ! tr -d '\000' < "$file" | cmp -s - "$file"; then
+            echo "Skipped binary $file" >&2
+            continue
+          fi
+          counts="$(awk '
+            /^-----BEGIN CERTIFICATE-----[ \t\r]*$/ { inside = 1; body = ""; next }
+            inside && /^-----END CERTIFICATE-----[ \t\r]*$/ {
               inside = 0
               if (FILENAME == ARGV[1]) known[body] = 1
               else { total++; if (body in known) shared++ }
               next
             }
-            inside { gsub(/[ \t\r]/, ""); body = body $0 }
-            END { print shared + 0, total + 0, file }
-          ' "$bundle" "$file"
+            inside && /^[A-Za-z0-9+\/=]+[ \t\r]*$/ { sub(/[ \t\r]+$/, ""); body = body $0; next }
+            { inside = 0 }
+            END { print shared + 0, total + 0 }
+          ' "$bundle" "$file")"
+          printf '%s %s\n' "$counts" "$file"
         done > "$found"
 
       linked=0
       set -f
       while read -r shared total file; do
-        # Source files can name the PEM marker without holding certificates.
+        # Text can name the PEM marker without holding certificates.
         if [ "$total" -eq 0 ]; then
           continue
         fi

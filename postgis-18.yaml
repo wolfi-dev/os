@@ -1,7 +1,7 @@
 package:
   name: postgis-18
   version: "3.7.0"
-  epoch: 0 # split/manpages
+  epoch: 1 # split/manpages
   description: Geographic Information Systems Extensions to PostgreSQL
   copyright:
     - license: GPL-2.0-or-later
@@ -112,6 +112,8 @@ test:
         - shadow
         - sudo-rs
         - glibc-locales
+        - bash
+        - ${{package.name}}-compat
     environment:
       PGDATA: /tmp/test_db
       PGUSER: wolfi
@@ -119,32 +121,52 @@ test:
     - uses: test/tw/help-check
       with:
         bins: pgtopo_export shp2pgsql
-    - name: "Test database creation"
-      runs: |
-        useradd $PGUSER
-        sudo -u $PGUSER initdb -D /tmp/test_db
-        sudo -u $PGUSER pg_ctl -D /tmp/test_db -l /tmp/logfile start
-        createdb testdb
-        psql -lqt | cut -d \| -f 1 | grep -Fw testdb
-    - name: "Test basic read/write operations"
-      runs: |
-        psql -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, test_value VARCHAR(50));"
-        psql -d testdb -c "INSERT INTO test_table (test_value) VALUES ('Hello, PostgreSQL!');"
-        psql -d testdb -t -A -c "SELECT test_value FROM test_table WHERE id=1;"
-    - name: "Test server can run and respond to requests"
-      runs: |
-        psql -d testdb -c "\conninfo"
-    - name: "Test PostGIS extension is installed and working"
-      runs: |
-        psql -d testdb -c "CREATE EXTENSION postgis;"
-        psql -d testdb -c "SELECT PostGIS_Full_Version();" | grep -F "POSTGIS="
-    # address_standardizer was removed from PostGIS in 3.7.0 (upstream #6053),
-    # so exercise spatial functions instead.
-    - name: "Test PostGIS spatial functions"
-      runs: |
-        psql -d testdb -t -A -c "SELECT ST_AsText(ST_Centroid(ST_GeomFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))')));" | grep -Fx 'POINT(2 2)'
-        psql -d testdb -t -A -c "SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))'));" | grep -Fx '16'
-        psql -d testdb -t -A -c "SELECT ST_Distance(ST_GeomFromText('POINT(0 0)'), ST_GeomFromText('POINT(3 4)'));" | grep -Fx '5'
+    - name: "Test PostGIS against a live PostgreSQL server"
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          useradd $PGUSER
+          sudo -u $PGUSER initdb -D $PGDATA
+        start: sudo -u $PGUSER /usr/libexec/postgresql${{vars.postgresql-version}}/postgres -D $PGDATA
+        expected_output: |
+          starting PostgreSQL
+          listening on Unix socket
+          database system is ready to accept connections
+        error_strings: |
+          FATAL:
+          PANIC:
+        post: |
+          #!/bin/bash
+          set -euxo pipefail
+          createdb testdb
+          psql -lqt | cut -d \| -f 1 | grep -Fw testdb
+
+          psql -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, test_value VARCHAR(50));"
+          psql -d testdb -c "INSERT INTO test_table (test_value) VALUES ('Hello, PostgreSQL!');"
+          psql -d testdb -t -A -c "SELECT test_value FROM test_table WHERE id=1;"
+
+          psql -d testdb -c "\conninfo"
+
+          psql -d testdb -c "CREATE EXTENSION postgis;"
+          psql -d testdb -c "SELECT PostGIS_Full_Version();" | grep -F "POSTGIS="
+
+          # address_standardizer was removed from PostGIS in 3.7.0 (upstream #6053),
+          # so exercise spatial functions instead.
+          psql -d testdb -t -A -c "SELECT ST_AsText(ST_Centroid(ST_GeomFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))')));" | grep -Fx 'POINT(2 2)'
+          psql -d testdb -t -A -c "SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,4 0,4 4,0 4,0 0))'));" | grep -Fx '16'
+          psql -d testdb -t -A -c "SELECT ST_Distance(ST_GeomFromText('POINT(0 0)'), ST_GeomFromText('POINT(3 4)'));" | grep -Fx '5'
+
+          createdb initdb_test
+          (
+            export POSTGRES_USER="$PGUSER" POSTGRES_DB=initdb_test
+            # docker-entrypoint.sh sources /var/lib/postgres/initdb/*.sh with this psql array.
+            psql=(psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --no-password --no-psqlrc --dbname "$POSTGRES_DB")
+            source /var/lib/postgres/initdb/10_postgis.sh
+          )
+          for db in template_postgis initdb_test; do
+            psql -d "$db" -t -A -c "SELECT extname FROM pg_extension;" | grep -Fx postgis
+            psql -d "$db" -t -A -c "SELECT extname FROM pg_extension;" | grep -Fx postgis_topology
+          done
     - uses: test/tw/ldd-check
 
 update:

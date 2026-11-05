@@ -2,10 +2,14 @@
 package:
   name: glib
   version: "2.90.1"
-  epoch: 1
+  epoch: 2
   description: Common C routines used by Gtk+ and other libs
   copyright:
     - license: LGPL-2.1-or-later
+  dependencies:
+    runtime:
+      # dlopen()ed by GChecksum/GHmac, so not picked up as a so: dependency
+      - openssl-${{vars.openssl-version}}-libcrypto
   resources:
     cpu: "2"
     memory: 4Gi
@@ -17,6 +21,7 @@ vars:
   # build uses rst2man from py3-docutils and also invokes 'python3'
   # installed /usr/bin/gtester-report gets correct shbang (/usr/bin/python3.XX)
   python-version: 3.13
+  openssl-version: "4.0"
 
 environment:
   contents:
@@ -36,6 +41,7 @@ environment:
       - libxslt
       - libxslt-dev
       - meson
+      - openssl-${{vars.openssl-version}}-dev
       - pcre2-dev
       - py${{vars.python-version}}-docutils-bin
       - python-${{vars.python-version}}
@@ -57,18 +63,58 @@ pipeline:
       tag: ${{package.version}}
       expected-commit: e05063ccc6c8f222465a1080927f4c14349f3de6
 
+  # Route GChecksum/GHmac through libcrypto so they honour the OpenSSL config
+  # (FIPS provider in FIPS images); enabled with -Dopenssl=true below.
+  - uses: patch
+    with:
+      patches: 0001-Add-an-OpenSSL-backend-for-GChecksum-and-GHmac.patch
+      fuzz: "0"
+
   - uses: meson/configure
     with:
       opts: |
         -Db_lto=true \
         -Dc_args=-ffat-lto-objects \
-        --default-library=both \
+        --default-library=shared \
         -Dman=true \
+        -Dopenssl=true \
         -Dtests=false
 
   - uses: meson/compile
 
+  - name: Run upstream checksum and hmac tests against the OpenSSL backend
+    runs: |
+      # -Dtests=true would LTO-link every glib test; build only these two.
+      for t in checksum hmac; do
+        cc -o output/test-$t glib/tests/$t.c -I. -Iglib -Ioutput -Ioutput/glib \
+          -Loutput/glib -lglib-2.0
+        LD_LIBRARY_PATH=output/glib ./output/test-$t
+      done
+
   - uses: meson/install
+
+  # Static archives keep GLib's built-in GChecksum/GHmac: statically linked
+  # programs can't use the OpenSSL FIPS provider either way.
+  - uses: meson/configure
+    with:
+      output-dir: output-static
+      opts: |
+        -Db_lto=true \
+        -Dc_args=-ffat-lto-objects \
+        --default-library=static \
+        -Dman=false \
+        -Dtests=false
+
+  - uses: meson/compile
+    with:
+      output-dir: output-static
+
+  - name: Install the static archives
+    runs: |
+      for lib in glib gobject gio gmodule gthread girepository; do
+        install -Dm644 output-static/$lib/lib$lib-2.0.a \
+          "${{targets.destdir}}"/usr/lib/lib$lib-2.0.a
+      done
 
   - name: update shbang
     runs: |
@@ -98,9 +144,29 @@ subpackages:
       # The fat LTO objects carry GCC bytecode next to the machine code; ship only the machine code.
       - uses: strip-lto-bytecode
     test:
+      environment:
+        contents:
+          packages:
+            - binutils
+            - build-base
+            - glib-dev
+            - pkgconf
       pipeline:
         - uses: test/tw/staticpackage
         - uses: test/lto-bytecode-check
+        - name: Static libglib keeps the built-in GChecksum/GHmac
+          runs: |
+            # libcrypto is not linked, so static linkers must not be told to link it
+            if pkg-config --print-requires-private glib-2.0 | grep libcrypto; then exit 1; fi
+            if nm /usr/lib/libglib-2.0.a 2>/dev/null | grep -E " U (EVP_|dlopen)"; then exit 1; fi
+            # Fully static, hashing from GLib threads, under an OpenSSL config
+            # that offers nothing: only the built-in code passes
+            cc -static-pie -fPIE -DGLIB_STATIC_COMPILATION -DNO_LIBCRYPTO \
+              -o static-test checksum-openssl-test.c $(pkg-config --cflags glib-2.0) \
+              /usr/lib/libglib-2.0.a -lpcre2-8 -latomic -lm -pthread
+            if readelf -d static-test | grep NEEDED; then exit 1; fi
+            ./static-test default
+            OPENSSL_CONF=restricted-openssl.cnf ./static-test default
     dependencies:
       runtime:
         - gettext-static
@@ -195,6 +261,14 @@ update:
     - ^GNOME_PRINT_.*
 
 test:
+  environment:
+    contents:
+      packages:
+        - build-base
+        - glib-dev
+        - openssl-${{vars.openssl-version}}-dev
+        - pkgconf
+        - posix-libc-utils
   pipeline:
     - uses: test/tw/help-check
       with:
@@ -217,3 +291,15 @@ test:
           glib-compile-schemas
         version: ${{package.version}}
     - uses: test/tw/ldd-check
+    - name: GChecksum and GHmac are backed by libcrypto
+      runs: |
+        # dlopen()ed, not linked
+        grep -F 'libcrypto.so.4' /usr/lib/libglib-2.0.so.0
+        if ldd /usr/lib/libglib-2.0.so.0 | grep libcrypto; then exit 1; fi
+        cc -o checksum-openssl-test checksum-openssl-test.c \
+          $(pkg-config --cflags --libs glib-2.0) -lcrypto
+        ./checksum-openssl-test default
+        OPENSSL_CONF=/dev/null ./checksum-openssl-test default
+        # Providers offering nothing: every constructor must fail, so no
+        # built-in fallback exists
+        OPENSSL_CONF=restricted-openssl.cnf ./checksum-openssl-test restricted

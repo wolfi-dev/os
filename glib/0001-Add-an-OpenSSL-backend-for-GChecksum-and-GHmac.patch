@@ -1,0 +1,1038 @@
+From 88c2ab42c49a47f6ff490f960fd09bf62463c7af Mon Sep 17 00:00:00 2001
+From: Thomas Bechtold <thomas.bechtold@chainguard.dev>
+Date: Wed, 4 Nov 2026 15:20:53 +0100
+Subject: [PATCH] Add an OpenSSL backend for GChecksum and GHmac
+
+With -Dopenssl=true, GChecksum and GHmac are implemented with OpenSSL
+libcrypto (EVP_MD and the "HMAC" EVP_MAC) instead of GLib's built-in
+MD5/SHA code. Algorithms are fetched from the default library context,
+so the process-wide OpenSSL configuration decides which provider
+computes them. With a FIPS configuration all hashing and HMAC done
+through GLib (and its users, e.g. libsoup) runs inside the FIPS
+provider.
+
+libcrypto is dlopen()ed by soname rather than linked, so that
+libglib-2.0.a can still be linked without a static libcrypto, and
+processes that never compute a checksum do not load it. Only the
+OpenSSL headers are needed at build time; the function pointer types
+come from them, so prototype changes fail the build.
+
+Behaviour differences from the built-in backend:
+
+- g_checksum_new() and g_hmac_new() return NULL (with a warning) when
+  the configured providers do not offer the algorithm, e.g. MD5 in a
+  strict FIPS configuration, or reject the HMAC key, e.g. keys shorter
+  than 112 bits under the FIPS key check.
+- A libcrypto that cannot be loaded, or a failure in an operation that
+  cannot report errors (update, finalise, copy), aborts the process
+  with g_error() rather than silently using unvalidated code or
+  returning a wrong digest.
+- OpenSSL errors are cleared from the thread's error queue after they
+  are reported, so other OpenSSL users in the process (glib-networking)
+  do not see stale errors.
+
+The built-in GHmac core in ghmac.c is compiled out with -Dopenssl; the
+g_compute_hmac_*() helpers there only use the public API and are shared
+by both backends.
+---
+ glib/gchecksum-openssl.c | 261 +++++++++++++++++++++++++++++++++++++++
+ glib/gchecksum.c         |  18 ++-
+ glib/gchecksumprivate.h  |  39 ++++++
+ glib/ghmac-openssl.c     | 255 ++++++++++++++++++++++++++++++++++++++
+ glib/ghmac.c             |   4 +
+ glib/gopenssl.c          | 134 ++++++++++++++++++++
+ glib/gopensslprivate.h   |  90 ++++++++++++++
+ glib/meson.build         |   8 ++
+ meson.build              |  17 +++
+ meson.options            |   5 +
+ 10 files changed, 827 insertions(+), 4 deletions(-)
+ create mode 100644 glib/gchecksum-openssl.c
+ create mode 100644 glib/gchecksumprivate.h
+ create mode 100644 glib/ghmac-openssl.c
+ create mode 100644 glib/gopenssl.c
+ create mode 100644 glib/gopensslprivate.h
+
+diff --git a/glib/gchecksum-openssl.c b/glib/gchecksum-openssl.c
+new file mode 100644
+index 0000000..5efd877
+--- /dev/null
++++ b/glib/gchecksum-openssl.c
+@@ -0,0 +1,261 @@
++/* gchecksum-openssl.c - GChecksum backed by OpenSSL libcrypto
++ *
++ * Copyright (C) 2026 Chainguard, Inc.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* The public functions here are documented in gchecksum.c. Digests are
++ * fetched from the default library context, so the process-wide OpenSSL
++ * configuration (providers, default_properties such as "fips=yes") decides
++ * which implementation is used and which algorithms are available. In
++ * particular g_checksum_new() returns %NULL for %G_CHECKSUM_MD5 when no
++ * loaded provider offers it under the configured properties. */
++
++#include "config.h"
++
++#include <string.h>
++
++#include "gchecksumprivate.h"
++#include "gopensslprivate.h"
++
++#include "gmem.h"
++#include "gmessages.h"
++#include "gstrfuncs.h"
++#include "gtestutils.h"
++
++struct _GChecksum
++{
++  GChecksumType type;
++
++  /* Set once the checksum is closed, as in the built-in implementation. */
++  gchar *digest_str;
++
++  EVP_MD *md;
++  EVP_MD_CTX *ctx;
++  guint8 digest[EVP_MAX_MD_SIZE];
++};
++
++static void
++checksum_init (const GOpenSSLFuncs *funcs,
++               GChecksum           *checksum)
++{
++  if (!funcs->EVP_DigestInit_ex2 (checksum->ctx, checksum->md, NULL))
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_error ("GChecksum: EVP_DigestInit_ex2 failed: %s", err);
++    }
++}
++
++GChecksum *
++g_checksum_new (GChecksumType checksum_type)
++{
++  const GOpenSSLFuncs *funcs;
++  const char *name;
++  GChecksum *checksum;
++  EVP_MD *md;
++
++  name = g_openssl_digest_name (checksum_type);
++  if (name == NULL)
++    return NULL;
++
++  funcs = g_openssl_get_funcs ();
++
++  md = funcs->EVP_MD_fetch (NULL, name, NULL);
++  if (md == NULL)
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_warning ("GChecksum: %s is not available: %s", name, err);
++      g_free (err);
++      return NULL;
++    }
++
++  checksum = g_new0 (GChecksum, 1);
++  checksum->type = checksum_type;
++  checksum->md = md;
++  checksum->ctx = funcs->EVP_MD_CTX_new ();
++  if (checksum->ctx == NULL)
++    g_error ("GChecksum: EVP_MD_CTX_new failed");
++
++  checksum_init (funcs, checksum);
++
++  return checksum;
++}
++
++void
++g_checksum_reset (GChecksum *checksum)
++{
++  g_return_if_fail (checksum != NULL);
++
++  g_free (checksum->digest_str);
++  checksum->digest_str = NULL;
++
++  checksum_init (g_openssl_get_funcs (), checksum);
++}
++
++GChecksum *
++g_checksum_copy (const GChecksum *checksum)
++{
++  const GOpenSSLFuncs *funcs;
++  GChecksum *copy;
++
++  g_return_val_if_fail (checksum != NULL, NULL);
++
++  funcs = g_openssl_get_funcs ();
++
++  copy = g_new0 (GChecksum, 1);
++  copy->type = checksum->type;
++  copy->digest_str = g_strdup (checksum->digest_str);
++  memcpy (copy->digest, checksum->digest, sizeof (copy->digest));
++
++  if (!funcs->EVP_MD_up_ref (checksum->md))
++    g_error ("GChecksum: EVP_MD_up_ref failed");
++  copy->md = checksum->md;
++
++  /* A finalised context cannot be duplicated meaningfully; a closed copy
++   * only needs a context that g_checksum_reset() can initialise. */
++  if (checksum->digest_str != NULL)
++    copy->ctx = funcs->EVP_MD_CTX_new ();
++  else
++    copy->ctx = funcs->EVP_MD_CTX_dup (checksum->ctx);
++
++  if (copy->ctx == NULL)
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_error ("GChecksum: copying the digest context failed: %s", err);
++    }
++
++  return copy;
++}
++
++void
++g_checksum_free (GChecksum *checksum)
++{
++  const GOpenSSLFuncs *funcs;
++
++  if (G_UNLIKELY (checksum == NULL))
++    return;
++
++  funcs = g_openssl_get_funcs ();
++
++  funcs->EVP_MD_CTX_free (checksum->ctx);
++  funcs->EVP_MD_free (checksum->md);
++  g_free (checksum->digest_str);
++  g_free (checksum);
++}
++
++void
++g_checksum_update_internal (GChecksum    *checksum,
++                            const guchar *data,
++                            size_t        length)
++{
++  const GOpenSSLFuncs *funcs;
++
++  g_return_if_fail (checksum != NULL);
++  g_return_if_fail (length == 0 || data != NULL);
++
++  if (checksum->digest_str)
++    {
++      g_warning ("The checksum '%s' has been closed and cannot be updated "
++                 "any more.",
++                 checksum->digest_str);
++      return;
++    }
++
++  if (length == 0)
++    return;
++
++  funcs = g_openssl_get_funcs ();
++
++  /* g_checksum_update() cannot fail, and carrying on would return a wrong
++   * digest later, so a libcrypto failure here is fatal. */
++  if (!funcs->EVP_DigestUpdate (checksum->ctx, data, length))
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_error ("GChecksum: EVP_DigestUpdate failed: %s", err);
++    }
++}
++
++void
++g_checksum_update (GChecksum    *checksum,
++                   const guchar *data,
++                   gssize        length)
++{
++  size_t unsigned_length;
++
++  g_return_if_fail (checksum != NULL);
++  g_return_if_fail (length == 0 || data != NULL);
++
++  if (length < 0)
++    unsigned_length = strlen ((const gchar *) data);
++  else
++    unsigned_length = (size_t) length;
++
++  g_checksum_update_internal (checksum, data, unsigned_length);
++}
++
++static void
++checksum_close (GChecksum *checksum)
++{
++  const GOpenSSLFuncs *funcs;
++  unsigned int len = 0;
++
++  if (checksum->digest_str != NULL)
++    return;
++
++  funcs = g_openssl_get_funcs ();
++
++  if (!funcs->EVP_DigestFinal_ex (checksum->ctx, checksum->digest, &len))
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_error ("GChecksum: EVP_DigestFinal_ex failed: %s", err);
++    }
++
++  g_assert ((gssize) len == g_checksum_type_get_length (checksum->type));
++
++  checksum->digest_str = gchecksum_digest_to_string (checksum->digest, len);
++}
++
++const gchar *
++g_checksum_get_string (GChecksum *checksum)
++{
++  g_return_val_if_fail (checksum != NULL, NULL);
++
++  checksum_close (checksum);
++
++  return checksum->digest_str;
++}
++
++void
++g_checksum_get_digest (GChecksum  *checksum,
++                       guint8     *buffer,
++                       gsize      *digest_len)
++{
++  gssize signed_len;
++  gsize len;
++
++  g_return_if_fail (checksum != NULL);
++
++  signed_len = g_checksum_type_get_length (checksum->type);
++  g_assert (signed_len >= 0);  /* @checksum should be internally consistent */
++  len = (size_t) signed_len;
++  g_return_if_fail (*digest_len >= len);
++
++  checksum_close (checksum);
++
++  memcpy (buffer, checksum->digest, len);
++  *digest_len = len;
++}
+diff --git a/glib/gchecksum.c b/glib/gchecksum.c
+index 196fda2..093ae81 100644
+--- a/glib/gchecksum.c
++++ b/glib/gchecksum.c
+@@ -22,7 +22,7 @@
+ 
+ #include <string.h>
+ 
+-#include "gchecksum.h"
++#include "gchecksumprivate.h"
+ 
+ #include "gslice.h"
+ #include "gmem.h"
+@@ -120,6 +120,7 @@ typedef struct
+   guchar digest[SHA512_DIGEST_LEN];
+ } Sha512sum;
+ 
++#ifndef USE_OPENSSL
+ struct _GChecksum
+ {
+   GChecksumType type;
+@@ -175,10 +176,11 @@ sha_byte_reverse (guint32 *buffer,
+     }
+ }
+ #endif /* G_BYTE_ORDER == G_BIG_ENDIAN */
++#endif /* !USE_OPENSSL */
+ 
+-static gchar *
+-digest_to_string (guint8 *digest,
+-                  gsize   digest_len)
++gchar *
++gchecksum_digest_to_string (const guint8 *digest,
++                            gsize         digest_len)
+ {
+   gsize i, len = digest_len * 2;
+   gchar *retval;
+@@ -197,7 +199,9 @@ digest_to_string (guint8 *digest,
+ 
+   return retval;
+ }
++#define digest_to_string gchecksum_digest_to_string
+ 
++#ifndef USE_OPENSSL
+ /*
+  * MD5 Checksum
+  */
+@@ -1401,6 +1405,7 @@ sha512_sum_digest (Sha512sum *sha512,
+ #undef sigma1
+ 
+ #undef PUT_UINT64
++#endif /* !USE_OPENSSL */
+ 
+ /*
+  * Public API
+@@ -1447,6 +1452,7 @@ g_checksum_type_get_length (GChecksumType checksum_type)
+   return len;
+ }
+ 
++#ifndef USE_OPENSSL
+ /**
+  * g_checksum_new:
+  * @checksum_type: the desired type of checksum
+@@ -1786,6 +1792,10 @@ g_checksum_get_digest (GChecksum  *checksum,
+ 
+   *digest_len = len;
+ }
++#else /* USE_OPENSSL */
++/* Implemented in gchecksum-openssl.c */
++#define checksum_update_internal g_checksum_update_internal
++#endif /* !USE_OPENSSL */
+ 
+ /**
+  * g_compute_checksum_for_data:
+diff --git a/glib/gchecksumprivate.h b/glib/gchecksumprivate.h
+new file mode 100644
+index 0000000..b592dff
+--- /dev/null
++++ b/glib/gchecksumprivate.h
+@@ -0,0 +1,39 @@
++/* gchecksumprivate.h - Private GChecksum functions
++ *
++ * Copyright (C) 2026 Chainguard, Inc.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef __G_CHECKSUM_PRIVATE_H__
++#define __G_CHECKSUM_PRIVATE_H__
++
++#include "gchecksum.h"
++
++G_BEGIN_DECLS
++
++gchar *gchecksum_digest_to_string (const guint8 *digest,
++                                   gsize         digest_len);
++
++#ifdef USE_OPENSSL
++void g_checksum_update_internal (GChecksum    *checksum,
++                                 const guchar *data,
++                                 size_t        length);
++#endif
++
++G_END_DECLS
++
++#endif /* __G_CHECKSUM_PRIVATE_H__ */
+diff --git a/glib/ghmac-openssl.c b/glib/ghmac-openssl.c
+new file mode 100644
+index 0000000..b2eeee0
+--- /dev/null
++++ b/glib/ghmac-openssl.c
+@@ -0,0 +1,255 @@
++/* ghmac-openssl.c - GHmac backed by OpenSSL libcrypto
++ *
++ * Copyright (C) 2026 Chainguard, Inc.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* The public functions here are documented in ghmac.c. The HMAC itself is
++ * computed by the "HMAC" EVP_MAC of the default library context, not built
++ * on top of GChecksum, so that the keyed construction also runs inside the
++ * configured (e.g. FIPS) provider. g_hmac_new() returns %NULL when the
++ * provider rejects the digest or the key, for instance MD5, or keys
++ * shorter than 112 bits when the FIPS provider enforces its key check. */
++
++#include "config.h"
++
++#include <string.h>
++
++#include "ghmac.h"
++
++#include "gatomic.h"
++#include "gchecksumprivate.h"
++#include "gmem.h"
++#include "gmessages.h"
++#include "gopensslprivate.h"
++#include "gstrfuncs.h"
++#include "gtestutils.h"
++
++struct _GHmac
++{
++  int ref_count;
++  GChecksumType digest_type;
++  EVP_MAC_CTX *ctx;
++  gboolean closed;
++  guint8 digest[EVP_MAX_MD_SIZE];
++  gchar *digest_str;
++};
++
++GHmac *
++g_hmac_new (GChecksumType  digest_type,
++            const guchar  *key,
++            gsize          key_len)
++{
++  static const guchar empty_key[1] = { 0 };
++  const GOpenSSLFuncs *funcs;
++  OSSL_PARAM params[2];
++  const char *name;
++  EVP_MAC *mac;
++  GHmac *hmac;
++
++  g_return_val_if_fail (key_len <= G_MAXSSIZE, NULL);
++  g_return_val_if_fail (key_len == 0 || key != NULL, NULL);
++
++  name = g_openssl_digest_name (digest_type);
++  g_return_val_if_fail (name != NULL, NULL);
++
++  funcs = g_openssl_get_funcs ();
++
++  mac = funcs->EVP_MAC_fetch (NULL, "HMAC", NULL);
++  if (mac == NULL)
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_warning ("GHmac: HMAC is not available: %s", err);
++      g_free (err);
++      return NULL;
++    }
++
++  hmac = g_new0 (GHmac, 1);
++  hmac->ref_count = 1;
++  hmac->digest_type = digest_type;
++  hmac->ctx = funcs->EVP_MAC_CTX_new (mac);
++  funcs->EVP_MAC_free (mac);  /* the context holds its own reference */
++  if (hmac->ctx == NULL)
++    g_error ("GHmac: EVP_MAC_CTX_new failed");
++
++  params[0] = funcs->OSSL_PARAM_construct_utf8_string (OSSL_MAC_PARAM_DIGEST,
++                                                     (char *) name, 0);
++  params[1] = funcs->OSSL_PARAM_construct_end ();
++
++  /* A NULL key tells EVP_MAC_init() to reuse a previous key, so an empty
++   * key must still be passed as a non-NULL pointer. */
++  if (!funcs->EVP_MAC_init (hmac->ctx, key_len > 0 ? key : empty_key,
++                            key_len, params))
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_warning ("GHmac: HMAC-%s is not available: %s", name, err);
++      g_free (err);
++      funcs->EVP_MAC_CTX_free (hmac->ctx);
++      g_free (hmac);
++      return NULL;
++    }
++
++  return hmac;
++}
++
++GHmac *
++g_hmac_copy (const GHmac *hmac)
++{
++  const GOpenSSLFuncs *funcs;
++  GHmac *copy;
++
++  g_return_val_if_fail (hmac != NULL, NULL);
++
++  funcs = g_openssl_get_funcs ();
++
++  copy = g_new0 (GHmac, 1);
++  copy->ref_count = 1;
++  copy->digest_type = hmac->digest_type;
++  copy->closed = hmac->closed;
++  memcpy (copy->digest, hmac->digest, sizeof (copy->digest));
++  copy->digest_str = g_strdup (hmac->digest_str);
++
++  /* g_hmac_copy() cannot fail. */
++  copy->ctx = funcs->EVP_MAC_CTX_dup (hmac->ctx);
++  if (copy->ctx == NULL)
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_error ("GHmac: EVP_MAC_CTX_dup failed: %s", err);
++    }
++
++  return copy;
++}
++
++GHmac *
++g_hmac_ref (GHmac *hmac)
++{
++  g_return_val_if_fail (hmac != NULL, NULL);
++
++  g_atomic_int_inc (&hmac->ref_count);
++
++  return hmac;
++}
++
++void
++g_hmac_unref (GHmac *hmac)
++{
++  g_return_if_fail (hmac != NULL);
++
++  if (g_atomic_int_dec_and_test (&hmac->ref_count))
++    {
++      g_openssl_get_funcs ()->EVP_MAC_CTX_free (hmac->ctx);
++      g_free (hmac->digest_str);
++      g_free (hmac);
++    }
++}
++
++void
++g_hmac_update (GHmac        *hmac,
++               const guchar *data,
++               gssize        length)
++{
++  const GOpenSSLFuncs *funcs;
++  size_t unsigned_length;
++
++  g_return_if_fail (hmac != NULL);
++  g_return_if_fail (length == 0 || data != NULL);
++
++  if (hmac->closed)
++    {
++      g_warning ("The HMAC has been closed and cannot be updated any more.");
++      return;
++    }
++
++  if (length < 0)
++    unsigned_length = strlen ((const gchar *) data);
++  else
++    unsigned_length = (size_t) length;
++
++  if (unsigned_length == 0)
++    return;
++
++  funcs = g_openssl_get_funcs ();
++
++  /* g_hmac_update() cannot fail, and carrying on would return a wrong
++   * digest later, so a libcrypto failure here is fatal. */
++  if (!funcs->EVP_MAC_update (hmac->ctx, data, unsigned_length))
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_error ("GHmac: EVP_MAC_update failed: %s", err);
++    }
++}
++
++static void
++hmac_close (GHmac *hmac)
++{
++  const GOpenSSLFuncs *funcs;
++  size_t len = 0;
++
++  if (hmac->closed)
++    return;
++
++  funcs = g_openssl_get_funcs ();
++
++  if (!funcs->EVP_MAC_final (hmac->ctx, hmac->digest, &len,
++                             sizeof (hmac->digest)))
++    {
++      gchar *err = g_openssl_take_error (funcs);
++      g_error ("GHmac: EVP_MAC_final failed: %s", err);
++    }
++
++  g_assert ((gssize) len == g_checksum_type_get_length (hmac->digest_type));
++
++  hmac->closed = TRUE;
++}
++
++const gchar *
++g_hmac_get_string (GHmac *hmac)
++{
++  g_return_val_if_fail (hmac != NULL, NULL);
++
++  if (hmac->digest_str == NULL)
++    {
++      hmac_close (hmac);
++      hmac->digest_str = gchecksum_digest_to_string (
++          hmac->digest, (gsize) g_checksum_type_get_length (hmac->digest_type));
++    }
++
++  return hmac->digest_str;
++}
++
++void
++g_hmac_get_digest (GHmac  *hmac,
++                   guint8 *buffer,
++                   gsize  *digest_len)
++{
++  gssize len_signed;
++  gsize len;
++
++  g_return_if_fail (hmac != NULL);
++
++  len_signed = g_checksum_type_get_length (hmac->digest_type);
++  g_assert (len_signed >= 0);
++  len = (gsize) len_signed;
++
++  /* @buffer must be long enough for the digest */
++  g_return_if_fail (*digest_len >= len);
++
++  hmac_close (hmac);
++
++  memcpy (buffer, hmac->digest, len);
++  *digest_len = len;
++}
+diff --git a/glib/ghmac.c b/glib/ghmac.c
+index 97e2fff..f755b11 100644
+--- a/glib/ghmac.c
++++ b/glib/ghmac.c
+@@ -58,6 +58,8 @@
+  * Since: 2.30
+  */
+ 
++#ifndef USE_OPENSSL
++/* Built-in implementation; ghmac-openssl.c replaces it with -Dopenssl. */
+ struct _GHmac
+ {
+   int ref_count;
+@@ -357,6 +359,8 @@ g_hmac_get_digest (GHmac  *hmac,
+   g_checksum_get_digest (hmac->digesto, buffer, digest_len);
+ }
+ 
++#endif /* !USE_OPENSSL */
++
+ /**
+  * g_compute_hmac_for_data:
+  * @digest_type: a #GChecksumType to use for the HMAC
+diff --git a/glib/gopenssl.c b/glib/gopenssl.c
+new file mode 100644
+index 0000000..87012c9
+--- /dev/null
++++ b/glib/gopenssl.c
+@@ -0,0 +1,134 @@
++/* gopenssl.c - libcrypto loader for the OpenSSL GChecksum/GHmac backend
++ *
++ * Copyright (C) 2026 Chainguard, Inc.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "config.h"
++
++#include <dlfcn.h>
++
++#include "gopensslprivate.h"
++
++#include "gmessages.h"
++#include "gstrfuncs.h"
++#include "gthread.h"
++
++/* libcrypto is dlopen()ed rather than linked so that libglib-2.0.a can
++ * still be linked statically without a static libcrypto, and so that
++ * processes which never compute a checksum do not load it. */
++
++static GOpenSSLFuncs openssl_funcs;
++
++#define LOAD(name) \
++  G_STMT_START { \
++    openssl_funcs.name = dlsym (handle, #name); \
++    if (openssl_funcs.name == NULL) \
++      g_error ("GChecksum: cannot find %s in %s: %s", \
++               #name, OPENSSL_LIBCRYPTO_SONAME, dlerror ()); \
++  } G_STMT_END
++
++static void
++load_libcrypto (void)
++{
++  void *handle;
++
++  handle = dlopen (OPENSSL_LIBCRYPTO_SONAME, RTLD_NOW | RTLD_LOCAL);
++  if (handle == NULL)
++    g_error ("GChecksum: cannot load %s: %s",
++             OPENSSL_LIBCRYPTO_SONAME, dlerror ());
++
++  LOAD (EVP_MD_fetch);
++  LOAD (EVP_MD_free);
++  LOAD (EVP_MD_up_ref);
++  LOAD (EVP_MD_CTX_new);
++  LOAD (EVP_MD_CTX_free);
++  LOAD (EVP_MD_CTX_dup);
++  LOAD (EVP_DigestInit_ex2);
++  LOAD (EVP_DigestUpdate);
++  LOAD (EVP_DigestFinal_ex);
++  LOAD (EVP_MAC_fetch);
++  LOAD (EVP_MAC_free);
++  LOAD (EVP_MAC_CTX_new);
++  LOAD (EVP_MAC_CTX_free);
++  LOAD (EVP_MAC_CTX_dup);
++  LOAD (EVP_MAC_init);
++  LOAD (EVP_MAC_update);
++  LOAD (EVP_MAC_final);
++  LOAD (OSSL_PARAM_construct_utf8_string);
++  LOAD (OSSL_PARAM_construct_end);
++  LOAD (ERR_get_error);
++  LOAD (ERR_error_string_n);
++  LOAD (ERR_clear_error);
++
++  /* The handle is intentionally never closed. */
++}
++
++#undef LOAD
++
++const GOpenSSLFuncs *
++g_openssl_get_funcs (void)
++{
++  static gsize loaded = 0;
++
++  if (g_once_init_enter (&loaded))
++    {
++      load_libcrypto ();
++      g_once_init_leave (&loaded, 1);
++    }
++
++  return &openssl_funcs;
++}
++
++const char *
++g_openssl_digest_name (GChecksumType type)
++{
++  switch (type)
++    {
++    case G_CHECKSUM_MD5:
++      return "MD5";
++    case G_CHECKSUM_SHA1:
++      return "SHA1";
++    case G_CHECKSUM_SHA256:
++      return "SHA256";
++    case G_CHECKSUM_SHA384:
++      return "SHA384";
++    case G_CHECKSUM_SHA512:
++      return "SHA512";
++    default:
++      return NULL;
++    }
++}
++
++gchar *
++g_openssl_take_error (const GOpenSSLFuncs *funcs)
++{
++  char buf[256];
++  unsigned long err;
++
++  err = funcs->ERR_get_error ();
++  if (err == 0)
++    {
++      funcs->ERR_clear_error ();
++      return g_strdup ("unknown error");
++    }
++
++  funcs->ERR_error_string_n (err, buf, sizeof (buf));
++  funcs->ERR_clear_error ();
++
++  return g_strdup (buf);
++}
+diff --git a/glib/gopensslprivate.h b/glib/gopensslprivate.h
+new file mode 100644
+index 0000000..33ad06c
+--- /dev/null
++++ b/glib/gopensslprivate.h
+@@ -0,0 +1,90 @@
++/* gopensslprivate.h - libcrypto loader for the OpenSSL GChecksum/GHmac backend
++ *
++ * Copyright (C) 2026 Chainguard, Inc.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef __G_OPENSSL_PRIVATE_H__
++#define __G_OPENSSL_PRIVATE_H__
++
++#include "config.h"
++
++#ifndef USE_OPENSSL
++#error "build configuration error"
++#endif
++
++/* Only the declarations are used; libcrypto is never linked directly. */
++#include <openssl/core.h>
++#include <openssl/core_names.h>
++#include <openssl/evp.h>
++#include <openssl/err.h>
++#include <openssl/params.h>
++
++#include "gchecksum.h"
++
++G_BEGIN_DECLS
++
++#define G_OPENSSL_FUNC(name) __typeof__ (name) *name
++
++/* Function pointers into the dlopen()ed libcrypto. The member names match
++ * the libcrypto symbols, and the types are taken from the OpenSSL headers,
++ * so a prototype change in a new OpenSSL release fails the build rather
++ * than miscalling at runtime. */
++typedef struct
++{
++  G_OPENSSL_FUNC (EVP_MD_fetch);
++  G_OPENSSL_FUNC (EVP_MD_free);
++  G_OPENSSL_FUNC (EVP_MD_up_ref);
++  G_OPENSSL_FUNC (EVP_MD_CTX_new);
++  G_OPENSSL_FUNC (EVP_MD_CTX_free);
++  G_OPENSSL_FUNC (EVP_MD_CTX_dup);
++  G_OPENSSL_FUNC (EVP_DigestInit_ex2);
++  G_OPENSSL_FUNC (EVP_DigestUpdate);
++  G_OPENSSL_FUNC (EVP_DigestFinal_ex);
++  G_OPENSSL_FUNC (EVP_MAC_fetch);
++  G_OPENSSL_FUNC (EVP_MAC_free);
++  G_OPENSSL_FUNC (EVP_MAC_CTX_new);
++  G_OPENSSL_FUNC (EVP_MAC_CTX_free);
++  G_OPENSSL_FUNC (EVP_MAC_CTX_dup);
++  G_OPENSSL_FUNC (EVP_MAC_init);
++  G_OPENSSL_FUNC (EVP_MAC_update);
++  G_OPENSSL_FUNC (EVP_MAC_final);
++  G_OPENSSL_FUNC (OSSL_PARAM_construct_utf8_string);
++  G_OPENSSL_FUNC (OSSL_PARAM_construct_end);
++  G_OPENSSL_FUNC (ERR_get_error);
++  G_OPENSSL_FUNC (ERR_error_string_n);
++  G_OPENSSL_FUNC (ERR_clear_error);
++} GOpenSSLFuncs;
++
++#undef G_OPENSSL_FUNC
++
++/* Loads libcrypto on first use. Aborts the process if it cannot be loaded:
++ * silently falling back to the built-in implementation would defeat the
++ * purpose of this backend. */
++const GOpenSSLFuncs *g_openssl_get_funcs (void);
++
++/* OpenSSL algorithm name for @type, or %NULL if unknown. */
++const char *g_openssl_digest_name (GChecksumType type);
++
++/* Pops the thread's OpenSSL error queue into a newly allocated string and
++ * clears it, so that stale errors are not seen by other OpenSSL users in
++ * the process (e.g. glib-networking checking ERR_get_error()). */
++gchar *g_openssl_take_error (const GOpenSSLFuncs *funcs);
++
++G_END_DECLS
++
++#endif /* __G_OPENSSL_PRIVATE_H__ */
+diff --git a/glib/meson.build b/glib/meson.build
+index 0fb6e26..af4e5fd 100644
+--- a/glib/meson.build
++++ b/glib/meson.build
+@@ -412,6 +412,10 @@ else
+   glib_dtrace_hdr = []
+ endif
+ 
++if get_option('openssl')
++  glib_sources += files('gchecksum-openssl.c', 'ghmac-openssl.c', 'gopenssl.c')
++endif
++
+ pcre2_static_args = []
+ 
+ if use_pcre2_static_flag
+@@ -433,6 +437,8 @@ libglib = library('glib-2.0',
+   dependencies : [
+     atomic_dep,
+     gnulib_libm_dependency,
++    libcrypto_headers_dep,
++    libdl_dep,
+     libiconv,
+     libintl_deps,
+     libm,
+@@ -460,6 +466,8 @@ libglib_static_dep = declare_dependency(
+   dependencies: [
+     atomic_dep,
+     gnulib_libm_dependency,
++    libcrypto_headers_dep,
++    libdl_dep,
+     libiconv,
+     libintl_deps,
+     libm,
+diff --git a/meson.build b/meson.build
+index efa7e89..1b4a7f4 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1153,6 +1153,23 @@ else
+   have_dlopen_dlsym = false
+ endif
+ 
++# OpenSSL optionally implements GChecksum and GHmac. Only the headers are used
++# at build time; libcrypto is dlopen()ed by soname at runtime.
++libcrypto_headers_dep = []
++if get_option('openssl')
++  if not have_dlopen_dlsym
++    error('-Dopenssl=true requires dlopen()')
++  endif
++  libcrypto_dep = dependency('libcrypto', version : '>=3.0', required : true)
++  # A plain include path, so that libcrypto does not end up in
++  # glib-2.0.pc's Requires.private (as a partial_dependency would)
++  libcrypto_headers_dep = declare_dependency(
++    compile_args : ['-I' + libcrypto_dep.get_variable(pkgconfig : 'includedir')])
++  glib_conf.set('USE_OPENSSL', 1)
++  glib_conf.set_quoted('OPENSSL_LIBCRYPTO_SONAME',
++                       'libcrypto.so.' + libcrypto_dep.version().split('.')[0])
++endif
++
+ # if statfs() takes 2 arguments (Posix) or 4 (Solaris)
+ if have_func_statfs
+   if cc.compiles(glib_conf_prefix + '''
+diff --git a/meson.options b/meson.options
+index 5ebbe4d..bad12ae 100644
+--- a/meson.options
++++ b/meson.options
+@@ -32,6 +32,11 @@ option('xattr',
+        value : true,
+        description : 'build with xattr support')
+ 
++option('openssl',
++       type : 'boolean',
++       value : false,
++       description : 'implement GChecksum and GHmac with OpenSSL libcrypto (loaded at runtime)')
++
+ option('libmount',
+        type : 'feature',
+        value : 'auto',
+-- 
+2.53.0
+

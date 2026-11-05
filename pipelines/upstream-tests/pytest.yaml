@@ -66,6 +66,15 @@ description: |
   plugin is not installed, and listed in the output; so clear-addopts is
   only needed for other addopts. The test-retry plugins (rerunfailures,
   flaky) are always disabled, installed or not (see the hard gate below).
+  With pytest-asyncio 0.24 or later importable (and not disabled with
+  -p no:asyncio), when neither the project's pytest config, args nor
+  PYTEST_ADDOPTS sets asyncio_default_fixture_loop_scope, the plugin's
+  "is unset" deprecation warning is ignored with a targeted -W (under
+  filterwarnings = error it is an INTERNALERROR and nothing runs). The
+  option stays unset, so each async fixture's event loop keeps its
+  caching scope; do not pass `-o asyncio_default_fixture_loop_scope=...`
+  in args just to silence that warning (forcing function breaks module-
+  and session-scoped async fixtures).
 
   Isolation: the workspace, minus melange-out/ and .wheels/, is copied to
   a scratch directory on disk under /var/cache/melange/upstream-tests-pytest
@@ -128,10 +137,15 @@ description: |
       + xfailed + failed + errored; selected = ran + skipped, i.e. every
       collected test not deselected by `ignore`, `markers` or -k, so named
       exceptions do not count against the package (ignore-files are not
-      collected at all). A suite where 1 test passes and 2000 skip fails.
+      collected at all). A module skipped at collection
+      (pytest.importorskip, allow_module_level skip) counts as one skipped
+      test, so a suite whose modules mostly importorskip a missing
+      dependency still trips it. A suite where 1 test passes and 2000
+      skip fails.
       A package whose upstream suite mostly skips by default sets
       min-run-percent lower, with a comment and a TODO(upstream-tests);
       the default may be raised later.
+    - an `ignore` entry matches no collected test (see below),
     - the package under test was never imported from the destdir, or was
       imported from the source tree,
     - the run changed ${{targets.contextdir}}.
@@ -142,7 +156,7 @@ description: |
     UPSTREAM-TESTS-FAIL <package>: <nodeid>                (one per failing test)
     UPSTREAM-TESTS-FAIL <package>: <nodeid> [error]        (setup/teardown error)
     UPSTREAM-TESTS-FAIL <package>: <path> [collection]     (module failed to collect)
-    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>]
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [xfail=<n>] [ignored=<n>] [modskip=<n>]
     UPSTREAM-TESTS-WARN <package>: ...   (not a failure: e.g. extension
       sources in the tree but no compiled extension installed)
     UPSTREAM-TESTS <package>: FAILED: <reasons>   (when the gate fails)
@@ -151,9 +165,10 @@ description: |
   on addopts): one outcome per test run (a test that passes and then
   errors in teardown counts once, as a failure); fail = failed + errored tests +
   collection errors; xfail = expected failures; ignored = tests
-  deselected by `ignore`. On failure, a HINT line names modules that
-  tests could not import (ModuleNotFoundError, pytest.importorskip) with a
-  guessed package name (py3-supported-<name>).
+  deselected by `ignore`; modskip = modules skipped at collection, whose
+  tests are never collected and so are not in skip. On failure, a HINT
+  line names modules that tests could not import (ModuleNotFoundError,
+  pytest.importorskip) with a guessed package name (py3-supported-<name>).
 
   Examples:
     - range: py-versions
@@ -181,10 +196,19 @@ description: |
   that continue it with `::` or `[`, so tests/test_net.py::TestDNS
   deselects the whole class and tests/test_x.py::test_y its parametrized
   cases, but test_y does not deselect test_y_regression (pytest's own
-  --deselect would, as a plain prefix). A directory in ignore matches
-  nothing and only warns, so its tests run. ignore-files: paths (files or
-  whole directories) passed to --ignore (not collected at all, for
-  modules that fail to import or directories to skip). Every
+  --deselect would, as a plain prefix). An entry that matches no
+  collected test fails the step (a stale exception must be removed),
+  unless its module was not collected (skipped at collection, or a
+  collection error); a directory in ignore matches nothing, so it fails
+  too: use ignore-files. A node id that exists only on some builds (a
+  test under a sys.version_info check, a parametrized case per
+  importable backend, a platform-gated class) does not belong in ignore,
+  since every python3.X and arch runs the suite: pass it in args as
+  `--deselect <id>` instead (pytest's prefix match, silent where absent;
+  the tests it drops get no IGNORE line and are not in ignored=).
+  ignore-files: paths (files or whole directories) passed to --ignore
+  (not collected at all, for modules that fail to import or directories
+  to skip). Every
   exception needs a comment in the calling package explaining why and a
   `TODO(upstream-tests): ...` to remove it:
     # test_fetch_remote downloads from example.org; the build has no network.
@@ -225,8 +249,9 @@ inputs:
     description: |
       Extra pytest arguments, parsed once as shell words (quotes work,
       nothing is expanded twice), e.g. `-p no:randomly`, `-k 'not slow'` or
-      `-W ignore::DeprecationWarning`. Do not pass -m, -n, --deselect,
-      --ignore, --timeout or --import-mode here; use the inputs.
+      `-W ignore::DeprecationWarning`. Do not pass -m, -n, --ignore,
+      --timeout or --import-mode here; use the inputs. --deselect is only
+      for node ids that exist on some builds only (see ignore).
     default: ""
   markers:
     description: |
@@ -238,11 +263,13 @@ inputs:
       Space-separated pytest node ids to deselect. An entry also covers
       the ids that continue it with `::` or `[` (a file's or class's
       tests, parametrized cases), but not test_x_regression for test_x.
-      A directory entry such as tests/integration matches nothing here
-      (its ids continue with `/`), so its tests still run and the step
-      only prints a WARNING on stderr; pytest's prefix --deselect used to
-      drop them. Put whole directories in ignore-files instead (or leave
-      them out of paths). Each one needs a comment and TODO in the caller.
+      An entry that matches no collected test fails the step, unless its
+      module was not collected. A directory entry such as
+      tests/integration matches nothing here (its ids continue with `/`),
+      so it fails too; put whole directories in ignore-files instead (or
+      leave them out of paths). An id present on some builds only goes in
+      args as `--deselect <id>`. Each one needs a comment and TODO in the
+      caller.
     default: ""
   ignore-files:
     description: |
@@ -304,6 +331,7 @@ inputs:
     description: |
       Minimum share of the selected tests that must actually run, in
       percent (see "the suite did not really run" in the description).
+      Each module skipped at collection counts as one skipped test.
       A package whose upstream suite mostly skips by default sets it lower,
       with a comment and a TODO(upstream-tests). The default may be raised
       later.

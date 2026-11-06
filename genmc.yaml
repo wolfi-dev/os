@@ -1,0 +1,234 @@
+package:
+  name: genmc
+  version: "0.20.0"
+  epoch: 0
+  description: GenMC stateless model checker for weak-memory concurrency in C, C++ and Rust
+  copyright:
+    # GenMC is Apache-2.0 OR MIT. Parts of three interpreter files
+    # (lli/Runtime/{Interpreter.h,Execution.cpp,ExternalFunctions.cpp})
+    # come from LLVM 3.5 and are also under the University of Illinois/NCSA
+    # license (LLVMLICENSE).
+    - license: Apache-2.0 OR MIT
+    - license: NCSA
+    # The runtime headers installed in /usr/share/genmc/include carry their
+    # own licenses: lkmm.h GPL-3.0-or-later, threads.h GPL-2.0-or-later,
+    # pthread.h (from glibc) LGPL-2.1-or-later, atomic (from libc++) NCSA
+    # and stdatomic.h (from clang) MIT.
+    - license: GPL-3.0-or-later
+    - license: GPL-2.0-or-later
+    - license: LGPL-2.1-or-later
+    - license: MIT
+  resources:
+    cpu: "8"
+    memory: 16Gi
+  dependencies:
+    runtime:
+      # genmc compiles C and C++ input with the clang of the LLVM it is built
+      # against (its path is compiled in).
+      - clang-${{vars.llvm-version}}
+      # Rust input: genmc runs rustc and cargo (paths compiled in) and
+      # interprets rustc's LLVM IR, so rustc's LLVM major must be GenMC's;
+      # see the vars block.
+      - rust-${{vars.rust-version}}
+  test-resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  # GenMC 0.20 supports LLVM 19 to 22. Its Rust support requires rustc's
+  # LLVM to have the same major version (CMakeLists.txt refuses another),
+  # so llvm-version and rust-version move together: rust-1.99 is built
+  # against LLVM 22.
+  llvm-version: 22
+  rust-version: "1.99"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - clang-${{vars.llvm-version}}
+      - cmake
+      # CMakeLists.txt records `git rev-parse --short HEAD` for --version.
+      - git
+      - glibc-2.44-dev
+      - gperftools-dev
+      - libedit-dev
+      - libffi-dev
+      - llvm-${{vars.llvm-version}}
+      - llvm-${{vars.llvm-version}}-dev
+      - rust-${{vars.rust-version}}
+      - samurai
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/MPI-SWS/genmc
+      tag: v${{package.version}}
+      expected-commit: fab5bba7d9efaf76990227c2f59d62c11c7ea2a3
+
+  # Upstream compiles in the source tree's paths for the C runtime headers
+  # (lli/runtime-include/c) and for genmc-std, the std crate it links into
+  # Rust programs, and installs only the headers' *.h files (not `atomic`,
+  # `cstdio` and the other C++ ones). Its RUST_DIR is also one level above
+  # genmc-std (lli/runtime-include/rust, where genmc-std is under rust/),
+  # so a Rust run from the build tree fails to find it.
+  # install-runtime-files.patch installs both under /usr/share/genmc and
+  # compiles in those paths. For Rust input genmc still runs `cargo build`
+  # in that genmc-std directory and moves rustc's output into its target/,
+  # so Rust runs need write access there (root) and run one at a time.
+  #
+  # GenMC reroutes rustc's allocator shims (`__rust_alloc` and its kin) to
+  # genmc-std's allocator by name, and rustc since 1.9x mangles those names
+  # (`_RNvCs<hash>_7___rustc12___rust_alloc`), so every Rust program that
+  # allocates (thread::spawn does) calls a function with no body.
+  # rust-mangled-alloc-shims.patch matches the mangled names too.
+  - uses: patch
+    with:
+      patches: install-runtime-files.patch rust-mangled-alloc-shims.patch
+
+  # Upstream looks for rustc and cargo only under CMAKE_PREFIX_PATH. Naming
+  # them directly keeps /usr/bin out of CMAKE_PREFIX_PATH, where it would come
+  # ahead of PATH when CMake picks the compiler and skip the /usr/local/bin
+  # openssf compiler wrapper.
+  - uses: cmake/configure
+    with:
+      opts: |
+        -DCMAKE_PREFIX_PATH=/usr/lib/llvm-${{vars.llvm-version}}/lib/cmake \
+        -DRUSTC_PATH=/usr/bin/rustc \
+        -DCARGO_PATH=/usr/bin/cargo \
+        -DENABLE_RUST=ON \
+        -DGENMC_TCMALLOC=ON
+
+  - uses: cmake/build
+
+  - uses: cmake/install
+
+  # The install also writes the model-checking library and its headers, for
+  # programs that embed GenMC. The genmc tool does not need them, so they are
+  # not shipped.
+  - runs: |
+      rm -r ${{targets.destdir}}/usr/include/genmc ${{targets.destdir}}/usr/lib/genmc
+      rmdir ${{targets.destdir}}/usr/include ${{targets.destdir}}/usr/lib
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: MPI-SWS/genmc
+    use-tag: true
+    strip-prefix: v
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: version
+      runs: |
+        genmc --version | tee version.log
+        grep -F "GenMC v${{package.version}}" version.log
+        grep -F "Built with LLVM ${{vars.llvm-version}}." version.log
+    - name: the runtime headers and genmc-std are where genmc looks for them
+      runs: |
+        test -f /usr/share/genmc/include/genmc.h
+        test -f /usr/share/genmc/include/atomic
+        test -e /usr/share/genmc/include/cassert
+        test -f /usr/share/genmc/rust/genmc-std/Cargo.toml
+    - name: a C litmus test passes, and fails with its orderings weakened
+      runs: |
+        # Message passing: a reader that sees the flag must see the data.
+        cat > mp.c <<'EOF'
+        #include <assert.h>
+        #include <pthread.h>
+        #include <stdatomic.h>
+        #include <stdlib.h>
+
+        #ifndef ORDER_STORE
+        #define ORDER_STORE memory_order_release
+        #define ORDER_LOAD memory_order_acquire
+        #endif
+
+        atomic_int data;
+        atomic_int flag;
+
+        void *writer(void *arg)
+        {
+          atomic_store_explicit(&data, 1, memory_order_relaxed);
+          atomic_store_explicit(&flag, 1, ORDER_STORE);
+          return NULL;
+        }
+
+        void *reader(void *arg)
+        {
+          if (atomic_load_explicit(&flag, ORDER_LOAD) == 1)
+            assert(atomic_load_explicit(&data, memory_order_relaxed) == 1);
+          return NULL;
+        }
+
+        int main()
+        {
+          pthread_t w, r;
+          if (pthread_create(&w, NULL, writer, NULL))
+            abort();
+          if (pthread_create(&r, NULL, reader, NULL))
+            abort();
+          return 0;
+        }
+        EOF
+        genmc mp.c | tee ok.log
+        grep -F "No errors were detected." ok.log
+
+        rc=0
+        genmc -- -DORDER_STORE=memory_order_relaxed -DORDER_LOAD=memory_order_relaxed mp.c > bad.log 2>&1 || rc=$?
+        cat bad.log
+        # 42: GenMC's exit status for a verification error.
+        test "$rc" -eq 42
+        grep -F "Safety violation!" bad.log
+    - name: a Rust litmus test passes, and fails with its orderings weakened
+      runs: |
+        # Message passing over a plain (non-atomic) value: with Relaxed
+        # orderings the reader's read races the writer's write.
+        # With rustc 1.99, GenMC 0.20 stops on unoptimised IR (`Constant
+        # unimplemented for type: { ptr, ptr }`), and in optimised IR its
+        # Rust front end cannot find `main` behind `std::rt::lang_start`,
+        # so the program is built at -Copt-level=1 with a C `main`.
+        cat > mp.rs <<'EOF'
+        #![no_main]
+        use std::cell::UnsafeCell;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::thread;
+
+        struct Data(UnsafeCell<u32>);
+        unsafe impl Sync for Data {}
+
+        static DATA: Data = Data(UnsafeCell::new(0));
+        static FLAG: AtomicU32 = AtomicU32::new(0);
+
+        #[cfg(not(weak))]
+        const ORDERS: (Ordering, Ordering) = (Ordering::Release, Ordering::Acquire);
+        #[cfg(weak)]
+        const ORDERS: (Ordering, Ordering) = (Ordering::Relaxed, Ordering::Relaxed);
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn main() -> i32 {
+            let w = thread::spawn(|| {
+                unsafe { *DATA.0.get() = 1 };
+                FLAG.store(1, ORDERS.0);
+            });
+            if FLAG.load(ORDERS.1) == 1 {
+                let _ = unsafe { std::ptr::read_volatile(DATA.0.get()) };
+            }
+            let _ = w.join();
+            0
+        }
+        EOF
+        genmc -- -Copt-level=1 mp.rs | tee ok.log
+        grep -F "No errors were detected." ok.log
+
+        rc=0
+        genmc -- -Copt-level=1 --cfg weak mp.rs > bad.log 2>&1 || rc=$?
+        cat bad.log
+        test "$rc" -eq 42
+        grep -F "Non-atomic race!" bad.log

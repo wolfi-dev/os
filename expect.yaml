@@ -1,0 +1,231 @@
+package:
+  name: expect
+  version: "6.0_alpha2"
+  epoch: 1
+  description: Tcl-based tool for automating interactive terminal programs, providing the expect interpreter and the Expect Tcl extension
+  copyright:
+    - license: LicenseRef-Public-Domain
+      license-path: license.terms
+  dependencies:
+    runtime:
+      - tcl
+
+vars:
+  glibc-version: "2.44"
+
+var-transforms:
+  - from: ${{package.version}}
+    match: _alpha
+    replace: a
+    to: mangled-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - glibc-${{vars.glibc-version}}-dev
+      - tcl
+      - tcl-dev
+
+pipeline:
+  # The aeruder/expect mirror and the 5.45.x releases only build against
+  # Tcl 8; Wolfi ships Tcl 9 only, so this uses the Tcl 9 port of Expect.
+  - uses: git-checkout
+    with:
+      repository: https://github.com/tcltk-depot/expect
+      tag: v${{vars.mangled-version}}
+      expected-commit: 9827f26781d5f2f16444434ef4ee587674c20120
+
+  # Legacy K&R-style prototypes fail under GCC's C23 default.
+  - uses: autoconf/configure
+    with:
+      opts: |
+        --with-tcl=/usr/lib \
+        --with-tclinclude=/usr/include \
+        --enable-shared \
+        CFLAGS="${CFLAGS} -std=gnu17"
+
+  - uses: autoconf/make
+
+  # Tk-only helper scripts (tkpasswd, xkibitz, tknewsbiff, multixterm) are
+  # dropped from the upstream SCRIPTS list because Tk is not packaged.
+  # TCLSH_ENV is cleared so tclsh does not look for Tcl's source tree.
+  - runs: |
+      make install \
+        DESTDIR="${{targets.destdir}}" \
+        TCLSH_ENV= \
+        SCRIPTS="timed-run timed-read ftp-rfc autopasswd lpunlock weather passmass rftp kibitz rlogin-cwd xpstat dislocate unbuffer mkpasswd cryptdir decryptdir autoexpect" \
+        SCRIPTS_MANPAGES="kibitz dislocate unbuffer mkpasswd passmass cryptdir decryptdir autoexpect"
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: Development headers for ${{package.name}}
+    dependencies:
+      runtime:
+        - ${{package.name}}
+    pipeline:
+      - uses: split/dev
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - tcl-dev
+      pipeline:
+        - uses: test/tw/devpackage
+        - name: Compile against the Expect C headers
+          runs: |
+            cat > /tmp/exp-hdr.c <<'EOF'
+            #include <expect.h>
+            #include <stdio.h>
+            int main(void) {
+                void *spawn = (void *)exp_spawnl;
+                printf("%p %d\n", spawn, exp_timeout);
+                return 0;
+            }
+            EOF
+            gcc -c /tmp/exp-hdr.c -o /tmp/exp-hdr.o
+            nm /tmp/exp-hdr.o | grep -F exp_spawnl
+
+  - name: ${{package.name}}-doc
+    description: Man pages for ${{package.name}}
+    pipeline:
+      - uses: split/manpages
+    test:
+      pipeline:
+        - uses: test/tw/docs
+
+update:
+  enabled: true
+  version-transform:
+    - match: a
+      replace: _alpha
+  github:
+    identifier: tcltk-depot/expect
+    strip-prefix: v
+    use-tag: true
+
+capabilities:
+  add:
+    - CAP_SYS_ADMIN
+
+test:
+  environment:
+    environment:
+      # Tcl 9.1 searches only /usr/lib/tcl9.1 for init.tcl, but the tcl package
+      # ships its script library in /usr/library; CI showed Tcl_Init failing.
+      TCL_LIBRARY: /usr/library
+  pipeline:
+    - uses: test/tw/ldd-check
+    # No help-check: expect's getopt string defines no help option, so any help
+    # request falls through to its usage error and exits 1.
+    # No ver-check: CI showed "expect -v" exiting 1 on this Tcl 9 port, so the
+    # version is read from the interpreter's exp_version command instead.
+    - name: Interpreter reports the packaged Expect version
+      runs: |
+        out=$(expect -c 'puts "version:[exp_version]"')
+        echo "$out"
+        echo "$out" | grep -F "version:${{vars.mangled-version}}"
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/expect
+    - name: Drive an interactive prompt with spawn/expect/send
+      runs: |
+        cat > /tmp/dialog.sh <<'EOF'
+        printf 'Name: '
+        read name
+        echo "Hello, $name"
+        EOF
+        cat > /tmp/drive.exp <<'EOF'
+        set timeout 10
+        spawn sh /tmp/dialog.sh
+        expect {
+          "Name: " { send "chainguard\r" }
+          timeout { puts "TIMEOUT waiting for prompt"; exit 1 }
+        }
+        expect {
+          "Hello, chainguard" { puts "DIALOG-OK" }
+          timeout { puts "TIMEOUT waiting for reply"; exit 2 }
+        }
+        expect eof
+        # wait returns {pid spawn_id os_error status}; propagate the child's status.
+        exit [lindex [wait] 3]
+        EOF
+        expect /tmp/drive.exp > /tmp/drive.out
+        cat /tmp/drive.out
+        grep -F "DIALOG-OK" /tmp/drive.out
+    - name: Capture regexp submatches through expect_out
+      runs: |
+        out=$(expect -c 'set timeout 10; spawn echo build-id=4242; expect -re {build-id=([0-9]+)} { puts "captured:$expect_out(1,string)" } timeout { exit 1 }')
+        echo "$out"
+        echo "$out" | grep -F "captured:4242"
+    - name: Propagate a timeout when the pattern never appears
+      runs: |
+        # CI showed a spawned cat hitting EOF on its pty at once; tail -f on
+        # /dev/null ignores stdin and prints nothing, so only the timeout branch
+        # can fire.
+        # CI showed expect exiting 1 at teardown while the spawned child was
+        # still alive, so the timeout branch kills and reaps it, and the exit
+        # status is recorded rather than aborting before the output check.
+        # CI showed the branch's piped stdout being dropped by the explicit exit
+        # (status 0, no output), so the branch result is written to a file that
+        # is closed, and therefore flushed, before exiting.
+        # Expect reads a braced pattern list with no newline as one literal
+        # pattern (CI showed no branch firing), so the block spans lines.
+        rc=0
+        rm -f /tmp/timeout.out
+        cat > /tmp/timeout.exp <<'EOF'
+        set timeout 2
+        spawn tail -f /dev/null
+        expect {
+          "never-printed" { set r MATCHED }
+          eof { set r EOF-BEFORE-TIMEOUT }
+          timeout { set r TIMED-OUT; exec kill [exp_pid]; catch close; catch wait }
+        }
+        set f [open /tmp/timeout.out w]
+        puts $f $r
+        close $f
+        exit 0
+        EOF
+        out=$(expect /tmp/timeout.exp 2>&1) || rc=$?
+        echo "$out"
+        echo "expect exit status: $rc"
+        cat /tmp/timeout.out
+        grep -Fx "TIMED-OUT" /tmp/timeout.out
+    - name: Load the Expect extension into tclsh
+      runs: |
+        cat > /tmp/load.tcl <<'EOF'
+        lappend auto_path /usr/lib
+        set v [package require Expect]
+        puts "loaded:$v"
+        set timeout 10
+        spawn echo from-tclsh
+        expect {
+          "from-tclsh" { puts "TCLSH-SPAWN-OK" }
+          timeout { exit 1 }
+        }
+        EOF
+        stat /usr/lib/expect${{vars.mangled-version}}/pkgIndex.tcl
+        tclsh /tmp/load.tcl > /tmp/load.out
+        cat /tmp/load.out
+        grep -F "loaded:${{vars.mangled-version}}" /tmp/load.out
+        grep -F "TCLSH-SPAWN-OK" /tmp/load.out
+    - name: unbuffer runs the command on a pseudo-terminal
+      runs: |
+        out=$(unbuffer sh -c 'if [ -t 1 ]; then echo is-a-tty; else echo not-a-tty; fi' | cat)
+        echo "$out"
+        echo "$out" | grep -F "is-a-tty"
+    - name: mkpasswd generates a password of the requested length
+      runs: |
+        pw=$(mkpasswd -l 16 -d 3)
+        echo "generated: $pw"
+        [ "${#pw}" -eq 16 ]
+        digits=$(printf '%s' "$pw" | tr -cd '0-9' | wc -c)
+        [ "$digits" -ge 3 ]
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        min-coverage: 90

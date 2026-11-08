@@ -1,7 +1,7 @@
 package:
   name: tcl
   version: "9.1.0"
-  epoch: 2 # upstream-tests/make-check
+  epoch: 3 # --disable-zipfs: install the script library to /usr/lib/tcl9.1
   description: The Tcl scripting language
   copyright:
     - license: TCL
@@ -29,6 +29,12 @@ pipeline:
       expected-sha256: 536c45543f64d6eb11832d97ba3494aacff046fbc5040273bd55258d0e448ff1
       uri: https://downloads.sourceforge.net/project/tcl/Tcl/${{package.version}}/tcl${{package.version}}-src.tar.gz
 
+  # zipfs is disabled: Tcl 9's default build appends the script library to
+  # libtcl9.1.so as a zip archive, and the strip step drops everything after
+  # the ELF sections, so the shipped library had no init.tcl and Tcl_Init
+  # failed in every program embedding libtcl. With zipfs off, make install
+  # puts the library in /usr/lib/tcl9.1, the path libtcl looks in (as
+  # Debian's tcl9.0 does).
   - uses: autoconf/configure
     with:
       dir: unix
@@ -40,7 +46,8 @@ pipeline:
         --mandir=/usr/share/man \
         --localstatedir=/var \
         --with-system-sqlite \
-        --enable-64bit
+        --enable-64bit \
+        --disable-zipfs
 
   - runs: |
       # Set LD_LIBRARY_PATH so that tclsh can find libtcl9.0.so when
@@ -92,9 +99,45 @@ subpackages:
         - tzdata
     description: tcl dev
     test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - pkgconf
       pipeline:
         - uses: test/tw/devpackage
         - uses: test/pkgconf
+        # Embedders are what broke when the zipfs archive was stripped from
+        # libtcl: Tcl_Init returned TCL_ERROR ("Cannot find a usable
+        # init.tcl"). tclsh only prints that and carries on, so check an
+        # embedding program directly.
+        - name: "An embedding program's Tcl_Init finds the script library"
+          runs: |
+            unset TCL_LIBRARY
+            cat > /tmp/embed.c <<'EOF'
+            #include <stdio.h>
+            #include <tcl.h>
+            int main(int argc, char **argv) {
+                (void)argc;
+                Tcl_FindExecutable(argv[0]);
+                Tcl_Interp *interp = Tcl_CreateInterp();
+                if (Tcl_Init(interp) != TCL_OK) {
+                    fprintf(stderr, "Tcl_Init failed: %s\n", Tcl_GetStringResult(interp));
+                    return 1;
+                }
+                if (Tcl_Eval(interp, "package require http") != TCL_OK) {
+                    fprintf(stderr, "package require http failed: %s\n", Tcl_GetStringResult(interp));
+                    return 2;
+                }
+                printf("embed-ok %s\n", Tcl_GetVar(interp, "tcl_library", TCL_GLOBAL_ONLY));
+                return 0;
+            }
+            EOF
+            gcc -o /tmp/embed /tmp/embed.c $(pkg-config --cflags --libs tcl)
+            mm=$(echo "${{package.version}}" | cut -d. -f1,2)
+            /tmp/embed > /tmp/embed.out
+            cat /tmp/embed.out
+            grep -Fx "embed-ok /usr/lib/tcl${mm}" /tmp/embed.out
 
 update:
   enabled: true
@@ -117,3 +160,32 @@ test:
       runs: |
         echo 'puts "Hello, Tcl!"; exit 0' | tclsh | grep -F "Hello, Tcl!"
     - uses: test/tw/ldd-check
+    # tclsh keeps running after a failed Tcl_Init (Tcl_MainEx prints
+    # "application-specific initialization failed" and continues), so the
+    # checks above pass even when the script library is missing. This one
+    # fails unless Tcl_Init finds init.tcl in /usr/lib/tcl9.1 on its own.
+    - name: "Tcl_Init finds the script library without TCL_LIBRARY"
+      runs: |
+        unset TCL_LIBRARY
+        mm=$(echo "${{package.version}}" | cut -d. -f1,2)
+        if [ ! -f "/usr/lib/tcl${mm}/init.tcl" ]; then
+          echo "FAIL: /usr/lib/tcl${mm}/init.tcl is missing"
+          exit 1
+        fi
+        cat > /tmp/init-check.tcl <<'EOF'
+        package require http
+        puts "tcl_library=[info library] http=[package present http]"
+        EOF
+        rc=0
+        tclsh /tmp/init-check.tcl > /tmp/init-check.out 2> /tmp/init-check.err || rc=$?
+        cat /tmp/init-check.out
+        cat /tmp/init-check.err
+        if grep -F "application-specific initialization failed" /tmp/init-check.err; then
+          echo "FAIL: tclsh could not run Tcl_Init"
+          exit 1
+        fi
+        if [ "$rc" -ne 0 ]; then
+          echo "FAIL: tclsh exited $rc"
+          exit 1
+        fi
+        grep -E "^tcl_library=/usr/lib/tcl${mm} http=[0-9]" /tmp/init-check.out

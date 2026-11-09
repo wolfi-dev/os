@@ -246,10 +246,10 @@ $(dbg_targets): debug/%: cache $(KEY) $(QEMU_KERNEL_DEP)
 # /etc/apk/repositories provides the presubmit repo instead.
 define stage_local_packages
 	@if [ -f ./$(1)/apko.yaml ]; then \
-		ls ./packages/$(ARCH)/$(1)-*.apk >/dev/null 2>&1 || { echo "ERROR: $(1) has apko.yaml (in-test docker+apko) but no built apks in packages/$(ARCH)/; run 'make package/$(1)' first" >&2; exit 1; }; \
+		ls $(REPO)/$(ARCH)/$(1)-*.apk >/dev/null 2>&1 || { echo "ERROR: $(1) has apko.yaml (in-test docker+apko) but no built apks in $(REPO)/$(ARCH)/; run 'make package/$(1)' first" >&2; exit 1; }; \
 		printf "Staging local apks into ./%s/local-packages\n" "$(1)"; \
 		rm -rf ./$(1)/local-packages; mkdir -p ./$(1)/local-packages/$(ARCH); \
-		cp ./packages/$(ARCH)/$(1)-*.apk ./$(1)/local-packages/$(ARCH)/; \
+		cp $(REPO)/$(ARCH)/$(1)-*.apk ./$(1)/local-packages/$(ARCH)/; \
 		$(MELANGE) index --signing-key $(KEY) -o ./$(1)/local-packages/$(ARCH)/APKINDEX.tar.gz ./$(1)/local-packages/$(ARCH)/*.apk >/dev/null; \
 	fi
 endef
@@ -393,9 +393,12 @@ check-bootstrap:
 		--keyring-append $(BOOTSTRAP_KEY) \
 		--repository-append $(BOOTSTRAP_REPO)
 
+# Download to a temporary file named after the shell's PID, then rename it into
+# place, so parallel makes (rdep-test workers, say) fetching the same file do
+# not move each other's download away.
 authget = tok=$$(chainctl auth token --audience=$(1)) || \
 	{ echo "failed token from $(1) for target $@"; exit 1; }; \
 	mkdir -p $$(dirname $(2)) && \
 	echo "auth-download[$(1)] to $(2) from $(3)" && \
-	curl --fail -LS --silent -o $(2).tmp --user "user:$$tok" $(3) && \
-	mv "$(2).tmp" "$(2)"
+	curl --fail -LS --silent -o "$(2).tmp.$$$$" --user "user:$$tok" $(3) && \
+	mv "$(2).tmp.$$$$" "$(2)" || { rm -f "$(2).tmp.$$$$"; exit 1; }

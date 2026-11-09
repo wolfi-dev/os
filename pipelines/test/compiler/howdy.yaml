@@ -1,0 +1,108 @@
+name: howdy compile-and-run test
+
+description: |
+  Compiles and runs one language's howdy-yall hello program against the
+  toolchain installed in the test environment, with upstream's own rule and
+  test runner from the howdy-yall-src package:
+
+    make <lang>
+    sh tests/howdy-test.sh <lang>
+
+  It works in a temporary copy of /usr/share/howdy-yall/src, so the installed
+  tree stays read-only, and removes the copy when it finishes.
+
+  The pipeline adds only howdy-yall-src, make and busybox. The calling
+  package provides the toolchain under test in its test environment:
+    asm      binutils (as and ld, on x86_64 and aarch64)
+    c        gcc (which pulls in binutils and glibc-dev)
+    cpp      gcc (g++; it pulls in libstdc++-dev)
+    fortran  gfortran
+    vala     vala, gcc, glib-dev, pkgconf
+    zig      zig
+  The other languages in tests/howdy-test.sh work the same way. Its table
+  names the build tool and the run-time tool each one needs.
+
+  The step fails if:
+    - make <lang> fails (for example, a missing compiler),
+    - the runner exits non-zero or reports "not ok",
+    - the runner reports the language as a SKIP. A SKIP means the toolchain
+      is absent, which is a caller error in a toolchain's own test.
+
+  Streams make's output and the runner's TAP and automake summary, then:
+    HOWDY <package> <lang>: pass=<n> fail=<n> skip=<n>
+    HOWDY <package> <lang>: FAILED: <reason>      (on failure)
+  These are not UPSTREAM-TESTS lines on purpose: those report a package's
+  own upstream test suite, and a howdy hello program is not that.
+
+  Example:
+    test:
+      environment:
+        contents:
+          packages:
+            - zig
+      pipeline:
+        - uses: test/compiler/howdy
+          with:
+            lang: zig
+
+needs:
+  packages:
+    - busybox
+    - howdy-yall-src
+    - make
+
+inputs:
+  lang:
+    description: |
+      The howdy-yall language to build and run: its make target and its
+      name in tests/howdy-test.sh (for example asm, c, cpp, fortran, vala
+      or zig).
+    required: true
+
+pipeline:
+  - name: Compile and run the howdy ${{inputs.lang}} program
+    runs: |
+      lang="${{inputs.lang}}"
+      pkg="${{context.name}}"
+      src=/usr/share/howdy-yall/src
+      fail() {
+        echo "HOWDY ${pkg} ${lang}: FAILED: $*"
+        exit 1
+      }
+
+      case "$lang" in
+        "" | *[!a-z0-9]*) fail "lang must be a single howdy-yall language name, not '$lang'" ;;
+      esac
+      [ -f "$src/Makefile" ] && [ -f "$src/tests/howdy-test.sh" ] ||
+        fail "$src lacks the Makefile or tests/howdy-test.sh"
+
+      work=$(mktemp -d)
+      trap 'rm -rf "$work"' EXIT
+      cp -R "$src/." "$work/"
+      chmod -R u+w "$work"
+      cd "$work"
+
+      rc=0
+      make "$lang" || rc=$?
+      [ "$rc" -eq 0 ] ||
+        fail "make $lang exited $rc; does the test environment provide the $lang toolchain?"
+
+      rc=0
+      sh tests/howdy-test.sh "$lang" > tap.log 2>&1 || rc=$?
+      cat tap.log
+
+      set -- $(awk '
+        /^ok [0-9]+ - .* # SKIP/ { s++; next }
+        /^ok [0-9]+ - /          { p++; next }
+        /^not ok [0-9]+ - /      { f++ }
+        END { printf "%d %d %d\n", p, f, s }' tap.log)
+      pass=$1 failed=$2 skipped=$3
+      echo "HOWDY ${pkg} ${lang}: pass=$pass fail=$failed skip=$skipped"
+
+      if [ "$skipped" -ne 0 ]; then
+        fail "the runner skipped $lang ($(sed -n 's/.*# SKIP //p' tap.log)): add its toolchain to the test environment"
+      fi
+      if [ "$rc" -ne 0 ] || [ "$failed" -ne 0 ]; then
+        fail "tests/howdy-test.sh $lang exited $rc with $failed not ok"
+      fi
+      [ "$pass" -eq 1 ] || fail "expected one passing test, found $pass"

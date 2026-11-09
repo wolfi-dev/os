@@ -1,0 +1,345 @@
+package:
+  name: zlib-ng-compat-mode
+  version: "2.3.3"
+  epoch: 4 # move to os/ (wolfi tier)
+  description: zlib data compression library for the next generation systems
+  copyright:
+    - license: Zlib
+  options:
+    # Built with ZLIB_COMPAT=ON, zlib-ng ships the SAME soname and pkg-config
+    # module as the stock `zlib` package (so:libz.so.1, pc:zlib). Melange's
+    # SCA would auto-generate those provides at versions that outrank zlib:
+    #   * so:libz.so.1 is versioned by the soname major ("1") for both, a tie
+    #     that apk then breaks on package version -> zlib-ng 2.x beats zlib 1.x
+    #   * pc:zlib is versioned by the package version -> 2.x beats zlib's 1.x
+    # Either one makes zlib-ng silently displace zlib for anything depending on
+    # so:libz.so.1 / pc:zlib. Suppress the auto provides here and re-declare
+    # them at a deliberately low 0.x version under dependencies.provides so
+    # stock zlib always wins provider selection; zlib-ng only satisfies those
+    # names when it is the package actually installed (opt-in drop-in).
+    no-provides: true
+  dependencies:
+    provides:
+      - so:libz.so.1=0.${{package.version}}
+      - zlib=0.${{package.version}}
+    # Own the shared files (libz.so*) when installed in place of zlib.
+    replaces:
+      - zlib
+  resources:
+    cpu: "1"
+    memory: 2Gi
+  test-resources:
+    cpu: "1"
+    memory: 4Gi
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - glibc-2.44-dev
+      - samurai
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 12731092979c6d07f42da27da673a9f6c7b13586
+      repository: https://github.com/zlib-ng/zlib-ng
+      tag: ${{package.version}}
+
+  # ZLIB_COMPAT=ON builds zlib-ng as a drop-in for stock zlib: libz.so
+  # (SONAME libz.so.1), zlib.h and zlib.pc with the standard zlib symbols,
+  # substituting for (not co-installable with) the `zlib` package.
+  # WITH_NATIVE_INSTRUCTIONS=OFF keeps the build portable, relying on
+  # zlib-ng's runtime CPU detection. BUILD_SHARED_LIBS is left undefined so
+  # both the shared and static libraries are built (setting it ON = shared
+  # only). Other defaults (install dirs, Release, WITH_GZFILEOP/OPTIM/...)
+  # come from cmake/configure.
+  - uses: cmake/configure
+    with:
+      opts: |
+        -DZLIB_COMPAT=ON \
+        -DWITH_NATIVE_INSTRUCTIONS=OFF \
+        -DBUILD_TESTING=OFF
+
+  - uses: cmake/build
+
+  - uses: cmake/install
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-static
+    description: zlib-ng static library
+    pipeline:
+      - uses: split/static
+    dependencies:
+      replaces:
+        - zlib-static
+    test:
+      pipeline:
+        - uses: test/tw/staticpackage
+
+  - name: ${{package.name}}-dev
+    description: zlib-ng development headers
+    pipeline:
+      - uses: split/dev
+    dependencies:
+      replaces:
+        - zlib-dev
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+    test:
+      environment:
+        contents:
+          packages:
+            - zlib-ng-compat-mode-dev
+      pipeline:
+        - uses: test/tw/devpackage
+        - uses: test/tw/header-check
+        - uses: test/pkgconf
+        - uses: test/tw/ldd-check
+        - name: Compile and link against libz (zlib-compat) via pkg-config
+          runs: |
+            set -euo pipefail
+            # In ZLIB_COMPAT mode zlib-ng exposes the standard zlib API
+            # (zlib.h, compress/uncompress, zlibVersion) through the `zlib`
+            # pkg-config module, so this compiles exactly like stock zlib.
+            tee zngtest.c <<'EOF'
+            #include <zlib.h>
+            #include <string.h>
+            #include <stdio.h>
+            int main(void) {
+                const char *in = "the quick brown fox jumps over the lazy dog";
+                Bytef comp[256];
+                Bytef out[256];
+                uLongf cl = sizeof(comp);
+                uLongf ol = sizeof(out);
+                if (compress(comp, &cl, (const Bytef *)in, (uLong)strlen(in) + 1) != Z_OK) {
+                    fprintf(stderr, "compress failed\n");
+                    return 1;
+                }
+                if (uncompress(out, &ol, comp, cl) != Z_OK) {
+                    fprintf(stderr, "uncompress failed\n");
+                    return 2;
+                }
+                if (strcmp((char *)out, in) != 0) {
+                    fprintf(stderr, "round-trip mismatch: %s\n", (char *)out);
+                    return 3;
+                }
+                printf("zlib version: %s\n", zlibVersion());
+                return 0;
+            }
+            EOF
+            zlib_cflags="$(pkg-config --cflags zlib)"
+            zlib_libs="$(pkg-config --libs zlib)"
+            # shellcheck disable=SC2086  # pkg-config flags must word-split
+            gcc ${zlib_cflags} zngtest.c ${zlib_libs} -o zngtest
+            # set -e drives pass/fail on the exit code; only reach the final
+            # printf if compress/uncompress and the round-trip all succeeded.
+            ./zngtest | tee zngtest.out
+            grep -F "zlib version:" zngtest.out
+
+test:
+  environment:
+    contents:
+      packages:
+        - build-base
+        - pkgconf
+        - zlib-ng-compat-mode-dev
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: SONAME and NEEDED metadata check
+      runs: |
+        set -euo pipefail
+        # Confirm the installed shared object exports the expected SONAME
+        # and links only against libc (a self-contained compression library).
+        # In zlib-compat mode the SONAME is the stock zlib libz.so.1.
+        soname=$(readelf -d /usr/lib/libz.so | awk -F'[][]' '/SONAME/ {print $2}')
+        echo "SONAME: ${soname}"
+        echo "${soname}" | grep -E '^libz\.so\.'
+
+        # libc must be present in NEEDED. The dynamic linker (ld-linux-*.so)
+        # also legitimately appears on some arches, so assert on libc.
+        readelf -d /usr/lib/libz.so | awk -F'[][]' '/NEEDED/ {print $2}' > needed.txt
+        cat needed.txt
+        grep -E '^libc(\.|-)' needed.txt
+    - name: Wide API test
+      runs: |
+        set -euo pipefail
+        # zlib-ng is a shared-library package; the installed APK ships
+        # libz.so plus the static libz.a, not CLI utilities. In zlib-compat
+        # mode the public ABI is the stock zlib API, so exercise it end-to-end
+        # against the installed shared library. This is the installed-package
+        # analogue of the upstream ctest suite (test_compress, gzio, infcover).
+        tee wide.c <<'EOF'
+        #include <zlib.h>
+        #include <string.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        static const char *SAMPLE =
+            "the quick brown fox jumps over the lazy dog. "
+            "pack my box with five dozen liquor jugs. "
+            "how vexingly quick daft zebras jump!";
+
+        /* One-shot compress/uncompress round trip at a given level. */
+        static int test_oneshot(int level) {
+            uLong in_len = (uLong)strlen(SAMPLE) + 1;
+            uLong bound = compressBound(in_len);
+            Bytef *comp = malloc(bound);
+            Bytef *out = malloc(in_len);
+            uLongf cl = bound, ol = in_len;
+            int rc = 1;
+
+            if (compress2(comp, &cl, (const Bytef *)SAMPLE, in_len, level) != Z_OK) goto done;
+            if (uncompress(out, &ol, comp, cl) != Z_OK) goto done;
+            if (ol != in_len || memcmp(out, SAMPLE, in_len) != 0) goto done;
+            printf("oneshot level %d: %lu -> %lu bytes OK\n", level, in_len, cl);
+            rc = 0;
+        done:
+            free(comp);
+            free(out);
+            return rc;
+        }
+
+        /* Streaming deflate/inflate through the z_stream API. */
+        static int test_stream(void) {
+            uLong in_len = (uLong)strlen(SAMPLE) + 1;
+            Bytef comp[1024];
+            Bytef out[1024];
+            z_stream ds, is;
+
+            memset(&ds, 0, sizeof(ds));
+            if (deflateInit2(&ds, Z_BEST_COMPRESSION, Z_DEFLATED, 15, 8,
+                             Z_DEFAULT_STRATEGY) != Z_OK) return 1;
+            ds.next_in = (Bytef *)SAMPLE;
+            ds.avail_in = (uInt)in_len;
+            ds.next_out = comp;
+            ds.avail_out = sizeof(comp);
+            if (deflate(&ds, Z_FINISH) != Z_STREAM_END) { deflateEnd(&ds); return 2; }
+            uInt clen = sizeof(comp) - ds.avail_out;
+            deflateEnd(&ds);
+
+            memset(&is, 0, sizeof(is));
+            if (inflateInit(&is) != Z_OK) return 3;
+            is.next_in = comp;
+            is.avail_in = clen;
+            is.next_out = out;
+            is.avail_out = sizeof(out);
+            if (inflate(&is, Z_FINISH) != Z_STREAM_END) { inflateEnd(&is); return 4; }
+            inflateEnd(&is);
+
+            if (memcmp(out, SAMPLE, in_len) != 0) return 5;
+            printf("stream deflate/inflate: %lu -> %u bytes OK\n", in_len, clen);
+            return 0;
+        }
+
+        /* Round trip using a preset dictionary. */
+        static int test_dictionary(void) {
+            const char *dict = "brown fox lazy dog liquor jugs zebras";
+            uLong in_len = (uLong)strlen(SAMPLE) + 1;
+            Bytef comp[1024];
+            Bytef out[1024];
+            z_stream ds, is;
+
+            memset(&ds, 0, sizeof(ds));
+            if (deflateInit(&ds, Z_DEFAULT_COMPRESSION) != Z_OK) return 1;
+            if (deflateSetDictionary(&ds, (const Bytef *)dict,
+                                     (uInt)strlen(dict)) != Z_OK) { deflateEnd(&ds); return 2; }
+            ds.next_in = (Bytef *)SAMPLE;
+            ds.avail_in = (uInt)in_len;
+            ds.next_out = comp;
+            ds.avail_out = sizeof(comp);
+            if (deflate(&ds, Z_FINISH) != Z_STREAM_END) { deflateEnd(&ds); return 3; }
+            uInt clen = sizeof(comp) - ds.avail_out;
+            deflateEnd(&ds);
+
+            memset(&is, 0, sizeof(is));
+            if (inflateInit(&is) != Z_OK) return 4;
+            is.next_in = comp;
+            is.avail_in = clen;
+            is.next_out = out;
+            is.avail_out = sizeof(out);
+            int rc = inflate(&is, Z_FINISH);
+            if (rc == Z_NEED_DICT) {
+                if (inflateSetDictionary(&is, (const Bytef *)dict,
+                                         (uInt)strlen(dict)) != Z_OK) { inflateEnd(&is); return 5; }
+                rc = inflate(&is, Z_FINISH);
+            }
+            inflateEnd(&is);
+            if (rc != Z_STREAM_END || memcmp(out, SAMPLE, in_len) != 0) return 6;
+            printf("dictionary round trip: %lu -> %u bytes OK\n", in_len, clen);
+            return 0;
+        }
+
+        /* gzip file write/read via the gzFile API. */
+        static int test_gzfile(void) {
+            const char *path = "sample.gz";
+            gzFile gz = gzopen(path, "wb9");
+            if (!gz) return 1;
+            if (gzputs(gz, SAMPLE) < 0) { gzclose(gz); return 2; }
+            if (gzclose(gz) != Z_OK) return 3;
+
+            char buf[1024] = {0};
+            gz = gzopen(path, "rb");
+            if (!gz) return 4;
+            char *line = gzgets(gz, buf, sizeof(buf));
+            gzclose(gz);
+            if (!line) return 5;
+            /* SAMPLE has no newline, so gzgets returns the whole string. */
+            if (strncmp(buf, "the quick brown fox", 19) != 0) return 6;
+            printf("gzfile write/read: %zu bytes written OK\n", strlen(SAMPLE));
+            return 0;
+        }
+
+        /* Checksums. */
+        static int test_checksums(void) {
+            uInt len = (uInt)strlen(SAMPLE);
+            uLong a = adler32(0, NULL, 0);
+            a = adler32(a, (const Bytef *)SAMPLE, len);
+            uLong c = crc32(0, NULL, 0);
+            c = crc32(c, (const Bytef *)SAMPLE, len);
+            if (a == 0 || c == 0) return 1;
+            printf("checksums: adler32=%08lx crc32=%08lx OK\n", a, c);
+            return 0;
+        }
+
+        int main(void) {
+            printf("zlib version: %s\n", zlibVersion());
+            if (test_oneshot(1)) { fprintf(stderr, "oneshot(1) failed\n"); return 10; }
+            if (test_oneshot(6)) { fprintf(stderr, "oneshot(6) failed\n"); return 11; }
+            if (test_oneshot(9)) { fprintf(stderr, "oneshot(9) failed\n"); return 12; }
+            if (test_stream())   { fprintf(stderr, "stream failed\n");     return 13; }
+            if (test_dictionary()) { fprintf(stderr, "dictionary failed\n"); return 14; }
+            if (test_gzfile())   { fprintf(stderr, "gzfile failed\n");     return 15; }
+            if (test_checksums()) { fprintf(stderr, "checksums failed\n"); return 16; }
+            printf("ALL zlib API TESTS PASSED\n");
+            return 0;
+        }
+        EOF
+        # Link against the installed shared library via pkg-config; this also
+        # validates that zlib.pc emits usable --cflags/--libs.
+        zlib_cflags="$(pkg-config --cflags zlib)"
+        zlib_libs="$(pkg-config --libs zlib)"
+        # shellcheck disable=SC2086  # pkg-config flags must word-split
+        gcc ${zlib_cflags} wide.c ${zlib_libs} -o wide
+        # set -e drives pass/fail on the exit code; the binary returns
+        # non-zero on any failed API check.
+        ./wide | tee wide.out
+        grep -F "ALL zlib API TESTS PASSED" wide.out
+    - uses: test/hardening-check
+      with:
+        package-match: "zlib-ng-compat-mode"
+
+# Monitor GitHub Releases (not tags): zlib-ng cuts a Release for every
+# version and correctly flags RCs/betas with prerelease=true, so the release
+# feed already excludes them. This is more reliable than tag matching, which
+# cannot see the prerelease flag — e.g. the stable-looking "2.2.0" tag is
+# actually a flagged pre-release (its stable is 2.2.1). Release tag names are
+# bare numerics, so tag: ${{package.version}} in git-checkout still resolves.
+update:
+  enabled: true
+  github:
+    identifier: zlib-ng/zlib-ng
+  ignore-regex-patterns:
+    - -rc

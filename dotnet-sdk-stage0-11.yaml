@@ -1,0 +1,248 @@
+package:
+  name: dotnet-sdk-stage0-11
+  version: "11.0.100"
+  epoch: 1
+  description: ".NET SDK ${{vars.major-version}} stage0"
+  copyright:
+    - license: MIT
+  resources:
+    cpu: "16"
+    memory: 64Gi
+  dependencies:
+    runtime:
+      - icu
+  test-resources:
+    cpu: "1"
+    memory: 5Gi
+
+vars:
+  llvm-version: '23'
+  openssl-version: "4.0"
+  prefix: 'usr/share/dotnet'
+
+var-transforms:
+  - from: ${{package.version}}
+    match: ^(\d+)\.\d+\.\d+.*$
+    replace: "$1"
+    to: major-version
+
+environment:
+  environment:
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    CFLAGS: "-Wno-error=used-but-marked-unused"
+  contents:
+    packages:
+      - bash
+      - brotli-dev
+      - busybox
+      - clang-${{vars.llvm-version}}
+      - cmake
+      - curl
+      - file
+      - glibc-2.44-dev
+      # The VMR packs its tarballs with GNU-only `tar --owner/--group`;
+      # busybox tar rejects them.
+      - gnutar
+      - icu-dev
+      - krb5-dev
+      - libunwind-dev
+      - lttng-ust-dev
+      - make
+      - openssl-hardened-${{vars.openssl-version}}-dev
+      - python3
+      - rapidjson-dev
+      - samurai # ninja: the 11.0 runtime build requires it (build-runtime.sh prerequisites)
+      - zlib-dev
+      - zstd-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/dotnet/dotnet
+      tag: v${{package.version}}
+      expected-commit: 297acf930fb0f5c07fd4e51d78e521b4ad2e5d1f
+
+  # The release manifest dotnet/dotnet publishes with each tag. Its
+  # officialBuildId is the id Microsoft built this tag with; build.sh needs it
+  # to stamp real versions instead of the -dev / 42.42.42.42424 placeholders
+  # (see dotnet-11). A bootstrap seed needs them in particular: the band built
+  # on this SDK inherits its runtime version as BundledNETCoreAppPackageVersion.
+  # The package updater refreshes this checksum on every version bump, like
+  # any other fetch.
+  - uses: fetch # blocked-extract-false: release metadata (release.json), not source
+    with:
+      uri: https://github.com/dotnet/dotnet/releases/download/v${{package.version}}/release.json
+      expected-sha256: 007b0ad9b0cf567e35fab4db99fd01310e906e8566f57b437141ca314edc30cd
+      extract: false
+
+  - name: Check release.json describes this checkout
+    runs: |
+      python3 - "v${{package.version}}" "$(git rev-parse HEAD)" <<'EOF'
+      import json, sys
+      tag, head = sys.argv[1:]
+      m = json.load(open("release.json"))
+      if (m["tag"], m["sourceVersion"]) != (tag, head):
+          sys.exit(f"release.json is for {m['tag']} at {m['sourceVersion']}, not {tag} at {head}")
+      EOF
+
+  # The OpenSSL 4.0 backports dotnet-sdk-stage0-10 patches into src/runtime
+  # are upstream in 11.0; this build links the system OpenSSL directly.
+  - runs: |
+      # The runtime keeps the lock files of named mutexes (the MSBuild server,
+      # the Roslyn compiler server) in $XDG_RUNTIME_DIR, or under $HOME/.dotnet
+      # when it is unset. HOME is the repository root here, and the VMR's binary
+      # scan (eng/init-detect-binaries.proj) opens every file under that root
+      # exclusively, so a live lock fails the build. Give the runtime its own
+      # runtime directory instead. Set it before prep-source-build.sh: that
+      # script already runs the bootstrap SDK and the same scan.
+      export XDG_RUNTIME_DIR=/tmp/xdg-runtime
+      mkdir -m 0700 -p "$XDG_RUNTIME_DIR"
+
+      # Setup bootstrap .NET SDK
+      ./prep-source-build.sh
+
+      if [ ${{build.arch}} = "aarch64" ]; then
+        # Dotnet does not have support for PAC/BTI which Axion uses
+        # See: https://github.com/dotnet/runtime/pull/110472
+        # EXTRA_${FLAG} is supposed to work, but it doesn't
+        # so directly override the values which is supposedly a no-no
+        # See also: https://github.com/dotnet/runtime/issues/61859
+        export CFLAGS="$CFLAGS -mbranch-protection=none"
+        export CXXFLAGS="-mbranch-protection=none"
+      fi
+
+      # The .NET runtime is built with O0 so we cannot enable FORTIFY_SOURCE
+      sed -i 's/-D_FORTIFY_SOURCE=3//g' /etc/clang-${{vars.llvm-version}}/common.cfg
+
+      # Build .NET. build.sh refuses --release-manifest in a git checkout, so
+      # pass the official build id from release.json itself. System libraries
+      # replace every compression library the runtime vendors (zstd is new in
+      # .NET 11).
+      official_build_id=$(python3 -c 'import json; print(json.load(open("release.json"))["officialBuildId"])')
+      ./build.sh \
+        --clean-while-building \
+        --source-only \
+        --official-build-id "$official_build_id" \
+        -- \
+        /v:minimal \
+        /p:LogVerbosity=minimal \
+        /p:ContinueOnPrebuiltBaselineError=true \
+        /p:MinimalConsoleLogOutput=true \
+        /p:SkipPortableRuntimeBuild=true \
+        /p:UseSystemLibs=+brotli+rapidjson+zlib+libunwind+zstd \
+        /p:OfficialBuilder=Chainguard
+
+      mkdir -p ${{targets.contextdir}}/${{vars.prefix}}/artifacts
+
+      # Install SDK
+      tar xf ./artifacts/assets/Release/dotnet-sdk-${{vars.major-version}}*.tar.gz \
+          -C ${{targets.contextdir}}/${{vars.prefix}}/
+
+      # Install SDK symbols
+      tar xf ./artifacts/assets/Release/dotnet-symbols-sdk-${{vars.major-version}}*.tar.gz \
+            -C ${{targets.contextdir}}/${{vars.prefix}}/
+
+      # Install artifacts
+      tar xf ./artifacts/assets/Release/Private.SourceBuilt.Artifacts.*.tar.gz \
+          -C ${{targets.contextdir}}/${{vars.prefix}}/artifacts
+
+      # Provide host in path
+      mkdir -p ${{targets.contextdir}}/usr/bin
+      ln -s ../share/dotnet/dotnet ${{targets.contextdir}}/usr/bin/dotnet
+
+  - uses: strip
+
+test:
+  environment:
+    contents:
+      packages:
+        - unzip
+  pipeline:
+    - name: Basic .NET command test
+      runs: |
+        dotnet --info
+    - name: Compile and run a simple .NET application
+      runs: |
+        cat <<'EOF' > HelloWorld.cs
+        using System;
+
+        class Program
+        {
+            static void Main()
+            {
+                Console.WriteLine("Hello, World!");
+            }
+        }
+        EOF
+        dotnet new console -o HelloWorldApp --force
+        mv HelloWorld.cs HelloWorldApp/Program.cs
+        dotnet run --project HelloWorldApp | grep -F "Hello, World!"
+    - name: Compile and run a .NET application with arguments
+      runs: |
+        cat <<'EOF' > ArgumentEcho.cs
+        using System;
+
+        class Program
+        {
+            static void Main(string[] args)
+            {
+                Console.WriteLine("Arguments: " + String.Join(", ", args));
+            }
+        }
+        EOF
+        dotnet new console -o ArgumentEchoApp --force
+        mv ArgumentEcho.cs ArgumentEchoApp/Program.cs
+        dotnet run --project ArgumentEchoApp -- arg1 arg2 arg3 | grep -F "Arguments: arg1, arg2, arg3"
+    - uses: test/tw/ldd-check
+    - name: Installed runtime and packs use the system brotli and zstd
+      runs: |
+        d=/${{vars.prefix}}
+        for f in $d/shared/Microsoft.NETCore.App/*/libSystem.IO.Compression.Native.so \
+                 $d/packs/Microsoft.NETCore.App.Host.*/*/runtimes/*/native/singlefilehost \
+                 $d/packs/Microsoft.NETCore.App.Runtime.NativeAOT.*/*/runtimes/*/native/libSystem.IO.Compression.Native.so; do
+          grep -q libbrotlidec.so.1 "$f"
+          grep -q libzstd.so.1 "$f"
+          if grep -aq _ERROR_FORMAT_EXUBERANT_NIBBLE "$f"; then
+            echo "$f still bundles a Brotli decoder" >&2
+            exit 1
+          fi
+        done
+        for a in $d/packs/Microsoft.NETCore.App.Runtime.NativeAOT.*/*/runtimes/*/native/libbrotli*.a \
+                 $d/packs/Microsoft.NETCore.App.Runtime.NativeAOT.*/*/runtimes/*/native/libzstd*.a; do
+          if [ -e "$a" ]; then
+            echo "$a is a vendored compression library" >&2
+            exit 1
+          fi
+        done
+    - name: Runtime packs in the artifacts use the system brotli and zstd
+      runs: |
+        a=/${{vars.prefix}}/artifacts
+        check() {
+          rm -rf nupkg-check
+          mkdir nupkg-check
+          unzip -q -o "$1" "runtimes/*/native/*" -d nupkg-check
+          f=$(echo nupkg-check/runtimes/*/native/"$2")
+          grep -q libbrotlidec.so.1 "$f"
+          grep -q libzstd.so.1 "$f"
+          if grep -aq _ERROR_FORMAT_EXUBERANT_NIBBLE "$f"; then
+            echo "$1: $2 still bundles a Brotli decoder" >&2
+            exit 1
+          fi
+          for g in nupkg-check/runtimes/*/native/libbrotli*.a nupkg-check/runtimes/*/native/libzstd*.a; do
+            if [ -e "$g" ]; then
+              echo "$1 ships the vendored ${g##*/}" >&2
+              exit 1
+            fi
+          done
+        }
+        check $a/Microsoft.NETCore.App.Runtime.wolfi.*[0-9].nupkg libSystem.IO.Compression.Native.so
+        check $a/Microsoft.NETCore.App.Runtime.NativeAOT.wolfi.*[0-9].nupkg libSystem.IO.Compression.Native.so
+        check $a/Microsoft.NETCore.App.Host.wolfi.*[0-9].nupkg singlefilehost
+        check $a/runtime.wolfi.*.Microsoft.NETCore.DotNetAppHost.*[0-9].nupkg singlefilehost
+        rm -rf nupkg-check
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
+    tag-filter-prefix: "v11.0.1"

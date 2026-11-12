@@ -1,0 +1,141 @@
+diff -ruN a/doc/api/cli.md b/doc/api/cli.md
+--- a/doc/api/cli.md	2026-11-12 09:30:38
++++ b/doc/api/cli.md	2026-11-12 10:16:16
+@@ -2092,6 +2092,20 @@
+ Enable extra debug checks for memory leaks in Node.js internals. This is
+ usually only useful for developers debugging Node.js itself.
+ 
++### `--openssl-ca-bundled-fallback`
++
++<!-- YAML
++added: REPLACEME
++-->
++
++In builds configured with `--openssl-use-def-ca-store`, Node.js uses OpenSSL's
++default CA store. With this option, which is the default in such builds, the
++bundled Mozilla CA store is added when OpenSSL has no CA location configured:
++neither `SSL_CERT_FILE` nor `SSL_CERT_DIR` is set and nothing exists at
++OpenSSL's default certificate file or directory. A configured location is
++used as is, even when it is empty. An explicit `--use-openssl-ca` disables
++this behavior, as does `--no-openssl-ca-bundled-fallback`.
++
+ ### `--openssl-config=file`
+ 
+ <!-- YAML
+@@ -3731,6 +3745,7 @@
+ * `--no-strip-types`
+ * `--no-warnings`
+ * `--node-memory-debug`
++* `--openssl-ca-bundled-fallback`
+ * `--openssl-config`
+ * `--openssl-legacy-provider`
+ * `--openssl-shared-config`
+diff -ruN a/src/crypto/crypto_context.cc b/src/crypto/crypto_context.cc
+--- a/src/crypto/crypto_context.cc	2026-11-12 09:30:37
++++ b/src/crypto/crypto_context.cc	2026-11-12 10:16:16
+@@ -1065,7 +1065,39 @@
+ // 8. If users have reset the root cert store by calling
+ //    tls.setDefaultCACertificates(), the store will be populated with
+ //    the certificates provided by users.
++// 9. With --openssl-use-def-ca-store builds, --openssl-ca-bundled-fallback
++//    (on by default, cleared by an explicit --use-openssl-ca) adds the
++//    bundled CA certificates when OpenSSL has no CA location configured:
++//    neither SSL_CERT_FILE nor SSL_CERT_DIR is set and nothing exists at
++//    OpenSSL's default certificate file or directory. A configured, present
++//    or unreadable location is used as is.
+ // TODO(joyeecheung): maybe these rules need a bit of consolidation?
++
++// Whether OpenSSL has a CA location configured. Structural on purpose: it
++// looks at the environment and at the existence of the default paths, not at
++// what X509_STORE_set_default_paths() loaded, because the hash directory
++// lookup loads certificates lazily and an explicitly configured but empty or
++// broken location must not be replaced. Only a definite absence (ENOENT,
++// ENOTDIR) counts as missing; a dangling symlink, a permission error or any
++// other failure counts as present, so an existing store that cannot be read
++// is never replaced by the bundled roots.
++static bool HasOpenSSLCALocation() {
++  std::string value;
++  if (credentials::SafeGetenv(X509_get_default_cert_file_env(), &value) ||
++      credentials::SafeGetenv(X509_get_default_cert_dir_env(), &value)) {
++    return true;
++  }
++  for (const char* path :
++       {X509_get_default_cert_file(), X509_get_default_cert_dir()}) {
++    if (path == nullptr || *path == '\0') continue;
++    uv_fs_t req;
++    int r = uv_fs_lstat(nullptr, &req, path, nullptr);
++    uv_fs_req_cleanup(&req);
++    if (r != UV_ENOENT && r != UV_ENOTDIR) return true;
++  }
++  return false;
++}
++
+ X509_STORE* NewRootCertStore(Environment* env) {
+   X509_STORE* store = X509_STORE_new();
+   CHECK_NOT_NULL(store);
+@@ -1090,9 +1122,12 @@
+ 
+   bool use_system_ca = false;
+   bool ssl_openssl_cert_store = false;
++  bool openssl_ca_bundled_fallback = false;
+   {
+     Mutex::ScopedLock cli_lock(node::per_process::cli_options_mutex);
+     ssl_openssl_cert_store = per_process::cli_options->ssl_openssl_cert_store;
++    openssl_ca_bundled_fallback =
++        per_process::cli_options->openssl_ca_bundled_fallback;
+     if (env != nullptr) {
+       use_system_ca = env->options()->use_system_ca;
+     } else if (per_process::cli_options->per_isolate != nullptr &&
+@@ -1103,6 +1138,14 @@
+   }
+   if (ssl_openssl_cert_store) {
+     CHECK_EQ(1, X509_STORE_set_default_paths(store));
++    if (openssl_ca_bundled_fallback && !HasOpenSSLCALocation()) {
++      per_process::Debug(DebugCategory::CRYPTO,
++                         "No OpenSSL CA location configured, "
++                         "using the bundled CA store\n");
++      for (X509* cert : GetBundledRootCertificates()) {
++        CHECK_EQ(1, X509_STORE_add_cert(store, cert));
++      }
++    }
+   } else {
+     for (X509* cert : GetBundledRootCertificates()) {
+       CHECK_EQ(1, X509_STORE_add_cert(store, cert));
+diff -ruN a/src/node_options.cc b/src/node_options.cc
+--- a/src/node_options.cc	2026-11-12 09:30:36
++++ b/src/node_options.cc	2026-11-12 10:16:16
+@@ -1460,6 +1460,17 @@
+             &PerProcessOptions::ssl_openssl_cert_store);
+   Implies("--use-openssl-ca", "[ssl_openssl_cert_store]");
+   ImpliesNot("--use-bundled-ca", "[ssl_openssl_cert_store]");
++  AddOption("--openssl-ca-bundled-fallback",
++            "with OpenSSL's default CA store, use the bundled CA store when "
++            "no CA location is configured"
++#if defined(NODE_OPENSSL_CERT_STORE)
++            " (default)"
++#endif
++            ,
++            &PerProcessOptions::openssl_ca_bundled_fallback,
++            kAllowedInEnvvar);
++  // An explicit request for OpenSSL's CA store keeps its documented meaning.
++  ImpliesNot("--use-openssl-ca", "--openssl-ca-bundled-fallback");
+   AddOption("--enable-fips",
+             "enable FIPS crypto at startup",
+             &PerProcessOptions::enable_fips_crypto,
+diff -ruN a/src/node_options.h b/src/node_options.h
+--- a/src/node_options.h	2026-11-12 09:30:35
++++ b/src/node_options.h	2026-11-12 10:16:16
+@@ -370,6 +370,13 @@
+ #endif
+   bool use_openssl_ca = false;
+   bool use_bundled_ca = false;
++  // With the OpenSSL CA store as the build default, add the bundled CA store
++  // when no CA location is configured at all. Cleared by --use-openssl-ca.
++#ifdef NODE_OPENSSL_CERT_STORE
++  bool openssl_ca_bundled_fallback = true;
++#else
++  bool openssl_ca_bundled_fallback = false;
++#endif
+   bool enable_fips_crypto = false;
+   bool enable_fips_indicator_events = false;
+   bool force_fips_crypto = false;

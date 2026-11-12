@@ -1,7 +1,7 @@
 package:
   name: docbook-xml
   version: "4.5"
-  epoch: 8 # remove ca-certificates-bundle from build deps
+  epoch: 10 # docbook-xsl from git: -nons for the xsl URLs (fixes indented man page macros), namespaced for xsl-ns
   description: A widely used XML scheme for writing documentation and help
   copyright:
     - license: MIT
@@ -9,9 +9,13 @@ package:
 environment:
   contents:
     packages:
+      - bash
       - build-base
       - busybox
       - libxml2-utils
+      - libxslt
+      - patch
+      - perl
 
 pipeline:
   - uses: fetch
@@ -305,35 +309,87 @@ pipeline:
           "file:///etc/xml/docbook-xml" \
           ${{targets.destdir}}/etc/xml/catalog
 
-  - uses: fetch
+  # The DocBook XSL stylesheets, built from git. Two variants: -nons for
+  # DocBook 4 sources, which use the http://docbook.sourceforge.net/release/xsl/
+  # URLs, and the namespaced stylesheets for DocBook 5, which use xsl-ns/.
+  # This package used to install the namespaced release under the xsl/ URLs,
+  # and DocBook 4 sources rendered through it keep their indentation: every
+  # man page macro came out indented, which roff prints as text (systemd,
+  # samba, shadow, sssd and others).
+  - uses: git-checkout
     with:
-      expected-sha256: 966188d7c05fc76eaca115a55893e643dd01a3486f6368733c9ad974fcee7a26
-      uri: https://github.com/docbook/xslt10-stylesheets/releases/download/release%2F1.79.2/docbook-xsl-1.79.2.tar.gz
+      repository: https://github.com/docbook/xslt10-stylesheets
+      tag: release/1.79.2
+      expected-commit: 135dc12e26b28fa26b2ba55f78edc9741f56acda
+      destination: xslt10-stylesheets
 
-  - uses: patch
-    with:
-      patches: 765567_non-recursive_string_subst.patch
+  - name: build the stylesheets and their -nons variant
+    runs: |
+      cd xslt10-stylesheets
+      # The Makefiles run XSLT through buildtools/xslt, whose xsltproc
+      # wrapper needs Perl's XML::XPath only to read a ~/.xmlc config naming
+      # the xsltproc binary. Call xsltproc directly with the same calling
+      # convention: input style [output] [name=value ...].
+      cat > xslt-shim <<'EOF'
+      #!/bin/sh
+      in=$1 style=$2
+      shift 2
+      out=-
+      if [ $# -gt 0 ]; then
+        case $1 in *=*) ;; *) out=$1; shift ;; esac
+      fi
+      params=
+      for p in "$@"; do
+        params="$params --stringparam ${p%%=*} '${p#*=}'"
+      done
+      if [ "$out" = - ]; then
+        eval exec xsltproc --nonet $params '"$style"' '"$in"'
+      fi
+      eval exec xsltproc --nonet $params '"$style"' '"$in"' '>' '"$out"'
+      EOF
+      chmod +x xslt-shim
+      # Generates the files the release ships but git does not: the
+      # localisations in common/, lib/lib.xsl, the parameter lists and the
+      # title page templates. One make per directory, because upstream's
+      # xsl/Makefile loops over them without stopping on a failure. slides,
+      # extensions and webhelp need trang, javac or ant, and are not
+      # installed.
+      export repo_dir=$PWD
+      for d in common lib html fo manpages htmlhelp javahelp eclipse \
+        roundtrip website xhtml xhtml-1_1 xhtml5 epub3; do
+        make -C xsl/$d XSLTENGINE=xsltproc XSLT="$PWD/xslt-shim"
+      done
+      patch -p1 -d xsl < ../765567_non-recursive_string_subst.patch
+      # The -nons release is generated from the namespaced sources by
+      # upstream's own converter, then relabelled as zip-nons does.
+      perl releasetools/xslnons-build xsl ../xsl-nons
+      sed -i 's|<xsl:param name="DistroName">docbook-xsl</xsl:param>|<xsl:param name="DistroName">docbook-xsl-nons</xsl:param>|' ../xsl-nons/VERSION
+      sed -i 's|<fm:Branch>XSL Stylesheets</fm:Branch>|<fm:Branch>XSL-NS Stylesheets</fm:Branch>|' ../xsl-nons/VERSION
 
   - runs: |
-      _dest=${{targets.destdir}}/usr/share/xml/docbook/xsl-stylesheets-1.79.2
-      install -dm755 "$_dest"
-      install -m644 VERSION VERSION.xsl "$_dest"/
-      ln -s xsl-stylesheets-1.79.2 "${_dest%/*}/xsl-stylesheets"
+      install_tree() {
+        src=$1 _dest=$2
+        install -dm755 "$_dest"
+        install -m644 "$src"/VERSION "$src"/VERSION.xsl "$_dest"/
+        for dir in assembly common eclipse epub epub3 fo highlighting html \
+          htmlhelp javahelp lib manpages params profiling roundtrip \
+          template website xhtml xhtml-1_1 xhtml5; do
 
-      for dir in assembly common eclipse epub epub3 fo highlighting html \
-        htmlhelp javahelp lib manpages params profiling roundtrip \
-        template website xhtml xhtml-1_1 xhtml5; do
-
-        install -dm755 $_dest/$dir
-        for f in $dir/*.xml $dir/*.xsl $dir/*.dtd $dir/*.ent; do
-          [ -e "$f" ] || continue
-          install -m644 $f $_dest/$dir
+          install -dm755 $_dest/$dir
+          for f in "$src"/$dir/*.xml "$src"/$dir/*.xsl "$src"/$dir/*.dtd "$src"/$dir/*.ent; do
+            [ -e "$f" ] || continue
+            install -m644 $f $_dest/$dir
+          done
         done
-      done
+      }
+      docbookdir=${{targets.destdir}}/usr/share/xml/docbook
+      install_tree xsl-nons "$docbookdir"/xsl-stylesheets-1.79.2
+      ln -s xsl-stylesheets-1.79.2 "$docbookdir"/xsl-stylesheets
+      install_tree xslt10-stylesheets/xsl "$docbookdir"/xsl-ns-stylesheets-1.79.2
 
       install -dm755 ${{targets.destdir}}/etc/xml
 
-      install -m644 -D COPYING \
+      install -m644 -D xslt10-stylesheets/xsl/COPYING \
         ${{targets.destdir}}/usr/share/licenses/docbook-xsl/COPYING
 
   - name: generate docbook-xsl catalog
@@ -365,21 +421,94 @@ pipeline:
         done
       done
 
+      # The namespaced stylesheets, for DocBook 5 (note the CDN names the
+      # namespaced variant plain "xsl").
+      nsurls="
+        http://cdn.docbook.org/release/xsl
+        http://docbook.sourceforge.net/release/xsl-ns
+      "
+
+      for url in $nsurls; do
+        for rewrite in rewriteSystem rewriteURI; do
+          for version in $newver current; do
+            xmlcatalog --noout --add "$rewrite" \
+              "$url/$version" \
+              "file://$docbookdir/xsl-ns-stylesheets-$newver" \
+              ${{targets.destdir}}/etc/xml/catalog
+          done
+        done
+      done
+
 update:
   enabled: true
+  # The package version is the DocBook XML DTD set (4.1.2 to 4.5, frozen
+  # upstream); the git source is the XSL stylesheets, whose releases are
+  # unrelated to it. Updates stay manual: bump either part by hand.
   manual: true # package contains multiple versions which are not easily updatable
-  release-monitor:
-    identifier: 227335
-    version-filter-contains: 4.
+  git:
+    strip-prefix: release/
+    tag-filter-prefix: release/
 
 test:
   environment:
     contents:
       packages:
         - libxml2-utils
+        - libxslt
   pipeline:
     - runs: |
         # Check the obvious xml files installed
         for i in $(apk info -L docbook-xml | grep "\.xsl$\|\.xml$"); do
           xmllint --quiet --noout /$i
         done
+    - name: DocBook 4 renders to man pages through the catalog, offline
+      runs: |
+        cat > t.xml <<'XML'
+        <?xml version="1.0"?>
+        <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN" "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+        <refentry id="demo">
+          <refmeta><refentrytitle>demo</refentrytitle><manvolnum>1</manvolnum></refmeta>
+          <refnamediv><refname>demo</refname><refpurpose>a demo page</refpurpose></refnamediv>
+          <refsynopsisdiv><cmdsynopsis><command>demo</command><arg>OPTIONS</arg></cmdsynopsis></refsynopsisdiv>
+          <refsect1><title>Description</title><para>Hello <command>world</command>.</para></refsect1>
+        </refentry>
+        XML
+        xsltproc --nonet http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl t.xml
+        test -s demo.1
+        grep -q '^\.SH "NAME"' demo.1
+        # The namespaced stylesheets indent every macro of a DocBook 4
+        # page, which roff prints as text.
+        if grep -nE '^[[:space:]]+\.(SH|PP|HP|TP)' demo.1; then
+          echo "man page macros are indented: xsl/ resolves to the wrong stylesheet variant"
+          exit 1
+        fi
+        # The control: the same page through the namespaced stylesheets
+        # does come out indented, so the check above can fail.
+        mkdir ns && cd ns
+        xsltproc --nonet http://docbook.sourceforge.net/release/xsl-ns/current/manpages/docbook.xsl ../t.xml
+        grep -qE '^[[:space:]]+\.(SH|PP|HP|TP)' demo.1 || {
+          echo "xsl-ns/ did not indent a DocBook 4 page: it is not the namespaced variant, or the check cannot fail"
+          exit 1
+        }
+        # The other output formats load too, so no generated file
+        # (param.xsl, titlepage templates, lib.xsl) is missing from either
+        # tree. (manpages is covered above, and ignores -o.)
+        for tree in xsl-stylesheets-1.79.2 xsl-ns-stylesheets-1.79.2; do
+          for f in html xhtml xhtml-1_1 xhtml5 fo; do
+            xsltproc --nonet -o "out-$tree-$f" /usr/share/xml/docbook/$tree/$f/docbook.xsl ../t.xml
+            test -s "out-$tree-$f"
+          done
+        done
+    - name: each URL family resolves to its own stylesheet tree
+      runs: |
+        resolves() {
+          got=$(xmlcatalog /etc/xml/catalog "$1/current/manpages/docbook.xsl")
+          want=file:///usr/share/xml/docbook/$2/manpages/docbook.xsl
+          [ "$got" = "$want" ] || { echo "$1 resolves to $got, want $want"; exit 1; }
+        }
+        resolves http://docbook.sourceforge.net/release/xsl xsl-stylesheets-1.79.2
+        resolves http://cdn.docbook.org/release/xsl-nons xsl-stylesheets-1.79.2
+        resolves http://docbook.sourceforge.net/release/xsl-ns xsl-ns-stylesheets-1.79.2
+        resolves http://cdn.docbook.org/release/xsl xsl-ns-stylesheets-1.79.2
+        grep -q 'docbook-xsl-nons' /usr/share/xml/docbook/xsl-stylesheets/VERSION
+        grep -q 'xmlns:d="http://docbook.org/ns/docbook"' /usr/share/xml/docbook/xsl-ns-stylesheets-1.79.2/manpages/docbook.xsl

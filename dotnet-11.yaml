@@ -1,7 +1,7 @@
 package:
   name: dotnet-11
   version: "11.0.100"
-  epoch: 1
+  epoch: 2
   description: ".NET ${{vars.major-version}} host"
   copyright:
     - license: MIT
@@ -94,9 +94,11 @@ pipeline:
 
   # The OpenSSL 4.0 backports dotnet-10 carries are upstream in the 11.0
   # runtime. What remains is Chainguard's: prefer libssl.so.4 over .so.3 in
-  # the portable OpenSSL shim, and the DistroAgnosticOpenSsl switch that makes
+  # the portable OpenSSL shim, the DistroAgnosticOpenSsl switch that makes
   # the source-built runtime load OpenSSL through that shim (dlopen) instead
-  # of linking a libssl soname.
+  # of linking a libssl soname, and a default PKCS#12 export with AES-256
+  # instead of Triple DES, which Chainguard's OpenSSL does not offer by
+  # default ("Chainguard Hardening" in the dotnet image README).
   - runs: |
       git -c "user.name=Melange Build" -c "user.email=melange-build@cgr.dev" am *.patch
 
@@ -356,6 +358,7 @@ test:
     contents:
       packages:
         - dotnet-${{vars.major-version}}-sdk=${{package.full-version}}
+        - openssl-${{vars.openssl-version}} # the openssl CLI reads the PKCS#12 files back
   pipeline:
     - name: Basic .NET command test
       runs: |
@@ -401,4 +404,112 @@ test:
         dotnet new console -o ArgumentEchoApp --force
         mv ArgumentEcho.cs ArgumentEchoApp/Program.cs
         dotnet run --project ArgumentEchoApp -- arg1 arg2 arg3
+    - name: The default PKCS#12 export uses AES-256, and Triple DES needs CHAINGUARD_LEGACY_ENABLE_DES=1
+      runs: |
+        dotnet new console -o PfxApp --force
+        cat <<'EOF' > PfxApp/Program.cs
+        // Writes a self-signed certificate and its key as PKCS#12, or loads such a file.
+        using System;
+        using System.IO;
+        using System.Security.Cryptography;
+        using System.Security.Cryptography.X509Certificates;
+
+        switch (args[0])
+        {
+            case "export":
+                using (X509Certificate2 cert = CreateCertificate())
+                {
+                    // X509ContentType.Pkcs12 is the same value as Pfx.
+                    File.WriteAllBytes("cert.pfx", cert.Export(X509ContentType.Pfx, "pw"));
+                    File.WriteAllBytes("collection.pfx", new X509Certificate2Collection(cert).Export(X509ContentType.Pfx, "pw")!);
+                }
+                break;
+            case "export-3des":
+                using (X509Certificate2 cert = CreateCertificate())
+                {
+                    File.WriteAllBytes("3des.pfx", cert.ExportPkcs12(Pkcs12ExportPbeParameters.Pkcs12TripleDesSha1, "pw"));
+                }
+                break;
+            case "load":
+                using (X509Certificate2 cert = X509CertificateLoader.LoadPkcs12FromFile(args[1], "pw"))
+                using (RSA key = cert.GetRSAPrivateKey() ?? throw new CryptographicException(args[1] + " has no private key"))
+                using (RSA publicKey = cert.GetRSAPublicKey()!)
+                {
+                    // The key must sign, and the certificate must verify the signature.
+                    byte[] data = { 1, 2, 3 };
+                    byte[] signature = key.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                    if (!publicKey.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1))
+                    {
+                        throw new CryptographicException("the key in " + args[1] + " does not match its certificate");
+                    }
+                    Console.WriteLine(args[1] + ": " + cert.Subject + ", its key signs");
+                }
+                break;
+            default:
+                throw new ArgumentException("unknown mode " + args[0]);
+        }
+
+        static X509Certificate2 CreateCertificate()
+        {
+            using RSA rsa = RSA.Create(2048);
+            var request = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            return request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+        }
+        EOF
+        dotnet build PfxApp -o pfxapp
+
+        # 0003-*.patch: X509Certificate2.Export and X509Certificate2Collection.Export
+        # with X509ContentType.Pfx write PBES2 (PBKDF2 with HMAC-SHA256,
+        # AES-256-CBC) and a SHA-256 MAC, the parameters of
+        # Pkcs12ExportPbeParameters.Default, instead of 3DES and a SHA-1 MAC.
+        dotnet pfxapp/PfxApp.dll export
+        for f in cert.pfx collection.pfx; do
+          openssl pkcs12 -info -noout -in "$f" -passin pass:pw > "$f.txt" 2>&1
+          cat "$f.txt"
+          grep -F 'MAC: sha256, Iteration 2000' "$f.txt"
+          grep -F 'PKCS7 Encrypted data: PBES2, PBKDF2, AES-256-CBC, Iteration 2000, PRF hmacWithSHA256' "$f.txt"
+          grep -F 'Shrouded Keybag: PBES2, PBKDF2, AES-256-CBC, Iteration 2000, PRF hmacWithSHA256' "$f.txt"
+          dotnet pfxapp/PfxApp.dll load "$f"
+        done
+
+        # Chainguard's OpenSSL leaves Triple DES out of its default provider, and
+        # the legacy-allowed provider offers it only with
+        # CHAINGUARD_LEGACY_ENABLE_DES=1: writing a 3DES file on request, and
+        # reading one, work only with the variable set. The failures without it
+        # also show that the export above ran without Triple DES.
+        if dotnet pfxapp/PfxApp.dll export-3des > export-3des.out 2>&1; then
+          echo "ERROR: a 3DES PKCS#12 export worked without CHAINGUARD_LEGACY_ENABLE_DES=1" >&2
+          exit 1
+        fi
+        grep -F 'error:0308010C' export-3des.out
+        CHAINGUARD_LEGACY_ENABLE_DES=1 dotnet pfxapp/PfxApp.dll export-3des
+        CHAINGUARD_LEGACY_ENABLE_DES=1 openssl pkcs12 -info -noout -in 3des.pfx -passin pass:pw > 3des.txt 2>&1
+        cat 3des.txt
+        grep -F 'Shrouded Keybag: pbeWithSHA1And3-KeyTripleDES-CBC, Iteration 2000' 3des.txt
+        if dotnet pfxapp/PfxApp.dll load 3des.pfx > load-3des.out 2>&1; then
+          echo "ERROR: a 3DES PKCS#12 file loaded without CHAINGUARD_LEGACY_ENABLE_DES=1" >&2
+          exit 1
+        fi
+        grep -F 'error:0308010C' load-3des.out
+        CHAINGUARD_LEGACY_ENABLE_DES=1 dotnet pfxapp/PfxApp.dll load 3des.pfx
+    - name: dotnet dev-certs https saves, checks and exports its certificate
+      runs: |
+        # dev-certs saves a new certificate by exporting it with
+        # X509ContentType.Pkcs12 and loading the result into the X509Store, and
+        # -ep exports it the same way. With the 3DES default both failed with
+        # error:0308010C (unsupported). The SDK's first run, in the steps above,
+        # may already have created a certificate: remove it, so that dev-certs
+        # creates and saves one here.
+        dotnet dev-certs https --clean
+        if ! dotnet dev-certs https --verbose > dev-certs.txt 2>&1; then
+          cat dev-certs.txt
+          exit 1
+        fi
+        cat dev-certs.txt
+        grep -F 'Finished saving certificate to the store.' dev-certs.txt
+        dotnet dev-certs https --check
+        dotnet dev-certs https -ep dev.pfx -p pw
+        openssl pkcs12 -info -noout -in dev.pfx -passin pass:pw > dev.txt 2>&1
+        cat dev.txt
+        grep -F 'Shrouded Keybag: PBES2, PBKDF2, AES-256-CBC, Iteration 2000, PRF hmacWithSHA256' dev.txt
     - uses: test/tw/ldd-check

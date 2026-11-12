@@ -1,7 +1,7 @@
 package:
   name: nodejs-24
   version: "24.22.3" # On update, please check if -fdelete-null-pointer-checks is still required
-  epoch: 1 # openssl-ca-bundled-fallback.patch
+  epoch: 2 # bundled CA roots regenerated from ca-certificates-bundle
   description: "JavaScript runtime built on V8 engine"
   dependencies:
     provides:
@@ -91,6 +91,30 @@ pipeline:
     with:
       patches: openssl-ca-bundled-fallback.patch
 
+  # The compiled-in root list (src/node_root_certs.h) is upstream's copy of
+  # Mozilla's roots at the time of the node release. Regenerate it from the
+  # ca-certificates-bundle in the build environment, so --use-bundled-ca and
+  # the fallback added by openssl-ca-bundled-fallback.patch use our bundle,
+  # and a ca-certificates change plus an epoch bump here propagates a
+  # revocation without waiting for a node release.
+  - name: Regenerate the bundled CA roots from ca-certificates-bundle
+    runs: |
+      bundle=/etc/ssl/certs/ca-certificates.crt
+      n=$(grep -c 'BEGIN CERTIFICATE' "$bundle")
+      [ "$n" -gt 100 ] || { echo "unexpected certificate count in $bundle: $n" >&2; exit 1; }
+      {
+        echo '#if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS'
+        echo
+        echo "/* $n root certificates from ca-certificates-bundle */"
+        awk '
+          /^-----BEGIN CERTIFICATE-----/ { inpem=1 }
+          inpem && /^-----END CERTIFICATE-----/ { printf "\"%s\",\n\n", $0; inpem=0; next }
+          inpem { printf "\"%s\\n\"\n", $0 }
+        ' "$bundle"
+        echo '#endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS'
+      } > src/node_root_certs.h
+      echo "bundled $n root certificates"
+
   - name: Configure and build
     runs: |
       # Add defines recommended in libuv readme.
@@ -179,6 +203,16 @@ test:
         assert.ok(!/^s$/i.test('\u017f'));
         EOF
         node testCaseFold.js
+    - name: Bundled CA roots are the ca-certificates-bundle
+      runs: |
+        # Same certificates, compared by SHA-256 fingerprint, in both orders.
+        bundle=/etc/ssl/certs/ca-certificates.crt
+        split=$(mktemp -d ./ca-split.XXXXXX)
+        awk '/BEGIN CERT/{p=1} p{print} /END CERT/{p=0; print ""}' "$bundle" | awk -v dir="$split" 'BEGIN{RS=""} {f=dir "/" NR ".pem"; print > f; close(f)}'
+        want=$(for f in "$split"/*.pem; do openssl x509 -in "$f" -noout -fingerprint -sha256; done | sort)
+        rm -rf "$split"
+        got=$(node -e 'for (const c of require("node:tls").getCACertificates("bundled")) console.log(new (require("node:crypto").X509Certificate)(c).fingerprint256)' | sed 's/^/sha256 Fingerprint=/' | sort)
+        [ -n "$want" ] && [ "$want" = "$got" ] || { echo "bundled roots differ from $bundle"; echo "$want" | wc -l; echo "$got" | wc -l; exit 1; }
     - name: CA store selection (openssl-ca-bundled-fallback.patch)
       runs: |
         set -e

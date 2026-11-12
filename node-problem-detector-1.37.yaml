@@ -1,7 +1,7 @@
 package:
   name: node-problem-detector-1.37
   version: "1.37.0"
-  epoch: 3 # toolchain rebuild for  go-1.27-1.27.4
+  epoch: 4 # accept os-release ID "wolfi"
   description: node-problem-detector aims to make various node problems visible to the upstream layers in the cluster management stack.
   copyright:
     - license: Apache-2.0
@@ -43,6 +43,15 @@ pipeline:
       repository: https://github.com/kubernetes/node-problem-detector
       tag: v${{package.version}}
       expected-commit: 7dad835ec831225db2a8090bde46430970bfcc9b
+
+  # The host collector (system-stats monitor) exits at startup unless
+  # /etc/os-release ID is in its list. "chainguard" is there (upstream
+  # 14aa2fc8), "wolfi" is not. The patch also falls back to VERSION_ID when
+  # VERSION is unset (both baselayouts only write VERSION_ID), so the
+  # os_version metric tag is "wolfi <date>" rather than "wolfi ".
+  - uses: patch
+    with:
+      patches: os-release-wolfi.patch
 
   - uses: bump
     with:
@@ -146,6 +155,10 @@ update:
     tag-filter-prefix: v1.37.
 
 test:
+  environment:
+    contents:
+      packages:
+        - curl
   pipeline:
     - uses: test/tw/ldd-check
     - uses: test/tw/ver-check
@@ -156,3 +169,38 @@ test:
       with:
         dir: /config
         name: "*.json"
+    - name: Starts with the system-stats monitor
+      uses: test/daemon-check-output
+      with:
+        # The host collector reads /etc/os-release when the system-stats
+        # monitor is built (before "Start system stats monitor" is logged)
+        # and exits (klog.Fatalf) if it does not know the ID.
+        start: /usr/bin/node-problem-detector --enable-k8s-exporter=false --config.system-stats-monitor=/config/system-stats-monitor.json --logtostderr
+        expected_output: |
+          Start system stats monitor
+          Problem detector started
+        # Not the default ERROR/FAIL patterns: NPD logs benign errors in the
+        # test VM (no lsblk, no /mount). Fail on the os-release fatal and on
+        # any klog fatal ("F<mmdd> ...") or Go panic.
+        error_strings: |
+          Failed to retrieve OS version
+          unsupported ID in /etc/os-release
+          ^F[0-9][0-9][0-9][0-9] [0-9][0-9]:
+          ^panic:
+        post: |
+          # The host collector tags its metrics with os_version, built from
+          # os-release ID and VERSION (falling back to VERSION_ID).
+          # The scrape endpoint and the first collection both start in
+          # goroutines, so wait for the port and give the first sample a
+          # bounded window to land.
+          . /etc/os-release
+          want="os_version=\"${ID} ${VERSION_ID}\""
+          wait-for-it 127.0.0.1:20257 -t 30
+          for i in $(seq 15); do
+            curl -fsS -o metrics.txt http://127.0.0.1:20257/metrics && grep -qF "$want" metrics.txt && break
+            sleep 2
+          done
+          if ! grep -F "$want" metrics.txt; then
+            grep -F host_uptime metrics.txt
+            exit 1
+          fi

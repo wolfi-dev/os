@@ -1,7 +1,7 @@
 package:
   name: nodejs-26
   version: "26.13.1" # On update, please check if -fdelete-null-pointer-checks is still required
-  epoch: 0
+  epoch: 1 # openssl-ca-bundled-fallback.patch, bundled CA roots from ca-certificates-bundle
   description: "JavaScript runtime built on V8 engine"
   dependencies:
     provides:
@@ -74,7 +74,31 @@ pipeline:
   # pass pkcs5=1 so non-approved parameters still work under FIPS
   - uses: patch
     with:
-      patches: ncrypto-pbkdf2-pkcs5.patch v8-regexp-special-case-icu79.patch
+      patches: ncrypto-pbkdf2-pkcs5.patch v8-regexp-special-case-icu79.patch openssl-ca-bundled-fallback.patch
+
+  # The compiled-in root list (src/node_root_certs.h) is upstream's copy of
+  # Mozilla's roots at the time of the node release. Regenerate it from the
+  # ca-certificates-bundle in the build environment, so --use-bundled-ca and
+  # the fallback added by openssl-ca-bundled-fallback.patch use our bundle,
+  # and a ca-certificates change plus an epoch bump here propagates a
+  # revocation without waiting for a node release.
+  - name: Regenerate the bundled CA roots from ca-certificates-bundle
+    runs: |
+      bundle=/etc/ssl/certs/ca-certificates.crt
+      n=$(grep -c 'BEGIN CERTIFICATE' "$bundle")
+      [ "$n" -gt 100 ] || { echo "unexpected certificate count in $bundle: $n" >&2; exit 1; }
+      {
+        echo '#if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS'
+        echo
+        echo "/* $n root certificates from ca-certificates-bundle */"
+        awk '
+          /^-----BEGIN CERTIFICATE-----/ { inpem=1 }
+          inpem && /^-----END CERTIFICATE-----/ { printf "\"%s\",\n\n", $0; inpem=0; next }
+          inpem { printf "\"%s\\n\"\n", $0 }
+        ' "$bundle"
+        echo '#endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS'
+      } > src/node_root_certs.h
+      echo "bundled $n root certificates"
 
   - name: Configure and build
     runs: |
@@ -123,6 +147,10 @@ update:
     tag-filter-prefix: v26.
 
 test:
+  environment:
+    contents:
+      packages:
+        - openssl
   pipeline:
     - uses: test/tw/ver-check
       with:
@@ -165,6 +193,92 @@ test:
         assert.ok(!/^s$/i.test('\u017f'));
         EOF
         node testCaseFold.js
+    - name: Bundled CA roots are the ca-certificates-bundle
+      runs: |
+        # Same certificates, compared by SHA-256 fingerprint, in both orders.
+        bundle=/etc/ssl/certs/ca-certificates.crt
+        split=$(mktemp -d ./ca-split.XXXXXX)
+        awk '/BEGIN CERT/{p=1} p{print} /END CERT/{p=0; print ""}' "$bundle" | awk -v dir="$split" 'BEGIN{RS=""} {f=dir "/" NR ".pem"; print > f; close(f)}'
+        want=$(for f in "$split"/*.pem; do openssl x509 -in "$f" -noout -fingerprint -sha256; done | sort)
+        rm -rf "$split"
+        got=$(node -e 'for (const c of require("node:tls").getCACertificates("bundled")) console.log(new (require("node:crypto").X509Certificate)(c).fingerprint256)' | sed 's/^/sha256 Fingerprint=/' | sort)
+        [ -n "$want" ] && [ "$want" = "$got" ] || { echo "bundled roots differ from $bundle"; echo "$want" | wc -l; echo "$got" | wc -l; exit 1; }
+    - name: CA store selection (openssl-ca-bundled-fallback.patch)
+      runs: |
+        set -e
+        d=$(mktemp -d)
+        chmod 755 "$d"
+        cd "$d"
+        # Restore the system store on any exit; rows below move and edit it.
+        cp /etc/ssl/certs/ca-certificates.crt bundle.orig
+        restore() {
+          [ -d /etc/ssl.off ] && mv /etc/ssl.off /etc/ssl
+          chmod 755 /etc/ssl
+          cp bundle.orig /etc/ssl/certs/ca-certificates.crt
+          [ -n "$server" ] && kill "$server" 2>/dev/null
+          return 0
+        }
+        trap restore EXIT
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 2 -subj '/CN=nodejs-26 test CA' 2>/dev/null
+        openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr -subj '/CN=localhost' 2>/dev/null
+        printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n' > ext.cnf
+        openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out srv.pem -days 2 -extfile ext.cnf 2>/dev/null
+        cat <<'EOF' > server.js
+        const https = require('node:https');
+        const fs = require('node:fs');
+        https.createServer({ key: fs.readFileSync('srv.key'), cert: fs.readFileSync('srv.pem') },
+          (req, res) => res.end('ok')).listen(8443, '127.0.0.1');
+        EOF
+        cat <<'EOF' > client.js
+        require('node:https').get('https://localhost:8443/', (res) => { console.log('OK', res.statusCode); process.exit(0); })
+          .on('error', (e) => { console.log('ERR', e.code || e.message); process.exit(1); });
+        EOF
+        node server.js &
+        server=$!
+        sleep 1
+        fallback='using the bundled CA store'
+        # check <label> <expected OK|ERR> <expected fallback yes|no> <stdout> <stderr file>
+        check() {
+          case "$4" in "$2"*) ;; *) echo "$1: expected $2, got: $4"; cat "$5"; exit 1;; esac
+          if grep -q "$fallback" "$5"; then got=yes; else got=no; fi
+          [ "$got" = "$3" ] || { echo "$1: expected fallback=$3, got $got"; cat "$5"; exit 1; }
+        }
+        # probe <label> <expected OK|ERR> <expected fallback yes|no> [node args...]
+        probe() {
+          label=$1; want=$2; fb=$3; shift 3
+          if out=$(NODE_DEBUG_NATIVE=crypto node "$@" client.js 2>err.txt); then :; fi
+          check "$label" "$want" "$fb" "$out" err.txt
+        }
+        # System store holding the test CA: used as is, no fallback.
+        cat ca.pem >> /etc/ssl/certs/ca-certificates.crt
+        probe system-store OK no
+        cp bundle.orig /etc/ssl/certs/ca-certificates.crt
+        # Hashed directory only, via SSL_CERT_DIR: configured, no fallback.
+        mkdir hashed && cp ca.pem hashed/ && openssl rehash hashed 2>/dev/null
+        export SSL_CERT_FILE=/nonexistent SSL_CERT_DIR="$d/hashed"
+        probe hashed-dir OK no
+        # Broken explicit override: configured, fails closed, no fallback.
+        export SSL_CERT_DIR=/nonexistent
+        probe broken-override ERR no
+        unset SSL_CERT_FILE SSL_CERT_DIR
+        # Existing store that the process cannot search: present, no fallback.
+        # Needs a non-root user, which the test environment does not ship.
+        # OPENSSL_CONF=/dev/null keeps OpenSSL from aborting on the unreadable
+        # openssl.cnf, so the root store code is reached.
+        grep -q '^catest:' /etc/passwd || adduser -D -H -s /bin/sh catest
+        chmod 000 /etc/ssl
+        if out=$(su catest -s /bin/sh -c "cd '$d' && OPENSSL_CONF=/dev/null NODE_DEBUG_NATIVE=crypto node client.js 2>/tmp/catest-err.txt"); then :; fi
+        check unsearchable-store ERR no "$out" /tmp/catest-err.txt
+        chmod 755 /etc/ssl
+        # No CA location at all: bundled roots are added, the test CA is not among them.
+        mv /etc/ssl /etc/ssl.off
+        probe no-store ERR yes
+        # Explicit --use-openssl-ca and the opt-out keep the empty store.
+        probe explicit-openssl-ca ERR no --use-openssl-ca
+        probe opt-out ERR no --no-openssl-ca-bundled-fallback
+        mv /etc/ssl.off /etc/ssl
+        # Default store back in place: no fallback.
+        probe restored ERR no
 
 subpackages:
   - name: ${{package.name}}-minimal

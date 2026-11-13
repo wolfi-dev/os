@@ -1,0 +1,133 @@
+package:
+  name: theseus-proved-port
+  version: "0.2.4"
+  epoch: 0
+  description: The proved-port kit, the coverage counter (verus-count) and make targets that proved Rust ports share
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - busybox
+      - git
+      - make
+
+vars:
+  rust-version: "1.99"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cargo-auditable
+      - glibc-2.44-dev
+      - rust-${{vars.rust-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/chainguard-project-theseus/proved-port
+      tag: v${{package.version}}
+      expected-commit: 78fbafe4fa4948f3fa50efa2f4cee7f337645dac
+
+  - uses: cargo/build
+    with:
+      modroot: kit/count
+      output: verus-count
+      opts: --locked --release
+
+  # The make targets and templates ports vendor today through kit/sync.sh.
+  # KIT records the kit commit and tag in the form a port's verus/count/KIT
+  # does, which the make targets' headers check reads.
+  - name: install the make targets and templates
+    runs: |
+      dest="${{targets.contextdir}}/usr/share/proved-port"
+      mkdir -p "$dest/make" "$dest/templates"
+      install -m644 kit/make/* "$dest/make/"
+      cp -a kit/templates/. "$dest/templates/"
+      {
+        echo "# kit: the proved-port kit installed by the theseus-proved-port package."
+        printf 'commit '
+        git rev-parse HEAD
+        echo "tag v${{package.version}}"
+      } > "$dest/KIT"
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: chainguard-project-theseus/proved-port
+    strip-prefix: v
+    tag-filter-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - make
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: version
+      runs: |
+        verus-count --version | grep -F "verus-count"
+    - name: installed make targets, templates and KIT
+      runs: |
+        kit=/usr/share/proved-port
+        for f in proved-port.mk kani.sh headers.sh VERUS-FILES; do
+          test -f "$kit/make/$f"
+        done
+        # Every template the headers check holds a port to is installed.
+        grep -v -e '^#' -e '^$' "$kit/make/VERUS-FILES" > verus-files
+        test -s verus-files
+        while IFS= read -r f; do
+          test -f "$kit/templates/$f" || { echo "missing $kit/templates/$f"; exit 1; }
+        done < verus-files
+        test -f "$kit/templates/.chainguard/deps.yaml"
+        test -f "$kit/templates/.chainguard/develop.yaml"
+        grep -Fx "tag v${{package.version}}" "$kit/KIT"
+        grep -E '^commit [0-9a-f]{40}$' "$kit/KIT"
+    - name: the installed make fragment finds its scripts
+      runs: |
+        printf 'include /usr/share/proved-port/make/proved-port.mk\n' > Makefile
+        make -n kani-list | grep -F "sh /usr/share/proved-port/make/kani.sh --list"
+        make -n verus-headers | grep -F "sh /usr/share/proved-port/make/headers.sh ."
+    - name: count a one-crate fixture
+      runs: |
+        mkdir -p fixture/crates/a/src fixture/verus
+        printf '[package]\nname = "a"\nversion = "0.0.0"\nedition = "2021"\n' > fixture/crates/a/Cargo.toml
+        printf 'pub fn f() {}\n\nverus! {\npub fn g() {}\n}\n' > fixture/crates/a/src/lib.rs
+        printf '[crates]\ndir = "crates"\n' > fixture/verus/count.toml
+        verus-count --list fixture > count.out
+        cat count.out
+        grep -E '^a[[:space:]]+Outside[[:space:]].*crates/a/src/lib.rs:1[[:space:]]+f$' count.out
+        grep -E '^a[[:space:]]+Verified[[:space:]].*crates/a/src/lib.rs:4[[:space:]]+g$' count.out
+        grep -E '^shipped[[:space:]]+1[[:space:]]+0[[:space:]]+0[[:space:]]+1[[:space:]]+50.0%' count.out
+    # --base-rev reads the base's FLOOR and configuration through git, so
+    # this runs with only the package's runtime dependencies installed.
+    - name: compare a FLOOR with a base revision
+      runs: |
+        mkdir -p port/crates/a/src port/verus
+        cd port
+        printf '[package]\nname = "a"\nversion = "0.0.0"\nedition = "2021"\n' > crates/a/Cargo.toml
+        printf 'pub fn f() {}\n\nverus! {\npub fn g() {}\n}\n' > crates/a/src/lib.rs
+        printf '[crates]\ndir = "crates"\n[floor]\npath = "verus/FLOOR"\n' > verus/count.toml
+        printf 'functions 50.0\nlines 50.0\nchecked-functions 50.0\nchecked-lines 50.0\n' > verus/FLOOR
+        g() { git -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+        g init -q
+        g add .
+        g commit -q -m base
+        printf 'pub fn f() {}\n\nverus! {\npub fn g() {}\npub fn h() {}\n}\n' > crates/a/src/lib.rs
+        g commit -q -am head
+        verus-count --floor verus/FLOOR --base-rev HEAD^ .
+        # Lowering a figure with no lowered line fails against the base.
+        printf 'functions 40.0\nlines 50.0\nchecked-functions 50.0\nchecked-lines 50.0\n' > verus/FLOOR
+        g commit -q -am lower
+        if verus-count --floor verus/FLOOR --base-rev HEAD^ . > lower.out 2>&1; then
+          cat lower.out
+          echo "a lowered FLOOR passed against its base"
+          exit 1
+        fi
+        grep -F "verus/FLOOR lowers functions from 50.0% to 40.0%" lower.out

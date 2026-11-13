@@ -1,0 +1,335 @@
+package:
+  name: challoc
+  version: "0.1.0"
+  epoch: 0
+  description: A memory-safe, jemalloc-compatible malloc replacement for Wolfi and Chainguard OS
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  rust-version: "1.98"
+  # The ABI major in the soname (build.rs: libchalloc.so.0). Bump with it.
+  soversion: "0"
+  # The version mallctl("version") reports and jemalloc.pc carries
+  # (src/api/mallctl.rs VERSION_STR minus its -0-gchalloc tail). The
+  # pipeline checks the built library agrees.
+  jemalloc-version: "5.3.0"
+
+environment:
+  contents:
+    packages:
+      # build-base brings gcc, whose g++ build.rs uses to compile
+      # src/api/cxx_handler.cpp.
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - glibc-2.44-dev
+      - rust-${{vars.rust-version}}
+      - wolfi-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/chainguard-project-theseus/challoc
+      tag: ${{package.version}}
+      expected-commit: 1886f9e11b9c37a7a6cc77fb4c4df1b177a0f3e5
+
+  - name: Check the tree matches the package version
+    runs: |
+      crate=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+      [ "$crate" = "${{package.version}}" ] || {
+        echo "Cargo.toml version $crate != package.version ${{package.version}}"; exit 1; }
+      jv=$(sed -n 's/^pub const VERSION_STR: &str = "\([0-9][0-9.]*\)-.*/\1/p' src/api/mallctl.rs)
+      [ "$jv" = "${{vars.jemalloc-version}}" ] || {
+        echo "VERSION_STR $jv != vars.jemalloc-version ${{vars.jemalloc-version}}"; exit 1; }
+      rustc --version; cargo --version
+
+  - name: Build the system library (quantum16, soname libchalloc.so.0)
+    runs: |
+      cargo build --release --locked --no-default-features --features quantum16
+      readelf -d target/release/libchalloc.so | grep -q 'Library soname: \[libchalloc.so.${{vars.soversion}}\]'
+
+  - name: Install the runtime, the link name, the header and challoc.pc
+    runs: |
+      lib=${{targets.destdir}}/usr/lib
+      install -Dm755 target/release/libchalloc.so "$lib/libchalloc.so.${{vars.soversion}}"
+      ln -s libchalloc.so.${{vars.soversion}} "$lib/libchalloc.so"
+      install -Dm644 include/challoc/jemalloc.h \
+        ${{targets.destdir}}/usr/include/challoc/jemalloc.h
+      install -Dm644 include/challoc/challoc.h \
+        ${{targets.destdir}}/usr/include/challoc/challoc.h
+      mkdir -p "$lib/pkgconfig"
+      # Libs scopes --no-as-needed to -lchalloc so a consumer that
+      # references no allocator symbol itself still records DT_NEEDED
+      # libchalloc.so.0 (design 13.6: Wolfi's gcc links --as-needed by
+      # default and would drop it, and the program would silently run on
+      # glibc malloc).
+      cat > "$lib/pkgconfig/challoc.pc" <<PC
+      prefix=/usr
+      exec_prefix=\${prefix}
+      libdir=\${exec_prefix}/lib
+      includedir=\${prefix}/include
+
+      Name: challoc
+      Description: A memory-safe, jemalloc-compatible malloc replacement
+      URL: https://github.com/wolfi-dev/challoc
+      Version: ${{package.version}}
+      Cflags: -I\${includedir}
+      Libs: -L\${libdir} -Wl,--push-state,--no-as-needed -lchalloc -Wl,--pop-state
+      PC
+
+  - uses: strip
+
+subpackages:
+  - name: challoc-dev
+    description: challoc headers, link name and pkg-config file
+    dependencies:
+      runtime:
+        - challoc=${{package.full-version}}
+    pipeline:
+      - uses: split/dev
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils
+            - build-base
+            - pkgconf
+      pipeline:
+        - uses: test/tw/ldd-check
+          with:
+            packages: challoc
+        - uses: test/pkgconf
+        - name: Link a program with pkg-config's flags and check DT_NEEDED
+          runs: |
+            set -eux
+            [ "$(pkg-config --modversion challoc)" = "${{package.version}}" ]
+            [ "$(readlink /usr/lib/libchalloc.so)" = "libchalloc.so.${{vars.soversion}}" ]
+            cat > version.c <<'EOF'
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <challoc/jemalloc.h>
+            #ifndef JEMALLOC_CHALLOC_USABLE
+            #error "JEMALLOC_CHALLOC_USABLE missing"
+            #endif
+            #include <challoc/challoc.h>
+            int main(void) {
+                const char *v = challoc_version();
+                size_t u = 0;
+                char *p = challoc_malloc_usable(100, &u);
+                size_t n = je_malloc_usable_size(p);
+                if (n != u || challoc_free_usable(p) != u) return 3;
+                p = je_malloc(100);
+                const char *jv = NULL; size_t sz = sizeof jv;
+                if (je_mallctl("version", &jv, &sz, NULL, 0) != 0) return 2;
+                printf("challoc_version=%s usable=%zu mallctl.version=%s\n", v, n, jv);
+                je_free(p);
+                return strcmp(v, "${{package.version}}") == 0 && n >= 100 ? 0 : 1;
+            }
+            EOF
+            gcc $(pkg-config --cflags challoc) version.c -o version $(pkg-config --libs challoc)
+            readelf -d version | grep NEEDED
+            readelf -d version | grep -q 'NEEDED.*\[libchalloc.so.${{vars.soversion}}\]'
+            ./version
+            # A program that references nothing from the library: the pc
+            # file's --no-as-needed must still keep DT_NEEDED (design 13.6).
+            printf 'int main(void){return 0;}\n' > none.c
+            gcc none.c -o none $(pkg-config --libs challoc)
+            readelf -d none | grep -q 'NEEDED.*\[libchalloc.so.${{vars.soversion}}\]'
+            ./none
+
+  - name: challoc-jemalloc-compat
+    description: challoc under jemalloc's soname (libjemalloc.so.2), a drop-in for libjemalloc2
+    dependencies:
+      # The file set of Wolfi's libjemalloc2 runtime (the one file), so the
+      # two conflict and a consumer picks one by name; the automatic
+      # `so:libjemalloc.so.2` provide is what a jemalloc consumer's own
+      # automatic dependency resolves to once this package is chosen. The
+      # link name, the pc file and the header are the -dev package's, as
+      # jemalloc-dev's are.
+      provides:
+        - libjemalloc2=${{package.full-version}}
+    pipeline:
+      - name: Build with the jemalloc-soname feature and stage as scripts/jemalloc-compat.sh does
+        runs: |
+          QUANTUM=16 PREFIX=/usr OUT="$PWD/compat-stage" TARGET_DIR="$PWD/target/jemalloc-compat" \
+            sh scripts/jemalloc-compat.sh
+          mkdir -p ${{targets.contextdir}}/usr/lib
+          cp compat-stage/lib/libjemalloc.so.2 ${{targets.contextdir}}/usr/lib/
+          readelf -d ${{targets.contextdir}}/usr/lib/libjemalloc.so.2 | grep -q 'Library soname: \[libjemalloc.so.2\]'
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils
+            - posix-libc-utils
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: The library carries jemalloc's soname, loads, and is challoc
+          runs: |
+            set -eux
+            readelf -d /usr/lib/libjemalloc.so.2 | grep -q 'Library soname: \[libjemalloc.so.2\]'
+            ldd /usr/lib/libjemalloc.so.2
+            ! ldd /usr/lib/libjemalloc.so.2 | grep -q 'not found'
+            # The runtime package ships no link name and no pc file: those
+            # are challoc-jemalloc-compat-dev's.
+            ! [ -e /usr/lib/libjemalloc.so ]
+            ! [ -e /usr/lib/pkgconfig/jemalloc.pc ]
+            LD_PRELOAD=/usr/lib/libjemalloc.so.2 ls / >/dev/null
+            LD_PRELOAD=/usr/lib/libjemalloc.so.2 readelf -h /usr/lib/libjemalloc.so.2 | grep -q 'Shared object file'
+
+  - name: challoc-jemalloc-compat-dev
+    description: link name, jemalloc.pc and <jemalloc/jemalloc.h> for building a jemalloc consumer against challoc, a drop-in for jemalloc-dev
+    dependencies:
+      runtime:
+        - challoc-jemalloc-compat=${{package.full-version}}
+      # The file set of Wolfi's jemalloc-dev (/usr/lib/libjemalloc.so,
+      # /usr/lib/pkgconfig/jemalloc.pc, /usr/include/jemalloc/jemalloc.h),
+      # so the two conflict and apk refuses to co-install them; a consumer
+      # swaps by naming this package in place of jemalloc-dev in its build
+      # environment (and challoc-jemalloc-compat in its runtime
+      # dependencies, so the automatic so:libjemalloc.so.2 dependency is
+      # not resolved to libjemalloc2 by name preference). `provides:
+      # jemalloc-dev` mirrors the runtime's `provides: libjemalloc2`: a
+      # dependency on jemalloc-dev is satisfied once this package is
+      # installed, and no provider-priority, so nothing flips merely because
+      # it exists (contrib/wolfi/README.md, "Swapping"). Wolfi may prefer no provides here: it is one line.
+      provides:
+        - jemalloc-dev=${{package.full-version}}
+    pipeline:
+      - name: Install the link name, jemalloc.pc and the header from the compat stage
+        runs: |
+          mkdir -p ${{targets.contextdir}}/usr/lib/pkgconfig ${{targets.contextdir}}/usr/include/jemalloc
+          cp -a compat-stage/lib/libjemalloc.so ${{targets.contextdir}}/usr/lib/
+          [ "$(readlink ${{targets.contextdir}}/usr/lib/libjemalloc.so)" = libjemalloc.so.2 ]
+          cp compat-stage/lib/pkgconfig/jemalloc.pc ${{targets.contextdir}}/usr/lib/pkgconfig/
+          grep -q '^Version: ${{vars.jemalloc-version}}$' ${{targets.contextdir}}/usr/lib/pkgconfig/jemalloc.pc
+          grep -q '^prefix=/usr$' ${{targets.contextdir}}/usr/lib/pkgconfig/jemalloc.pc
+          install -Dm644 compat-stage/include/jemalloc/jemalloc.h \
+            ${{targets.contextdir}}/usr/include/jemalloc/jemalloc.h
+          # The header's version macros agree with the library and the pc file.
+          grep -q '^#define JEMALLOC_VERSION "${{vars.jemalloc-version}}-0-gchalloc"$' \
+            ${{targets.contextdir}}/usr/include/jemalloc/jemalloc.h
+    test:
+      environment:
+        contents:
+          packages:
+            - binutils
+            - build-base
+            - pkgconf
+      pipeline:
+        - uses: test/tw/ldd-check
+          with:
+            packages: challoc-jemalloc-compat
+        - uses: test/pkgconf
+        - name: The link name and jemalloc.pc are jemalloc-dev's
+          runs: |
+            set -eux
+            [ "$(readlink /usr/lib/libjemalloc.so)" = libjemalloc.so.2 ]
+            [ "$(pkg-config --modversion jemalloc)" = "${{vars.jemalloc-version}}" ]
+            pkg-config --atleast-version=5.3 jemalloc
+            pkg-config --libs jemalloc | grep -q -- '-ljemalloc'
+            pkg-config --cflags jemalloc
+            [ -f /usr/include/jemalloc/jemalloc.h ]
+        - name: A consumer that includes <jemalloc/jemalloc.h> builds, and resolves into the compat library
+          runs: |
+            set -eux
+            # Ruby's configure probe (configure.ac, --with-jemalloc): a read
+            # of malloc_conf through the header, linked with -ljemalloc.
+            cat > probe.c <<'EOF'
+            #include <stdio.h>
+            #include <jemalloc/jemalloc.h>
+            int main(void) {
+                if (malloc_conf) printf("malloc_conf=%s\n", malloc_conf);
+                return 0;
+            }
+            EOF
+            gcc $(pkg-config --cflags jemalloc) probe.c -o probe $(pkg-config --libs jemalloc)
+            ./probe
+            # The API the header declares, in C and in C++ (Ruby's
+            # ruby/missing.h includes the header into every translation
+            # unit, extensions in C++ included).
+            cat > compat.c <<'EOF'
+            #ifndef _GNU_SOURCE
+            #define _GNU_SOURCE /* g++ predefines it */
+            #endif
+            #include <dlfcn.h>
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <jemalloc/jemalloc.h>
+            int main(void) {
+                void *p = mallocx(64, MALLOCX_ALIGN(64));
+                if (!p || sallocx(p, 0) < 64 || ((size_t)p & 63) != 0) return 1;
+                if (nallocx(64, MALLOCX_ALIGN(64)) != sallocx(p, 0)) return 7;
+                Dl_info di, dm;
+                if (!dladdr((void *)mallocx, &di) || !dladdr((void *)malloc, &dm)) return 2;
+                const char *v = NULL; size_t sz = sizeof v;
+                if (mallctl("version", &v, &sz, NULL, 0) != 0) return 3;
+                size_t mib[2], miblen = 2; size_t alloc = 0, al = sizeof alloc;
+                uint64_t epoch = 1;
+                if (mallctl("epoch", NULL, NULL, &epoch, sizeof epoch) != 0) return 8;
+                if (mallctlnametomib("stats.allocated", mib, &miblen) != 0) return 9;
+                if (mallctlbymib(mib, miblen, &alloc, &al, NULL, 0) != 0 || alloc < 64) return 10;
+                void *q = je_malloc(10);
+                if (!q || malloc_usable_size(q) < 10 || je_malloc_usable_size(q) < 10) return 11;
+                je_free(q);
+                printf("mallocx from %s\nmalloc from %s\nversion %s (header %s)\nstats.allocated %zu\n",
+                       di.dli_fname, dm.dli_fname, v, JEMALLOC_VERSION, alloc);
+                dallocx(p, 0);
+                const char *tail = strrchr(di.dli_fname, '/');
+                if (!tail || strcmp(tail, "/libjemalloc.so.2") != 0) return 4;
+                tail = strrchr(dm.dli_fname, '/');
+                if (!tail || strcmp(tail, "/libjemalloc.so.2") != 0) return 5;
+                if (strcmp(v, JEMALLOC_VERSION) != 0) return 12;
+                return strstr(v, "challoc") ? 0 : 6;
+            }
+            EOF
+            gcc -Wall -Wextra -Werror $(pkg-config --cflags jemalloc) compat.c -o compat $(pkg-config --libs jemalloc) -ldl
+            readelf -d compat | grep NEEDED
+            # scripts/check-needed.sh's rule: DT_NEEDED must name the library.
+            readelf -d compat | grep -q 'NEEDED.*\[libjemalloc.so.2\]'
+            ./compat
+            g++ -Wall -Wextra -Werror -x c++ $(pkg-config --cflags jemalloc) compat.c -o compatxx $(pkg-config --libs jemalloc) -ldl
+            ./compatxx
+            # malloc_stats_print reaches the library and names it.
+            cat > stats.c <<'EOF'
+            #include <jemalloc/jemalloc.h>
+            int main(void) { malloc_stats_print(NULL, NULL, NULL); return 0; }
+            EOF
+            gcc stats.c -o stats $(pkg-config --libs jemalloc)
+            ./stats >stats.out 2>&1
+            head -3 stats.out
+            grep -q '^Version: "${{vars.jemalloc-version}}-0-gchalloc"' stats.out
+
+update:
+  enabled: true
+  github:
+    identifier: chainguard-project-theseus/challoc
+    strip-prefix: ""
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - binutils
+        - posix-libc-utils
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: soname, loadability and an LD_PRELOAD run
+      runs: |
+        set -eux
+        readelf -d /usr/lib/libchalloc.so.${{vars.soversion}} | grep 'Library soname'
+        readelf -d /usr/lib/libchalloc.so.${{vars.soversion}} | grep -q 'Library soname: \[libchalloc.so.${{vars.soversion}}\]'
+        ldd /usr/lib/libchalloc.so.${{vars.soversion}}
+        ! ldd /usr/lib/libchalloc.so.${{vars.soversion}} | grep -q 'not found'
+        # The runtime package ships no link name: that is challoc-dev's.
+        ! [ -e /usr/lib/libchalloc.so ]
+        LD_PRELOAD=/usr/lib/libchalloc.so.${{vars.soversion}} ls /usr/lib | grep -q libchalloc.so.${{vars.soversion}}
+        LD_PRELOAD=/usr/lib/libchalloc.so.${{vars.soversion}} readelf -h /usr/lib/libchalloc.so.${{vars.soversion}} | grep -q 'Shared object file'

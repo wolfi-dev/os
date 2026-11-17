@@ -49,7 +49,9 @@ description: |
   t.TempDir() then crosses filesystems (EXDEV); such a caller can set
   GOTMPDIR itself (e.g. GOTMPDIR: /var/tmp), which keeps both on one
   disk. Packages are built and tested at most 4 at a time by default
-  (`jobs`).
+  (`jobs`). The -exec wrapper runs a private copy of each test binary, in
+  a new directory next to it, so starting it cannot fail with "Text file
+  busy" (golang/go#22315, see the comment in the step).
 
   The suite is a hard gate. The step fails if:
     - a test fails (top-level test reported as fail),
@@ -231,6 +233,24 @@ pipeline:
       # would put test temp dirs on a different filesystem from
       # os.TempDir() (EXDEV renames, conftest) and lengthen the unix
       # socket paths tests create in them past the 108-byte limit (xcover).
+      #
+      # The wrapper runs a private copy of the test binary, not the file go
+      # test linked. cmd/go rewrites the build ID in each freshly linked
+      # binary through a write descriptor, and a child that another
+      # goroutine forks meanwhile holds a copy of it until its own exec, so
+      # executing the binary can fail with ETXTBSY ("Text file busy",
+      # golang/go#22315). cmd/go retries that when it starts the binary
+      # itself, but with -exec it starts this wrapper, and the wrapper's
+      # exec has no retry (a failed exec ends a non-interactive sh, and its
+      # exit status could not be told apart from the test's). Only cp has
+      # ever had the copy open for writing, and cp has exited, so the exec
+      # cannot hit the race: no retry, and the test runs at most once. A
+      # hard link would not help (same inode). The copy keeps the binary's
+      # name (os.Args[0] still ends in <pkg>.test; helper-process tests
+      # re-exec it), the working directory is unchanged, and it sits in a
+      # new directory next to the original, inside the package's go-build
+      # directory, which go test removes when the package is done, so at
+      # most `jobs` extra copies exist at a time.
       execw=$(mktemp)
       gowork=""
       trap 'rm -rf "$gowork" "$execw"' EXIT
@@ -238,7 +258,11 @@ pipeline:
         echo '#!/bin/sh'
         echo 'unset GOTMPDIR GOCACHE'
         export -p | grep -E '^(export|declare -x) (GOTMPDIR|GOCACHE)=' || true
-        echo 'exec "$@"'
+        echo 'run=$(mktemp -d "$(dirname -- "$1")/run.XXXXXX") || exit 1'
+        echo 'bin="$run/${1##*/}"'
+        echo 'cp -- "$1" "$bin" || exit 1'
+        echo 'shift'
+        echo 'exec "$bin" "$@"'
       } > "$execw"
       chmod +x "$execw"
       if [ -z "${GOTMPDIR:-}" ] || [ -z "${GOCACHE:-}" ]; then

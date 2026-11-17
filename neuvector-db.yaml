@@ -1,8 +1,8 @@
+#nolint:valid-pipeline-git-checkout-tag
 package:
   name: neuvector-db
-  version: 0.0.0
-  # Increment daily
-  epoch: 7 # refresh the NeuVector CVE database
+  version: "0.0.0_git20261116"
+  epoch: 0
   description: NeuVector vulnerability database for the SUSE NeuVector Container Security Platform
   copyright:
     - license: Apache-2.0
@@ -17,29 +17,63 @@ environment:
       - crane
 
 pipeline:
+  - uses: git-checkout
+    with:
+      # Unused, here to just have an auto-bumped reference. Upstream commits
+      # "chore: bump VULNDB_VERSION" to main with every CVE database release.
+      repository: https://github.com/neuvector/scanner
+      branch: main
+      expected-commit: 7e88f95ce184aa8eb573e697dbfb3fd8794f0d93
+      destination: unused
+
   - runs: |
-      # Fetch NeuVector scanner
-      crane export neuvector/scanner:latest scanner.tar
+      # The database itself is only published in the upstream scanner image.
+      # Every published release has a "<VULNDB_VERSION>-b" tag on Docker Hub
+      # (plain version tags are sometimes missing), and it lands about an hour
+      # after the VULNDB_VERSION commit on main. Pin to that tag so the DB
+      # matches the package version and rebuilds are reproducible. If the tag
+      # is not published yet (or never is), fail so the bump is retried
+      # instead of shipping a stale DB under a new version.
+      upstream_vulndb=$(sed -n 's/^ARG VULNDB_VERSION=//p' unused/package/Dockerfile)
+      rm -r unused
+      if [ -z "$upstream_vulndb" ]; then
+        echo "ERROR: could not read VULNDB_VERSION from upstream package/Dockerfile"
+        exit 1
+      fi
 
-      # Extract image
+      crane export neuvector/scanner:${upstream_vulndb}-b scanner.tar
       mkdir -p scanner
-      tar xvf scanner.tar -C scanner
+      tar xf scanner.tar -C scanner
 
-      # Install DB
+      # The cvedb file starts with a JSON header: {"Version":"4.327","UpdateTime":...
+      # The image labels are not reliable (4.318-b carries DB 4.319), so check
+      # the header itself.
+      db_version=$(head -c 200 scanner/etc/neuvector/db/cvedb | grep -ao '"Version":"[^"]*"' | cut -d'"' -f4 || true)
+      if [ "$db_version" != "$upstream_vulndb" ]; then
+        echo "ERROR: neuvector/scanner:${upstream_vulndb}-b carries CVE database '${db_version}', upstream main expects ${upstream_vulndb}"
+        exit 1
+      fi
+      echo "CVE database version ${db_version}"
+
       mkdir -p ${{targets.contextdir}}/etc/neuvector/db
       cp scanner/etc/neuvector/db/cvedb ${{targets.contextdir}}/etc/neuvector/db/cvedb
 
-  - uses: strip
-
 test:
   pipeline:
-    - runs: |
-        if [ -f "/etc/neuvector/db/cvedb" ]; then
-          echo "CVE DB found!" && exit 0
-        else
-          echo "CVE DB not found!" && exit 1
+    - name: CVE database has a valid version header
+      runs: |
+        test -s /etc/neuvector/db/cvedb
+        # The cvedb file starts with a JSON header: {"Version":"4.327","UpdateTime":...
+        db_version=$(head -c 200 /etc/neuvector/db/cvedb | grep -ao '"Version":"[^"]*"' | cut -d'"' -f4 || true)
+        if [ -z "$db_version" ]; then
+          echo "CVE database version not found in cvedb header"
+          exit 1
         fi
+        echo "CVE database version ${db_version}"
 
 update:
-  manual: true
-  exclude-reason: No releases or tags
+  enabled: true
+  git: {}
+  schedule:
+    period: daily
+    reason: Upstream publishes a new CVE database with each scanner release, refresh it on every upstream main commit

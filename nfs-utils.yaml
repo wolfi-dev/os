@@ -1,8 +1,8 @@
 package:
   name: nfs-utils
   version: "3.1.1"
-  epoch: 1 # rebuild to publish nfs-utils-source
-  description: kernel-mode NFS
+  epoch: 2 # split into per-tool subpackages; nfs-utils becomes a metapackage
+  description: kernel-mode NFS (metapackage over the nfs-utils-* tool packages)
   copyright:
     - license: GPL-2.0-only
   checks:
@@ -11,8 +11,21 @@ package:
   dependencies:
     runtime:
       - busybox
+      # nfs-utils is a metapackage. Every tool lives in its own nfs-utils-<tool>
+      # subpackage below; this list is the union of all of them, so an existing
+      # "apk add nfs-utils" keeps the same file closure at the same paths.
+      - libnfsidmap-ldap
       - merged-sbin
       - merged-usrsbin
+      - nfs-utils-client
+      - nfs-utils-exportfs
+      - nfs-utils-fsidd
+      - nfs-utils-nfsdclddb
+      - nfs-utils-nfsdclnts
+      - nfs-utils-nfsdctl
+      - nfs-utils-nfsref
+      - nfs-utils-rpc-mountd
+      - nfs-utils-rpc-nfsd
       - wolfi-baselayout
   resources:
     cpu: "1"
@@ -77,6 +90,55 @@ pipeline:
 
   - uses: strip
 
+# Per-tool split. Distros do not agree on a client/server line (Debian puts
+# nfsdcld in nfs-kernel-server, SLES and Tumbleweed in nfs-client; Fedora puts
+# rpc.idmapd on the server side; Tumbleweed and Fedora have a third package for
+# rpcctl, nfsdclddb and nfsdclnts), so instead of choosing one, every tool is its
+# own package and the groups (nfs-utils-client, nfs-utils-stats, nfs-utils) are
+# composed from them. The DISA GPOS STIG No_Remote_Access rule (SV-263652r982557)
+# matches package names in the apk database, nfs-utils among them, so an image
+# that only mounts NFS can take nfs-utils-client or individual tools and stop
+# recording the umbrella name. Subpackages that own files outside usr/bin are
+# written out; the rest come from these ranges. The last leaf declared
+# (nfs-utils-rpc-nfsd) asserts nothing is left behind.
+data:
+  # Keys are the package-name suffix (dots in binary names become hyphens);
+  # values are the binaries that tool owns.
+  - name: elf-tools
+    items:
+      fsidd: fsidd
+      nfsconf: nfsconf
+      nfsdcld: nfsdcld
+      nfsdctl: nfsdctl
+      nfsidmap: nfsidmap
+      nfsref: nfsref
+      nfsstat: nfsstat
+      rpc-gssd: rpc.gssd
+      rpc-idmapd: rpc.idmapd
+      rpc-svcgssd: rpc.svcgssd
+      rpcdebug: rpcdebug
+      showmount: showmount
+
+  # The statistics scripts. These two already lived outside nfs-utils in the
+  # -stats subpackage and declared python3; that stays the same.
+  - name: stats-tools
+    items:
+      mountstats: mountstats
+      nfsiostat: nfsiostat
+
+  # Three more Python scripts that have always shipped inside nfs-utils with no
+  # python3 dependency. They keep shipping that way: declaring python3 here
+  # would pull an interpreter into every image that installs nfs-utils or
+  # nfs-utils-client (the CSI drivers, siderolabs-kubelet, trident, the longhorn
+  # managers), and would collide with images that pin a specific Python, which
+  # is why the -stats split kept Python out of nfs-utils in the first place.
+  # They run wherever python3 is already present, exactly as today.
+  - name: extra-tools
+    items:
+      nfsdclddb: nfsdclddb
+      nfsdclnts: nfsdclnts
+      rpcctl: rpcctl
+
 subpackages:
   - name: ${{package.name}}-static
     description: "${{package.name}} static library"
@@ -134,29 +196,217 @@ subpackages:
       pipeline:
         - uses: test/tw/debugpackage
 
-  - name: ${{package.name}}-stats
-    description: "NFS I/O statistics tools (mountstats and nfsiostat)"
-    # mountstats and nfsiostat are Python scripts; split them out so the main
-    # nfs-utils package has no python dep and can coexist with images that pin
-    # a specific Python version (e.g. cephcsi with python-3.12 via ceph).
+  # The LDAP idmap plugin is the only piece that drags in openldap and krb5, so
+  # it is split from libnfsidmap the way Alpine does (libnfsidmap-ldap).
+  - name: libnfsidmap-ldap
+    description: LDAP (umich_ldap) plugin for libnfsidmap
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/lib/libnfsidmap
+          mv "${{targets.destdir}}"/usr/lib/libnfsidmap/umich_ldap.so "${{targets.contextdir}}"/usr/lib/libnfsidmap/
+    dependencies:
+      runtime:
+        - libnfsidmap
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  - name: libnfsidmap
+    description: NFSv4 user and group ID mapping library
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libnfsidmap.so.* "${{targets.contextdir}}"/usr/lib/
+          mv "${{targets.destdir}}"/usr/lib/libnfsidmap "${{targets.contextdir}}"/usr/lib/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  # nfsrahead is run by 99-nfs.rules to set per-mount readahead.
+  - name: ${{package.name}}-nfsrahead
+    description: NFS mount readahead helper and its udev rule
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/libexec "${{targets.contextdir}}"/usr/lib/udev/rules.d
+          mv "${{targets.destdir}}"/usr/libexec/nfsrahead "${{targets.contextdir}}"/usr/libexec/
+          mv "${{targets.destdir}}"/usr/lib/udev/rules.d/99-nfs.rules "${{targets.contextdir}}"/usr/lib/udev/rules.d/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+
+  # rpc.statd with its notifier, its shell wrapper and its lock-recovery state.
+  - name: ${{package.name}}-rpc-statd
+    description: NSM status daemon (rpc.statd, sm-notify, start-statd)
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin "${{targets.contextdir}}"/var/lib/nfs
+          for b in rpc.statd sm-notify start-statd; do
+            mv "${{targets.destdir}}"/usr/bin/"$b" "${{targets.contextdir}}"/usr/bin/
+          done
+          mv "${{targets.destdir}}"/var/lib/nfs/sm "${{targets.contextdir}}"/var/lib/nfs/
+          mv "${{targets.destdir}}"/var/lib/nfs/sm.bak "${{targets.contextdir}}"/var/lib/nfs/
+          mv "${{targets.destdir}}"/var/lib/nfs/state "${{targets.contextdir}}"/var/lib/nfs/
+    dependencies:
+      runtime:
+        - busybox # start-statd is a POSIX sh script
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: rpc.statd
+        - uses: test/tw/help-check
+          with:
+            bins: rpc.statd
+        - runs: |
+            command -v sm-notify start-statd
+            test -d /var/lib/nfs/sm && test -d /var/lib/nfs/sm.bak && test -f /var/lib/nfs/state
+
+  # mount.nfs4, umount.nfs and umount.nfs4 are symlinks to mount.nfs.
+  - name: ${{package.name}}-mount-nfs
+    description: NFS mount and umount helpers
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          for b in mount.nfs mount.nfs4 umount.nfs umount.nfs4; do
+            mv "${{targets.destdir}}"/usr/bin/"$b" "${{targets.contextdir}}"/usr/bin/
+          done
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              mount.nfs
+              mount.nfs4
+        - runs: |
+            for l in mount.nfs4 umount.nfs umount.nfs4; do
+              test "$(readlink /usr/bin/$l)" = mount.nfs
+            done
+
+  # etab is the export table exportfs maintains.
+  - name: ${{package.name}}-exportfs
+    description: maintain the table of exported NFS file systems
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin "${{targets.contextdir}}"/var/lib/nfs
+          mv "${{targets.destdir}}"/usr/bin/exportfs "${{targets.contextdir}}"/usr/bin/
+          mv "${{targets.destdir}}"/var/lib/nfs/etab "${{targets.contextdir}}"/var/lib/nfs/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/help-check
+          with:
+            bins: exportfs
+
+  # rmtab is the remote-mount table rpc.mountd writes.
+  - name: ${{package.name}}-rpc-mountd
+    description: NFS mount daemon
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin "${{targets.contextdir}}"/var/lib/nfs
+          mv "${{targets.destdir}}"/usr/bin/rpc.mountd "${{targets.contextdir}}"/usr/bin/
+          mv "${{targets.destdir}}"/var/lib/nfs/rmtab "${{targets.contextdir}}"/var/lib/nfs/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: rpc.mountd
+        - uses: test/tw/help-check
+          with:
+            bins: rpc.mountd
+
+  - range: elf-tools
+    name: ${{package.name}}-${{range.key}}
+    description: NFS utility ${{range.value}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/${{range.value}} "${{targets.contextdir}}"/usr/bin/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: |
+            command -v ${{range.value}}
+
+  - range: stats-tools
+    name: ${{package.name}}-${{range.key}}
+    description: NFS utility ${{range.value}} (Python)
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/${{range.value}} "${{targets.contextdir}}"/usr/bin/
     dependencies:
       runtime:
         - merged-sbin
         - merged-usrsbin
         - python3
         - wolfi-baselayout
-    pipeline:
-      - runs: |
-          mkdir -p "${{targets.contextdir}}"/usr/bin
-          mv "${{targets.destdir}}"/usr/bin/mountstats "${{targets.contextdir}}"/usr/bin/
-          mv "${{targets.destdir}}"/usr/bin/nfsiostat "${{targets.contextdir}}"/usr/bin/
     test:
       pipeline:
         - uses: test/tw/help-check
           with:
-            bins: |
-              mountstats
-              nfsiostat
+            bins: ${{range.value}}
+
+  - range: extra-tools
+    name: ${{package.name}}-${{range.key}}
+    description: NFS utility ${{range.value}} (Python script; needs a python3 the image already has)
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/${{range.value}} "${{targets.contextdir}}"/usr/bin/
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      environment:
+        contents:
+          packages:
+            - python3
+      pipeline:
+        - runs: |
+            command -v ${{range.value}}
+            # not a dependency of the package, so the test brings python3 itself
+            python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' /usr/bin/${{range.value}}
 
   - name: rpcgen
     description: Remote Procedure Call (RPC) protocol compiler
@@ -178,6 +428,150 @@ subpackages:
         - merged-usrsbin
         - wolfi-baselayout
 
+  # Client/server split. The boundary is the one SUSE draws, read from the rpm
+  # database inside the upstream longhorn images (SLES 15 SP7; crane export of
+  # longhornio/longhorn-manager, longhorn-instance-manager and
+  # backing-image-manager at v1.9.2 and v1.12.1). Those three install only
+  # nfs-client-2.6.4. longhorn-share-manager, the component that exports shares,
+  # adds nfs-kernel-server-2.6.4. Setting aside the SUSE rc* scripts, blkmapd and
+  # nfsdcltrack (which we do not build) and mountstats/nfsiostat (already in
+  # -stats), nfs-client is exactly the 17 client binaries below and
+  # nfs-kernel-server is the 8 server binaries minus nfsdctl. nfsdctl post-dates
+  # 2.6.4; Debian trixie and openSUSE Tumbleweed both ship it in their server
+  # package, so it joins the server half here.
+  #
+  # Distros do not agree on this line. Debian puts nfsdcld in nfs-kernel-server,
+  # and openSUSE Tumbleweed moves rpcctl, nfsdclddb and nfsdclnts into a third
+  # package, nfs-tools-extra. This split follows the images these subpackages
+  # exist to match, not a canonical convention.
+  #
+  # nfsdcld (NFSv4 client tracking for nfsd) and rpc.svcgssd (server-side
+  # rpcsec_gss daemon) run on a server by their man pages, but SLES nfs-client
+  # ships both and the client-only images carry both, so they stay on the client
+  # side. Moving them would cost parity and change nothing for the STIG rule,
+  # which matches package names rather than binaries.
+  #
+  # Images that only mount NFS should not carry a server they never run. The
+  # DISA GPOS STIG No_Remote_Access rule (SV-263652r982557) also flags any image
+  # whose apk database records a remote-access service, nfs-utils among them.
+  #
+  # Declared server-first so the client pipeline can claim what is left over and
+  # then assert /usr/bin is empty: a binary added by a future upstream release
+  # fails the build here instead of silently landing in the client package.
+  # Declared last so it can assert every other tool has been claimed: a binary
+  # or state file added by a future upstream release fails the build here instead
+  # of silently staying in the (empty) umbrella package.
+  - name: ${{package.name}}-rpc-nfsd
+    description: the NFS server process
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/rpc.nfsd "${{targets.contextdir}}"/usr/bin/
+          rmdir "${{targets.destdir}}"/usr/bin
+          rmdir "${{targets.destdir}}"/var/lib/nfs
+          rmdir "${{targets.destdir}}"/usr/libexec
+    dependencies:
+      runtime:
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: |
+            command -v rpc.nfsd
+
+  # Groups composed from the leaves.
+  - name: ${{package.name}}-stats
+    description: metapackage for the NFS I/O statistics tools (mountstats and nfsiostat)
+    dependencies:
+      runtime:
+        - ${{package.name}}-mountstats
+        - ${{package.name}}-nfsiostat
+    test:
+      pipeline:
+        - uses: test/metapackage
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              mountstats
+              nfsiostat
+
+  # Everything an NFS client needs, and nothing that serves NFS. This is the set
+  # SLES 15 ships in nfs-client (read from the rpm database inside the upstream
+  # longhorn images), which is a superset of the client packages in Debian,
+  # Tumbleweed and Fedora for the binaries built here. nfsdcld and rpc.svcgssd run
+  # on a server by their man pages but sit in every SUSE client package and in the
+  # client-only upstream images, so they stay. libnfsidmap-ldap is left out so a
+  # client image does not carry openldap; add it if you map ids through LDAP.
+  - name: ${{package.name}}-client
+    description: metapackage for the NFS client tools (mount helpers, statd, idmapd, gssd)
+    dependencies:
+      runtime:
+        - ${{package.name}}-mount-nfs
+        - ${{package.name}}-nfsconf
+        - ${{package.name}}-nfsdcld
+        - ${{package.name}}-nfsidmap
+        - ${{package.name}}-nfsrahead
+        - ${{package.name}}-nfsstat
+        - ${{package.name}}-rpc-gssd
+        - ${{package.name}}-rpc-idmapd
+        - ${{package.name}}-rpc-statd
+        - ${{package.name}}-rpc-svcgssd
+        - ${{package.name}}-rpcctl
+        - ${{package.name}}-rpcdebug
+        - ${{package.name}}-showmount
+    test:
+      pipeline:
+        - uses: test/metapackage
+        - uses: test/tw/ver-check
+          with:
+            bins: |
+              mount.nfs
+              mount.nfs4
+              nfsstat
+              rpc.statd
+              showmount
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              nfsdcld
+              nfsidmap
+              nfsstat
+              rpc.idmapd
+              rpc.statd
+              rpcdebug
+              showmount
+        - name: Test nfsidmap domain lookup
+          runs: |
+            # nfsidmap -d prints the configured NFS domain name (from
+            # /etc/idmapd.conf or derived from the DNS domain). This exercises
+            # real ID-mapping functionality without requiring a running NFS server.
+            nfsidmap -d
+        - name: Test nfsstat statistics output
+          runs: |
+            # nfsstat reads NFS statistics from /proc/net/rpc/nfs (client) and
+            # /proc/net/rpc/nfsd (server). The NFS kernel module may not be loaded
+            # in the test environment, so /proc/net/rpc/nfs may not exist. Accept
+            # either a successful parse with "Client" output or the expected error
+            # message indicating the proc file is absent.
+            if [ -f /proc/net/rpc/nfs ]; then
+              nfsstat -c | grep -F "Client"
+            else
+              out=$(nfsstat -c 2>&1 || true)
+              echo "$out" | grep -F "No Client Stats"
+            fi
+        - name: No server daemons in the client set
+          runs: |
+            for b in rpc.nfsd rpc.mountd exportfs nfsdctl nfsref fsidd; do
+              if command -v "$b" >/dev/null 2>&1; then
+                echo "FAIL: server binary $b present in nfs-utils-client closure"; exit 1
+              fi
+            done
+        - name: No LDAP plugin in the client set
+          runs: |
+            test ! -e /usr/lib/libnfsidmap/umich_ldap.so
+
 update:
   enabled: true
   version-transform:
@@ -187,9 +581,13 @@ update:
     tag-filter-prefix: nfs-utils-
     strip-prefix: nfs-utils-
 
+# nfs-utils ships no files of its own; this asserts the metapackage still pulls
+# both halves, so existing consumers keep the same binaries at the same paths.
+# nfs-utils itself ships no tools; this asserts the umbrella still pulls every
+# one of them, so existing consumers keep the same binaries at the same paths.
 test:
   pipeline:
-    - uses: test/tw/ldd-check
+    - uses: test/metapackage
     - uses: test/tw/ver-check
       with:
         bins: |
@@ -202,31 +600,21 @@ test:
     - uses: test/tw/help-check
       with:
         bins: |
-          nfsidmap
-          rpc.idmapd
-          rpcdebug
           exportfs
           nfsdcld
+          nfsidmap
           nfsstat
+          rpc.idmapd
           rpc.mountd
           rpc.statd
+          rpcdebug
           showmount
-    - name: Test nfsidmap domain lookup
+    - name: Every tool is present
       runs: |
-        # nfsidmap -d prints the configured NFS domain name (from
-        # /etc/idmapd.conf or derived from the DNS domain). This exercises
-        # real ID-mapping functionality without requiring a running NFS server.
-        nfsidmap -d
-    - name: Test nfsstat statistics output
-      runs: |
-        # nfsstat reads NFS statistics from /proc/net/rpc/nfs (client) and
-        # /proc/net/rpc/nfsd (server). The NFS kernel module may not be loaded
-        # in the test environment, so /proc/net/rpc/nfs may not exist. Accept
-        # either a successful parse with "Client" output or the expected error
-        # message indicating the proc file is absent.
-        if [ -f /proc/net/rpc/nfs ]; then
-          nfsstat -c | grep -F "Client"
-        else
-          out=$(nfsstat -c 2>&1 || true)
-          echo "$out" | grep -F "No Client Stats"
-        fi
+        for b in exportfs fsidd mount.nfs mount.nfs4 nfsconf nfsdcld nfsdclddb nfsdclnts nfsdctl \
+                 nfsidmap nfsref nfsstat rpcctl rpcdebug rpc.gssd rpc.idmapd rpc.mountd rpc.nfsd \
+                 rpc.statd rpc.svcgssd showmount sm-notify start-statd umount.nfs umount.nfs4; do
+          command -v "$b" >/dev/null || { echo "FAIL: $b missing from nfs-utils closure"; exit 1; }
+        done
+        test -e /usr/lib/libnfsidmap/umich_ldap.so
+        test -e /usr/libexec/nfsrahead

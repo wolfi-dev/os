@@ -1,0 +1,105 @@
+diff --git a/src/rust/src/backend/aead.rs b/src/rust/src/backend/aead.rs
+index 47528a5..5ff31f6 100644
+--- a/src/rust/src/backend/aead.rs
++++ b/src/rust/src/backend/aead.rs
+@@ -1217,10 +1217,10 @@ impl AesOcb3 {
+                     ));
+                 }
+ 
+-                let cipher = match key_buf.as_bytes().len() {
+-                    16 => openssl::cipher::Cipher::aes_128_ocb(),
+-                    24 => openssl::cipher::Cipher::aes_192_ocb(),
+-                    32 => openssl::cipher::Cipher::aes_256_ocb(),
++                let cipher_name = match key_buf.as_bytes().len() {
++                    16 => "aes-128-ocb",
++                    24 => "aes-192-ocb",
++                    32 => "aes-256-ocb",
+                     _ => {
+                         return Err(CryptographyError::from(
+                             pyo3::exceptions::PyValueError::new_err(
+@@ -1229,11 +1229,18 @@ impl AesOcb3 {
+                         ))
+                     }
+                 };
++                let cipher = openssl::cipher::Cipher::fetch(None, cipher_name, None).map_err(|_| {
++                    CryptographyError::from(exceptions::UnsupportedAlgorithm::new_err((
++                        "AES-OCB3 is not supported by this version of OpenSSL",
++                        exceptions::Reasons::UNSUPPORTED_CIPHER,
++                    )))
++                })?;
++
+ 
+                 Ok(AesOcb3 {
+                     ctx: EvpCipherAead::new(
+                         py,
+-                        AeadCipher::Static(cipher),
++                        AeadCipher::Fetched(cipher),
+                         key,
+                         16,
+                         false,
+diff --git a/src/rust/src/backend/cipher_registry.rs b/src/rust/src/backend/cipher_registry.rs
+index 2a2e5ed..ced9891 100644
+--- a/src/rust/src/backend/cipher_registry.rs
++++ b/src/rust/src/backend/cipher_registry.rs
+@@ -92,6 +92,29 @@ impl<'p> RegistryBuilder<'p> {
+         key_size: Option<u16>,
+         cipher: impl Into<RegistryCipher>,
+     ) -> CryptographyResult<()> {
++        let cipher = cipher.into();
++        // OpenSSL 3+ hands out static EVP_CIPHERs even when no loaded
++        // provider implements them; only register what can be fetched.
++        #[cfg(not(any(
++            CRYPTOGRAPHY_IS_LIBRESSL,
++            CRYPTOGRAPHY_IS_BORINGSSL,
++            CRYPTOGRAPHY_IS_AWSLC
++        )))]
++        {
++            let available = match &cipher {
++                RegistryCipher::Ref(c) => c
++                    .nid()
++                    .short_name()
++                    .map(|n| Cipher::fetch(None, n, None).is_ok())
++                    .unwrap_or(false),
++                // Already fetched from a provider by the caller (SM4-GCM),
++                // and a fetched cipher's NID can be NID_undef.
++                RegistryCipher::Owned(_) => true,
++            };
++            if !available {
++                return Ok(());
++            }
++        }
+         self.m.insert(
+             RegistryKey::new(
+                 self.py,
+@@ -99,7 +122,7 @@ impl<'p> RegistryBuilder<'p> {
+                 mode.clone().unbind(),
+                 key_size,
+             )?,
+-            cipher.into(),
++            cipher,
+         );
+ 
+         Ok(())
+diff --git a/src/rust/src/backend/hashes.rs b/src/rust/src/backend/hashes.rs
+index fa3b924..3bd8c10 100644
+--- a/src/rust/src/backend/hashes.rs
++++ b/src/rust/src/backend/hashes.rs
+@@ -55,7 +55,17 @@ pub(crate) fn message_digest_from_algorithm(
+         Cow::Borrowed(name.as_ref())
+     };
+ 
+-    match openssl::hash::MessageDigest::from_name(&openssl_name) {
++    // EVP_get_digestbyname() consults the static name table, which still
++    // returns an EVP_MD when no loaded provider implements the digest. On
++    // OpenSSL 3+ confirm a provider can actually supply it.
++    let md = openssl::hash::MessageDigest::from_name(&openssl_name);
++    #[cfg(not(any(
++        CRYPTOGRAPHY_IS_LIBRESSL,
++        CRYPTOGRAPHY_IS_BORINGSSL,
++        CRYPTOGRAPHY_IS_AWSLC
++    )))]
++    let md = md.filter(|_| openssl::md::Md::fetch(None, &openssl_name, None).is_ok());
++    match md {
+         Some(md) => Ok(md),
+         None => Err(CryptographyError::from(
+             exceptions::UnsupportedAlgorithm::new_err((

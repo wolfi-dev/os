@@ -2,7 +2,7 @@
 package:
   name: py3-cryptography
   version: "50.0.2"
-  epoch: 5 # rust: 1.99->1.100
+  epoch: 6 # provider-aware capability checks (stereo#400899)
   description: cryptography is a package which provides cryptographic recipes and primitives to Python developers.
   copyright:
     - license: Apache-2.0 OR BSD-3-Clause
@@ -57,6 +57,18 @@ pipeline:
       repository: https://github.com/pyca/cryptography/
       tag: ${{package.version}}
       expected-commit: 4dda5c7fe4ae71b8925f2551910a0ef959df9c7a
+
+  # Make hash and cipher capability checks provider-aware. Our OpenSSL 4
+  # hardening removes algorithms from the default provider's fetch tables
+  # while keeping their static EVP objects (ABI), so name-based checks
+  # reported e.g. SM3, SHA-512/224, Camellia, 3DES modes and AES-OCB as
+  # supported and then failed with InternalError on use. Probe with
+  # EVP_*_fetch instead so callers get UnsupportedAlgorithm. DH and DSA are
+  # left to a follow-up once stereo#400899 decides their policy. Upstream
+  # discussion in pyca/cryptography#15848.
+  - uses: patch
+    with:
+      patches: provider-aware-capability-checks.patch
 
 subpackages:
   - range: py-versions
@@ -126,6 +138,135 @@ subpackages:
             imports: |
               import ${{vars.pypi-package}}
               import cryptography.hazmat.primitives.ciphers
+        - name: Capability checks agree with the operations
+          runs: |
+            # Where hash_supported/cipher_supported says True the operation
+            # works; where it says False it raises UnsupportedAlgorithm, never
+            # InternalError. AEADs have no capability check: they must work
+            # or raise UnsupportedAlgorithm. Positive controls (SHA-256,
+            # HMAC-SHA256, AES-GCM, AES-CBC, ChaCha20, ChaCha20-Poly1305) must
+            # be reported supported and work whatever stereo#400899 decides.
+            # Every AES mode, SHA-2 (but SHA-512/224), SHA-3, SHAKE and BLAKE2
+            # are positive controls too, so a cipher or digest that the
+            # provider-aware registry drops (a fetch-name mismatch) fails here.
+            python${{range.key}} - <<'EOF'
+            import os
+            from cryptography.exceptions import UnsupportedAlgorithm
+            from cryptography.hazmat.backends.openssl.backend import backend
+            from cryptography.hazmat.primitives import hashes, hmac
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives.ciphers import aead
+            from cryptography.hazmat.decrepit.ciphers.algorithms import Camellia, TripleDES
+
+            bad = []
+
+            def outcome(fn):
+                try:
+                    fn()
+                    return True
+                except UnsupportedAlgorithm:
+                    return False
+                except Exception as e:  # InternalError or anything else
+                    return e
+
+            def check(label, supported, fn, must=False):
+                got = outcome(fn)
+                print(f"{label}: supported={supported} works={got}")
+                if not isinstance(got, bool):
+                    bad.append(f"{label}: {type(got).__name__}: {got}")
+                elif supported is not None and supported != got:
+                    bad.append(f"{label}: supported={supported} but works={got}")
+                if must and got is not True:
+                    bad.append(f"{label}: positive control failed")
+
+            def run_hash(alg):
+                h = hashes.Hash(alg)
+                h.update(b"x")
+                h.finalize()
+
+            for alg, must in [
+                (hashes.SHA256(), True), (hashes.SHA1(), False),
+                (hashes.SHA224(), True), (hashes.SHA384(), True),
+                (hashes.SHA512(), True), (hashes.SHA512_224(), False),
+                (hashes.SHA512_256(), True), (hashes.SHA3_224(), True),
+                (hashes.SHA3_256(), True), (hashes.SHA3_384(), True),
+                (hashes.SHA3_512(), True), (hashes.SHAKE128(16), True),
+                (hashes.SHAKE256(32), True), (hashes.MD5(), False),
+                (hashes.SM3(), False), (hashes.BLAKE2b(64), True),
+                (hashes.BLAKE2s(32), True),
+            ]:
+                check(f"hash {alg.name}", backend.hash_supported(alg),
+                      lambda alg=alg: run_hash(alg), must)
+
+            def hmac_sha256():
+                h = hmac.HMAC(os.urandom(32), hashes.SHA256())
+                h.update(b"x")
+                h.finalize()
+            check("hmac sha256", True, hmac_sha256, True)
+
+            def run_cipher(alg, mode):
+                e = Cipher(alg, mode).encryptor()
+                e.update(b"\0" * 64)
+                e.finalize()
+
+            iv16 = os.urandom(16)
+            aes = algorithms.AES(os.urandom(16))
+            cam = Camellia(os.urandom(16))
+            des3 = TripleDES(os.urandom(24))
+            sm4 = algorithms.SM4(os.urandom(16))
+            iv8 = os.urandom(8)
+            for label, alg, mode, must in [
+                ("aes-128-cbc", aes, modes.CBC(iv16), True),
+                ("aes-128-ecb", aes, modes.ECB(), True),
+                ("aes-128-ctr", aes, modes.CTR(iv16), True),
+                ("aes-128-ofb", aes, modes.OFB(iv16), True),
+                ("aes-128-cfb", aes, modes.CFB(iv16), True),
+                ("aes-128-cfb8", aes, modes.CFB8(iv16), True),
+                ("aes-128-gcm", aes, modes.GCM(os.urandom(12)), True),
+                ("aes-256-gcm", algorithms.AES(os.urandom(32)), modes.GCM(os.urandom(12)), True),
+                ("aes-256-cbc", algorithms.AES(os.urandom(32)), modes.CBC(iv16), True),
+                ("aes-256-xts", algorithms.AES(os.urandom(64)), modes.XTS(iv16), True),
+                ("camellia-128-cbc", cam, modes.CBC(iv16), False),
+                ("camellia-128-ecb", cam, modes.ECB(), False),
+                ("camellia-128-ofb", cam, modes.OFB(iv16), False),
+                ("camellia-128-cfb", cam, modes.CFB(iv16), False),
+                ("3des-cbc", des3, modes.CBC(iv8), False),
+                ("3des-ecb", des3, modes.ECB(), False),
+                ("3des-ofb", des3, modes.OFB(iv8), False),
+                ("3des-cfb", des3, modes.CFB(iv8), False),
+                ("3des-cfb8", des3, modes.CFB8(iv8), False),
+                ("sm4-cbc", sm4, modes.CBC(iv16), False),
+                ("sm4-ecb", sm4, modes.ECB(), False),
+                ("sm4-ctr", sm4, modes.CTR(iv16), False),
+                ("sm4-ofb", sm4, modes.OFB(iv16), False),
+                ("sm4-cfb", sm4, modes.CFB(iv16), False),
+                ("chacha20", algorithms.ChaCha20(os.urandom(32), iv16), None, True),
+            ]:
+                check(f"cipher {label}", backend.cipher_supported(alg, mode),
+                      lambda alg=alg, mode=mode: run_cipher(alg, mode), must)
+
+            def run_aead(cls, key_len, nonce_len):
+                cls(os.urandom(key_len)).encrypt(os.urandom(nonce_len), b"x", None)
+
+            for label, cls, key_len, nonce_len, must in [
+                ("aes-gcm", aead.AESGCM, 16, 12, True),
+                ("chacha20-poly1305", aead.ChaCha20Poly1305, 32, 12, True),
+                ("aes-ccm", aead.AESCCM, 16, 12, False),
+                ("aes-ocb3", aead.AESOCB3, 16, 12, False),
+                ("aes-gcm-siv", aead.AESGCMSIV, 16, 12, False),
+            ]:
+                check(f"aead {label}", None,
+                      lambda c=cls, k=key_len, n=nonce_len: run_aead(c, k, n), must)
+            check("aead aes-siv", None,
+                  lambda: aead.AESSIV(os.urandom(32)).encrypt(b"x", None))
+
+            if bad:
+                print("FAIL:")
+                for b in bad:
+                    print("  " + b)
+                raise SystemExit(1)
+            print("capability checks agree with the operations")
+            EOF
 
   - name: py3-wheels-${{vars.pypi-package}}
     description: built ${{vars.pypi-package}} wheels

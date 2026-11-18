@@ -1,7 +1,7 @@
 package:
   name: php-8.3-ddtrace
-  version: "1.27.2"
-  epoch: 1 # rust: 1.99->1.100
+  version: "2.0.0"
+  epoch: 0 # rust: 1.99->1.100
   description: "Datadog PHP Clients"
   copyright:
     - license: Apache-2.0 OR BSD-3-Clause
@@ -49,7 +49,7 @@ pipeline:
     with:
       repository: https://github.com/DataDog/dd-trace-php
       tag: "${{package.version}}"
-      expected-commit: 75950347e3b18e038e01c54500d9ba2e1de4f1ac
+      expected-commit: 40e4fb9be4eed6cf108dae79583b3817323a7081
 
   - name: Clone submodules
     runs: git submodule update --init --recursive
@@ -58,36 +58,17 @@ pipeline:
     runs: phpize
 
   - name: Configure
-    runs: ./configure
+    runs: |
+      # As of 2.0.0 the tracer, the profiler and AppSec are a single
+      # ddtrace.so. The standalone ddappsec.so and datadog-profiling.so
+      # extensions are no longer built (loading ddappsec.so next to
+      # ddtrace.so is a fatal error).
+      ./configure \
+        --enable-ddtrace-appsec \
+        --enable-ddtrace-profiling
 
   - name: Make install
     runs: INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
-
-  - name: Build appsec extension
-    runs: |
-      # Upstream uses -Werror but has a GCC 15 compat issue: anonymous
-      # structs in components-rs/common.h are flagged by -pedantic.
-      # Note: DD_APPSEC_BUILD_HELPER and the ddappsec-helper target were
-      # removed in 1.25.0; the helper is now embedded in the sidecar.
-      cmake -S appsec -B tmp/build_appsec \
-        -DDD_APPSEC_TESTING=OFF \
-        -DDD_APPSEC_BUILD_EXTENSION=ON \
-        -DCMAKE_CXX_FLAGS="-Wno-error=pedantic" \
-        -DCMAKE_C_FLAGS="-Wno-error=pedantic"
-      cmake --build tmp/build_appsec -j$(nproc) --target extension
-
-  - name: Build profiling extension
-    runs: |
-      # As of 1.25.0, the standalone profiling extension is built separately
-      # from the tracer. It uses --no-default-features --features profiling
-      # with the profiler-release cargo profile. The output is
-      # target-profiling/profiler-release/libdatadog_php.so.
-      RUSTFLAGS="--cfg tokio_unstable" \
-        CARGO_TARGET_DIR=/home/build/target-profiling \
-        cargo build \
-        --no-default-features \
-        --features profiling \
-        --profile profiler-release
 
 subpackages:
   - name: ${{package.name}}-config
@@ -126,10 +107,10 @@ subpackages:
         - php-${{vars.phpMM}}
     pipeline:
       - runs: |
-          extdir="${{targets.subpkgdir}}/usr/lib/php/modules"
+          # AppSec is compiled into ddtrace.so as of 2.0.0; this package
+          # only ships the default ruleset.
           sharedir="${{targets.subpkgdir}}/usr/share/dd-trace-php/etc"
-          mkdir -p "$extdir" "$sharedir"
-          install -Dm755 tmp/build_appsec/ddappsec.so "$extdir/ddappsec.so"
+          mkdir -p "$sharedir"
           install -Dm644 appsec/recommended.json "$sharedir/recommended.json"
     test:
       environment:
@@ -141,9 +122,9 @@ subpackages:
             - ${{package.name}}-appsec-config
             - ${{package.name}}-src
       pipeline:
-        - name: Verify appsec extension is loaded
+        - name: Verify appsec is part of the loaded ddtrace extension
           runs: |
-            php -m | grep -F "ddappsec"
+            php -m | grep -F "ddtrace"
         - name: Verify appsec INI settings are recognized
           runs: |
             php -i | grep -F "datadog.appsec.enabled"
@@ -160,8 +141,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
-          echo "extension=ddappsec.so" > "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
-          echo "datadog.appsec.rules=/usr/share/dd-trace-php/etc/recommended.json" >> "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
+          echo "datadog.appsec.rules=/usr/share/dd-trace-php/etc/recommended.json" > "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
     test:
       pipeline:
         - uses: test/tw/configpackage
@@ -175,9 +155,9 @@ subpackages:
         - php-${{vars.phpMM}}
     pipeline:
       - runs: |
-          extdir="${{targets.subpkgdir}}/usr/lib/php/modules"
-          mkdir -p "$extdir"
-          install -Dm755 target-profiling/profiler-release/libdatadog_php.so "$extdir/datadog-profiling.so"
+          # The profiler is compiled into ddtrace.so as of 2.0.0 and is
+          # opt-in; this package only enables it through its -config package.
+          mkdir -p "${{targets.subpkgdir}}"
     test:
       environment:
         contents:
@@ -188,19 +168,20 @@ subpackages:
             - ${{package.name}}-profiling-config
             - ${{package.name}}-src
       pipeline:
-        - name: Verify profiling extension is loaded
+        - name: Verify ddtrace extension is loaded
           runs: |
-            php -m | grep -F "datadog-profiling"
-        - name: Verify profiling appears in phpinfo
+            php -m | grep -F "ddtrace"
+        - name: Verify profiling is enabled and appears in phpinfo
           runs: |
-            php -i | grep -F "datadog-profiling"
-        - name: Verify profiling extension coexists with ddtrace
+            php -i | grep -F "datadog.profiling.enabled"
+            php -r 'if (!filter_var(ini_get("datadog.profiling.enabled"), FILTER_VALIDATE_BOOLEAN)) { echo "profiling not enabled\n"; exit(1); }'
+        - name: Verify profiling is part of the ddtrace extension
           runs: |
             php -r '
               $mods = get_loaded_extensions();
               if (!in_array("ddtrace", $mods)) { echo "ddtrace not loaded\n"; exit(1); }
-              if (!in_array("datadog-profiling", $mods)) { echo "datadog-profiling not loaded\n"; exit(1); }
-              echo "Both ddtrace and datadog-profiling loaded successfully\n";
+              if (in_array("datadog-profiling", $mods)) { echo "standalone datadog-profiling must not be loaded\n"; exit(1); }
+              echo "ddtrace with built-in profiling loaded successfully\n";
             '
         - uses: test/tw/ldd-check
 
@@ -208,7 +189,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
-          echo "extension=datadog-profiling.so" > "${{targets.subpkgdir}}/etc/php/conf.d/datadog-profiling.ini"
+          echo "datadog.profiling.enabled=On" > "${{targets.subpkgdir}}/etc/php/conf.d/datadog-profiling.ini"
     test:
       pipeline:
         - uses: test/tw/configpackage

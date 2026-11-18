@@ -2,7 +2,7 @@
 package:
   name: lvm2
   version: "2.03.44"
-  epoch: 1 # go/wolfi-rsc/lvm2
+  epoch: 2 # locking dir, modprobe, dmeventd links, systemd-run
   description: Logical Volume Manager 2 utilities
   copyright:
     - license: GPL-2.0-only AND LGPL-2.1-only
@@ -60,6 +60,7 @@ pipeline:
         --with-usrsbindir=/usr/bin \
         --with-staticdir=/usr/bin \
         --localstatedir=/var \
+        --with-default-locking-dir=/run/lock/lvm \
         --enable-static_link \
         --disable-nls \
         --disable-readline \
@@ -78,9 +79,10 @@ pipeline:
         --with-cache-repair=/usr/bin/cache_repair \
         --with-cache-restore=/usr/bin/cache_restore \
         --with-dmeventd-path=/usr/bin/dmeventd \
-        --without-systemd-run \
+        --with-systemd-run=/usr/bin/systemd-run \
         --enable-udev_rules \
-        CLDFLAGS="$LDFLAGS"
+        CLDFLAGS="$LDFLAGS" \
+        MODPROBE_CMD=/usr/bin/modprobe
 
   - uses: autoconf/make
 
@@ -156,6 +158,17 @@ subpackages:
   - name: lvm2-dev
     pipeline:
       - uses: split/dev
+      - runs: |
+          # split/dev moves every usr/lib/*.so symlink into this package.
+          # The links to the dmeventd plugins are not for linking.
+          # dmeventd loads each plugin with dlopen() by bare name (for
+          # example libdevmapper-event-lvm2thin.so) and finds it only
+          # through these links. Move the links back into lvm2, next to
+          # the plugins in usr/lib/device-mapper that they point to.
+          for plugin in "${{targets.destdir}}"/usr/lib/device-mapper/*.so; do
+            link="usr/lib/${plugin##*/}"
+            mv "${{targets.contextdir}}/$link" "${{targets.destdir}}/$link"
+          done
     test:
       pipeline:
         - uses: test/tw/devpackage
@@ -210,6 +223,25 @@ subpackages:
         - uses: test/verify-service
           with:
             man: true
+        - name: Test dmeventd finds the LVM plugins by name
+          runs: |
+            # LVM tells dmeventd which plugin to load for each segment
+            # type, as set in the dmeventd section of the configuration.
+            # dmeventd passes the bare name to dlopen(), which searches
+            # the library path, here /usr/lib.
+            lvmconfig --typeconfig full dmeventd > dmeventd.conf
+            sed -n 's/^[[:space:]]*[a-z]*_library="\(.*\)"$/\1/p' dmeventd.conf > plugins
+
+            # Fail if the configuration names no plugins at all, so the
+            # loop below cannot pass by checking nothing.
+            [ -s plugins ]
+
+            # Each name must resolve in /usr/lib. -e follows symlinks, so
+            # a dangling link fails too.
+            while read -r plugin; do
+              echo "Checking /usr/lib/$plugin"
+              [ -e "/usr/lib/$plugin" ]
+            done < plugins
     dependencies:
       runtime:
         - lvm2
@@ -248,6 +280,8 @@ test:
     contents:
       packages:
         - lvm2-doc
+        - mount
+        - util-linux-misc
   pipeline:
     - uses: test/tw/ver-check
       with:
@@ -375,3 +409,40 @@ test:
         lvm formats | grep -iF "lvm2"
         # List available segment types
         lvm segtypes | grep -iF "linear"
+    - name: Test LVM creates its locking directory before /run/lock exists
+      runs: |
+        # At boot, lvm2-monitor.service runs before systemd-tmpfiles
+        # creates /run/lock, so /run is still an empty tmpfs. Recreate
+        # that state in a private mount namespace with an empty tmpfs on
+        # /run, so the /run of the test environment stays untouched.
+        #
+        # In there, run the ExecStart command of lvm2-monitor.service.
+        # LVM sets up its file locking before it scans for volume groups.
+        # If LVM cannot create its locking directory, the command fails
+        # with exit status 5, also when there are no volume groups. LVM
+        # must create the locking directory under /run itself, not behind
+        # the /var/lock symlink.
+        unshare --mount sh -ec '
+          mount -t tmpfs tmpfs /run
+          lvm vgchange --monitor y
+          [ -d /run/lock/lvm ]
+        '
+    - name: Test LVM can load device-mapper target modules
+      runs: |
+        # LVM runs modprobe for a missing device-mapper target, such as
+        # dm-snapshot, only if configure found modprobe. Otherwise the
+        # code is compiled out and the path is not in the binary.
+        # Without a kernel, check that the path is compiled in.
+        grep -qF /usr/bin/modprobe /usr/bin/lvm
+    - name: Test udev autoactivation does not run the literal "no"
+      runs: |
+        # 69-dm-lvm.rules activates a complete volume group with
+        # "systemd-run ... lvm vgchange -aay". configure substitutes the
+        # systemd-run path into the rule, and substitutes the literal
+        # "no" when it is built --without-systemd-run. Take the command
+        # that the activation rule runs and make sure that it is not "no".
+        run_cmd=$(sed -n 's/.*RUN+="\([^ "]*\) .*vgchange -aay.*/\1/p' \
+          /usr/lib/udev/rules.d/69-dm-lvm.rules)
+        echo "Activation runs: $run_cmd"
+        [ -n "$run_cmd" ]
+        [ "$run_cmd" != no ]

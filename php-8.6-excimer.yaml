@@ -1,0 +1,129 @@
+package:
+  name: php-8.6-excimer
+  version: "1.2.7"
+  epoch: 0
+  description: "Excimer is a PHP extension that provides an interrupting timer and a low-overhead sampling profiler."
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ${{package.name}}-config
+      - php-${{vars.phpMM}}
+  resources:
+    cpu: "1"
+    memory: 5Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - build-base
+      - busybox
+      - glibc-2.44-dev
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/wikimedia/mediawiki-php-excimer
+      tag: "${{package.version}}"
+      expected-commit: 23f541b9d970db0524a1b2506b4df727e5e59998
+      # PHP 8.6 removed XtOffsetOf() and INI_INT(), which 1.2.7 still uses.
+      # Drop this cherry-pick with the first release after 1.2.7.
+      cherry-picks: |
+        master/34183f9487bf95cd5b8dab50af737d19de5179f7: fix build with PHP 8.6.0alpha3 (XtOffsetOf and INI_INT removed)
+
+  - name: Prepare build
+    runs: phpize
+
+  - name: Configure
+    runs: |
+      set -x
+      ./configure
+
+  - uses: autoconf/make
+
+  - name: Make install
+    runs: |
+      set -x
+      INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
+
+  - uses: upstream-tests/php-ext-test
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=excimer.so" > "${{targets.subpkgdir}}/etc/php/conf.d/excimer.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+test:
+  environment:
+    contents:
+      packages:
+        - ${{package.name}}-config
+        - php-${{vars.phpMM}}
+  pipeline:
+    # The steps run plain `php`, with no `-d extension=excimer.so`: the
+    # extension must load through /etc/php/conf.d/excimer.ini, which the
+    # -config subpackage ships.
+    - name: Verify excimer extension loads
+      runs: |
+        php -r "
+          if (!extension_loaded('excimer')) {
+            fwrite(STDERR, 'excimer extension not loaded' . PHP_EOL);
+            exit(1);
+          }
+          echo 'excimer extension loaded OK\n';
+        "
+    - name: Verify ExcimerTimer class exists
+      runs: |
+        php -r "
+          if (!class_exists('ExcimerTimer')) {
+            fwrite(STDERR, 'ExcimerTimer class not found' . PHP_EOL);
+            exit(1);
+          }
+          echo 'ExcimerTimer class found OK\n';
+        "
+    - name: Verify ExcimerProfiler collects samples
+      runs: |
+        php -r "
+          \$prof = new ExcimerProfiler;
+          \$prof->setPeriod(0.001);
+          \$prof->setEventType(EXCIMER_REAL);
+          \$prof->start();
+          \$end = microtime(true) + 0.1;
+          while (microtime(true) < \$end) {
+            // busy-wait to generate samples
+          }
+          \$prof->stop();
+          \$log = \$prof->getLog();
+          if (!(\$log instanceof ExcimerLog)) {
+            fwrite(STDERR, 'getLog() did not return ExcimerLog' . PHP_EOL);
+            exit(1);
+          }
+          if (\$log->count() < 1) {
+            fwrite(STDERR, 'ExcimerProfiler recorded no samples' . PHP_EOL);
+            exit(1);
+          }
+          echo 'ExcimerProfiler collected log OK\n';
+        "
+    - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  github:
+    identifier: wikimedia/mediawiki-php-excimer
+    use-tag: true

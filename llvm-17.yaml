@@ -2,7 +2,7 @@
 package:
   name: llvm-17
   version: 17.0.6
-  epoch: 31 # rebuild to publish llvm-17-source
+  epoch: 32 # dev deps, terminfo, lld split globs, lldb subpackages
   description: Low-level virtual machine ${{vars.major-version}} - core frameworks
   copyright:
     - license: Apache-2.0
@@ -41,12 +41,15 @@ environment:
       - git
       - glibc-2.44-dev
       - help2man
+      - libedit-dev
       - libffi-dev
       - libxml2-dev
+      - ncurses-dev
       - pkgconf
       - python-${{vars.python-version}}
       - samurai
       - wolfi-base
+      - xz-dev
       - zlib-dev
 
 pipeline:
@@ -95,6 +98,12 @@ pipeline:
         C_INCLUDE_DIRS="/usr/lib/oldglibc/usr/include:/usr/include"
       fi
 
+      # lldb's curses search finds libcurses.so, which does not link libtinfo,
+      # so lldb-server fails to link. libncursesw.so is a linker script that
+      # adds -ltinfo.
+      # libedit-dev is only here for lldb. LLVM_ENABLE_LIBEDIT stays off so
+      # libLLVM and the LLVM tools do not start linking libedit.
+      # The Intel MPX plugin is off: MPX support is gone from GCC and Linux.
       cmake -B output -G Ninja -S llvm -Wno-dev \
         ${C_INCLUDE_DIRS:+-DC_INCLUDE_DIRS="${C_INCLUDE_DIRS}"} \
         -DCMAKE_BUILD_TYPE=Release \
@@ -114,7 +123,7 @@ pipeline:
         -DLLVM_ENABLE_FFI=ON \
         -DLLVM_ENABLE_LIBCXX=ON \
         -DLLVM_ENABLE_PIC=ON \
-        -DLLVM_ENABLE_PROJECTS="clang;lld;clang-tools-extra" \
+        -DLLVM_ENABLE_PROJECTS="clang;lld;lldb;clang-tools-extra" \
         -DLLVM_ENABLE_RUNTIMES="compiler-rt;libcxx;libcxxabi;libunwind" \
         -DLLVM_ENABLE_RTTI=ON \
         -DLLVM_ENABLE_SPHINX=OFF \
@@ -139,7 +148,18 @@ pipeline:
         -DCOMPILER_RT_INCLUDE_TESTS=OFF \
         -DCOMPILER_RT_BUILD_SANITIZERS=ON \
         -DCOMPILER_RT_INSTALL_PATH="${{vars.clang-prefix}}" \
-        -DCOMPILER_RT_BUILD_GWP_ASAN=OFF
+        -DCOMPILER_RT_BUILD_GWP_ASAN=OFF \
+        -DCURSES_INCLUDE_DIRS=/usr/include \
+        -DCURSES_LIBRARIES=/usr/lib/libncursesw.so \
+        -DPANEL_LIBRARIES=/usr/lib/libpanelw.so \
+        -DLLDB_BUILD_INTEL_MPX=OFF \
+        -DLLDB_ENABLE_CURSES=ON \
+        -DLLDB_ENABLE_LIBEDIT=ON \
+        -DLLDB_ENABLE_LIBXML2=ON \
+        -DLLDB_ENABLE_LUA=OFF \
+        -DLLDB_ENABLE_LZMA=ON \
+        -DLLDB_ENABLE_PYTHON=OFF \
+        -DLLVM_ENABLE_LIBEDIT=OFF
 
       cmake --build output --target llvm-tblgen
       cmake --build output --target clang-tblgen
@@ -637,6 +657,83 @@ subpackages:
           with:
             bins: ${{vars.bpf-bins}}
 
+  - name: liblldb-${{vars.major-version}}
+    description: LLDB ${{vars.major-version}} runtime library
+    dependencies:
+      runtime:
+        - libLLVM-${{vars.major-version}}=${{package.full-version}}
+        - libclang-cpp-${{vars.major-version}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/usr/lib ${{targets.contextdir}}/${{vars.llvm-prefix}}/lib
+          for path in ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/liblldb.so.*; do
+            name=${path##*/}
+            mv "$path" ${{targets.contextdir}}/usr/lib/
+            ln -s ../../$name ${{targets.contextdir}}/${{vars.llvm-prefix}}/lib/$name
+          done
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/soversion-check
+
+  - name: liblldb-${{vars.major-version}}-dev
+    description: LLDB ${{vars.major-version}} development files
+    dependencies:
+      runtime:
+        - liblldb-${{vars.major-version}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/${{vars.llvm-prefix}}/include
+          mv ${{targets.destdir}}/${{vars.llvm-prefix}}/include/lldb ${{targets.contextdir}}/${{vars.llvm-prefix}}/include/
+
+          mkdir -p ${{targets.contextdir}}/${{vars.llvm-prefix}}/lib
+          target=$(readlink ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/liblldb.so)
+          rm ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/liblldb.so
+          ln -s ../../$target ${{targets.contextdir}}/${{vars.llvm-prefix}}/lib/liblldb.so
+    test:
+      pipeline:
+        - uses: test/tw/devpackage
+
+  - name: lldb-${{vars.major-version}}
+    description: LLVM ${{vars.major-version}} debugger
+    dependencies:
+      runtime:
+        - libLLVM-${{vars.major-version}}=${{package.full-version}}
+        - liblldb-${{vars.major-version}}=${{package.full-version}}
+    pipeline:
+      - runs: |
+          mkdir -p ${{targets.contextdir}}/${{vars.llvm-prefix}}/bin
+          mv ${{targets.destdir}}/${{vars.llvm-prefix}}/bin/lldb* ${{targets.contextdir}}/${{vars.llvm-prefix}}/bin/
+
+          mkdir -p ${{targets.contextdir}}/usr/bin
+          for path in ${{targets.contextdir}}/${{vars.llvm-prefix}}/bin/*; do
+            name=${path##*/}
+            ln -s ../lib/llvm-${{vars.major-version}}/bin/$name ${{targets.contextdir}}/usr/bin/$name
+          done
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+      pipeline:
+        - uses: test/tw/ldd-check
+        - runs: |
+            lldb --version | grep "lldb version ${{package.version}}"
+            lldb --help
+            lldb-server version
+            lldb-vscode --help
+        - name: Debug a program
+          runs: |
+            cat > hello.c <<'EOF'
+            #include <stdio.h>
+            int main(void) { puts("hello from lldb"); return 0; }
+            EOF
+            cc -g -o hello hello.c
+            lldb --batch -o "breakpoint set --name main" -o run -o "frame variable" -o continue ./hello > out.txt 2>&1
+            cat out.txt
+            grep -q "stop reason = breakpoint" out.txt
+            grep -q "hello from lldb" out.txt
+
   - name: lld-${{vars.major-version}}
     description: LLVM linker
     dependencies:
@@ -647,8 +744,10 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/bin
-          mv ${{targets.destdir}}/${{vars.llvm-prefix}}/bin/lld* ${{targets.contextdir}}/usr/bin/
-          mv ${{targets.destdir}}/${{vars.llvm-prefix}}/bin/*lld ${{targets.contextdir}}/usr/bin/
+          for name in lld lld-link; do
+            mv ${{targets.destdir}}/${{vars.llvm-prefix}}/bin/$name ${{targets.contextdir}}/usr/bin/
+          done
+          mv ${{targets.destdir}}/${{vars.llvm-prefix}}/bin/*.lld ${{targets.contextdir}}/usr/bin/
           mv ${{targets.destdir}}/${{vars.llvm-prefix}}/bin/wasm-ld ${{targets.contextdir}}/usr/bin/
     test:
       pipeline:
@@ -673,7 +772,7 @@ subpackages:
     pipeline:
       - runs: |
           mkdir -p ${{targets.contextdir}}/usr/lib
-          mv ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/*lld*.a ${{targets.contextdir}}/usr/lib/
+          mv ${{targets.destdir}}/${{vars.llvm-prefix}}/lib/liblld[A-Z]*.a ${{targets.contextdir}}/usr/lib/
 
   - name: lld-${{vars.major-version}}-dev
     description: LLVM linker development files
@@ -824,7 +923,11 @@ subpackages:
     description: Development headers for LLVM ${{vars.major-version}}
     dependencies:
       runtime:
+        - libffi-dev
+        - libxml2-dev
         - llvm-${{vars.major-version}}=${{package.full-version}}
+        - ncurses-dev
+        - zlib-dev
     pipeline:
       - uses: split/dev
       - runs: |
@@ -842,12 +945,39 @@ subpackages:
             ln -s ../lib/llvm-${{vars.major-version}}/bin/$name ${{targets.destdir}}/usr/bin/$name
           done
     test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - cmake
+            - gcc-14-default
       pipeline:
         - uses: test/tw/devpackage
         - uses: test/tw/ldd-check
         - runs: |
             llvm-config --version
             llvm-config --help
+        - name: Link a CMake project against LLVM's static libraries
+          runs: |
+            mkdir cmake-test
+            cd cmake-test
+            cat > CMakeLists.txt <<'EOF'
+            cmake_minimum_required(VERSION 3.20)
+            project(llvm_dev_test C CXX)
+            find_package(LLVM REQUIRED CONFIG)
+            llvm_map_components_to_libnames(llvm_libs support interpreter windowsmanifest)
+            add_executable(llvm-dev-test main.cpp)
+            target_include_directories(llvm-dev-test PRIVATE ${LLVM_INCLUDE_DIRS})
+            target_compile_definitions(llvm-dev-test PRIVATE ${LLVM_DEFINITIONS})
+            target_link_libraries(llvm-dev-test PRIVATE ${llvm_libs})
+            EOF
+            cat > main.cpp <<'EOF'
+            #include "llvm/Support/raw_ostream.h"
+            int main() { llvm::outs() << "linked against LLVM\n"; return 0; }
+            EOF
+            cmake -B build -DLLVM_DIR=/usr/lib/llvm-${{vars.major-version}}/lib/cmake/llvm
+            cmake --build build
+            ./build/llvm-dev-test | grep "linked against LLVM"
 
 update:
   enabled: true

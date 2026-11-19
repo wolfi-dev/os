@@ -1,0 +1,275 @@
+package:
+  name: php-8.6-ddtrace
+  version: "2.0.0"
+  epoch: 0
+  description: "Datadog PHP Clients"
+  copyright:
+    - license: Apache-2.0 OR BSD-3-Clause
+  dependencies:
+    runtime:
+      - ${{package.name}}-config
+      - ${{package.name}}-src
+      - php-${{vars.phpMM}}
+  resources:
+    cpu: "9"
+    memory: 20Gi
+  test-resources:
+    cpu: "1"
+    memory: 3Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+vars:
+  rust-version: "1.100"
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - busybox
+      - clang-23
+      - cmake
+      - curl-dev
+      - glibc-2.44-dev
+      - libclang-cpp-23
+      - libtool
+      - pcre2-dev
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-dev
+      - posix-libc-utils
+      - rust-${{vars.rust-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/DataDog/dd-trace-php
+      tag: "${{package.version}}"
+      expected-commit: 40e4fb9be4eed6cf108dae79583b3817323a7081
+      recurse-submodules: true
+
+  - name: Prepare build
+    runs: phpize
+
+  - name: Configure
+    runs: |
+      # In 2.0.0 AppSec and the profiler are compiled into ddtrace.so (no
+      # separate ddappsec.so or datadog-profiling.so). Loading a standalone
+      # datadog-profiling.so alongside ddtrace is a fatal startup error.
+      ./configure --enable-ddtrace-appsec --enable-ddtrace-profiling
+
+  - name: Make install
+    runs: INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
+
+subpackages:
+  - name: ${{package.name}}-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=ddtrace.so" > "${{targets.subpkgdir}}/etc/php/conf.d/ddtrace.ini"
+          echo "datadog.trace.sources_path=\"/usr/share/dd-trace-php/src\"" >> "${{targets.subpkgdir}}/etc/php/conf.d/ddtrace.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+  - name: ${{package.name}}-src
+    description: "Datadog PHP tracer source files"
+    dependencies:
+      runtime:
+        - php-${{vars.phpMM}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/usr/share/dd-trace-php"
+          cp -r src "${{targets.subpkgdir}}/usr/share/dd-trace-php/"
+    test:
+      pipeline:
+        - uses: test/tw/srcpackage
+          with:
+            dir: /usr/share/dd-trace-php/src/
+
+  - name: ${{package.name}}-appsec
+    description: "Datadog PHP Application Security extension"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - ${{package.name}}-appsec-config
+        - php-${{vars.phpMM}}
+    pipeline:
+      - runs: |
+          # In 2.0.0 the AppSec extension is part of ddtrace.so; only the
+          # recommended rules are shipped separately.
+          sharedir="${{targets.subpkgdir}}/usr/share/dd-trace-php/etc"
+          mkdir -p "$sharedir"
+          install -Dm644 appsec/recommended.json "$sharedir/recommended.json"
+    test:
+      # No packages are listed here on purpose: PHP, ddtrace and the config
+      # packages must come from this subpackage's runtime dependencies, so a
+      # dropped dependency fails the test.
+      environment:
+        environment:
+          # Without a reachable agent, the sidecar's in-process thread-mode
+          # fallback races process shutdown and segfaults PHP (dd-trace-php
+          # 1.21.0). Subprocess-only mode fails the connect cleanly instead.
+          DD_TRACE_SIDECAR_CONNECTION_MODE: subprocess
+      pipeline:
+        - name: Verify appsec support is built into ddtrace
+          runs: |
+            php -m | grep -F "ddtrace"
+            php -i | grep -F "datadog.appsec.enabled"
+        - name: Verify appsec INI settings are recognized
+          runs: |
+            php -i | grep -F "datadog.appsec.enabled"
+            php -i | grep -F "datadog.appsec.rules"
+        - name: Verify PHP reads the packaged rules path
+          runs: |
+            php -r '
+              $rules = ini_get("datadog.appsec.rules");
+              if (!is_readable($rules)) { echo "rules file is not readable: ", var_export($rules, true), "\n"; exit(1); }
+              echo $rules, "\n";
+            ' | grep -Fx "/usr/share/dd-trace-php/etc/recommended.json"
+        - name: Verify is_enabled function exists
+          runs: |
+            php -r 'var_dump(function_exists("Datadog\AppSec\is_enabled"));' | grep -F "bool(true)"
+        - name: Verify rules file is installed
+          runs: |
+            stat /usr/share/dd-trace-php/etc/recommended.json
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-appsec-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "datadog.appsec.rules=/usr/share/dd-trace-php/etc/recommended.json" > "${{targets.subpkgdir}}/etc/php/conf.d/ddappsec.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+  - name: ${{package.name}}-profiling
+    description: "Datadog PHP Profiling extension"
+    dependencies:
+      runtime:
+        - ${{package.name}}
+        - ${{package.name}}-profiling-config
+        - php-${{vars.phpMM}}
+    pipeline:
+      - runs: |
+          # In 2.0.0 the profiler is part of ddtrace.so, so this package
+          # ships no files of its own; it only pulls in the config that
+          # enables profiling.
+          mkdir -p "${{targets.subpkgdir}}"
+    test:
+      # No packages are listed here on purpose: PHP, ddtrace and the config
+      # packages must come from this subpackage's runtime dependencies, so a
+      # dropped dependency fails the test.
+      environment:
+        environment:
+          DD_TRACE_SIDECAR_CONNECTION_MODE: subprocess
+      pipeline:
+        - name: Verify profiling support is loaded
+          runs: |
+            php -m | grep -F "ddtrace"
+        - name: Verify profiling appears in phpinfo
+          runs: |
+            php -i | grep -F "Profiling Enabled"
+        - name: Verify profiling is enabled alongside ddtrace
+          runs: |
+            php -r '
+              $mods = get_loaded_extensions();
+              if (!in_array("ddtrace", $mods)) { echo "ddtrace not loaded\n"; exit(1); }
+              if (in_array("datadog-profiling", $mods)) { echo "standalone datadog-profiling must not be loaded\n"; exit(1); }
+              if (!filter_var(ini_get("datadog.profiling.enabled"), FILTER_VALIDATE_BOOLEAN)) { echo "profiling not enabled\n"; exit(1); }
+              echo "ddtrace loaded with profiling enabled\n";
+            '
+        - uses: test/tw/ldd-check
+
+  - name: ${{package.name}}-profiling-config
+    pipeline:
+      - runs: |
+          # In 2.0.0 the profiler is opt-in and built into ddtrace.so.
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "datadog.profiling.enabled=On" > "${{targets.subpkgdir}}/etc/php/conf.d/datadog-profiling.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+test:
+  environment:
+    contents:
+      packages:
+        - php-${{vars.phpMM}}
+        - ${{package.name}}-config
+        - ${{package.name}}-src
+    environment:
+      DD_TRACE_SIDECAR_CONNECTION_MODE: subprocess
+  pipeline:
+    - name: Verify Extension is Loaded
+      runs: |
+        php -m | grep -F 'ddtrace'
+        if [ $? -ne 0 ]; then
+          echo "Test failed: ddtrace extension is not loaded."
+          exit 1
+        else
+          echo "Test passed: ddtrace extension is loaded."
+        fi
+    - name: Test Basic ddtrace Functionality
+      runs: |
+        cat > test.php <<'EOF'
+        <?php
+        class App {
+          public function get() {
+            return "get";
+          }
+        }
+
+        function some_utility_function() {
+          return "utility";
+        }
+
+        // The tracing callbacks run when the traced call returns.
+        if (!\DDTrace\trace_method('App', 'get', function () {
+          echo "Datadog tracer is running and the trace method callback ran.\n";
+        })) {
+          echo "Test failed: trace_method did not register its hook.\n";
+          exit(1);
+        }
+
+        if (!\DDTrace\trace_function('some_utility_function', function () {
+          echo "Datadog tracer is running and the trace function callback ran.\n";
+        })) {
+          echo "Test failed: trace_function did not register its hook.\n";
+          exit(1);
+        }
+
+        (new App())->get();
+        some_utility_function();
+        ?>
+        EOF
+
+        # A hook that is registered but never runs prints nothing, so the
+        # output must hold both callbacks' lines.
+        php test.php > test.out || { cat test.out; exit 1; }
+        cat test.out
+        grep -F "the trace method callback ran" test.out
+        grep -F "the trace function callback ran" test.out
+        echo "Test passed: ddtrace extension is functional."
+    - name: Test PHP Class Availability
+      runs: |
+        php -r 'if (!class_exists("DDTrace\\GlobalTracer")) exit(1);'
+        if [ $? -ne 0 ]; then
+          echo "Test failed: DDTrace\\GlobalTracer class is not available."
+          exit 1
+        else
+          echo "Test passed: DDTrace\\GlobalTracer class is available."
+        fi
+    - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  github:
+    identifier: DataDog/dd-trace-php
+    use-tag: true

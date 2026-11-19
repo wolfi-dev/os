@@ -1,0 +1,124 @@
+package:
+  name: php-8.6-memcached
+  version: "3.4.0"
+  epoch: 0
+  description: "A PHP extension for Memcached"
+  copyright:
+    - license: PHP-3.01
+  dependencies:
+    runtime:
+      - ${{package.name}}-config
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-igbinary # memcached.so needs igbinary_serialize and friends
+  resources:
+    cpu: "1"
+    memory: 5Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - build-base
+      - busybox
+      - glibc-2.44-dev
+      - libmemcached-dev
+      - memcached # upstream-tests: server for tests/*.phpt
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-dev
+      - php-${{vars.phpMM}}-igbinary
+      - php-${{vars.phpMM}}-igbinary-dev
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/php-memcached-dev/php-memcached
+      tag: v${{package.version}}
+      expected-commit: ce37962769fc7b25f9905c4b23fa53df92447a32
+      cherry-picks: |
+        master/3c73b4f0abe5bbfbbbe686f44a8ae52fcd3e67ee: fix build on PHP 8.6+ (zval_dtor and XtOffsetOf removed, session save_path is a zend_string)
+
+  - name: Prepare build
+    runs: phpize
+
+  - name: Configure
+    runs: ./configure --enable-memcached-igbinary
+
+  - uses: autoconf/make
+
+  - name: Make install
+    runs: |
+      INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
+
+  # Same setup as upstream CI (.github/workflows/build-and-test.yml): a
+  # memcached on 127.0.0.1:11211, which tests/config.inc expects, and the
+  # tests in tests/*.phpt (tests/experimental/ is not part of the suite).
+  - name: Start memcached for the upstream tests
+    runs: |
+      # memcached -d returns before it binds; it writes the pidfile only after
+      # a successful bind, so wait for it and fail if the port wasn't ours.
+      memcached -d -u build -l 127.0.0.1 -p 11211 -P /tmp/memcached-tests.pid
+      for i in $(seq 50); do [ -s /tmp/memcached-tests.pid ] && break; sleep 0.1; done
+      [ -s /tmp/memcached-tests.pid ]
+
+  - uses: upstream-tests/php-ext-test
+    with:
+      tests: tests/*.phpt
+      # The tests share one server and several flush it.
+      jobs: 1
+
+  - name: Stop memcached
+    runs: kill "$(cat /tmp/memcached-tests.pid)"
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=memcached.so" > "${{targets.subpkgdir}}/etc/php/conf.d/memcached.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+update:
+  enabled: true
+  github:
+    identifier: php-memcached-dev/php-memcached
+    strip-prefix: v
+    tag-filter: v
+
+test:
+  pipeline:
+    - name: Verify extensions are loaded
+      runs: |
+        php -m | grep -F memcached
+        php -m | grep -F igbinary
+    - name: Verify igbinary serializer support
+      runs: |
+        php -r '
+        $m = new Memcached();
+        $m->setOption(Memcached::OPT_SERIALIZER, Memcached::SERIALIZER_IGBINARY);
+        if ($m->getOption(Memcached::OPT_SERIALIZER) !== Memcached::SERIALIZER_IGBINARY) {
+            echo "FAIL: igbinary serializer not active\n";
+            exit(1);
+        }
+        echo "igbinary serializer enabled\n";
+
+        $data = ["key" => "value", "nested" => [1, 2, 3]];
+        $serialized = igbinary_serialize($data);
+        $unserialized = igbinary_unserialize($serialized);
+        if ($data !== $unserialized) {
+            echo "FAIL: igbinary round-trip failed\n";
+            exit(1);
+        }
+        echo "igbinary round-trip OK\n";
+        '
+    - uses: test/tw/ldd-check

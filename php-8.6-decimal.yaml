@@ -1,0 +1,130 @@
+package:
+  name: php-8.6-decimal
+  version: "2.0.2"
+  epoch: 0
+  description: Correctly-rounded, arbitrary-precision decimal arithmetic for PHP
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - ${{package.name}}-config
+      - php-${{vars.phpMM}}
+  resources:
+    cpu: "1"
+    memory: 2Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - build-base
+      - busybox
+      - glibc-2.44-dev
+      - mpdecimal-dev
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/php-decimal/ext-decimal
+      tag: "v${{package.version}}"
+      expected-commit: d09287c18c26082f0286fb1414e0dc127416c878
+      # Neither fix is in a release yet (v2.0.2 is the latest tag).
+      cherry-picks: |
+        master/5dc78bade19c1499863689e176de9d6fe867d707: unsupported operator (e.g. $d | 1) segfaulted PHP instead of throwing
+        master/6fd818a8ddc9a48b26d350dd6bcf2634ff372d33: use-after-free in equals()/between()
+
+  # 5dc78bad undefines `result` for an unsupported operator. In compound
+  # assignment ($d |= 1, $a[0] |= 1, $o->p |= 1) result is the left-hand
+  # operand, so that would leave a live variable, array element or property
+  # undefined and leak its value. Guard it; proposed upstream.
+  - uses: patch
+    with:
+      patches: compound-assign-guard.patch
+
+  # PHP 8.6 removed INI_INT() and ZEND_PARSE_PARAMS_THROW, which v2.0.2 and
+  # upstream master still use. Drop the patch once a release builds on 8.6.
+  - uses: patch
+    with:
+      patches: fix-build-with-php-8.6.patch
+
+  - name: Prepare build
+    runs: phpize
+
+  - name: Configure
+    runs: ./configure
+
+  - uses: autoconf/make
+
+  - name: Make install
+    runs: INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
+
+  # upstream-tests: tests only, applied after install so it cannot change
+  # what ships. tests/Decimal/serialize.phpt and tests/Rational/serialize.phpt
+  # end with a hand-written "C:" payload for a class with no unserializer and
+  # expect an empty object. Since php-src#22058 (b50b30c15e), PHP 8.6 fails
+  # that unserialize() and returns false, so the expectation is stale on 8.6.
+  # The patch expects the new answer; both tests still run in full, and their
+  # serialize() and round-trip checks are unchanged. Nothing is ignored.
+  # TODO(upstream-tests): drop the patch once ext-decimal adapts both tests
+  # to PHP 8.6.
+  - uses: patch
+    with:
+      patches: fix-serialize-tests-with-php-8.6.patch
+
+  - uses: upstream-tests/php-ext-test
+
+subpackages:
+  - name: ${{package.name}}-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=decimal.so" > "${{targets.subpkgdir}}/etc/php/conf.d/decimal.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+test:
+  pipeline:
+    - name: Unsupported compound operator throws and leaves the left-hand side intact
+      runs: |
+        php -r '
+          $d = Decimal\Decimal::valueOf("1");
+          try { $d |= 1; echo "no exception\n"; exit(1); } catch (ArithmeticError $e) {}
+          if (!isset($d) || (string) $d !== "1") { echo "variable lost\n"; exit(1); }
+          $a = [Decimal\Decimal::valueOf("1")];
+          try { $a[0] |= 1; echo "no exception\n"; exit(1); } catch (ArithmeticError $e) {}
+          if (implode(",", $a) !== "1") { echo "array element lost\n"; exit(1); }
+          $o = new stdClass; $o->p = Decimal\Decimal::valueOf("1");
+          try { $o->p |= 1; echo "no exception\n"; exit(1); } catch (ArithmeticError $e) {}
+          if ((string) $o->p !== "1") { echo "property lost\n"; exit(1); }
+          echo "ok\n";
+        '
+    - name: Unsupported operator throws ArithmeticError instead of crashing
+      runs: |
+        php -r '
+          try {
+            $r = Decimal\Decimal::valueOf("1") | 1;
+          } catch (ArithmeticError $e) {
+            echo "ok: ", $e->getMessage(), "\n";
+            exit(0);
+          }
+          echo "FAIL: no ArithmeticError\n";
+          exit(1);
+        '
+    - uses: test/tw/ldd-check
+
+update:
+  enabled: true
+  github:
+    identifier: php-decimal/ext-decimal
+    strip-prefix: v
+    tag-filter: v
+    use-tag: true

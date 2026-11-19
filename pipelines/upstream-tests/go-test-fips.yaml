@@ -1,0 +1,801 @@
+name: Go upstream test suite under a FIPS toolchain (go test)
+
+description: |
+  upstream-tests/go-test for FIPS variants: the same step (inputs, module
+  resolution, vet policy, parsing, hard gate and UPSTREAM-TESTS lines, see
+  upstream-tests/go-test), plus the expectations every FIPS caller shares.
+  Use it in place of go-test in any recipe built with a FIPS Go toolchain
+  (go-msft-*, go-geomys-*, go-fips-md5-*, go-fips-*); migrating is a rename
+  of the `uses:` line, every go-test input keeps its meaning.
+
+  The step body is go-test's with the FIPS parts inserted between
+  "# >>> fips" and "# <<< fips" lines. `stereo lint` checks that the rest is
+  identical to go-test (and that every go-test input is repeated here
+  unchanged), so a go-test fix fails lint until it is made here too.
+  go-test's own messages keep their "upstream-tests/go-test:" prefix.
+
+  What it adds:
+
+  1. The tests must run in FIPS mode. Before the suite, a probe program is
+     built with the step's tags, GOEXPERIMENT, GOFLAGS and environment (what
+     the test binaries get) and run; crypto/fips140.Enabled() must be true.
+     If it is false, or the probe fails (e.g. requirefips without a FIPS
+     provider), the step fails: the suite would not test FIPS behaviour.
+     There is no input to turn this off.
+
+  2. The tests must be compiled like the shipped binaries. The build
+     settings `-tags`, CGO_ENABLED, GOEXPERIMENT, GOFIPS140 and
+     microsoft_systemcrypto of the probe are compared with those of the Go
+     binaries already installed in the package (`go version -m` on
+     ${{targets.contextdir}}). `match-build`: `any` (default) needs one
+     installed binary to match and prints a note for the others, `all`
+     needs every one to match, `off` skips the check (comment why in the
+     caller). With `any` or `all`, the step fails when no Go binary is
+     installed in ${{targets.contextdir}} yet (the step runs before go/build,
+     or the binaries are built in a subpackage whose pipeline runs after
+     this one): run it after the binaries are installed, e.g. in the
+     subpackage that builds them, or set `off` with a comment. A mismatch
+     usually means go/build's `tags`, `toolchaintags` or `experiments` were
+     not copied to this step.
+
+  3. Tests that fail only because FIPS mode rejects what they use go in
+     `fips-skip`, not `ignore`. One entry per line:
+       <class> <package> <test>[/<subtest>...] <reason>
+     <class> names what FIPS mode rejects, from this fixed list (adding a
+     class is a change to this pipeline):
+       tripledes         Triple DES / TDEA (crypto/des), e.g. PKCS#12
+                         legacy key bags
+       des               single DES
+       rc2               RC2 (PKCS#12 legacy certificate bags)
+       rc4               RC4
+       md5               MD5 for a security purpose (signature, HMAC, KDF)
+       sha1-signature    SHA-1 signatures and certificates (ssh-rsa,
+                         SHA1WithRSA, ...)
+       p224              NIST P-224 / secp224r1
+       small-rsa         RSA keys below 2048 bits
+       short-key         HMAC keys, PBKDF2 salts or passwords, or other
+                         secrets below the FIPS minimum length
+       dsa               DSA (withdrawn in FIPS 186-5)
+       x25519            X25519 / curve25519 key agreement
+       ed25519           Ed25519, only where the FIPS provider rejects it
+       chacha20          ChaCha20 and ChaCha20-Poly1305
+       non-approved-tls  TLS versions, cipher suites, groups or signature
+                         schemes that FIPS mode does not negotiate
+       non-fips-output   output or behaviour that differs in FIPS mode by
+                         design (a FIPS banner, "fips140": true, another
+                         default cipher list); nothing is rejected
+     <package> is the one package the entry applies to, as an import path
+     (as in UPSTREAM-TESTS-FAIL lines) or a path relative to `dir`
+     (`./internal/command`); not a `...` pattern, and it must be one of the
+     packages under test. <test> is the exact name as `go test -v` prints
+     it (spaces in subtest names are already "_"). "/" descends into
+     subtests, so a P-224 subtest is skipped while its P-256/384/521
+     siblings run. Each element is regex-escaped and anchored, and the
+     package's entries are joined with the `ignore` regex by Go 1.20+
+     alternation:
+       -skip '^(TestA|TestB)$|^TestX$/^ECDSA_P-224_\(weak\)$'
+     Unlike `ignore`, an entry applies only in its package: a same-named
+     test in another package still runs. Every package with entries is
+     tested in a go test run of its own (same flags, its own -skip), the
+     other packages in one run with `ignore` only; the runs are parsed
+     together, so the UPSTREAM-TESTS lines stay one aggregate. The runs are
+     sequential and overall-timeout applies to each.
+     <reason> is required and printed in the log. If the rejected path is
+     reachable from the shipped binary (a feature that cannot work in the
+     FIPS build), start the reason with its findings-register id.
+     The step fails on an unknown class, a missing reason, a package that
+     is a pattern or not under test, a top level that is not a Go
+     identifier, an empty element, a duplicate, or an entry already covered
+     by another entry of its package or by `ignore`. Blank lines and lines
+     starting with "#" are ignored. An entry whose top-level function is in
+     none of its package's *_test.go files gets a warning and counts as
+     stale.
+     `ignore` and `exclude-packages` keep their go-test meaning, for
+     reasons that are not FIPS (network, root, a live cluster).
+
+  Extra output, besides go-test's lines (which keep their format):
+    FIPS-SKIP <package>: <class> <importpath>.<test> (defined in <n> file(s)): <reason>
+    UPSTREAM-TESTS-FIPS-SKIP <package>: <class> <importpath>.<test>   (one per entry)
+    UPSTREAM-TESTS-FIPS <package>: fips140=on build-match=<m> skipped=<n> [stale=<n>] [<class>=<n> ...]
+  <m> is <matching>/<installed Go binaries>, or off.
+
+  Example:
+    - uses: go/build
+      with:
+        packages: ./cmd/foo
+        output: foo
+        go-package: go-msft-${{vars.go-version}}
+        tags: requirefips
+    # The fixture CA in TestKeys is generated on P-224.
+    - uses: upstream-tests/go-test-fips
+      with:
+        tags: requirefips
+        fips-skip: |
+          p224 ./internal/certs TestKeys/ECDSA_P-224 the fixture CA is generated on secp224r1, which the FIPS provider does not offer
+
+inputs:
+  dir:
+    description: |
+      Go module directory (where go.mod lives), relative to the workspace.
+      Matches the `modroot` input of go/build.
+    default: "."
+  packages:
+    description: |
+      Space-separated package patterns to test, relative to dir.
+    default: ./...
+  exclude-packages:
+    description: |
+      Space-separated packages to leave out, as import paths or relative
+      patterns (`./internal/e2e`, `./test/...`, `example.com/m/pkg`). Each
+      entry is expanded with `go list` and removed from the `packages` list.
+      Each one needs a comment and TODO in the caller.
+    default: ""
+  jobs:
+    description: |
+      Packages built and tested in parallel (go test -p). auto is
+      min(nproc, 4): every package links its own test binary, and nproc
+      parallel links of big binaries run large VMs out of memory.
+    default: auto
+  ignore:
+    description: |
+      Space-separated top-level test names to skip in every package
+      (go test -skip '^(A|B)$'). Each one needs a comment and TODO in the
+      caller.
+    default: ""
+  args:
+    description: |
+      Extra go test arguments, inserted verbatim into the command line,
+      e.g. `-count=1`. Do not pass -json, -skip or -timeout here, use
+      `tags` rather than -tags and `vet-skip` rather than -vet (rejected).
+    default: ""
+  vet-skip:
+    description: |
+      go vet analyzers to leave out of go test's vet pre-check, separated by
+      spaces or newlines (like `ignore`), e.g. `printf` or a block with
+      `printf` and `stdversion` on separate lines. Empty runs go test's
+      default analyzer set. Otherwise go test gets -vet=<the default set of
+      the go toolchain running the tests, minus these names>. That set
+      differs between go releases (1.27 renamed bool/buildtags to
+      bools/buildtag and added stdversion); it is picked from
+      `go env GOVERSION`, and an unknown release, or a name that is not in
+      that release's set, fails the step until it is added here.
+      `all` alone turns the pre-check off (-vet=off): last resort only.
+      See the policy above: upstream findings only, name only what fails,
+      and comment the findings with a TODO in the caller.
+    default: ""
+  toolchaintags:
+    description: |
+      Same as go/build's `toolchaintags`: build tags always passed to go
+      list and go test, ahead of `tags`.
+    default: netgo,osusergo
+  tags:
+    description: |
+      Same as go/build's `tags`: extra comma-separated build tags, passed
+      as -tags "<toolchaintags>,<tags>".
+    default: ""
+  experiments:
+    description: |
+      Same as go/build's `experiments`: GOEXPERIMENT for the test build
+      and run. Empty leaves GOEXPERIMENT unset.
+    default: ""
+  timeout:
+    description: Per test binary timeout (go test -timeout).
+    default: 20m
+  overall-timeout:
+    description: Timeout in seconds for the whole go test run.
+    default: "7200"
+  fips-skip:
+    description: |
+      Tests that fail only because FIPS mode rejects what they use, one per
+      line: `<class> <package> <test>[/<subtest>...] <reason>`. <class> is
+      one of tripledes des rc2 rc4 md5 sha1-signature p224 small-rsa
+      short-key dsa x25519 ed25519 chacha20 non-approved-tls non-fips-output
+      (see the pipeline description). <package> is one import path or
+      ./relative package dir; the entry applies there only. <test> is the
+      exact `go test -v` name; "/" selects a subtest. <reason> is required.
+    default: ""
+  match-build:
+    description: |
+      How the probe's build settings (-tags, CGO_ENABLED, GOEXPERIMENT,
+      GOFIPS140, microsoft_systemcrypto) must match the Go binaries
+      installed in the package: any (at least one), all, or off (comment
+      why in the caller). any and all fail when the package has no Go
+      binary installed when the step runs.
+    default: any
+
+pipeline:
+  - name: upstream-tests (go test, FIPS)
+    runs: |
+      PKG="${{package.name}}"
+      cd "${{inputs.dir}}"
+      if [ ! -f go.mod ]; then
+        echo "upstream-tests/go-test: no go.mod in '${{inputs.dir}}'; set 'dir' to the go/build modroot" >&2
+        exit 1
+      fi
+      if ! command -v go >/dev/null 2>&1; then
+        echo "upstream-tests/go-test: no go toolchain in the build environment" >&2
+        exit 1
+      fi
+      # Same module cache as go/build. Fetch what the tests need (go.mod
+      # requirements) while the proxy is still allowed, then resolve offline.
+      export GOMODCACHE=/var/cache/melange/gomodcache
+      # go test links one test binary per package. Its work dir (GOTMPDIR,
+      # default /tmp, a RAM-backed tmpfs in the qemu guest) fills memory on
+      # big suites (ENOSPC, OOM kills), and its build cache (GOCACHE,
+      # default $HOME/.cache/go-build) grows by GBs. Put both in a fresh
+      # directory under the melange cache mount, which is disk-backed (an
+      # overlay on the build disk, or the host cache dir) and outside the
+      # source tree ("outside the repository" tests run the test binary
+      # from GOTMPDIR), and remove it when the step ends. A caller's own
+      # GOTMPDIR/GOCACHE wins. TMPDIR stays put: the go command ignores a
+      # go.mod in the system temp root.
+      #
+      # The test binaries run through go test -exec with GOTMPDIR and
+      # GOCACHE as the step started with them, so tests see the same
+      # environment as before. t.TempDir() follows GOTMPDIR: moving it
+      # would put test temp dirs on a different filesystem from
+      # os.TempDir() (EXDEV renames, conftest) and lengthen the unix
+      # socket paths tests create in them past the 108-byte limit (xcover).
+      #
+      # The wrapper runs a private copy of the test binary, not the file go
+      # test linked. cmd/go rewrites the build ID in each freshly linked
+      # binary through a write descriptor, and a child that another
+      # goroutine forks meanwhile holds a copy of it until its own exec, so
+      # executing the binary can fail with ETXTBSY ("Text file busy",
+      # golang/go#22315). cmd/go retries that when it starts the binary
+      # itself, but with -exec it starts this wrapper, and the wrapper's
+      # exec has no retry (a failed exec ends a non-interactive sh, and its
+      # exit status could not be told apart from the test's). Only cp has
+      # ever had the copy open for writing, and cp has exited, so the exec
+      # cannot hit the race: no retry, and the test runs at most once. A
+      # hard link would not help (same inode). The copy keeps the binary's
+      # name (os.Args[0] still ends in <pkg>.test; helper-process tests
+      # re-exec it), the working directory is unchanged, and it sits in a
+      # new directory next to the original, inside the package's go-build
+      # directory, which go test removes when the package is done, so at
+      # most `jobs` extra copies exist at a time.
+      execw=$(mktemp)
+      gowork=""
+      trap 'rm -rf "$gowork" "$execw"' EXIT
+      # >>> fips
+      # Scratch space for the FIPS checks, removed with the rest.
+      mkdir -p /var/cache/melange/upstream-tests-go
+      fipsdir=$(mktemp -d /var/cache/melange/upstream-tests-go/fips.XXXXXX)
+      trap 'rm -rf "$gowork" "$execw" "$fipsdir"' EXIT
+      case "${{inputs.match-build}}" in
+        any|all|off) ;;
+        *)
+          echo "upstream-tests/go-test-fips: match-build must be any, all or off, not '${{inputs.match-build}}'" >&2
+          exit 1 ;;
+      esac
+      # fips-skip, "<class> <package> <test>[/<subtest>...] <reason>" per
+      # line, read through a quoted here-document so the reasons are taken
+      # literally. Validated into $fipsdir/skips:
+      # class<TAB>package<TAB>test<TAB>reason.
+      cat > "$fipsdir/decl" <<'UPSTREAM_TESTS_FIPS_SKIP'
+      ${{inputs.fips-skip}}
+      UPSTREAM_TESTS_FIPS_SKIP
+      set -f
+      printf '%s\n' ${{inputs.ignore}} > "$fipsdir/ignore"
+      set +f
+      : > "$fipsdir/errors"
+      awk -v classes="tripledes des rc2 rc4 md5 sha1-signature p224 small-rsa short-key dsa x25519 ed25519 chacha20 non-approved-tls non-fips-output" '
+        function bad(msg) { print "fips-skip line " FNR ": " msg ": " $0 > errf; nbad++ }
+        BEGIN { n = split(classes, c, " "); for (i = 1; i <= n; i++) known[c[i]] = 1 }
+        FNR == NR { if ($1 != "") ign[$1] = 1; next }
+        { sub(/\r$/, "") }
+        /^[ \t]*(#|$)/ { next }
+        {
+          cls = $1; pk = $2; t = $3; r = $0
+          sub(/^[ \t]*[^ \t]+[ \t]*/, "", r); sub(/^[^ \t]+[ \t]*/, "", r); sub(/^[^ \t]+[ \t]*/, "", r); sub(/[ \t]+$/, "", r)
+          top = t; sub(/\/.*/, "", top)
+          k = pk SUBSEP t
+          if (!(cls in known)) bad("unknown class \"" cls "\" (one of: " classes ")")
+          else if (pk == "") bad("no package")
+          else if (index(pk, "...")) bad("package \"" pk "\" is a pattern; name one package")
+          else if (t == "") bad("no test name")
+          else if (r == "") bad("no reason")
+          else if (top !~ /^[A-Za-z_][A-Za-z0-9_]*$/) bad("top-level test \"" top "\" is not a Go identifier")
+          else if (t ~ /\/\// || t ~ /\/$/) bad("empty subtest name")
+          else if (k in seen) bad("duplicate entry")
+          else if (top in ign) bad("its top-level test " top " is in ignore already")
+          else { seen[k] = 1; m++; opk[m] = pk; ot[m] = t; cl[m] = cls; why[m] = r; ln[m] = FNR; src[m] = $0 }
+        }
+        END {
+          for (i = 1; i <= m; i++) {
+            p = ot[i]
+            while (sub(/\/[^\/]*$/, "", p))
+              if ((opk[i] SUBSEP p) in seen) { print "fips-skip line " ln[i] ": covered by the entry for " opk[i] " " p ": " src[i] > errf; nbad++; break }
+          }
+          if (nbad) exit 1
+          for (i = 1; i <= m; i++) print cl[i] "\t" opk[i] "\t" ot[i] "\t" why[i]
+        }' errf="$fipsdir/errors" "$fipsdir/ignore" "$fipsdir/decl" > "$fipsdir/skips" || frc=$?
+      if [ -s "$fipsdir/errors" ] || [ "${frc:-0}" -ne 0 ]; then
+        sed 's/^/upstream-tests\/go-test-fips: /' "$fipsdir/errors" >&2
+        echo "upstream-tests/go-test-fips: invalid fips-skip (see the pipeline description for the format and classes)" >&2
+        exit 1
+      fi
+      # <<< fips
+      {
+        echo '#!/bin/sh'
+        echo 'unset GOTMPDIR GOCACHE'
+        export -p | grep -E '^(export|declare -x) (GOTMPDIR|GOCACHE)=' || true
+        echo 'run=$(mktemp -d "$(dirname -- "$1")/run.XXXXXX") || exit 1'
+        echo 'bin="$run/${1##*/}"'
+        echo 'cp -- "$1" "$bin" || exit 1'
+        echo 'shift'
+        echo 'exec "$bin" "$@"'
+      } > "$execw"
+      chmod +x "$execw"
+      if [ -z "${GOTMPDIR:-}" ] || [ -z "${GOCACHE:-}" ]; then
+        mkdir -p /var/cache/melange/upstream-tests-go
+        gowork=$(mktemp -d /var/cache/melange/upstream-tests-go/run.XXXXXX)
+      fi
+      export GOTMPDIR="${GOTMPDIR:-$gowork/tmp}" GOCACHE="${GOCACHE:-$gowork/cache}"
+      mkdir -p "$GOTMPDIR" "$GOCACHE"
+      if [ -f vendor/modules.txt ]; then
+        mod=vendor
+      else
+        go mod download
+        # Workspace mode (a go.work in use) rejects -mod=mod; there the
+        # no-argument download fetches all and writes go.work.sum, so
+        # readonly resolves offline. `go env GOWORK` prints "off" when the
+        # environment disables workspace mode: that is single-module mode.
+        case "$(go env GOWORK)" in
+          ""|off) mod=mod ;;
+          *) mod=readonly ;;
+        esac
+      fi
+      export GOFLAGS="${GOFLAGS:+$GOFLAGS }-mod=$mod"
+      export GOPROXY=off
+      if [ -n "${{inputs.experiments}}" ]; then
+        export GOEXPERIMENT="${{inputs.experiments}}"
+      fi
+      case " ${{inputs.args}} " in
+        *" -tags "*|*" -tags="*|*" --tags"*)
+          echo "upstream-tests/go-test: pass build tags in 'tags' (or 'toolchaintags'), not '-tags' in args: a second -tags replaces the first and drops ${{inputs.toolchaintags}}" >&2
+          exit 1 ;;
+      esac
+      case " ${{inputs.args}} " in
+        *" -vet"*|*" --vet"*)
+          echo "upstream-tests/go-test: leave analyzers out of go test's vet pre-check with the 'vet-skip' input, not '-vet' in args; see the pipeline description for the policy" >&2
+          exit 1 ;;
+      esac
+      # vet pre-check: vet-skip names analyzers (whitespace separated) to
+      # drop from go test's default set, or is "all" for -vet=off. go
+      # test's default set is a fixed list in cmd/go (defaultVetFlags) that
+      # changes between releases, so it is picked by toolchain here.
+      vetskip="${{inputs.vet-skip}}"
+      vetarg=""
+      vetmode=default
+      set -f
+      set -- $vetskip
+      set +f
+      if [ "$#" -gt 0 ]; then
+        for a in "$@"; do
+          case "$a" in
+            *[!a-z0-9]*)
+              echo "upstream-tests/go-test: vet-skip entry '$a' is not a go vet analyzer name" >&2
+              exit 1 ;;
+            all)
+              if [ "$#" -ne 1 ]; then
+                echo "upstream-tests/go-test: vet-skip 'all' (-vet=off) cannot be combined with other analyzer names" >&2
+                exit 1
+              fi ;;
+          esac
+        done
+        if [ "$1" = all ]; then
+          vetarg=-vet=off
+          vetmode=off
+        else
+          gov=$(go env GOVERSION)
+          case "$(printf '%s' "$gov" | sed -E 's/^go([0-9]+\.[0-9]+).*/\1/')" in
+            1.24|1.25|1.26)
+              defvet=atomic,bool,buildtags,directive,errorsas,ifaceassert,nilfunc,printf,slog,stringintconv,tests ;;
+            1.27)
+              defvet=atomic,bools,buildtag,directive,errorsas,ifaceassert,nilfunc,printf,slog,stdversion,stringintconv,tests ;;
+            *)
+              echo "upstream-tests/go-test: vet-skip: this pipeline does not know go test's default vet analyzers for $gov; add them (defaultVetFlags in cmd/go/internal/test/test.go)" >&2
+              exit 1 ;;
+          esac
+          list=",$defvet,"
+          skipped=""
+          for a in "$@"; do
+            case "$list" in
+              *",$a,"*) list=$(printf '%s' "$list" | sed "s/,$a,/,/") ;;
+              *)
+                echo "upstream-tests/go-test: vet-skip entry '$a' is not in go test's default vet analyzers for $gov ($defvet)" >&2
+                exit 1 ;;
+            esac
+            skipped="${skipped:+$skipped,}$a"
+          done
+          list=${list#,}
+          list=${list%,}
+          vetarg="-vet=$list"
+          vetmode="skip:$skipped"
+        fi
+      fi
+      set --
+      # Same tag set as go/build: "<toolchaintags>,<tags>". Comma separated,
+      # no spaces, so it is safe to expand unquoted below.
+      tags=$(printf '%s,%s' "${{inputs.toolchaintags}}" "${{inputs.tags}}" | sed 's/,,*/,/g; s/^,//; s/,$//')
+      tagsarg="${tags:+-tags $tags}"
+      jobs="${{inputs.jobs}}"
+      if [ "$jobs" = auto ]; then
+        # Each package links its own test binary, often 1-3 GB for big
+        # modules; nproc parallel links OOM large VMs.
+        jobs=$(nproc)
+        [ "$jobs" -gt 4 ] && jobs=4
+      fi
+      echo "upstream-tests/go-test: GOFLAGS=$GOFLAGS GOPROXY=$GOPROXY GOWORK=$(go env GOWORK) GOMODCACHE=$GOMODCACHE GOCACHE=$GOCACHE GOTMPDIR=$GOTMPDIR tags=$tags GOEXPERIMENT=${GOEXPERIMENT:-} -p $jobs vet=$vetmode${vetarg:+ ($vetarg)}"
+      # >>> fips
+      # FIPS mode probe: a program built with what the test binaries get
+      # (tags, GOEXPERIMENT, GOFLAGS, CGO_ENABLED, the toolchain's go.env and
+      # default GODEBUG) must report crypto/fips140.Enabled(). It is its own
+      # module with no requirements, so -mod=mod and GOWORK=off.
+      probe="$fipsdir/probe"
+      mkdir -p "$probe"
+      printf 'module upstreamtestsfipsprobe\n\ngo %s\n' "$(go env GOVERSION | sed -E 's/^go([0-9]+\.[0-9]+).*/\1/')" > "$probe/go.mod"
+      cat > "$probe/main.go" <<'UPSTREAM_TESTS_FIPS_PROBE'
+      package main
+
+      import (
+          "crypto/fips140"
+          "crypto/sha256"
+          "fmt"
+          "os"
+      )
+
+      func main() {
+          _ = sha256.Sum256([]byte("upstream-tests/go-test-fips"))
+          fmt.Printf("fips140=%v\n", fips140.Enabled())
+          if !fips140.Enabled() {
+              os.Exit(3)
+          }
+      }
+      UPSTREAM_TESTS_FIPS_PROBE
+      if ! (cd "$probe" && GOWORK=off go build -mod=mod $tagsarg -o "$probe/fipsprobe" .) > "$probe/build.log" 2>&1; then
+        cat "$probe/build.log" >&2
+        echo "upstream-tests/go-test-fips: the FIPS probe does not build with tags=$tags GOEXPERIMENT=${GOEXPERIMENT:-}" >&2
+        exit 1
+      fi
+      prc=0
+      pout=$("$probe/fipsprobe" 2>&1) || prc=$?
+      case "$prc:$pout" in
+        "0:fips140=true") fipsmode=on ;;
+        "3:fips140=false")
+          echo "upstream-tests/go-test-fips: crypto/fips140.Enabled() is false in a program built like the test binaries (tags=$tags GOEXPERIMENT=${GOEXPERIMENT:-}): the suite would not run in FIPS mode. Build with a FIPS Go toolchain (go-msft-*, go-geomys-*, go-fips-md5-*) and keep its FIPS configuration (openssl-config-fipshardened, GOFIPS140, the default GODEBUG)." >&2
+          exit 1 ;;
+        *)
+          printf '%s\n' "$pout" >&2
+          echo "upstream-tests/go-test-fips: the FIPS probe failed (exit $prc), so the test binaries would too" >&2
+          exit 1 ;;
+      esac
+      # Build settings that decide what the tests exercise, per Go binary in
+      # `go version -m` output: path<TAB>settings, with -tags sorted.
+      bsig='
+        function flush(   n, a, i, j, x, s) {
+          if (path == "") return
+          n = split(kv["-tags"], a, ",")
+          for (i = 2; i <= n; i++) { x = a[i]; for (j = i - 1; j > 0 && a[j] > x; j--) a[j + 1] = a[j]; a[j + 1] = x }
+          s = "-tags="; for (i = 1; i <= n; i++) s = s (i > 1 ? "," : "") a[i]
+          for (i = 1; i <= nk; i++) if (keys[i] in kv) s = s " " keys[i] "=" kv[keys[i]]
+          print path "\t" s
+          path = ""; split("", kv)
+        }
+        BEGIN { nk = split("CGO_ENABLED GOEXPERIMENT GOFIPS140 microsoft_systemcrypto", keys, " ") }
+        /^[^\t]/ { flush(); path = $0; sub(/: (go[0-9]|devel).*$/, "", path); next }
+        $2 == "build" { k = $3; v = $3; sub(/=.*/, "", k); sub(/^[^=]*=/, "", v); kv[k] = v }
+        END { flush() }'
+      go version -m "$probe/fipsprobe" | awk -F '\t' "$bsig" > "$probe/probe.sig"
+      want=$(cut -f2 "$probe/probe.sig")
+      buildmatch=off
+      if [ "${{inputs.match-build}}" != off ]; then
+        # A directory with no Go binary in it is not an error for
+        # `go version -m` (exit 0, no output); a missing or unreadable one is.
+        vrc=0
+        go version -m "${{targets.contextdir}}" > "$probe/installed.txt" 2> "$probe/installed.err" || vrc=$?
+        if [ -s "$probe/installed.err" ]; then
+          cat "$probe/installed.err" >&2
+        fi
+        if [ "$vrc" -ne 0 ]; then
+          echo "upstream-tests/go-test-fips: go version -m ${{targets.contextdir}} failed (exit $vrc), so the build settings of the shipped binaries cannot be read" >&2
+          exit 1
+        fi
+        awk -F '\t' "$bsig" "$probe/installed.txt" > "$probe/installed.sig"
+        total=$(awk 'END { print NR }' "$probe/installed.sig")
+        matched=$(awk -F '\t' -v w="$want" '$2 == w' "$probe/installed.sig" | awk 'END { print NR }')
+        if [ "$total" -eq 0 ]; then
+          echo "upstream-tests/go-test-fips: no Go binary is installed in ${{targets.contextdir}} yet, so the build settings of the tests cannot be compared with the shipped binaries (match-build=${{inputs.match-build}})" >&2
+          echo "upstream-tests/go-test-fips: run this step after the binaries are installed (for example in the subpackage pipeline that builds them), or set match-build: off with a comment saying why" >&2
+          exit 1
+        fi
+        buildmatch="$matched/$total"
+        lvl=NOTE
+        if [ "$matched" -eq 0 ] || { [ "${{inputs.match-build}}" = all ] && [ "$matched" -ne "$total" ]; }; then
+          lvl=ERROR
+        fi
+        awk -F '\t' -v w="$want" -v d="${{targets.contextdir}}" -v lvl="$lvl" '$2 != w {
+            p = $1; if (index(p, d) == 1) p = substr(p, length(d) + 1)
+            print "upstream-tests/go-test-fips: " lvl ": " p " was built with " $2 "; the tests are built with " w
+          }' "$probe/installed.sig" >&2
+        if [ "$lvl" = ERROR ]; then
+          echo "upstream-tests/go-test-fips: the tests are not built like the shipped binaries (match-build=${{inputs.match-build}}, $buildmatch match): copy go/build's tags, toolchaintags and experiments to this step" >&2
+          exit 1
+        fi
+      fi
+      echo "upstream-tests/go-test-fips: fips140=$fipsmode build-match=$buildmatch probe: $want"
+      # <<< fips
+
+      set -f
+      pkgs="${{inputs.packages}}"
+      if [ -n "$(echo ${{inputs.exclude-packages}})" ]; then
+        all=$(go list -e $tagsarg $pkgs)
+        drop=""
+        for e in ${{inputs.exclude-packages}}; do
+          m=$(go list -e $tagsarg -f '{{if .Dir}}{{.ImportPath}}{{end}}' "$e" 2>/dev/null || true)
+          if [ -z "$m" ]; then
+            echo "upstream-tests/go-test: WARNING: exclude-packages entry '$e' matches no package" >&2
+          fi
+          drop="$drop $m"
+        done
+        pkgs=$(printf '%s\n' "$all" | awk -v d="$drop" '
+          BEGIN { n = split(d, a, " "); for (i = 1; i <= n; i++) x[a[i]] = 1 }
+          !($0 in x)')
+        for p in $(printf '%s\n' "$all" | awk -v d="$drop" '
+          BEGIN { n = split(d, a, " "); for (i = 1; i <= n; i++) x[a[i]] = 1 }
+          $0 in x'); do
+          echo "EXCLUDE ${PKG}: $p"
+        done
+        if [ -z "$pkgs" ]; then
+          echo "upstream-tests/go-test: exclude-packages removed every package matching '${{inputs.packages}}'" >&2
+          exit 1
+        fi
+      fi
+
+      # Exact top-level names -> anchored, metacharacter-escaped -skip regex.
+      skip=""
+      ignored=0
+      for t in ${{inputs.ignore}}; do
+        case "$t" in
+          */*)
+            echo "upstream-tests/go-test: ignore entry '$t' names a subtest; go test -skip cannot combine subtest patterns, ignore the top-level test instead" >&2
+            exit 1
+            ;;
+        esac
+        re=$(printf '%s' "$t" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
+        skip="${skip:+$skip|}$re"
+        n=$(find . -name '*_test.go' -exec grep -lE "^func ${re}\(" {} + | wc -l || true)
+        if [ "$n" -gt 0 ]; then
+          echo "IGNORE ${PKG}: $t (skipped, defined in $n file(s))"
+          ignored=$((ignored + n))
+        else
+          echo "upstream-tests/go-test: WARNING: ignore entry '$t' matches no test function" >&2
+        fi
+      done
+      set --
+      if [ -n "$skip" ]; then
+        set -- -skip "^($skip)\$"
+        echo "upstream-tests/go-test: skipping tests matching: ^($skip)\$"
+      fi
+      # >>> fips
+      # fips-skip entries apply to their own package only: each package
+      # named in fips-skip is tested in a go test run of its own, with the
+      # ignore regex plus its entries (every "/"-separated element escaped
+      # and anchored, joined by Go 1.20+ top-level alternation, so a subtest
+      # entry skips that subtest only); every other package runs in the main
+      # run below, with ignore only. The JSON of all runs is parsed as one,
+      # so the summary stays a single aggregate.
+      stale=0
+      tab=$(printf '\t')
+      : > "$fipsdir/byimp"
+      : > "$fipsdir/groups"
+      if [ -s "$fipsdir/skips" ]; then
+        fall=$(go list -e $tagsarg $pkgs)
+        while IFS="$tab" read -r fc fp ft fr; do
+          imp=$(go list -e $tagsarg -f '{{if .Dir}}{{.ImportPath}}{{end}}' "$fp" 2>/dev/null || true)
+          if [ -z "$imp" ] || ! printf '%s\n' "$fall" | grep -qxF "$imp"; then
+            echo "upstream-tests/go-test-fips: fips-skip entry '$fp $ft': $fp is not one of the packages under test (packages, exclude-packages)" >> "$fipsdir/errors"
+            continue
+          fi
+          re=""
+          rest="$ft"
+          while :; do
+            e=$(printf '%s' "${rest%%/*}" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
+            re="${re:+$re/}^$e\$"
+            [ "$rest" = "${rest#*/}" ] && break
+            rest="${rest#*/}"
+          done
+          pdir=$(go list -e $tagsarg -f '{{.Dir}}' "$imp")
+          n=$(find "$pdir" -maxdepth 1 -name '*_test.go' -exec grep -lE "^func ${ft%%/*}\(" {} + | wc -l || true)
+          if [ "$n" -gt 0 ]; then
+            echo "FIPS-SKIP ${PKG}: $fc $imp.$ft (defined in $n file(s)): $fr"
+          else
+            echo "FIPS-SKIP ${PKG}: $fc $imp.$ft (stale): $fr"
+            echo "upstream-tests/go-test-fips: WARNING: fips-skip entry '$fp $ft': no test function ${ft%%/*} in $imp's *_test.go files" >&2
+            stale=$((stale + 1))
+          fi
+          printf '%s\t%s\t%s\t%s\n' "$imp" "$re" "$fc" "$ft" >> "$fipsdir/byimp"
+        done < "$fipsdir/skips"
+        awk -F '\t' 'seen[$1 FS $4]++ == 1 { print "upstream-tests/go-test-fips: duplicate fips-skip entry (two names for one package): " $1 " " $4 }' \
+          "$fipsdir/byimp" >> "$fipsdir/errors"
+        if [ -s "$fipsdir/errors" ]; then
+          cat "$fipsdir/errors" >&2
+          echo "upstream-tests/go-test-fips: invalid fips-skip (see the pipeline description for the format and classes)" >&2
+          exit 1
+        fi
+        # One line per package: import path<TAB>its -skip regex.
+        FIPS_IGNORE_RE="$skip" awk -F '\t' '
+          BEGIN { ign = ENVIRON["FIPS_IGNORE_RE"] }
+          !($1 in re) { order[++n] = $1; re[$1] = (ign != "" ? "^(" ign ")$" : "") }
+          { re[$1] = re[$1] (re[$1] != "" ? "|" : "") $2 }
+          END { for (i = 1; i <= n; i++) print order[i] "\t" re[order[i]] }' "$fipsdir/byimp" | LC_ALL=C sort > "$fipsdir/groups"
+        pkgs=$(printf '%s\n' "$fall" | awk -F '\t' 'FNR == NR { g[$1] = 1; next } !($0 in g)' "$fipsdir/groups" -)
+        if [ -z "$pkgs" ]; then
+          # Every package has entries: the last one takes the main run.
+          pkgs=$(tail -n 1 "$fipsdir/groups" | cut -f1)
+          set -- -skip "$(tail -n 1 "$fipsdir/groups" | cut -f2)"
+          sed -i '$d' "$fipsdir/groups"
+          echo "upstream-tests/go-test-fips: $pkgs: skipping tests matching: $2"
+        fi
+        while IFS="$tab" read -r imp re; do
+          echo "upstream-tests/go-test-fips: $imp: separate run, skipping tests matching: $re"
+        done < "$fipsdir/groups"
+      fi
+      # <<< fips
+
+      wrap=""
+      if command -v timeout >/dev/null 2>&1; then
+        wrap="timeout ${{inputs.overall-timeout}}"
+      fi
+      log=$(mktemp)
+      sum=$(mktemp)
+      start=$(date +%s)
+      rc=0
+      # >>> fips
+      # The packages with fips-skip entries, one go test run each (same
+      # flags as the main run below, plus their own -skip). go test gets
+      # /dev/null as stdin so nothing it runs can read the groups list.
+      frc=0
+      : > "$fipsdir/scoped.json"
+      while IFS="$tab" read -r imp re; do
+        $wrap go test -exec "$execw" -short -json -p $jobs -timeout ${{inputs.timeout}} \
+          $tagsarg $vetarg -skip "$re" ${{inputs.args}} "$imp" < /dev/null >> "$fipsdir/scoped.json" 2>&1 || {
+          r=$?
+          [ "$frc" -ne 0 ] || frc=$r
+        }
+      done < "$fipsdir/groups"
+      # <<< fips
+      $wrap go test -exec "$execw" -short -json -p $jobs -timeout ${{inputs.timeout}} \
+        $tagsarg $vetarg "$@" ${{inputs.args}} $pkgs > "$log" 2>&1 || rc=$?
+      # >>> fips
+      cat "$fipsdir/scoped.json" >> "$log"
+      if [ "$rc" -eq 0 ]; then
+        rc=$frc
+      fi
+      # <<< fips
+      end=$(date +%s)
+      set +f
+
+      # One JSON event per line; pull a string field out of it.
+      jf='function jstr(l, k,   re) {
+            re = "\"" k "\":\"([^\"\\\\]|\\\\.)*\""
+            if (!match(l, re)) return ""
+            return substr(l, RSTART + length(k) + 4, RLENGTH - length(k) - 5)
+          }
+          function dec(s,   i) {
+            gsub(/\\\\/, "\001", s); gsub(/\\n/, "\n", s); gsub(/\\t/, "\t", s)
+            gsub(/\\r/, "", s); gsub(/\\"/, "\"", s); gsub(/\\u003c/, "<", s)
+            gsub(/\\u003e/, ">", s); gsub(/\\u0026/, "\\&", s)
+            while ((i = index(s, "\001")) > 0)
+              s = substr(s, 1, i - 1) "\\" substr(s, i + 1)
+            return s
+          }'
+      # Summary: F<tab>pkg<tab>test per failing top-level test, B<tab>pkg<tab>why
+      # per package that failed without a failing test, then the counts.
+      awk "$jf"'
+        /^\{/ {
+          a = jstr($0, "Action"); p = jstr($0, "Package"); t = jstr($0, "Test")
+          if (a == "output" && index($0, "panic: test timed out")) why[p] = "test timed out"
+          if (a == "output" && jstr($0, "Output") ~ /^signal: [a-z]/) {
+            sig[p] = dec(jstr($0, "Output")); sub(/\n$/, "", sig[p]) }
+          if (t != "") {
+            if (index(t, "/")) next
+            # Top-level tests that started (or resumed after t.Parallel)
+            # and have not finished: a test binary that exits mid-test
+            # (os.Exit, log.Fatal) or is killed leaves its test here.
+            if (a == "run" || a == "cont") running[p, t] = 1
+            else if (a == "pause") delete running[p, t]
+            if (a == "pass" || a == "skip" || a == "fail") delete running[p, t]
+            if (a == "pass") pass++
+            else if (a == "skip") skip++
+            else if (a == "fail" && !((p, t) in tf)) {
+              tf[p, t] = 1; pf[p] = 1; fail++
+              print "F\t" p "\t" dec(t)
+            }
+            next
+          }
+          if (p == "") next
+          if (a == "output") {
+            o = jstr($0, "Output")
+            if (o ~ /\[build failed\]/) why[p] = "build failed"
+            else if (o ~ /\[setup failed\]/) why[p] = "setup failed"
+            else if (!(p in why) && index(o, "panic: ")) why[p] = "panic"
+          } else if (a == "fail") {
+            pkgf[p] = 1
+            if (!(p in why) && jstr($0, "FailedBuild") != "") why[p] = "build failed"
+          }
+        }
+        END {
+          for (p in pkgf) if (!(p in pf)) {
+            # A package that failed with no failing test, no build error,
+            # panic or timeout: name the test that was still running. With
+            # several running (t.Parallel), the one that exited is unknown,
+            # so the package stays [package failed] and the note lists them.
+            n = 0; names = ""
+            if (!(p in why)) for (k in running) {
+              split(k, kp, SUBSEP)
+              if (kp[1] == p) { n++; last = dec(kp[2]); names = names (names == "" ? "" : ", ") last }
+            }
+            how = (p in sig ? "was killed (" sig[p] "; out of memory?)" : "exited (os.Exit or log.Fatal in the test or the code under test?)")
+            if (n == 1) {
+              fail++; print "F\t" p "\t" last
+              print "X\t" p "\t" last "\t" how
+              continue
+            }
+            if (n > 1) print "X\t" p "\t" "one of " names "\t" how
+            fail++
+            print "B\t" p "\t" (p in why ? why[p] : "package failed")
+          }
+          print "C\t" pass + 0 "\t" fail + 0 "\t" skip + 0
+        }' "$log" > "$sum"
+      # Human-readable go test output: build errors, package-level lines and
+      # everything the failing tests (or failed packages) printed, one
+      # package at a time (packages run in parallel, their events interleave).
+      awk "$jf"'
+        FNR == NR { if ($1 == "F") want[$2, $3] = 1; if ($1 == "B") all[$2] = 1; next }
+        !/^\{/ { print; next }
+        {
+          a = jstr($0, "Action"); p = jstr($0, "Package"); t = dec(jstr($0, "Test"))
+          if (a == "build-output") { printf "%s", dec(jstr($0, "Output")); next }
+          sub(/\/.*/, "", t)
+          if (a == "output" && (t == "" || (p in all) || ((p, t) in want)))
+            buf[p] = buf[p] dec(jstr($0, "Output"))
+          if (t == "" && (a == "pass" || a == "fail" || a == "skip")) {
+            printf "%s", buf[p]; delete buf[p]
+          }
+        }
+        END { for (p in buf) printf "%s", buf[p] }' FS='\t' "$sum" FS=' ' "$log"
+
+      echo "UPSTREAM-TESTS ${PKG}: duration=$((end - start))s vet=$vetmode"
+      if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+        echo "upstream-tests/go-test: go test timed out or was killed (exit $rc, overall-timeout=${{inputs.overall-timeout}}s)" >&2
+      fi
+      awk -F '\t' '$1 == "X" { print "upstream-tests/go-test: " $2 ": the test binary " $4 " while " $3 " was running" }' "$sum" | sort >&2
+      awk -F '\t' -v pkg="$PKG" '
+        $1 == "F" { print "UPSTREAM-TESTS-FAIL " pkg ": " $2 "." $3 }
+        $1 == "B" { print "UPSTREAM-TESTS-FAIL " pkg ": " $2 " [" $3 "]" }' "$sum" | sort
+      set -- $(awk -F '\t' '$1 == "C" { print $2, $3, $4 }' "$sum")
+      pass=$1 fail=$2 skip=$3
+      extra=""
+      [ "$ignored" -gt 0 ] && extra=" ignored=$ignored"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=$skip$extra"
+      # >>> fips
+      awk -F '\t' -v pkg="$PKG" '{ print "UPSTREAM-TESTS-FIPS-SKIP " pkg ": " $3 " " $1 "." $4 }' "$fipsdir/byimp" | LC_ALL=C sort
+      fclasses=$(awk -F '\t' '{ n[$3]++ } END { for (c in n) print c "=" n[c] }' "$fipsdir/byimp" | LC_ALL=C sort | tr '\n' ' ')
+      fstale=""
+      [ "$stale" -gt 0 ] && fstale=" stale=$stale"
+      echo "UPSTREAM-TESTS-FIPS ${PKG}: fips140=$fipsmode build-match=$buildmatch skipped=$(awk 'END { print NR }' "$fipsdir/byimp")$fstale${fclasses:+ ${fclasses% }}"
+      # <<< fips
+      rm -f "$log" "$sum"
+      if [ "$pass" -eq 0 ] && [ "$fail" -eq 0 ]; then
+        echo "upstream-tests/go-test: no test passed in '${{inputs.dir}}' (no test files, or everything skipped); the suite did not really run. Check 'packages', 'exclude-packages' and 'ignore'." >&2
+        exit 1
+      fi
+      if [ "$fail" -ne 0 ]; then
+        exit 1
+      fi
+      if [ "$rc" -ne 0 ]; then
+        echo "upstream-tests/go-test: go test exited $rc without a reported failure" >&2
+        exit 1
+      fi

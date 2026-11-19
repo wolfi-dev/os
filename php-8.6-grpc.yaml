@@ -1,0 +1,170 @@
+package:
+  name: php-8.6-grpc
+  version: "1.85.3"
+  epoch: 0
+  description: "A PHP extension for gRPC"
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ${{package.name}}-config
+      - grpc
+      - php-${{vars.phpMM}}
+  resources:
+    cpu: "1"
+    memory: 2Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - build-base
+      - busybox
+      - glibc-2.44-dev
+      - grpc-dev
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/grpc/grpc
+      tag: "v${{package.version}}"
+      expected-commit: 34b810a1d47a49904b3fdcdc7d1c16d5f34d0c9f
+
+  - uses: patch
+    with:
+      patches: fix-build-with-php-8.6.patch
+
+  - name: Prepare build
+    runs: cd src/php/ext/grpc && phpize
+
+  - name: Configure
+    runs: cd src/php/ext/grpc && ./configure
+
+  - name: Make install
+    runs: |
+      cd src/php/ext/grpc
+      INSTALL_ROOT="${{targets.destdir}}" DESTDIR="${{targets.destdir}}" make install
+
+subpackages:
+  - name: ${{package.name}}-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=grpc.so" > "${{targets.subpkgdir}}/etc/php/conf.d/grpc.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+update:
+  enabled: true
+  github:
+    identifier: grpc/grpc
+    strip-prefix: v
+    tag-filter: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - php-${{vars.phpMM}}
+        - php-${{vars.phpMM}}-grpc
+        - php-${{vars.phpMM}}-grpc-config
+        - grpc
+  pipeline:
+    - name: Verify gRPC Extension
+      runs: |
+        php -m | grep -F grpc
+    - name: Test gRPC Functionality
+      runs: |
+        PHP_SCRIPT=$(cat <<'EOF'
+        <?php
+        // Simple script to test grpc
+        if (extension_loaded("grpc")) {
+            echo "gRPC extension loaded successfully.\n";
+            echo "gRPC version: " . phpversion("grpc") . "\n";
+        } else {
+            echo "gRPC extension is not loaded.\n";
+        }
+        ?>
+        EOF
+        )
+        echo "$PHP_SCRIPT" | php | grep -F "gRPC extension loaded successfully."
+    - name: Use the classes that fix-build-with-php-8.6.patch touches
+      runs: |
+        # The patch changes how each Grpc class finds its C struct from a PHP
+        # object. Loading the extension runs none of that code; using the
+        # objects does. Nothing here opens a connection. Server and
+        # ServerCredentials are left out: they need a port to listen on and a
+        # key pair.
+        cat > wrapped-objects.php <<'EOF'
+        <?php
+        $passed = 0;
+        function check($ok, $what) {
+            global $passed;
+            if (!$ok) {
+                fwrite(STDERR, "FAIL: $what\n");
+                exit(1);
+            }
+            $passed++;
+            echo "ok: $what\n";
+        }
+
+        // Timeval: add(), subtract() and compare() read back what the
+        // constructor stored.
+        $half = new Grpc\Timeval(1800000000);
+        $hour = $half->add($half);
+        check(Grpc\Timeval::compare($hour, new Grpc\Timeval(3600000000)) === 0,
+            "Timeval: 30 min + 30 min is 60 min");
+        check(Grpc\Timeval::compare($hour->subtract($half), $half) === 0,
+            "Timeval: 60 min - 30 min is 30 min");
+        check(Grpc\Timeval::compare($half, $hour) < 0,
+            "Timeval: 30 min is less than 60 min");
+        check(Grpc\Timeval::compare(Grpc\Timeval::zero(), Grpc\Timeval::infFuture()) < 0,
+            "Timeval: zero is before the infinite future");
+
+        // Channel: the target and the state come from the wrapped channel.
+        $channel = new Grpc\Channel("127.0.0.1:50051", [
+            "force_new" => true,
+            "credentials" => Grpc\ChannelCredentials::createInsecure(),
+        ]);
+        $target = $channel->getTarget();
+        check(is_string($target) && str_contains($target, "127.0.0.1:50051"),
+            "Channel: getTarget() names the target");
+        check($channel->getConnectivityState() === Grpc\CHANNEL_IDLE,
+            "Channel: a new channel is idle");
+
+        // Call: built from the channel and a Timeval deadline, never started.
+        $call = new Grpc\Call($channel, "/test.Service/Method", Grpc\Timeval::infFuture());
+        check(is_string($call->getPeer()), "Call: getPeer() returns a string");
+        check($call->cancel() === null, "Call: cancel() returns");
+        unset($call);
+        $channel->close();
+
+        // ChannelCredentials and CallCredentials: createComposite() unwraps
+        // both of its arguments.
+        $composite = Grpc\ChannelCredentials::createComposite(
+            Grpc\ChannelCredentials::createSsl(),
+            Grpc\CallCredentials::createFromPlugin(function () {
+                return [];
+            })
+        );
+        check($composite instanceof Grpc\ChannelCredentials,
+            "Credentials: createComposite() returns ChannelCredentials");
+
+        echo "$passed checks passed\n";
+        EOF
+        out=$(php wrapped-objects.php) || { printf '%s\n' "$out"; exit 1; }
+        printf '%s\n' "$out"
+        printf '%s\n' "$out" | grep -Fx "9 checks passed"
+    - uses: test/tw/ldd-check

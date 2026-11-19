@@ -1,7 +1,7 @@
 package:
   name: php-8.6-memcached
   version: "3.4.0"
-  epoch: 0
+  epoch: 1
   description: "A PHP extension for Memcached"
   copyright:
     - license: PHP-3.01
@@ -96,6 +96,11 @@ update:
     tag-filter: v
 
 test:
+  environment:
+    contents:
+      packages:
+        - memcached # the server for the round trip below
+        - wait-for-it
   pipeline:
     - name: Verify extensions are loaded
       runs: |
@@ -121,4 +126,82 @@ test:
         }
         echo "igbinary round-trip OK\n";
         '
+    # The steps above never reach a server. This one stores a value and a
+    # session in a memcached and reads both back in a second process. The
+    # session handler is the code that is specific to PHP 8.6 in this package:
+    # it gets its save_path as a zend_string there (the cherry-pick 3c73b4f0).
+    - name: Write and read through a local memcached server
+      uses: test/daemon-check-output
+      with:
+        # -vv makes memcached print the lines expected below. -u is required
+        # when the test runs as root, and has no effect otherwise.
+        start: /usr/bin/memcached -vv -u root -l 127.0.0.1 -p 11311
+        expected_output: |
+          slab class
+          server listening
+        error_strings: |
+          failed to listen
+        post: |
+          wait-for-it 127.0.0.1:11311 -t 30
+
+          # First process: store an array through the igbinary serializer, then
+          # a session, and leave the session's id in a file.
+          cat > roundtrip-write.php <<'EOF'
+          <?php
+          $m = new Memcached();
+          if (!$m->setOption(Memcached::OPT_SERIALIZER, Memcached::SERIALIZER_IGBINARY)
+              || !$m->addServer('127.0.0.1', 11311)
+              || !$m->set('roundtrip', ['key' => 'value', 'nested' => [1, 2, 3]])) {
+              fwrite(STDERR, 'storing a value failed: ' . $m->getResultMessage() . "\n");
+              exit(1);
+          }
+
+          if (!session_start()) {
+              fwrite(STDERR, "session_start() failed\n");
+              exit(1);
+          }
+          $id = session_id();
+          $_SESSION['answer'] = 42;
+          // session_write_close() does not report a failed write. The second
+          // process finds one when it reads the handler's key.
+          session_write_close();
+          if ($id === false || $id === '' || !file_put_contents('session-id', $id)) {
+              fwrite(STDERR, "no session id to hand to the second process\n");
+              exit(1);
+          }
+          EOF
+
+          # Second process: the array must come back from the server unchanged.
+          # The session data must be in the server under the handler's key, and
+          # a session with the same id must read it back.
+          cat > roundtrip-read.php <<'EOF'
+          <?php
+          $m = new Memcached();
+          $m->addServer('127.0.0.1', 11311);
+          $value = $m->get('roundtrip');
+          if ($value !== ['key' => 'value', 'nested' => [1, 2, 3]]) {
+              fwrite(STDERR, 'unexpected value from the server (' . $m->getResultMessage() . '): ' . var_export($value, true) . "\n");
+              exit(1);
+          }
+
+          $id = file_get_contents('session-id');
+          $stored = $m->get(ini_get('memcached.sess_prefix') . $id);
+          if ($stored !== 'answer|i:42;') {
+              fwrite(STDERR, 'unexpected session data in the server: ' . var_export($stored, true) . "\n");
+              exit(1);
+          }
+          session_id($id);
+          if (!session_start() || ($_SESSION['answer'] ?? null) !== 42) {
+              fwrite(STDERR, "the session did not come back from the server\n");
+              exit(1);
+          }
+          echo "value and session round trip through the memcached server: ok\n";
+          EOF
+
+          # session.serialize_handler=php is PHP's default. It is set here
+          # because the second process compares the stored string with it.
+          for script in roundtrip-write.php roundtrip-read.php; do
+            php -d session.save_handler=memcached -d session.save_path=127.0.0.1:11311 \
+              -d session.serialize_handler=php "$script"
+          done
     - uses: test/tw/ldd-check

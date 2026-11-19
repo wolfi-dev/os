@@ -1,0 +1,196 @@
+package:
+  name: php-8.6-pecl-http
+  version: "4.3.1"
+  epoch: 0
+  description: "Provides PHP ${{vars.phpMM}} HTTP module for PHP Extended HTTP Support- PECL"
+  copyright:
+    - license: BSD-2-Clause
+  dependencies:
+    runtime:
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-pecl-raphf # http.so requires the raphf module and does not load without it
+  resources:
+    cpu: "2"
+    memory: 5Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+vars:
+  openssl-version: "4.0"
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - binutils
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cmake
+      - curl-dev
+      - gcc
+      - glibc-2.44-dev
+      - icu-dev
+      - libtool
+      - openssl-hardened-${{vars.openssl-version}}-dev
+      - php-${{vars.phpMM}}-dev
+      - php-${{vars.phpMM}}-pecl-raphf
+      - zlib-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/m6w6/ext-http
+      tag: v${{package.version}}
+      expected-commit: 705491493e8292a51687824e6ede98c9b7a20ba9
+
+  - uses: patch
+    with:
+      # The file holds two patches. The first is upstream's fix for PHP 8.6,
+      # which is not in a release yet. The second is ours, for two faults
+      # that fix leaves in the closure of a user event loop. Each says more
+      # in its header.
+      patches: fix-build-with-php-8.6.patch
+
+  - uses: pecl/phpize
+
+  - uses: autoconf/make
+
+  - uses: pecl/install
+    with:
+      extension: "http"
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: m6w6/ext-http
+    strip-prefix: v
+    tag-filter-prefix: v
+
+test:
+  pipeline:
+    - name: Verify http extension is loaded
+      runs: |
+        # "php -m" prints one loaded module per line. Nothing is installed
+        # for this test besides the package, so the raphf module, which
+        # http.so requires, is here through the package's own dependency.
+        php -m | grep -Fx http
+    - name: Verify http extension version
+      runs: |
+        # "php --ri" prints only this module's section of phpinfo, and exits
+        # non-zero when the module is not loaded. Match the whole line.
+        php --ri http | grep -Fx "Extension Version => ${{package.version}}"
+    - name: Verify a client accepts a user event loop
+      runs: |
+        # http\Client::configure() with a user event loop runs
+        # php_http_client_curl_user_init(), which hands init() a closure of
+        # an internal function it builds by hand. PHP 8.6 changed the form
+        # of a function's argument info, and both patches change how that
+        # closure gets its own: without upstream's corrections PHP 8.6
+        # crashes here, and without our patch, the second in
+        # fix-build-with-php-8.6.patch, the first parameter has no usable
+        # type and the argument info is freed with the event loop, while
+        # the closure can still be in use.
+        php <<'EOF'
+        <?php
+        class Loop implements http\Client\Curl\User
+        {
+            public $run;
+            function init($run) { $this->run = $run; }
+            function timer(int $timeout_ms) {}
+            function socket($socket, int $action) {}
+            function once() { return 0; }
+            function wait(?int $timeout_ms = null) { return true; }
+            function send() {}
+        }
+
+        function fail($text)
+        {
+            echo "FAIL: $text\n";
+            exit(1);
+        }
+
+        // The type of the closure's first parameter, then all their names.
+        function parameters($closure)
+        {
+            $params = (new ReflectionFunction($closure))->getParameters();
+            $names = [];
+            foreach ($params as $p) {
+                $names[] = $p->getName();
+            }
+            $type = $params ? $params[0]->getType() : null;
+            return ($type ? $type->getName() : "(no type)") . " " . implode(", ", $names);
+        }
+
+        $expected = "http\\Client client, stream, action";
+
+        $client = new http\Client;
+        $loop = new Loop;
+        $client->configure(["use_eventloop" => $loop]);
+        if (!($loop->run instanceof Closure)) {
+            fail("init() was not given a closure");
+        }
+        $found = parameters($loop->run);
+        if ($found !== $expected) {
+            fail("the closure's parameters are: $found");
+        }
+        // No request is queued, so the closure reports none unfinished.
+        $unfinished = ($loop->run)($client);
+        if ($unfinished !== 0) {
+            fail("the closure returned " . var_export($unfinished, true));
+        }
+        // Detach the event loop, which frees its context. The closure that
+        // init() kept must still describe its parameters.
+        $client->configure(["use_eventloop" => false]);
+        $found = parameters($loop->run);
+        if ($found !== $expected) {
+            fail("after the event loop was detached, the closure's parameters are: $found");
+        }
+        echo "user event loop accepted and detached: closure($expected) returned 0\n";
+        EOF
+    - name: Verify the zlib stream filters
+      runs: |
+        # PHP 8.6 added a slot to the table of a stream filter's operations
+        # and arguments to php_stream_filter_alloc();
+        # fix-build-with-php-8.6.patch follows both. Deflate a text through
+        # one end of a socket pair and inflate it at the other, as upstream's
+        # tests/filterzlib.phpt does. No network is involved.
+        php <<'EOF'
+        <?php
+        function fail($text)
+        {
+            echo "FAIL: $text\n";
+            exit(1);
+        }
+
+        $text = str_repeat("pecl-http stream filters on PHP 8.6\n", 64);
+        list($in, $out) = stream_socket_pair(
+            STREAM_PF_UNIX,
+            STREAM_SOCK_STREAM,
+            STREAM_IPPROTO_IP
+        );
+        if (!stream_filter_append($in, "http.inflate", STREAM_FILTER_READ)) {
+            fail("the http.inflate filter was not created");
+        }
+        if (!stream_filter_append($out, "http.deflate", STREAM_FILTER_WRITE,
+            http\Encoding\Stream\Deflate::LEVEL_MAX)) {
+            fail("the http.deflate filter was not created");
+        }
+        fwrite($out, $text);
+        fclose($out);
+        $read = stream_get_contents($in);
+        fclose($in);
+        if ($read !== $text) {
+            fail("read " . strlen((string) $read) . " bytes that differ from the "
+                . strlen($text) . " written");
+        }
+        echo "http.deflate and http.inflate: " . strlen($text) . " bytes round trip\n";
+        EOF
+    - uses: test/tw/ldd-check

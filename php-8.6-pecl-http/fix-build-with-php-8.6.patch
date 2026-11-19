@@ -2456,60 +2456,96 @@ index eead59a..3bca958 100644
 2.56.1
 
 
-From 5b6d72642da6d1fad24c02c0098452267f4dc2ce Mon Sep 17 00:00:00 2001
+From 30c1f90b23833e788b410037b3260ca928ca028d Mon Sep 17 00:00:00 2001
 From: Sergio Durigan Junior <sergiodj@chainguard.dev>
 Date: Thu, 19 Nov 2026 13:40:45 -0500
-Subject: [PATCH] Give the user event loop's closure static argument info on
- PHP 8.6
+Subject: [PATCH] Make the closure of a user event loop safe to keep and to
+ inspect
 
 php_http_client_curl_user_init() builds an internal function by hand and
-gives a closure of it to http\Client\Curl\User::init(). Before PHP 8.6
-the function's arg_info pointed into the static ai_user_handler table.
-PHP 8.6 wants an array of zend_arg_info there, so the PHP 8.6 fix
-(0f0a17af21, d5cf06cb58, 34ba4a66b8) copies the three arguments into the
-event loop context. That leaves two faults:
+gives a closure of it to http\Client\Curl\User::init(). The function is
+never registered, so the engine never prepares its argument info, and
+the closure is created like the closure of an anonymous function.
+Calling the closure works. Keeping it and inspecting it does not. It has
+five faults. The first came with the PHP 8.6 fix (0f0a17af21,
+d5cf06cb58, 34ba4a66b8), so only upstream master has it. The other four
+are older: the code of the 4.3.1 release has them too.
 
-  . zend_create_closure() copies the function, pointer included, so the
-    closure keeps pointing into the context. The context is freed when
-    the event loop is detached or the client is destroyed, while user
-    code may still hold the closure. Listing its parameters after that
-    (Reflection, var_dump) reads freed memory.
+  1. Use after free. Before PHP 8.6 the function's arg_info pointed into
+     the static ai_user_handler table. PHP 8.6 wants an array of
+     zend_arg_info there, so the PHP 8.6 fix copies the three arguments
+     into the event loop context. zend_create_closure() copies the
+     function, pointer included, so the closure keeps pointing into the
+     context. The context is freed when the event loop is detached or
+     the client is destroyed, while user code may still hold the
+     closure. Listing its parameters after that reads freed memory.
 
-  . The type of the first argument is copied as it is in
-    zend_internal_arg_info: a C string with _ZEND_TYPE_LITERAL_NAME_BIT.
-    The engine only knows how to print a type whose class name is a
-    zend_string (_ZEND_TYPE_NAME_BIT), so the parameter has no usable
-    type.
+  2. The type of "client" cannot be read. The table holds it as the
+     ZEND_ARG_* macros write it: a C string with
+     _ZEND_TYPE_LITERAL_NAME_BIT. The engine only knows how to print a
+     type whose class name is a zend_string (_ZEND_TYPE_NAME_BIT), which
+     is what registering a function makes of it. 4.3.1 gives the table
+     to the closure as it is, and the PHP 8.6 fix copies the type as it
+     is. ReflectionNamedType::getName() crashes on such a type.
 
-Convert ai_user_handler once, in MINIT, with the function the engine
-itself uses when it registers a function, zend_convert_internal_arg_info()
-(PHP 8.6), into a static array, and point the closure's function at it.
-This is what the engine does for a registered function, and it gives the
-closure's argument info the lifetime it had before PHP 8.6. The strings
-are permanent interned strings, so nothing has to be freed, and the
-event loop context needs no copy.
+  3. The class name of "client" is written with quotes. The macro
+     stringifies its argument, so the declared class has a name that
+     begins and ends with a quote and has two backslashes in the middle;
+     `gcc -E` shows the literal "\"http\\\\Client\"".
 
-Also write the class name of the first argument without quotes, as every
-other ZEND_ARG_OBJ_INFO() in this extension does. The macro stringifies
-its argument, so the quoted form declared, on every PHP version, a class
-whose name begins and ends with a quote and has two backslashes in the
-middle; `gcc -E` shows the literal "\"http\\\\Client\"".
+  4. The type of "stream" cannot be read. It is declared as IS_RESOURCE,
+     and the engine has no name for that type, so
+     ReflectionNamedType::getName() crashes on it as well.
 
-[Chainguard: not from upstream, and not reported there yet;
-m6w6/ext-http master (34ba4a66b8) has both faults. Applies on top of the
-patch before it in this file. It is needed for as long as upstream's
-php_http_client_curl_user_context_t has the member "ai", and
-src/php_http_client_curl_user.c writes the class name in
-ZEND_ARG_OBJ_INFO(0, client, "http\\Client", 0) with quotes. When the
-first patch is dropped for a release after 4.3.1, check those two, and
-keep this patch if they still hold.]
+  5. var_dump() of the closure crashes. For a closure that is not marked
+     ZEND_ACC_FAKE_CLOSURE, zend_closure_get_debug_info() reports the
+     file and the line of its function, and an internal function has
+     neither.
+
+What this patch changes, by fault:
+
+  1, 2. Convert ai_user_handler once, in MINIT, with the function the
+     engine itself uses when it registers a function,
+     zend_convert_internal_arg_info() (PHP 8.6), into a static array,
+     and point the closure's function at it. This is what the engine
+     does for a registered function, and it gives the closure's argument
+     info the lifetime it had before PHP 8.6. The strings are permanent
+     interned strings, so nothing has to be freed, and the event loop
+     context needs no copy. Before PHP 8.6 the engine exports no such
+     function: there the closure points to ai_user_handler again, as in
+     4.3.1, and fault 2 stays.
+
+  3. Write the class name without quotes, as every other
+     ZEND_ARG_OBJ_INFO() in this extension does.
+
+  4. Declare "stream" without a type, as PHP declares the resource
+     parameters of its own functions. The handler still checks the
+     argument, with zend_parse_parameters("O|rl").
+
+  5. Create the closure with zend_create_fake_closure(), which marks it
+     as the closure of a named function, as Closure::fromCallable()
+     does. var_dump() then shows the name of the function and its
+     parameters.
+
+[Chainguard: not from upstream, and not reported there yet.
+m6w6/ext-http master (34ba4a66b8) has all five faults. Applies on top of
+the patch before it in this file. When that patch is dropped for a
+release after 4.3.1, look at upstream's src/php_http_client_curl_user.c
+and src/php_http_client_curl_user.h, and keep the part of this patch for
+each fault that is still there:
+  1. php_http_client_curl_user_context_t has the member "ai";
+  2. the argument info that the closure gets is not converted with
+     zend_convert_internal_arg_info();
+  3. ZEND_ARG_OBJ_INFO(0, client, "http\\Client", 0) has the quotes;
+  4. "stream" is declared with IS_RESOURCE;
+  5. the closure is created with zend_create_closure().]
 ---
- src/php_http_client_curl_user.c | 34 +++++++++++++++++++--------------
+ src/php_http_client_curl_user.c | 38 +++++++++++++++++++--------------
  src/php_http_client_curl_user.h |  5 -----
- 2 files changed, 20 insertions(+), 19 deletions(-)
+ 2 files changed, 22 insertions(+), 21 deletions(-)
 
 diff --git a/src/php_http_client_curl_user.c b/src/php_http_client_curl_user.c
-index 0c8a750..243deea 100644
+index 0c8a750..fc4a83d 100644
 --- a/src/php_http_client_curl_user.c
 +++ b/src/php_http_client_curl_user.c
 @@ -23,10 +23,19 @@ typedef struct php_http_client_curl_user_ev {
@@ -2517,8 +2553,9 @@ index 0c8a750..243deea 100644
  
  ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_user_handler, 0, 1, IS_LONG, 1)
 -	ZEND_ARG_OBJ_INFO(0, client, "http\\Client", 0)
+-	ZEND_ARG_TYPE_INFO(0, stream, IS_RESOURCE, 1)
 +	ZEND_ARG_OBJ_INFO(0, client, http\\Client, 0)
- 	ZEND_ARG_TYPE_INFO(0, stream, IS_RESOURCE, 1)
++	ZEND_ARG_INFO(0, stream)
  	ZEND_ARG_TYPE_INFO(0, action, IS_LONG, 1)
  ZEND_END_ARG_INFO();
 +#if PHP_VERSION_ID >= 80600
@@ -2541,7 +2578,7 @@ index 0c8a750..243deea 100644
  
  #if DBG_EVENTS
  	fprintf(stderr, "I");
-@@ -192,15 +200,11 @@ static void *php_http_client_curl_user_init(php_http_client_t *client, void *use
+@@ -192,20 +200,16 @@ static void *php_http_client_curl_user_init(php_http_client_t *client, void *use
  	ctx->closure.common.type = ZEND_INTERNAL_FUNCTION;
  	ctx->closure.common.function_name = zend_string_init(ZEND_STRL("php_http_client_curl_user_handler"), 0);
  	ctx->closure.internal_function.handler = php_http_client_curl_user_handler;
@@ -2559,6 +2596,12 @@ index 0c8a750..243deea 100644
  	ctx->closure.internal_function.num_args = 3;
  	ctx->closure.internal_function.required_num_args = 1;
  
+ 
+-	zend_create_closure(zclosure, &ctx->closure, NULL, NULL, NULL);
++	zend_create_fake_closure(zclosure, &ctx->closure, NULL, NULL, NULL);
+ 
+ 	php_http_object_method_init(&init, &ctx->user, ZEND_STRL("init"));
+ 	php_http_object_method_call(&init, &ctx->user, NULL, 1, args);
 @@ -230,7 +234,6 @@ static void php_http_client_curl_user_dtor(void **context)
  {
  	php_http_client_curl_user_context_t *ctx = *context;

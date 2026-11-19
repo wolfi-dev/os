@@ -1,0 +1,109 @@
+package:
+  name: py3.14-autocommand
+  version: "2.2.2"
+  epoch: 0
+  description: "Automatically generate and run simple argparse parsers from function signatures."
+  copyright:
+    - license: LGPL-3.0-or-later
+  resources:
+    cpu: "3"
+    memory: 5Gi
+
+vars:
+  pypi-package: autocommand
+  python-version: "3.14"
+
+environment:
+  contents:
+    packages:
+      - py${{vars.python-version}}-build-base-dev
+      - py${{vars.python-version}}-pytest # upstream-tests: test runner
+      - py${{vars.python-version}}-pytest-timeout # upstream-tests: per-test timeout
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/Lucretiel/autocommand
+      tag: ${{package.version}}
+      expected-commit: 9d95de8ad227a76604a9205b5b211bc2a0576e91
+
+  # Python 3.14 made asyncio.get_event_loop() raise when no loop is set.
+  # Fixes @autoasync without loop= and the upstream test fixture.
+  # https://github.com/Lucretiel/autocommand/issues/39
+  - uses: patch
+    with:
+      patches: python-3.14-get-event-loop.patch
+
+  - uses: py/pip-build-install
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: upstream-tests/pytest
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: strip
+
+update:
+  enabled: true
+  manual: false
+  github:
+    identifier: Lucretiel/autocommand
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - py${{vars.python-version}}-pytest
+  pipeline:
+    - uses: test/tw/pip-check
+    - uses: python/import
+      with:
+        python: python${{vars.python-version}}
+        import: ${{vars.pypi-package}}
+    # Exercise the patched @autoasync path with no current event loop, which
+    # the upstream tests never reach (their fixtures always set a loop).
+    - runs: |
+        python${{vars.python-version}} -c '
+        import asyncio
+        from autocommand import autoasync
+
+        @autoasync
+        async def double(x):
+            return x * 2
+
+        assert double(21) == 42, "autoasync returned the wrong value"
+        loop = asyncio.get_event_loop()
+        assert not loop.is_closed(), "created loop was closed"
+        assert double(4) == 8
+        assert asyncio.get_event_loop() is loop, "second call made a new loop"
+
+        @autoasync(pass_loop=True)
+        async def current(loop):
+            return loop
+
+        assert current() is loop, "pass_loop did not inject the current loop"
+
+        explicit = asyncio.new_event_loop()
+
+        @autoasync(loop=explicit, pass_loop=True)
+        async def given(loop):
+            return loop
+
+        assert given() is explicit, "explicit loop= was not used"
+        print("autoasync without a current loop: OK")
+        '
+    - uses: git-checkout
+      with:
+        repository: https://github.com/Lucretiel/autocommand
+        tag: ${{package.version}}
+        expected-commit: 9d95de8ad227a76604a9205b5b211bc2a0576e91
+    # Apply the Python 3.14 get_event_loop() fix to the checked-out tests.
+    - uses: patch
+      with:
+        patches: python-3.14-get-event-loop.patch
+    - runs: |
+        # Make sure the tests import the installed package, not src/.
+        python${{vars.python-version}} -c 'import autocommand; assert "/site-packages/" in autocommand.__file__, autocommand.__file__'
+        python${{vars.python-version}} -m pytest test/

@@ -1,7 +1,7 @@
 package:
   name: php-8.6-zstd
   version: "0.18.0"
-  epoch: 0
+  epoch: 1 # strip zstd.so
   description: Zstd Extension for PHP
   copyright:
     - license: MIT
@@ -30,6 +30,10 @@ environment:
       - file
       - glibc-2.44-dev
       - php-${{vars.phpMM}}
+      # For the upstream tests of the output handler (tests/ob_*.phpt):
+      # run-tests.php runs a test that has a GET section with the php-cgi
+      # it finds beside php, and skips it when there is none.
+      - php-${{vars.phpMM}}-cgi
       - php-${{vars.phpMM}}-dev
       - zstd-dev
 
@@ -62,6 +66,8 @@ pipeline:
 
   - uses: upstream-tests/php-ext-test
 
+  - uses: strip
+
 subpackages:
   - name: ${{package.name}}-config
     pipeline:
@@ -83,3 +89,62 @@ update:
 test:
   pipeline:
     - uses: test/tw/ldd-check
+    - name: Verify the installed configuration loads the extension
+      runs: |
+        # Nothing here writes an ini file or names the module on the command
+        # line: zstd.so is loaded through /etc/php/conf.d/zstd.ini of the
+        # -config subpackage, which this package depends on at run time.
+        php -m | grep -Fx zstd
+    - name: Round trip through the installed extension
+      runs: |
+        # The upstream tests run the module in the build tree. This runs the
+        # installed one: the functions, then the compress.zstd:// stream
+        # wrapper. PHP 8.6 reports the result of a stream's close handler,
+        # so without the cherry-pick above file_put_contents() and fclose()
+        # return false here.
+        php <<'EOF'
+        <?php
+        function fail($text)
+        {
+            echo "FAIL: $text\n";
+            exit(1);
+        }
+
+        $data = str_repeat("The installed zstd module gives this line back.\n", 200);
+
+        $packed = zstd_compress($data);
+        if (!is_string($packed) || strlen($packed) >= strlen($data)) {
+            fail("zstd_compress() did not compress the data");
+        }
+        if (zstd_uncompress($packed) !== $data) {
+            fail("zstd_uncompress() did not give the data back");
+        }
+
+        $file = tempnam(sys_get_temp_dir(), "zstd");
+        if ($file === false) {
+            fail("no temporary file");
+        }
+        if (file_put_contents("compress.zstd://" . $file, $data) !== strlen($data)) {
+            fail("file_put_contents() on compress.zstd:// did not report the bytes written");
+        }
+        // What is on disk is a zstd frame, not the text.
+        $stored = file_get_contents($file);
+        if (!is_string($stored) || strlen($stored) >= strlen($data)) {
+            fail("the stream wrapper did not compress the file");
+        }
+        if (zstd_uncompress($stored) !== $data) {
+            fail("zstd_uncompress() did not give back what the stream wrapper wrote");
+        }
+        $fp = fopen("compress.zstd://" . $file, "r");
+        if ($fp === false) {
+            fail("cannot open the compressed file for reading");
+        }
+        if (stream_get_contents($fp) !== $data) {
+            fail("reading through compress.zstd:// did not give the data back");
+        }
+        if (fclose($fp) !== true) {
+            fail("fclose() on compress.zstd:// did not report success");
+        }
+        unlink($file);
+        echo "PASS: functions and stream wrapper round trip\n";
+        EOF

@@ -1,0 +1,530 @@
+name: PostgreSQL extension upstream test suite (make installcheck)
+
+description: |
+  Runs a PostgreSQL extension's (PGXS) upstream regression suite, `make
+  installcheck`, against a throwaway PostgreSQL server that this step starts
+  and stops itself. Use it after `autoconf/make-install` (or whatever
+  installs the extension into the package), before `strip`. Run it after
+  install, so the package holds only what the build produced: the suite runs
+  in the build tree that install copies from.
+
+  PGXS has no `make check` for extensions (it answers '"make check" is not
+  supported'): its suite is `make installcheck`, which runs pg_regress (and
+  pg_isolation_regress for ISOLATION tests) against a running server with
+  the extension already installed. This step provides both:
+    1. It builds a private server tree in a temp directory: a copy of the
+       server binaries from `pg_config --bindir`, symlinks to everything in
+       `pg_config --pkglibdir` and `--sharedir`, and on top of them the
+       files the package installed (`destdir`, default the package being
+       built). PostgreSQL finds its lib and share directories relative to
+       its own binary, so the server loads the extension just built, and
+       other extensions already in the build environment, without touching
+       the system tree. Binaries the package installs into bindir are on
+       PATH (after the system ones) for suites that call them.
+    2. It runs initdb and starts postgres as an unprivileged user (`user`,
+       created if missing; the server refuses to run as root) with a private
+       socket directory, a free TCP port on 127.0.0.1, fsync off, and any
+       `config` lines, then waits until it accepts connections.
+    3. It runs `make installcheck` in `dir` (as the calling user, so results/
+       and regression.diffs land in the build tree as usual) with PGHOST,
+       PGPORT, PGUSER (a superuser) and PGDATABASE exported.
+    4. It always stops the server and removes the temp directory. On failure
+       it prints regression.diffs (first 5000 lines) and the server log.
+
+  The server is the one in the build environment: add the stream's server
+  and headers, normally `postgresql-${{vars.pg-version}}-dev` (which pulls
+  in `postgresql-${{vars.pg-version}}`). Set `version` to the stream's
+  major so a mismatched pg_config fails the step instead of testing against
+  the wrong server.
+
+  Other extensions the suite uses (CREATE EXTENSION of a contrib module
+  such as bloom, hstore or pgcrypto, or another extension package such as
+  hypopg) come from the build environment: everything installed under
+  pkglibdir and sharedir is linked into the server tree, so add the
+  package that ships them (contrib modules: `postgresql-${{vars.pg-version}}-contrib`)
+  and list the extensions in `extensions`. The step then checks before
+  starting the server that each one's control file is there, and fails
+  naming the missing ones instead of letting the suite fail on "extension
+  ... is not available". When a suite fails that way anyway, the step
+  prints a HINT naming the extension.
+
+  The suite is a hard gate. The step fails if:
+    - a test that is not in `ignore` fails (pg_regress "FAILED" or
+      "not ok"), or make fails for any other reason (missing target,
+      pg_regress could not connect, timeout),
+    - the suite did not run: no pg_regress result line and summary were
+      found (no REGRESS in the Makefile, or installcheck overridden),
+    - a suite the Makefile declares (REGRESS, ISOLATION, TAP_TESTS, asked
+      of make with `args` before the run) did not start, or a pg_regress
+      suite printed no summary. PGXS runs the suites one after another in
+      one recipe, so a failure in REGRESS, ignored or not, stops make
+      before ISOLATION; the step fails rather than pass with a suite not
+      run (see ignore below),
+    - the package installed nothing under the pg_config paths (the step is
+      before the install step, or `destdir` is wrong),
+    - the server did not start (bad `config`, or a library in
+      shared_preload_libraries that is missing),
+    - an extension listed in `extensions` is not in the build environment.
+  TAP tests (TAP_TESTS / prove_installcheck) need a server built with
+  --enable-tap-tests and are not run; the step prints a WARNING when the
+  Makefile asks for them.
+
+  Prints the make output as it runs (and again, its last 300 lines, when
+  the step fails with no failing test to explain it), then:
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS-FAIL <package>: <test>      (one per non-ignored failure)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=0 [ignored=<n>]
+  Counts come from pg_regress's per-test lines, summed across every
+  pg_regress run in the log (regress and isolation suites), in both output
+  formats: PostgreSQL 14/15 ("test foo ... ok", "... FAILED") and 16+
+  (TAP: "ok 1 - foo", "not ok 2 - bar"). pg_regress has no skip result.
+
+  Examples:
+    - uses: autoconf/make
+    - uses: autoconf/make-install
+    - uses: upstream-tests/pg-installcheck
+      with:
+        version: ${{vars.pg-version}}
+    - uses: strip
+
+    # Logical decoding output plugin: the suite needs wal_level=logical.
+    - uses: upstream-tests/pg-installcheck
+      with:
+        version: ${{vars.pg-version}}
+        config: |
+          wal_level = logical
+
+    # hypo_inval_am does CREATE EXTENSION bloom (contrib); the build
+    # environment has postgresql-${{vars.pg-version}}-contrib.
+    - uses: upstream-tests/pg-installcheck
+      with:
+        version: ${{vars.pg-version}}
+        extensions: bloom
+
+    # The suite runs with --use-existing, so its database (and a
+    # tablespace it uses) must exist first. setup runs as the calling
+    # user with the server up; PG_SERVICE_USER owns the server and
+    # PG_SERVICE_DIR is its temp directory.
+    - uses: upstream-tests/pg-installcheck
+      with:
+        version: ${{vars.pg-version}}
+        setup: |
+          mkdir "$PG_SERVICE_DIR/ts"
+          chown "$PG_SERVICE_USER" "$PG_SERVICE_DIR/ts"
+          psql -v ON_ERROR_STOP=1 -c "CREATE TABLESPACE testts LOCATION '$PG_SERVICE_DIR/ts'"
+          createdb contrib_regression
+
+  Named exceptions go in ignore: space-separated test names as pg_regress
+  prints them. Each ignored test still runs and is reported as IGNORE; make
+  still exits non-zero for it, which the step accepts only when every
+  failure is ignored and every declared suite started. An ignored failure
+  in REGRESS stops make before ISOLATION and TAP_TESTS, so when the
+  Makefile declares those, run the suites in separate steps:
+
+    - uses: upstream-tests/pg-installcheck
+      with:
+        version: ${{vars.pg-version}}
+        args: ISOLATION= TAP_TESTS=
+        # <why foo fails here>
+        # TODO(upstream-tests): drop when <fixed>.
+        ignore: foo
+    - uses: upstream-tests/pg-installcheck
+      with:
+        version: ${{vars.pg-version}}
+        args: REGRESS=
+
+  Make runs with -k, so with several targets a failing one does not stop
+  the others. Every exception needs a comment in the calling package
+  explaining why (only environmental causes qualify, see the upstream-tests
+  skill) and a `TODO(upstream-tests): ...` to remove it.
+
+  For a server a package test (`test:`) needs, rather than an upstream
+  installcheck suite, use test/service/postgres.
+
+needs:
+  packages:
+    - bash
+    - busybox
+
+inputs:
+  version:
+    description: |
+      Expected PostgreSQL major version, e.g. ${{vars.pg-version}}. When
+      set, the step fails if pg_config or the server report another major.
+    default: ""
+  pg-config:
+    description: pg_config to take the server and PGXS paths from.
+    default: pg_config
+  target:
+    description: make target(s) that run the suite.
+    default: installcheck
+  dir:
+    description: Directory (relative to the build workspace) to run make in.
+    default: "."
+  args:
+    description: Extra make arguments, e.g. VAR=value.
+    default: ""
+  destdir:
+    description: |
+      Root the extension was installed into. Files under it at the
+      pg_config bindir, pkglibdir and sharedir paths are laid over the
+      server tree the suite runs against.
+    default: ${{targets.contextdir}}
+  extensions:
+    description: |
+      Space-separated extensions from the build environment the suite
+      needs (e.g. bloom from postgresql-<major>-contrib). Each must have a
+      control file in the server tree, or the step fails before the suite.
+    default: ""
+  config:
+    description: |
+      Lines appended to postgresql.conf, e.g. shared_preload_libraries =
+      'pg_stat_monitor' or wal_level = logical.
+    default: ""
+  initdb-args:
+    description: Extra initdb arguments.
+    default: "--no-locale --encoding=UTF8"
+  setup:
+    description: |
+      Shell commands run (with set -e -o pipefail) after the server is up and before
+      the suite, with the connection environment exported, e.g. to create
+      a database or role the suite expects.
+    default: ""
+  ignore:
+    description: |
+      Space-separated pg_regress test names whose failures are allowed.
+      Each one needs a comment and TODO in the caller.
+    default: ""
+  user:
+    description: |
+      Unprivileged user that owns and runs the server when the step runs as
+      root. Created (busybox adduser) if it does not exist.
+    default: build
+  superuser:
+    description: Name of the database superuser initdb creates (PGUSER).
+    default: postgres
+  listen-addresses:
+    description: |
+      postgresql.conf listen_addresses. The server always also listens on
+      a private Unix socket (PGHOST). Set to "" for socket only.
+    default: 127.0.0.1
+  start-timeout:
+    description: Seconds to wait for the server to start or stop.
+    default: "120"
+  timeout:
+    description: Wall-clock limit for the suite, in seconds.
+    default: "1800"
+
+pipeline:
+  - name: upstream-tests (pg installcheck)
+    runs: |
+      PKG="${{package.name}}"
+      ignore=" $(echo ${{inputs.ignore}}) "
+      targets="${{inputs.target}}"
+      fail_early() {
+        echo "UPSTREAM-TESTS ${PKG}: FAILED: $*"
+        exit 1
+      }
+
+      # --- server: locate, check version -------------------------------
+      pgconfig="${{inputs.pg-config}}"
+      command -v "$pgconfig" >/dev/null 2>&1 || fail_early "$pgconfig not found; add postgresql-<major>-dev (and the server, postgresql-<major>) to the build environment"
+      bindir=$("$pgconfig" --bindir)
+      pkglibdir=$("$pgconfig" --pkglibdir)
+      sharedir=$("$pgconfig" --sharedir)
+      major=$("$pgconfig" --version | sed -E 's/^PostgreSQL ([0-9]+).*/\1/')
+      [ -x "$bindir/postgres" ] && [ -x "$bindir/initdb" ] && [ -x "$bindir/pg_ctl" ] || \
+        fail_early "no server in $bindir; add postgresql-$major to the build environment"
+      srvmajor=$("$bindir/postgres" --version | sed -E 's/^postgres \(PostgreSQL\) ([0-9]+).*/\1/')
+      want="${{inputs.version}}"
+      if [ -n "$want" ] && { [ "$major" != "$want" ] || [ "$srvmajor" != "$want" ]; }; then
+        fail_early "version is $want but pg_config reports $major and the server $srvmajor"
+      fi
+      [ "$major" = "$srvmajor" ] || fail_early "pg_config ($major) and server ($srvmajor) majors differ"
+
+      # --- suites the Makefile declares --------------------------------
+      # PGXS installcheck runs REGRESS, then ISOLATION, then TAP_TESTS as
+      # consecutive commands of one recipe, so a failing suite (even one
+      # whose failures are all in ignore) stops make before the later ones
+      # start. Ask make, with the caller's args, which suites are declared,
+      # so the gate below can check that each one started.
+      suites=""
+      case " $targets " in
+        *" installcheck "*)
+          q=$(cd "${{inputs.dir}}" && make -s --no-print-directory ${{inputs.args}} \
+            --eval '__pg_installcheck_suites: ; @echo "pg-installcheck-suites:$(if $(NO_INSTALLCHECK),,$(if $(strip $(REGRESS)), regress)$(if $(strip $(ISOLATION)), isolation)$(if $(strip $(TAP_TESTS)), tap))"' \
+            __pg_installcheck_suites 2>&1) || {
+            printf '%s\n' "$q"
+            fail_early "could not ask make in ${{inputs.dir}} which suites the Makefile declares"
+          }
+          printf '%s\n' "$q" | grep -q '^pg-installcheck-suites:' || {
+            printf '%s\n' "$q"
+            fail_early "could not ask make in ${{inputs.dir}} which suites the Makefile declares"
+          }
+          suites=$(printf '%s\n' "$q" | sed -n 's/^pg-installcheck-suites://p' | tail -n 1)
+          echo "upstream-tests/pg-installcheck: suites declared:${suites:- none}"
+          ;;
+      esac
+
+      # --- private server tree ----------------------------------------
+      base=$(mktemp -d /tmp/pg-installcheck.XXXXXX)
+      inst="$base/install"
+      data="$base/data"
+      sock="$base/sock"
+      srvlog="$base/server.log"
+      mkdir -p "$sock"
+      # postgres, initdb and pg_ctl find the lib and share trees relative
+      # to their own (symlink-resolved) path, so the binaries are copied
+      # and the rest are symlinks into the system tree.
+      mkdir -p "$inst$bindir"
+      cp -a "$bindir/." "$inst$bindir/"
+      for d in "$pkglibdir" "$sharedir"; do
+        mkdir -p "$inst$d"
+        (cd "$d" && find . -type d) | while read -r x; do mkdir -p "$inst$d/$x"; done
+        (cd "$d" && find . ! -type d) | while read -r x; do ln -s "$d/${x#./}" "$inst$d/$x"; done
+      done
+      # Lay the package's files over it. rm first: never write through a
+      # symlink into the system tree.
+      destdir="${{inputs.destdir}}"
+      n=0
+      for d in "$bindir" "$pkglibdir" "$sharedir"; do
+        [ -d "$destdir$d" ] || continue
+        (cd "$destdir$d" && find . -type d) | while read -r x; do mkdir -p "$inst$d/$x"; done
+        for x in $(cd "$destdir$d" && find . ! -type d); do
+          rm -f "$inst$d/$x"
+          cp -a "$destdir$d/$x" "$inst$d/$x"
+          n=$((n + 1))
+        done
+      done
+      if [ "$n" -eq 0 ]; then
+        rm -rf "$base"
+        fail_early "nothing installed under $pkglibdir, $sharedir or $bindir in $destdir; run this step after the install step"
+      fi
+      echo "upstream-tests/pg-installcheck: PostgreSQL $major server tree in $inst, $n file(s) from $destdir"
+      # Extensions the suite needs from the build environment (contrib
+      # modules, other extension packages), linked in above.
+      missing=""
+      for e in ${{inputs.extensions}}; do
+        [ -e "$inst$sharedir/extension/$e.control" ] || missing="$missing $e"
+      done
+      if [ -n "$missing" ]; then
+        rm -rf "$base"
+        fail_early "extension(s)$missing not in the build environment (no $sharedir/extension/<name>.control); add the package that ships them, postgresql-$major-contrib for contrib modules"
+      fi
+
+      # --- start ------------------------------------------------------
+      if [ "$(id -u)" -eq 0 ]; then
+        svcuser="${{inputs.user}}"
+        if ! id "$svcuser" >/dev/null 2>&1; then
+          adduser -D -H -s /bin/sh "$svcuser" 2>/dev/null || useradd -M -s /bin/sh "$svcuser"
+        fi
+        as_svc() { su -s /bin/sh "$svcuser" -c "$*"; }
+      else
+        svcuser=$(id -un)
+        as_svc() { sh -c "$*"; }
+      fi
+      # Not -R: the tree under $inst is symlinks into the system tree.
+      chown "$svcuser" "$base" "$sock"
+      started=0
+      ok=0
+      stop_server() {
+        if [ "$started" -eq 1 ]; then
+          as_svc "'$inst$bindir/pg_ctl' stop -D '$data' -m fast -w -t ${{inputs.start-timeout}}" >/dev/null 2>&1 || \
+            as_svc "'$inst$bindir/pg_ctl' stop -D '$data' -m immediate -w -t 30" >/dev/null 2>&1 || true
+          started=0
+        fi
+      }
+      cleanup() {
+        stop_server
+        if [ "$ok" -ne 1 ] && [ -s "$srvlog" ]; then
+          echo "===== PostgreSQL server log (last 300 lines) ====="
+          tail -n 300 "$srvlog"
+        fi
+        rm -rf "$base"
+      }
+      trap cleanup EXIT
+      as_svc "'$inst$bindir/initdb' -D '$data' -U '${{inputs.superuser}}' -A trust --no-sync ${{inputs.initdb-args}}" > "$base/initdb.log" 2>&1 || {
+        cat "$base/initdb.log"; fail_early "initdb failed"; }
+      cat >> "$data/postgresql.conf" <<EOF
+      # upstream-tests/pg-installcheck
+      listen_addresses = '${{inputs.listen-addresses}}'
+      unix_socket_directories = '$sock'
+      fsync = off
+      EOF
+      cat >> "$data/postgresql.conf" <<'__PG_SERVICE_CONFIG__'
+      ${{inputs.config}}
+      __PG_SERVICE_CONFIG__
+      # A free TCP port: try a run of ports from a pid-derived start and
+      # move on when the bind fails.
+      port=$((20000 + $$ % 20000))
+      tries=0
+      while :; do
+        : > "$srvlog"
+        chown "$svcuser" "$srvlog"
+        if as_svc "'$inst$bindir/pg_ctl' start -D '$data' -l '$srvlog' -w -t ${{inputs.start-timeout}} -o '-p $port'" > /dev/null; then
+          started=1
+          break
+        fi
+        tries=$((tries + 1))
+        if grep -qE 'could not (bind|create listen socket)|Address (already )?in use' "$srvlog" && [ "$tries" -lt 20 ]; then
+          port=$((port + 1))
+          continue
+        fi
+        fail_early "the server did not start (see the server log below)"
+      done
+      export PGHOST="$sock" PGPORT="$port" PGUSER="${{inputs.superuser}}" PGDATABASE=postgres PGDATA="$data"
+      export PG_SERVICE_DIR="$base" PG_SERVICE_USER="$svcuser" PG_SERVICE_LOG="$srvlog"
+      # Last on PATH: binaries the package installs into bindir (client
+      # tools some suites call) are found, while pg_config and the PGXS
+      # paths make uses stay the system ones.
+      export PATH="$PATH:$inst$bindir"
+      "$inst$bindir/pg_isready" -q -t 30 2>/dev/null || psql -XAtqc 'select 1' >/dev/null || fail_early "the server does not accept connections"
+      echo "upstream-tests/pg-installcheck: server up as $svcuser, PGHOST=$PGHOST PGPORT=$PGPORT PGUSER=$PGUSER"
+
+      cat > "$base/setup.sh" <<'__PG_SERVICE_SETUP__'
+      ${{inputs.setup}}
+      __PG_SERVICE_SETUP__
+      if grep -q '[^[:space:]]' "$base/setup.sh"; then
+        (cd "${{inputs.dir}}" && sh -e -o pipefail "$base/setup.sh") || fail_early "setup failed"
+      fi
+
+      # --- suite ------------------------------------------------------
+      cd "${{inputs.dir}}"
+      log="$base/installcheck.log"
+      # Create the file before tail starts: busybox tail -f exits at once
+      # on a file that does not exist yet.
+      : > "$log"
+      start=$(date +%s)
+      # make writes to the file and a background tail streams it, as in
+      # upstream-tests/make-check: the step's lifetime follows make alone.
+      # -k: with several targets, a failing one does not stop the others.
+      tail -n +1 -f "$log" &
+      tailpid=$!
+      rc=0
+      timeout ${{inputs.timeout}} make -k ${{inputs.args}} $targets > "$log" 2>&1 || rc=$?
+      duration=$(( $(date +%s) - start ))
+      sleep 2
+      kill "$tailpid" 2>/dev/null || true
+      wait "$tailpid" 2>/dev/null || true
+      # pg_regress prints "Bail out!" without a newline.
+      echo
+
+      gate=0
+      why=""
+      if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+        gate=1; why="$why timed out or killed (exit $rc, limit ${{inputs.timeout}}s);"
+      fi
+      if grep -q 'No rule to make target' "$log"; then
+        gate=1; why="$why missing make target;"
+      fi
+      if grep -q 'TAP tests not enabled' "$log"; then
+        echo "WARNING: the Makefile has TAP_TESTS; the server is built without --enable-tap-tests, so they did not run"
+      fi
+      # Per-test result lines, both pg_regress formats:
+      #   14/15: "test foo                     ... ok           12 ms"
+      #          "     foo                     ... FAILED       12 ms"
+      #          "     foo                     ... failed (ignored)"
+      #   16+:   "ok 1         - foo                 12 ms"
+      #          "not ok 2     + bar                 12 ms"
+      results=$(awk '
+        /^(not )?ok +[0-9]+ +[-+] +[^ ]+ +[0-9.]+ ms/ {
+          o = ($1 == "not") ? "F" : "P"; n = ($1 == "not") ? $5 : $4; print o, n; next }
+        /^(test )? *[^ ]+ +\.\.\. +(ok|FAILED|failed \(ignored\))/ {
+          l = $0; sub(/^test /, "", l); sub(/^ +/, "", l); split(l, a, " ")
+          o = (l ~ /\.\.\. +ok/) ? "P" : "F"; print o, a[1] }' "$log")
+      summaries=$(grep -cE '^(# )? ?(All [0-9]+ tests passed\.|[0-9]+ of [0-9]+ tests (failed|passed))' "$log" || true)
+      pass=$(printf '%s\n' "$results" | grep -c '^P ' || true)
+      fail=$(printf '%s\n' "$results" | grep -c '^F ' || true)
+      ignored=0
+      nfail=0
+      for name in $(printf '%s\n' "$results" | awk '$1 == "F" {print $2}' | sort -u); do
+        case "$ignore" in
+          *" $name "*)
+            echo "IGNORE ${PKG}: $name"
+            ignored=$((ignored + 1))
+            ;;
+          *)
+            echo "UPSTREAM-TESTS-FAIL ${PKG}: $name"
+            nfail=$((nfail + 1))
+            ;;
+        esac
+      done
+      for name in $ignore; do
+        printf '%s\n' "$results" | grep -qxF "F $name" || \
+          echo "WARNING: ignore entry '$name' did not fail; drop it if it now passes"
+      done
+      if [ "$nfail" -gt 0 ]; then
+        gate=1; why="$why $nfail non-ignored failing test(s);"
+      fi
+      if [ "$summaries" -eq 0 ] || [ $((pass + fail)) -eq 0 ]; then
+        gate=1; why="$why no pg_regress results (no REGRESS tests ran, or pg_regress could not connect);"
+      elif [ "$pass" -eq 0 ]; then
+        gate=1; why="$why no tests passed;"
+      fi
+      if [ "$rc" -ne 0 ] && [ "$nfail" -eq 0 ] && [ "$ignored" -eq 0 ]; then
+        gate=1; why="$why make $targets exited $rc with no test failures;"
+        echo "UPSTREAM-TESTS-FAIL ${PKG}: make $targets (exit $rc)"
+      fi
+      if grep -q '^Bail out!' "$log"; then
+        gate=1; why="$why pg_regress bailed out;"
+      fi
+      # Every suite the Makefile declares must have started, and each
+      # pg_regress run must have printed its summary. PGXS prints
+      # "+++ <suite> install-check in ... +++" before each suite ("# +++"
+      # from PostgreSQL 16); a server without TAP support prints "TAP tests
+      # not enabled" instead (warned about above). This is what stops an
+      # ignored REGRESS failure from passing the step with the ISOLATION
+      # suite never run.
+      nruns=0
+      skipped=""
+      for s in $suites; do
+        case "$s" in
+          regress|isolation)
+            nruns=$((nruns + 1))
+            pat="^(# )?[+]{3} $s install-check"
+            ;;
+          *)
+            pat='^(# )?[+]{3} tap install-check|TAP tests not enabled'
+            ;;
+        esac
+        if ! grep -qE "$pat" "$log"; then
+          skipped="$skipped $s"
+          echo "UPSTREAM-TESTS-FAIL ${PKG}: $s suite (did not run)"
+        fi
+      done
+      if [ -n "$skipped" ]; then
+        gate=1; why="$why declared suite(s)$skipped did not run;"
+        if [ "$ignored" -gt 0 ]; then
+          echo "upstream-tests/pg-installcheck: HINT: an ignored failure still makes its suite exit non-zero, which stops make before the later suites. Run the suites in separate steps, e.g. args: ISOLATION= TAP_TESTS= on the step with ignore and args: REGRESS= on a second step."
+        fi
+      elif [ "$summaries" -lt "$nruns" ]; then
+        gate=1; why="$why $nruns pg_regress suite(s) declared but $summaries summary line(s) found;"
+      fi
+      if [ "$fail" -gt 0 ]; then
+        # "extension "bloom" is not available": a module the suite needs is
+        # not in the build environment.
+        for e in $(find . -name regression.diffs | while read -r f; do grep -ohE 'extension "[^"]+" is not available' "$f" || true; done | sed -E 's/^extension "([^"]+)".*/\1/' | sort -u); do
+          echo "upstream-tests/pg-installcheck: HINT: the suite needs extension $e, which is not in the build environment; add the package that ships it (postgresql-$major-contrib for contrib modules) and list it in extensions"
+        done
+        for f in $(find . -name regression.diffs | sort); do
+          echo "===== $f ====="
+          awk -v f="$f" 'NR <= 5000 { print } END { if (NR > 5000) print "===== " f ": " NR - 5000 " more lines not shown =====" }' "$f"
+        done
+      fi
+
+      if [ "$gate" -ne 0 ] && [ "$nfail" -eq 0 ]; then
+        # No failing test explains the failure (pg_regress could not
+        # connect, a missing target, a suite that did not run): show what
+        # make printed before cleanup removes the log.
+        echo "===== make $targets output (last 300 lines) ====="
+        tail -n 300 "$log"
+      fi
+      echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+      extra=""
+      [ "$ignored" -gt 0 ] && extra=" ignored=$ignored"
+      echo "UPSTREAM-TESTS ${PKG}: pass=$pass fail=$fail skip=0$extra"
+      if [ "$gate" -ne 0 ]; then
+        echo "UPSTREAM-TESTS ${PKG}: FAILED:$why"
+        exit 1
+      fi
+      ok=1

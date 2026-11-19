@@ -1,0 +1,208 @@
+name: Run commands against a throwaway PostgreSQL server
+
+description: |
+  Starts a private PostgreSQL server, runs the caller's `run` commands with
+  the connection environment exported, and always stops the server and
+  removes its files afterwards. On failure it prints the server log. Use it
+  in `test:` (or in a build step) wherever a package needs a live server:
+  PostgreSQL extensions, client libraries, applications that migrate a
+  schema at startup. It replaces the hand-written useradd / sudo -u initdb /
+  pg_ctl start / pg_ctl stop block.
+
+  The server runs from the installed PostgreSQL (`postgresql-<major>` must
+  be in the environment) as an unprivileged user (`user`, created with
+  busybox adduser if missing, since the server refuses to run as root),
+  with its data, log and Unix socket in a temp directory, a free TCP port
+  on 127.0.0.1, fsync off, and any `config` lines. The step waits until
+  the server accepts connections (pg_ctl -w, then pg_isready), and exports:
+    PGHOST            the private socket directory
+    PGPORT            the port it listens on (TCP and socket)
+    PGUSER            the superuser initdb created (`superuser`)
+    PGDATABASE        `database` (created if it is not postgres)
+    PGDATA            the data directory
+    DATABASE_URL      postgresql://PGUSER@127.0.0.1:PGPORT/PGDATABASE
+    PG_SERVICE_DIR    the temp directory (owned by PG_SERVICE_USER)
+    PG_SERVICE_USER   the user running the server
+    PG_SERVICE_LOG    the server log
+  `run` runs with `set -e -o pipefail`, like a melange `runs:` block, as the calling user (root in melange tests); a
+  failing command fails the step. Authentication is trust for local and
+  127.0.0.1 connections.
+
+  The server and the commands are one step: the server stops when `run`
+  ends, so put every command that needs it in `run`. With several
+  PostgreSQL streams installed, set `version` to pick
+  /usr/libexec/postgresql<version>.
+
+  For an extension's upstream `make installcheck` suite in the build, use
+  upstream-tests/pg-installcheck, which runs the server against the
+  extension just built.
+
+  Examples:
+    test:
+      environment:
+        contents:
+          packages:
+            - postgresql-${{vars.pg-version}}
+            - postgresql-${{vars.pg-version}}-client
+      pipeline:
+        - uses: test/service/postgres
+          with:
+            version: ${{vars.pg-version}}
+            run: |
+              psql -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION hypopg'
+              psql -tAc "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'" | grep -Fx ${{package.version}}
+
+        # An output plugin needs wal_level=logical.
+        - uses: test/service/postgres
+          with:
+            config: |
+              wal_level = logical
+            run: |
+              psql -c "SELECT pg_create_logical_replication_slot('s', 'wal2json')"
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  run:
+    description: Shell commands to run (with set -e -o pipefail, like a runs block) while the server is up.
+    required: true
+  version:
+    description: |
+      PostgreSQL major to use. When set, the server is
+      /usr/libexec/postgresql<version> and the step fails if it reports
+      another major. Default: the server pg_config on PATH points at.
+    default: ""
+  database:
+    description: Database exported as PGDATABASE, created if it is not postgres.
+    default: postgres
+  config:
+    description: |
+      Lines appended to postgresql.conf, e.g. shared_preload_libraries =
+      'pg_cron' or wal_level = logical.
+    default: ""
+  initdb-args:
+    description: Extra initdb arguments.
+    default: "--no-locale --encoding=UTF8"
+  user:
+    description: |
+      Unprivileged user that owns and runs the server when the step runs as
+      root. Created (busybox adduser) if it does not exist.
+    default: postgres
+  superuser:
+    description: Name of the database superuser initdb creates (PGUSER).
+    default: postgres
+  listen-addresses:
+    description: |
+      postgresql.conf listen_addresses. The server always also listens on
+      a private Unix socket (PGHOST). Set to "" for socket only.
+    default: 127.0.0.1
+  start-timeout:
+    description: Seconds to wait for the server to start or stop.
+    default: "120"
+  timeout:
+    description: Wall-clock limit for `run`, in seconds.
+    default: "1800"
+
+pipeline:
+  - name: test/service/postgres
+    runs: |
+      fail_early() {
+        echo "test/service/postgres: FAILED: $*"
+        exit 1
+      }
+      want="${{inputs.version}}"
+      if [ -n "$want" ]; then
+        bindir="/usr/libexec/postgresql$want"
+      elif command -v pg_config >/dev/null 2>&1; then
+        bindir=$(pg_config --bindir)
+      else
+        bindir=$(dirname "$(readlink -f "$(command -v postgres)")")
+      fi
+      [ -x "$bindir/postgres" ] && [ -x "$bindir/initdb" ] && [ -x "$bindir/pg_ctl" ] || \
+        fail_early "no server in '$bindir'; add postgresql-${want:-<major>} to the environment"
+      major=$("$bindir/postgres" --version | sed -E 's/^postgres \(PostgreSQL\) ([0-9]+).*/\1/')
+      if [ -n "$want" ] && [ "$major" != "$want" ]; then
+        fail_early "version is $want but $bindir/postgres is $major"
+      fi
+
+      base=$(mktemp -d /tmp/pg-service.XXXXXX)
+      data="$base/data"
+      sock="$base/sock"
+      srvlog="$base/server.log"
+      mkdir -p "$sock"
+      if [ "$(id -u)" -eq 0 ]; then
+        svcuser="${{inputs.user}}"
+        if ! id "$svcuser" >/dev/null 2>&1; then
+          adduser -D -H -s /bin/sh "$svcuser" 2>/dev/null || useradd -M -s /bin/sh "$svcuser"
+        fi
+        as_svc() { su -s /bin/sh "$svcuser" -c "$*"; }
+      else
+        svcuser=$(id -un)
+        as_svc() { sh -c "$*"; }
+      fi
+      chown "$svcuser" "$base" "$sock"
+      started=0
+      ok=0
+      cleanup() {
+        if [ "$started" -eq 1 ]; then
+          as_svc "'$bindir/pg_ctl' stop -D '$data' -m fast -w -t ${{inputs.start-timeout}}" >/dev/null 2>&1 || \
+            as_svc "'$bindir/pg_ctl' stop -D '$data' -m immediate -w -t 30" >/dev/null 2>&1 || true
+        fi
+        if [ "$ok" -ne 1 ] && [ -s "$srvlog" ]; then
+          echo "===== PostgreSQL server log (last 300 lines) ====="
+          tail -n 300 "$srvlog"
+        fi
+        rm -rf "$base"
+      }
+      trap cleanup EXIT
+      as_svc "'$bindir/initdb' -D '$data' -U '${{inputs.superuser}}' -A trust --no-sync ${{inputs.initdb-args}}" > "$base/initdb.log" 2>&1 || {
+        cat "$base/initdb.log"; fail_early "initdb failed"; }
+      cat >> "$data/postgresql.conf" <<EOF
+      # test/service/postgres
+      listen_addresses = '${{inputs.listen-addresses}}'
+      unix_socket_directories = '$sock'
+      fsync = off
+      EOF
+      cat >> "$data/postgresql.conf" <<'__PG_SERVICE_CONFIG__'
+      ${{inputs.config}}
+      __PG_SERVICE_CONFIG__
+      port=$((20000 + $$ % 20000))
+      tries=0
+      while :; do
+        : > "$srvlog"
+        chown "$svcuser" "$srvlog"
+        if as_svc "'$bindir/pg_ctl' start -D '$data' -l '$srvlog' -w -t ${{inputs.start-timeout}} -o '-p $port'" > /dev/null; then
+          started=1
+          break
+        fi
+        tries=$((tries + 1))
+        if grep -qE 'could not (bind|create listen socket)|Address (already )?in use' "$srvlog" && [ "$tries" -lt 20 ]; then
+          port=$((port + 1))
+          continue
+        fi
+        fail_early "the server did not start (see the server log below)"
+      done
+      export PGHOST="$sock" PGPORT="$port" PGUSER="${{inputs.superuser}}" PGDATABASE="${{inputs.database}}" PGDATA="$data"
+      export DATABASE_URL="postgresql://$PGUSER@127.0.0.1:$PGPORT/$PGDATABASE"
+      export PG_SERVICE_DIR="$base" PG_SERVICE_USER="$svcuser" PG_SERVICE_LOG="$srvlog"
+      # pg_isready and createdb come with postgresql-<major>-client.
+      if [ -x "$bindir/pg_isready" ]; then
+        "$bindir/pg_isready" -q -t 30 -d postgres || fail_early "the server does not accept connections"
+      fi
+      if [ "$PGDATABASE" != postgres ]; then
+        [ -x "$bindir/createdb" ] || fail_early "database is $PGDATABASE: add postgresql-$major-client to create it"
+        "$bindir/createdb" "$PGDATABASE" || fail_early "createdb $PGDATABASE failed"
+      fi
+      echo "test/service/postgres: PostgreSQL $major up as $svcuser, PGHOST=$PGHOST PGPORT=$PGPORT PGUSER=$PGUSER PGDATABASE=$PGDATABASE"
+
+      cat > "$base/run.sh" <<'__PG_SERVICE_RUN__'
+      ${{inputs.run}}
+      __PG_SERVICE_RUN__
+      rc=0
+      timeout ${{inputs.timeout}} sh -e -o pipefail "$base/run.sh" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        fail_early "run exited $rc"
+      fi
+      ok=1

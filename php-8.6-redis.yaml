@@ -1,0 +1,177 @@
+package:
+  name: php-8.6-redis
+  version: "6.3.0"
+  epoch: 0
+  description: "A PHP extension for Redis"
+  copyright:
+    - license: PHP-3.01
+  dependencies:
+    runtime:
+      - ${{package.name}}-config
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-igbinary
+  resources:
+    cpu: "2"
+    memory: 2Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - build-base
+      - busybox
+      - glibc-2.44-dev
+      - php-${{vars.phpMM}}
+      - php-${{vars.phpMM}}-dev
+      - php-${{vars.phpMM}}-igbinary-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/phpredis/phpredis
+      tag: ${{package.version}}
+      expected-commit: df4fab2de7fc327c54c94a13af2b9542e4fbd720
+      cherry-picks: |
+        develop/d24528e190437a47b53582f5d0b246266546db3e: replace the zval_dtor() alias removed in PHP 8.6 with zval_ptr_dtor_nogc()
+        develop/b8b765e610f89c44da6143f9a636a9d989d3fd82: fix compilation against PHP 8.6 (session save_path is now zend_string*)
+
+  - uses: patch
+    with:
+      patches: fix-build-with-php-8.6.patch
+
+  - name: Prepare build
+    runs: phpize
+
+  - name: Configure
+    runs: ./configure --enable-redis-igbinary
+
+  - uses: autoconf/make
+
+  # The Makefile that phpize generates installs under INSTALL_ROOT; it does
+  # not read the DESTDIR that autoconf/make-install passes.
+  - uses: autoconf/make-install
+    with:
+      opts: INSTALL_ROOT="${{targets.destdir}}"
+
+subpackages:
+  - name: ${{package.name}}-config
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}/etc/php/conf.d"
+          echo "extension=redis.so" > "${{targets.subpkgdir}}/etc/php/conf.d/redis.ini"
+    test:
+      pipeline:
+        - uses: test/tw/configpackage
+
+update:
+  enabled: true
+  github:
+    identifier: phpredis/phpredis
+
+test:
+  environment:
+    contents:
+      packages:
+        - php-${{vars.phpMM}}
+        # The server for the session test. The unversioned name resolves to
+        # the valkey stream that os/ carries; older streams leave this tree.
+        - valkey
+        - wait-for-it
+  pipeline:
+    - name: Verify the installed configuration loads the extension
+      runs: |
+        set -euo pipefail
+        # Nothing here writes an ini file: redis.so must be loaded by the
+        # -config subpackage, which this package depends on at run time.
+        php -m | grep -Fx redis
+    - name: Test Basic Redis Functionality
+      runs: |
+        # Create a PHP script to test the extension
+        cat > test.php <<'EOF'
+        <?php
+        $redis = new Redis();
+        if (!$redis) {
+          echo 'Failed to create Redis instance';
+          exit(1);
+        }
+        echo 'Redis extension is functional';
+        ?>
+        EOF
+
+        # Run the PHP script
+        php test.php
+
+        # Check the output
+        if [ $? -ne 0 ]; then
+          echo "Test failed: Unable to use Redis extension."
+          exit 1
+        else
+          echo "Test passed: Redis extension is functional."
+        fi
+    # Runs the code that is specific to PHP 8.6 in this package: the session
+    # handler, which now gets its save_path as a zend_string (the cherry-pick
+    # b8b765e6), and the ini readers behind the names that
+    # fix-build-with-php-8.6.patch defines. PHP creates the session id, since
+    # PHP 8.6 turns session.use_strict_mode on by default.
+    - name: Round-trip a session through a local server
+      uses: test/daemon-check-output
+      with:
+        start: /usr/bin/valkey-server --port 6399 --bind 127.0.0.1
+        expected_output: |
+          Valkey is starting
+          Server initialized
+          Ready to accept connections
+        error_strings: |
+          Failed listening on port
+        post: |
+          wait-for-it 127.0.0.1:6399 -t 30
+
+          # First process: store a session and leave its id in a file.
+          cat > session-write.php <<'EOF'
+          <?php
+          if (!session_start()) {
+              fwrite(STDERR, "session_start() failed\n");
+              exit(1);
+          }
+          $id = session_id();
+          $_SESSION['answer'] = 42;
+          if (!session_write_close()) {
+              fwrite(STDERR, "session_write_close() failed\n");
+              exit(1);
+          }
+          if ($id === false || $id === '' || !file_put_contents('session-id', $id)) {
+              fwrite(STDERR, "no session id to hand to the second process\n");
+              exit(1);
+          }
+          EOF
+
+          # Second process: the data must be in the server under the handler's
+          # key, and a session with the same id must read it back.
+          cat > session-read.php <<'EOF'
+          <?php
+          $id = file_get_contents('session-id');
+          $redis = new Redis();
+          $redis->connect('127.0.0.1', 6399);
+          $stored = $redis->get('PHPREDIS_SESSION:' . $id);
+          if ($stored !== 'answer|i:42;') {
+              fwrite(STDERR, 'unexpected session data in the server: ' . var_export($stored, true) . "\n");
+              exit(1);
+          }
+          session_id($id);
+          if (!session_start() || ($_SESSION['answer'] ?? null) !== 42) {
+              fwrite(STDERR, "the session did not come back from the server\n");
+              exit(1);
+          }
+          echo "session round trip through the redis save handler: ok\n";
+          EOF
+
+          for script in session-write.php session-read.php; do
+            php -d session.save_handler=redis -d session.save_path=tcp://127.0.0.1:6399 "$script"
+          done
+    - uses: test/tw/ldd-check

@@ -1,0 +1,176 @@
+package:
+  name: py3.14-awscrt
+  version: "0.38.1"
+  epoch: 0
+  description: Python bindings for the AWS Common Runtime
+  copyright:
+    - license: Apache-2.0
+
+vars:
+  pypi-package: awscrt
+  import: awscrt
+  openssl-version: "4.0"
+  python-version: "3.14"
+
+environment:
+  contents:
+    packages:
+      - cmake
+      - glibc-2.44-dev
+      - openssl-${{vars.openssl-version}}-dev
+      - py${{vars.python-version}}-build-base-dev
+      - py${{vars.python-version}}-gpep517
+      - py${{vars.python-version}}-setuptools
+      - samurai
+  environment:
+    AWS_CRT_BUILD_USE_SYSTEM_LIBCRYPTO: 1
+    AWS_CRT_BUILD_FORCE_STATIC_LIBS: 0 # Allow linking to shared libraries
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/awslabs/aws-crt-python
+      tag: v${{package.version}}
+      expected-commit: 9726f434f5933092a512f51be3d253ec127eec3d
+      recurse-submodules: true
+
+  - uses: patch
+    working-directory: ./crt/s2n
+    with:
+      patches: ../../0002-s2n-skip-digests-the-libcrypto-does-not-provide.patch
+
+  - uses: patch
+    with:
+      patches: 0003-crt-build-s2n-against-the-shared-libcrypto.patch
+
+  - uses: py/pip-build-install
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: awslabs/aws-crt-python
+    use-tag: true
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - openssl-${{vars.openssl-version}}
+        - python-${{vars.python-version}}
+  pipeline:
+    - name: TLS handshake and crypto on the OpenSSL ${{vars.openssl-version}} ABI
+      runs: |
+        set -eu
+        mkdir -p /tmp/tls && cd /tmp/tls
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=awscrt-test-ca" \
+          -keyout ca.key -out ca.crt 2>/dev/null
+        openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+          -keyout server.key -out server.csr 2>/dev/null
+        printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > server.ext
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+          -days 1 -extfile server.ext -out server.crt 2>/dev/null
+        # The bundled s2n (patched for OpenSSL 4) performs the TLS handshake
+        # and certificate validation; aws-c-cal resolves libcrypto for the
+        # hash and HMAC calls. Results are checked against Python's own
+        # ssl/hashlib, which use the same libcrypto.
+        python <<-EOF
+        import hashlib, http.server, ssl, threading
+        from awscrt import crypto, http as crt_http, io
+
+        h = crypto.Hash.sha256_new()
+        h.update(b"abc")
+        assert h.digest() == hashlib.sha256(b"abc").digest()
+        # Creating an HMAC makes aws-c-cal resolve libcrypto's HMAC API.
+        # HMAC.update()/digest() cannot be used: v0.37.0 source/module.c
+        # registers hash_update/hash_digest twice instead of hmac_*.
+        assert crypto.HMAC.sha256_hmac_new(b"key") is not None
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"awscrt-tls-ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain("/tmp/tls/server.crt", "/tmp/tls/server.key")
+        server.socket = server_ctx.wrap_socket(server.socket, server_side=True)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        event_loop_group = io.EventLoopGroup(1)
+        bootstrap = io.ClientBootstrap(event_loop_group, io.DefaultHostResolver(event_loop_group))
+
+        def get(trust_ca):
+            opts = io.TlsContextOptions()
+            if trust_ca:
+                opts.override_default_trust_store_from_path(None, "/tmp/tls/ca.crt")
+            conn_opts = io.ClientTlsContext(opts).new_connection_options()
+            conn_opts.set_server_name("localhost")
+            conn = crt_http.HttpClientConnection.new(
+                host_name="127.0.0.1", port=port, bootstrap=bootstrap,
+                tls_connection_options=conn_opts).result(30)
+            body = bytearray()
+            request = crt_http.HttpRequest("GET", "/")
+            request.headers.add("Host", "localhost")
+            stream = conn.request(request, on_body=lambda chunk, **kwargs: body.extend(chunk))
+            stream.activate()
+            status = stream.completion_future.result(30)
+            # http.server answers with HTTP/1.0 and closes the socket itself.
+            conn.close()
+            return status, bytes(body)
+
+        status, body = get(trust_ca=True)
+        assert status == 200, status
+        assert body == b"awscrt-tls-ok", body
+
+        try:
+            get(trust_ca=False)
+        except Exception as e:
+            print("untrusted server rejected:", type(e).__name__, e)
+        else:
+            raise SystemExit("TLS connection to an untrusted server certificate succeeded")
+
+        print("awscrt TLS and crypto tests passed!")
+        EOF
+    - runs: |
+        python <<-EOF
+        import awscrt
+        from awscrt import io, mqtt
+
+        # Test EventLoopGroup
+        event_loop_group = io.EventLoopGroup(1)
+        assert event_loop_group is not None
+
+        # Test HostResolver
+        host_resolver = io.DefaultHostResolver(event_loop_group)
+        assert host_resolver is not None
+
+        # Test ClientBootstrap
+        client_bootstrap = io.ClientBootstrap(event_loop_group, host_resolver)
+        assert client_bootstrap is not None
+
+        # Test TLS options
+        tls_ctx_options = io.TlsContextOptions()
+        assert tls_ctx_options is not None
+        assert hasattr(tls_ctx_options, 'verify_peer')
+
+        print("CRT functionality tests passed!")
+        EOF
+    - uses: python/import
+      with:
+        python: python${{vars.python-version}}
+        imports: |
+          import ${{vars.import}}
+    - uses: test/tw/pip-check
+    - uses: test/tw/ldd-check

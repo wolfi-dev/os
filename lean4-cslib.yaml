@@ -1,0 +1,191 @@
+package:
+  name: lean4-cslib
+  version: "4.36.0"
+  epoch: 0 # move from enterprise-packages to os
+  description: CSLib, the Lean 4 computer science library, prebuilt for the packaged Lean toolchain
+  copyright:
+    - license: Apache-2.0
+  # Every CSLib module imports a large part of Mathlib, so each of the 15
+  # concurrent `lean` processes holds a few gigabytes of environment: the
+  # build peaked at 41 GiB while averaging only 3 cores (CI, 2026-09-20).
+  # Memory, not CPU, is the constraint.
+  resources:
+    cpu: "16"
+    memory: 64Gi
+  # `import Cslib` pulls most of Mathlib into one process.
+  test-resources:
+    cpu: "4"
+    memory: 16Gi
+  dependencies:
+    runtime:
+      - lean4-mathlib~${{package.version}}
+      # .olean files load only into the exact toolchain and library revisions
+      # that produced them.
+      - lean4~${{package.version}}
+
+environment:
+  contents:
+    packages:
+      - jq
+      - lean4-mathlib~${{package.version}}
+      - lean4~${{package.version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/leanprover/cslib
+      tag: v${{package.version}}
+      expected-commit: 22b39634cb3dc80d829683ad1f65c5680b722309
+
+  - name: Verify the toolchain and Mathlib pins
+    runs: |
+      # CSLib tags each release against the Mathlib release of the same
+      # version; this build compiles it against that installed Mathlib.
+      test "$(cat lean-toolchain)" = "leanprover/lean4:v${{package.version}}"
+      lean --version | grep -q 'version ${{package.version}},'
+      # lean4-4.34.1-r0 depended on openssl-3.6-dev, so `lean4=` (which
+      # demands epoch 0) put OpenSSL 3 in this build environment. leanc links
+      # with /usr/lib/libssl.so and libcrypto.so from the toolchain's openssl
+      # -dev dependency: they must be there, and no OpenSSL 3 library may be.
+      for l in ssl crypto; do
+        test -e /usr/lib/lib$l.so
+        if test -e /usr/lib/lib$l.so.3; then
+          echo "lib$l.so.3 is in the build environment: lean4 still pulls in OpenSSL 3"
+          exit 1
+        fi
+      done
+      test "$(jq -r '.packages[] | select(.name == "mathlib") | .inputRev' lake-manifest.json)" = "v${{package.version}}"
+
+  - name: Build against the installed Mathlib
+    runs: |
+      # Without a `require`, Lake treats Mathlib and its dependencies as
+      # external libraries and `lean` finds them in /usr/lib/lean, so nothing
+      # is cloned or rebuilt. The lint driver refers to the Batteries package
+      # of the removed workspace and goes with it; the manifest is regenerated.
+      sed -i '/^\[\[require\]\]$/,/^$/d; /^lintDriver = /d' lakefile.toml
+      if grep -q '^\[\[require\]\]\|^lintDriver' lakefile.toml; then
+        echo "lakefile.toml still declares a dependency:"; cat lakefile.toml; exit 1
+      fi
+      rm lake-manifest.json
+      lake build Cslib
+
+  - name: Install
+    runs: |
+      sh install-lean-tree.sh build .lake/build/lib/lean "${{targets.destdir}}/usr/lib/lean"
+      test -f "${{targets.destdir}}/usr/lib/lean/Cslib.olean"
+      # Lake builds only what the root module imports; make that visible.
+      echo "modules under Cslib/: $(find Cslib -name '*.lean' | wc -l), built: $(find "${{targets.destdir}}/usr/lib/lean/Cslib" -name '*.olean' | wc -l)"
+      install -Dm644 LICENSE -t "${{targets.destdir}}/usr/share/licenses/${{package.name}}"
+
+subpackages:
+  - name: ${{package.name}}-src
+    description: CSLib sources for go-to-definition in the language server
+    dependencies:
+      runtime:
+        # The Mathlib, Batteries, and core sources CSLib builds on, at the
+        # version CSLib was compiled against.
+        - lean4-mathlib-src~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh src . "${{targets.contextdir}}/usr/src/lean" Cslib Cslib.lean
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/src/lean/Cslib.lean
+              /usr/src/lean/Cslib/Computability/Automata/DA/Basic.lean
+              /usr/src/lean/Mathlib.lean
+              /usr/src/lean/Batteries.lean
+              /usr/src/lean/Init/Prelude.lean
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - -rc\d+$
+  github:
+    identifier: leanprover/cslib
+    strip-prefix: v
+    use-tag: true
+    tag-filter-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - git
+  pipeline:
+    - name: Toolchain and library layout
+      runs: |
+        lean --version | grep -q 'version ${{package.version}},'
+        test -f /usr/lib/lean/Cslib.olean
+        test -f /usr/lib/lean/Cslib/Computability/Automata/DA/Basic.olean
+        test -f /usr/lib/lean/Mathlib.olean
+    - name: Deterministic automata from CSLib, with the run lemmas
+      runs: |
+        mkdir -p /tmp/cslib && cd /tmp/cslib
+        cat > Automata.lean <<'EOT'
+        import Cslib.Computability.Automata.DA.Basic
+
+        set_option autoImplicit false
+
+        open Cslib Automata
+
+        /-- A two-state automaton over `Bool` that toggles its state on `true`. -/
+        def toggle : DA Bool Bool where
+          tr s b := xor s b
+          start := false
+
+        /-- Reading `true` first moves `toggle` out of its start state. -/
+        theorem toggle_run_one (xs : ωSequence Bool) (h : xs 0 = true) : toggle.run xs 1 = true := by
+          simp [toggle, h]
+        EOT
+        lean -DwarningAsError=true Automata.lean
+        # CSLib resolves from the toolchain library directory, with no
+        # LEAN_PATH set. `--deps` lists the direct imports only.
+        lean --deps Automata.lean > deps.txt
+        grep -q '^/usr/lib/lean/Cslib/Computability/Automata/DA/Basic\.olean$' deps.txt
+    - name: The whole library imports into one process
+      runs: |
+        mkdir -p /tmp/all && cd /tmp/all
+        printf 'import Cslib\n\nexample : True := trivial\n' > All.lean
+        lean -DwarningAsError=true All.lean
+    - name: A Lake project imports CSLib without a require
+      runs: |
+        mkdir -p /tmp/lake && cd /tmp/lake
+        lake new demo lib > /dev/null
+        cd demo
+        cat > Demo/Basic.lean <<'EOT'
+        import Cslib.Computability.Automata.DA.Basic
+
+        set_option autoImplicit false
+
+        open Cslib Automata
+
+        /-- The automaton that never leaves its start state. -/
+        def still : DA Unit Nat where
+          tr _ _ := ()
+          start := ()
+        EOT
+        grep -vq 'require' lakefile.toml
+        lake build --wfail
+        test -f .lake/build/lib/lean/Demo/Basic.olean
+    - name: A false statement about a run is rejected
+      runs: |
+        mkdir -p /tmp/wrong && cd /tmp/wrong
+        cat > Wrong.lean <<'EOT'
+        import Cslib.Computability.Automata.DA.Basic
+
+        open Cslib Automata
+
+        def toggle : DA Bool Bool where
+          tr s b := xor s b
+          start := false
+
+        example (xs : ωSequence Bool) : toggle.run xs 0 = true := by
+          simp [toggle]
+        EOT
+        if lean Wrong.lean > wrong.txt 2>&1; then
+          echo "expected the false run statement to fail"; exit 1
+        fi
+        grep -q 'Wrong.lean:' wrong.txt

@@ -1,0 +1,640 @@
+package:
+  name: lean4-mathlib
+  version: "4.36.0"
+  epoch: 0 # move from enterprise-packages to os
+  description: Mathlib, the Lean 4 mathematics library, prebuilt for the packaged Lean toolchain
+  copyright:
+    - license: Apache-2.0
+    # The Cli library, shipped as lean4-cli, is MIT.
+    - license: MIT
+  # Lake elaborates one Mathlib module per CPU, but Mathlib's import chains set
+  # a floor: on 31 CPUs the build took 19 to 24 minutes at 22 cores on average;
+  # on 62 CPUs it took 20 minutes at 34 cores (CI, 2026-09-20). More CPUs mostly
+  # buy memory pressure. The host-side peaks were 39 and 46 GiB, but the guest
+  # also holds the 6 GB build tree, and the proven sizes are 96 and 128 GiB.
+  resources:
+    cpu: "32"
+    memory: 96Gi
+  # `import Mathlib` maps the whole library into one process (about 6.5 GB).
+  test-resources:
+    cpu: "4"
+    memory: 16Gi
+  dependencies:
+    runtime:
+      - lean4-aesop=${{package.full-version}}
+      - lean4-batteries=${{package.full-version}}
+      - lean4-cli=${{package.full-version}}
+      - lean4-importgraph=${{package.full-version}}
+      - lean4-leansearchclient=${{package.full-version}}
+      - lean4-plausible=${{package.full-version}}
+      - lean4-proofwidgets=${{package.full-version}}
+      - lean4-qq=${{package.full-version}}
+      # .olean files load only into the exact toolchain that produced them;
+      # `~` pins that version at any epoch (apk's `=` would demand epoch 0).
+      - lean4~${{package.version}}
+
+environment:
+  contents:
+    packages:
+      - ca-certificates-bundle
+      - git
+      - jq
+      - lean4~${{package.version}}
+
+# Every library here installs into /usr/lib/lean, the one directory that both
+# `lean` and `lake build` always search, so `import Mathlib.X` works with no
+# LEAN_PATH and no lakefile `require`. Each subpackage ships one Lake package
+# from Mathlib's workspace at the revision Mathlib's lake-manifest.json pins,
+# so the set is consistent by construction; Batteries in particular does not
+# tag every Lean patch release, which is why it is not a package of its own.
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/leanprover-community/mathlib4
+      tag: v${{package.version}}
+      expected-commit: fc4f59e577feb1a4956671bc04ac18aaaf8cd842
+
+  - name: Verify the toolchain pin
+    runs: |
+      # A Mathlib release supports only the toolchain it was released for.
+      test "$(cat lean-toolchain)" = "leanprover/lean4:v${{package.version}}"
+      lean --version | grep -q 'version ${{package.version}},'
+      # lean4-4.34.1-r0 depended on openssl-3.6-dev, so `lean4=` (which
+      # demands epoch 0) put OpenSSL 3 in this build environment. leanc links
+      # with /usr/lib/libssl.so and libcrypto.so from the toolchain's openssl
+      # -dev dependency: they must be there, and no OpenSSL 3 library may be.
+      for l in ssl crypto; do
+        test -e /usr/lib/lib$l.so
+        if test -e /usr/lib/lib$l.so.3; then
+          echo "lib$l.so.3 is in the build environment: lean4 still pulls in OpenSSL 3"
+          exit 1
+        fi
+      done
+
+  - name: Build Mathlib and the full library of every dependency
+    runs: |
+      # lake-manifest.json pins each dependency to a commit, as go.sum and
+      # Cargo.lock do, and Lake clones them at those commits into
+      # .lake/packages. Naming every dependency's library target also builds
+      # the modules Mathlib itself does not import, so each subpackage ships
+      # the whole library as upstream defines it: every module reachable from
+      # its root module.
+      lake build Mathlib \
+        aesop/Aesop \
+        batteries/Batteries \
+        Cli/Cli \
+        importGraph/ImportGraph \
+        LeanSearchClient/LeanSearchClient \
+        plausible/Plausible \
+        proofwidgets/ProofWidgets \
+        Qq/Qq
+
+  - name: Verify every dependency was built at its pinned commit
+    runs: |
+      jq -r '.packages[] | "\(.name) \(.rev)"' lake-manifest.json | while read -r name rev; do
+        head=$(git -C ".lake/packages/${name}" rev-parse HEAD)
+        if [ "${head}" != "${rev}" ]; then
+          echo "${name}: checked out ${head}, but lake-manifest.json pins ${rev}"
+          exit 1
+        fi
+      done
+
+  - name: Install Mathlib
+    runs: |
+      sh install-lean-tree.sh build .lake/build/lib/lean "${{targets.destdir}}/usr/lib/lean"
+      # Mathlib.lean imports every module under Mathlib/ (upstream CI enforces
+      # this), so a module without an .olean means the build skipped it.
+      sources=$(find Mathlib -name '*.lean' | wc -l)
+      oleans=$(find "${{targets.destdir}}/usr/lib/lean/Mathlib" -name '*.olean' | wc -l)
+      if [ "${sources}" -ne "${oleans}" ]; then
+        echo "Mathlib has ${sources} modules but ${oleans} were built"
+        exit 1
+      fi
+      test -f "${{targets.destdir}}/usr/lib/lean/Mathlib.olean"
+      install -Dm644 LICENSE -t "${{targets.destdir}}/usr/share/licenses/${{package.name}}"
+
+subpackages:
+  - name: lean4-batteries
+    description: Batteries, the Lean 4 standard library extension, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/batteries/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/Batteries.olean"
+          install -Dm644 .lake/packages/batteries/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: Union-find from Batteries, interpreted
+          runs: |
+            mkdir -p /tmp/batteries && cd /tmp/batteries
+            cat > UnionFind.lean <<'EOT'
+            import Batteries.Data.UnionFind.Basic
+
+            set_option autoImplicit false
+
+            /-- Three singletons, then the first and third merged. -/
+            def uf : Batteries.UnionFind :=
+              (Batteries.UnionFind.empty.push.push.push).union! 0 2
+
+            /-- Prints which elements share a class. -/
+            def main : IO Unit := do
+              IO.println ((uf.find! 0).2 == (uf.find! 2).2)
+              IO.println ((uf.find! 0).2 == (uf.find! 1).2)
+            EOT
+            lean -DwarningAsError=true --run UnionFind.lean > out.txt
+            printf 'true\nfalse\n' | cmp - out.txt
+            # The modules resolve from the toolchain library directory.
+            lean --deps UnionFind.lean | grep -q '^/usr/lib/lean/Batteries/'
+        - name: The whole library imports
+          runs: |
+            cd /tmp/batteries
+            printf 'import Batteries\n\nexample : True := trivial\n' > All.lean
+            lean -DwarningAsError=true All.lean
+
+  - name: lean4-aesop
+    description: Aesop, the automated proof search tactic for Lean 4, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+        - lean4-batteries=${{package.full-version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/aesop/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/Aesop.olean"
+          install -Dm644 .lake/packages/aesop/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: Aesop proves goals and reports the ones it cannot
+          runs: |
+            mkdir -p /tmp/aesop && cd /tmp/aesop
+            cat > Good.lean <<'EOT'
+            import Aesop
+
+            set_option autoImplicit false
+
+            /-- Aesop closes a propositional goal. -/
+            theorem and_of (p q : Prop) (hp : p) (hq : q) : p ∧ q := by
+              aesop
+
+            /-- Aesop proves list membership through its simp set. -/
+            theorem mem_cons (x : Nat) (xs : List Nat) : x ∈ x :: xs := by
+              aesop
+            EOT
+            lean -DwarningAsError=true Good.lean
+            cat > Wrong.lean <<'EOT'
+            import Aesop
+
+            example (p q : Prop) : p → q := by
+              aesop
+            EOT
+            if lean Wrong.lean > wrong.txt 2>&1; then
+              echo "expected aesop to fail on an unprovable goal"; exit 1
+            fi
+            grep -q 'aesop: failed to prove the goal' wrong.txt
+
+  - name: lean4-qq
+    description: Qq, typed expression quotations for Lean 4 metaprogramming, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/Qq/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/Qq.olean"
+          install -Dm644 .lake/packages/Qq/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: Quotations and antiquotations elaborate
+          runs: |
+            mkdir -p /tmp/qq && cd /tmp/qq
+            cat > Quote.lean <<'EOT'
+            import Qq
+
+            set_option autoImplicit false
+
+            open Qq
+
+            /-- A quoted natural-number expression. -/
+            def two : Q(Nat) := q(2)
+
+            /-- Quotation with antiquotations builds the sum of two quoted terms. -/
+            def add (a b : Q(Nat)) : Q(Nat) := q($a + $b)
+
+            example : Q(Nat) := add two two
+            EOT
+            lean -DwarningAsError=true Quote.lean
+
+  - name: lean4-proofwidgets
+    description: ProofWidgets, interactive infoview components for Lean 4, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/proofwidgets/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/ProofWidgets.olean"
+          install -Dm644 .lake/packages/proofwidgets/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: JSX syntax builds HTML
+          runs: |
+            # ProofWidgets deprecated bare JSX (ProofWidgets.Jsx) for jsx%{...}
+            # literals, and its Html type is protected, so it is named in full.
+            mkdir -p /tmp/pw && cd /tmp/pw
+            cat > Widget.lean <<'EOT'
+            import ProofWidgets.Component.HtmlDisplay
+
+            set_option autoImplicit false
+
+            /-- An HTML fragment built with ProofWidgets' `jsx%` syntax. -/
+            def greeting : ProofWidgets.Html := jsx%{<b>hello</b>}
+
+            example : ProofWidgets.Html := jsx%{<span>{greeting}</span>}
+            EOT
+            lean -DwarningAsError=true Widget.lean
+
+  - name: lean4-importgraph
+    description: ImportGraph, import analysis tooling for Lean 4 projects, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+        - lean4-cli=${{package.full-version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/importGraph/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/ImportGraph.olean"
+          install -Dm644 .lake/packages/importGraph/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: The import graph API is available
+          runs: |
+            mkdir -p /tmp/ig && cd /tmp/ig
+            cat > Graph.lean <<'EOT'
+            import ImportGraph.Imports.ImportGraph
+
+            set_option autoImplicit false
+
+            /-- The import graph of an environment, keyed by module name. -/
+            def graph (env : Lean.Environment) : Lean.NameMap (Array Lean.Name) := env.importGraph
+            EOT
+            lean -DwarningAsError=true Graph.lean
+            printf 'import ImportGraph\n\nexample : True := trivial\n' > All.lean
+            lean -DwarningAsError=true All.lean
+
+  - name: lean4-leansearchclient
+    description: LeanSearchClient, search commands for Lean 4 querying community servers, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/LeanSearchClient/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/LeanSearchClient.olean"
+          install -Dm644 .lake/packages/LeanSearchClient/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: The client library imports
+          runs: |
+            mkdir -p /tmp/lsc && cd /tmp/lsc
+            cat > Client.lean <<'EOT'
+            import LeanSearchClient
+
+            set_option autoImplicit false
+
+            /-- The client identifies itself to the search servers with this user agent. -/
+            def agent : Lean.CoreM String := LeanSearchClient.useragent
+            EOT
+            lean -DwarningAsError=true Client.lean
+
+  - name: lean4-plausible
+    description: Plausible, property-based testing for Lean 4, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/plausible/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/Plausible.olean"
+          install -Dm644 .lake/packages/plausible/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: Random testing runs and finds counterexamples
+          runs: |
+            mkdir -p /tmp/plausible && cd /tmp/plausible
+            # The tactic runs Plausible's compiled generators in the interpreter,
+            # so this exercises the shipped IR, not only the type signatures.
+            cat > Holds.lean <<'EOT'
+            import Plausible
+
+            example (xs : List Nat) : xs.reverse.reverse = xs := by
+              plausible
+            EOT
+            lean Holds.lean > holds.txt 2>&1
+            grep -q 'Unable to find a counter-example' holds.txt
+            cat > Fails.lean <<'EOT'
+            import Plausible
+
+            example (xs : List Nat) : xs.reverse = xs := by
+              plausible
+            EOT
+            if lean Fails.lean > fails.txt 2>&1; then
+              echo "expected plausible to find a counterexample"; exit 1
+            fi
+            grep -q 'Found a counter-example' fails.txt
+
+  - name: lean4-cli
+    description: Cli, a command-line argument parser for Lean 4, at the revision Mathlib pins
+    dependencies:
+      runtime:
+        - lean4~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh build .lake/packages/Cli/.lake/build/lib/lean "${{targets.contextdir}}/usr/lib/lean"
+          test -f "${{targets.contextdir}}/usr/lib/lean/Cli.olean"
+          install -Dm644 .lake/packages/Cli/LICENSE -t "${{targets.contextdir}}/usr/share/licenses/${{subpkg.name}}"
+    test:
+      pipeline:
+        - name: Parse flags and positional arguments
+          runs: |
+            mkdir -p /tmp/cli && cd /tmp/cli
+            cat > Demo.lean <<'EOT'
+            import Cli
+
+            set_option autoImplicit false
+
+            open Cli
+
+            /-- Prints the parsed arguments. -/
+            def run (p : Parsed) : IO UInt32 := do
+              IO.println s!"verbose={p.hasFlag "verbose"} input={p.positionalArg! "input" |>.as! String}"
+              return 0
+
+            /-- A command with one flag and one positional argument. -/
+            def demo : Cmd := `[Cli|
+              demo VIA run; ["0.1.0"]
+              "Demo command."
+
+              FLAGS:
+                v, verbose; "Say more."
+
+              ARGS:
+                input : String; "The input file."
+            ]
+
+            /-- Entry point: validates the arguments against `demo`. -/
+            def main (args : List String) : IO UInt32 := demo.validate args
+            EOT
+            lean -DwarningAsError=true --run Demo.lean -v in.txt > parsed.txt
+            grep -qx 'verbose=true input=in.txt' parsed.txt
+            lean --run Demo.lean --version > version.txt
+            grep -qx '0.1.0' version.txt
+            if lean --run Demo.lean > missing.txt 2>&1; then
+              echo "expected a missing positional argument to be rejected"; exit 1
+            fi
+            grep -q 'Missing positional argument' missing.txt
+
+  - name: ${{package.name}}-src
+    description: Mathlib sources, and those of its dependencies other than Batteries, for go-to-definition in the language server
+    dependencies:
+      runtime:
+        - lean4-batteries-src=${{package.full-version}}
+        # Go-to-definition from Mathlib into Init, Std, and Lean needs the core
+        # sources of the toolchain Mathlib was built with. `lean4-src` installed
+        # by name resolves to the newest toolchain, which leads Mathlib by days
+        # on every Lean release.
+        - lean4-src~${{package.version}}
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh src . "${{targets.contextdir}}/usr/src/lean" Mathlib Mathlib.lean
+          for dep in aesop:Aesop Cli:Cli importGraph:ImportGraph LeanSearchClient:LeanSearchClient \
+              plausible:Plausible proofwidgets:ProofWidgets Qq:Qq; do
+            sh install-lean-tree.sh src ".lake/packages/${dep%%:*}" "${{targets.contextdir}}/usr/src/lean" \
+              "${dep#*:}" "${dep#*:}.lean"
+          done
+    test:
+      environment:
+        contents:
+          packages:
+            - ${{package.name}}=${{package.full-version}}
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/src/lean/Mathlib.lean
+              /usr/src/lean/Mathlib/Algebra/Group/Defs.lean
+              /usr/src/lean/Aesop.lean
+              /usr/src/lean/Qq.lean
+              /usr/src/lean/Init/Prelude.lean
+              /usr/src/lean/Lean/Elab/Command.lean
+        - name: The language server resolves a Mathlib definition to the installed source
+          runs: |
+            mkdir -p /tmp/def && cd /tmp/def
+            # The feeder opens a file that uses `mul_comm`, waits (bounded) for
+            # the server to finish elaborating it, asks for the definition of the
+            # identifier at line 3, column 2, waits for the reply, and shuts the
+            # server down. The reply is recognized by the `targetUri` it carries,
+            # not by its id: the server sends requests of its own
+            # (workspace/inlayHint/refresh) with small integer ids, so an id alone
+            # is ambiguous. Output is captured, then asserted on, so the
+            # transcript is printed on failure.
+            cat > feeder.sh <<'EOT'
+            #!/bin/sh
+            set -e
+            send() {
+              printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"
+            }
+            wait_for() {
+              waited=0
+              while [ "${waited}" -lt 120 ] && ! grep -q "$1" server.txt 2> /dev/null; do
+                sleep 1
+                waited=$((waited + 1))
+              done
+            }
+            send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":"file:///tmp/def","capabilities":{}}}'
+            send '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+            send '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/def/Def.lean","languageId":"lean4","version":1,"text":"import Mathlib.Algebra.Group.Defs\n\nexample (G : Type) [CommGroup G] (a b : G) : a * b = b * a :=\n  mul_comm a b\n\nexample (m n : Nat) : m + n = n + m :=\n  Nat.add_comm m n\n"}}}'
+            wait_for '"processing":\[\]'
+            send '{"jsonrpc":"2.0","id":7,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///tmp/def/Def.lean"},"position":{"line":3,"character":2}}}'
+            wait_for '"targetUri"'
+            send '{"jsonrpc":"2.0","id":9,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///tmp/def/Def.lean"},"position":{"line":6,"character":6}}}'
+            wait_for 'file:///usr/src/lean/Init/'
+            send '{"jsonrpc":"2.0","id":8,"method":"shutdown","params":null}'
+            sleep 2
+            send '{"jsonrpc":"2.0","method":"exit","params":null}'
+            EOT
+            status=0
+            sh feeder.sh 2> /dev/null | timeout 300 lean --server > server.txt 2> server.err || status=$?
+            echo "lean --server pipeline status: ${status}"
+            echo "--- server.err ---"
+            cat server.err
+            echo "--- definition reply ---"
+            grep -o '"targetUri":"[^"]*"' server.txt || true
+            echo "--- server.txt (last 2500 bytes) ---"
+            tail -c 2500 server.txt
+            echo
+            test "${status}" -eq 0
+            test ! -s server.err
+            # The reply is a LocationLink into the installed sources. `mul_comm`
+            # lives under Mathlib/Algebra/Group/ (Semigroup.lean in 4.34.0) and
+            # moves between files there, so only the directory is asserted.
+            grep -q '"targetUri":"file:///usr/src/lean/Mathlib/Algebra/Group/' server.txt
+            # `Nat.add_comm` resolves into the core sources, and the line it
+            # points to declares it. A line that does not means the core sources
+            # come from a different toolchain than the compiled library.
+            reply=$(grep -o '"result":\[[^]]*file:///usr/src/lean/Init/[^]]*\]' server.txt | head -n 1)
+            test -n "${reply}"
+            file=$(echo "${reply}" | grep -o '"targetUri":"file:///usr/src/lean/Init/[^"]*"' | head -n 1 | cut -d'"' -f4)
+            file=${file#file://}
+            row=$(echo "${reply}" | sed 's/.*"targetSelectionRange":{//; s/}}.*//' | grep -o '"line":[0-9]*' | head -n 1 | cut -d: -f2)
+            echo "Nat.add_comm: ${file} line $((row + 1))"
+            sed -n "$((row + 1))p" "${file}" | tee decl.txt
+            grep -Eq '(theorem|lemma|def) .*add_comm' decl.txt
+
+  - name: lean4-batteries-src
+    description: Batteries sources for go-to-definition in the language server
+    pipeline:
+      - runs: |
+          sh install-lean-tree.sh src .lake/packages/batteries "${{targets.contextdir}}/usr/src/lean" Batteries Batteries.lean
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/src/lean/Batteries.lean
+              /usr/src/lean/Batteries/Data/UnionFind/Basic.lean
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - -rc\d+$
+  github:
+    identifier: leanprover-community/mathlib4
+    strip-prefix: v
+    tag-filter-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - git
+  pipeline:
+    - name: Toolchain and library layout
+      runs: |
+        lean --version | grep -q 'version ${{package.version}},'
+        test -f /usr/lib/lean/Mathlib.olean
+        test -f /usr/lib/lean/Mathlib/Tactic/Ring.olean
+        test -d /usr/lib/lean/Batteries
+        test -d /usr/lib/lean/Aesop
+    - name: Mathlib tactics, independent kernel re-check, and axiom audit
+      runs: |
+        mkdir -p /tmp/proofs/out && cd /tmp/proofs
+        cat > Proofs.lean <<'EOT'
+        import Mathlib.Tactic.Ring
+        import Mathlib.Tactic.Linarith
+        import Mathlib.Tactic.NormNum.Prime
+        import Mathlib.Tactic.Positivity
+        import Mathlib.Data.Finset.Card
+
+        set_option autoImplicit false
+
+        namespace Check
+
+        /-- `ring` normalizes commutative-ring expressions. -/
+        theorem square (a b : ℤ) : (a + b) ^ 2 = a ^ 2 + 2 * a * b + b ^ 2 := by
+          ring
+
+        /-- `linarith` decides linear arithmetic over ordered fields. -/
+        theorem below (x y : ℚ) (h₁ : x < y) (h₂ : 0 < x) : 0 < y := by
+          linarith
+
+        /-- `norm_num` evaluates rational numerals. -/
+        theorem power : (2 : ℚ) ^ 10 = 1024 := by
+          norm_num
+
+        /-- `norm_num` decides primality. -/
+        theorem prime : Nat.Prime 97 := by
+          norm_num
+
+        /-- `positivity` proves a square plus one is positive. -/
+        theorem positive (x : ℚ) : 0 < x ^ 2 + 1 := by
+          positivity
+
+        /-- The cardinality of an initial segment of the naturals, by `simp`. -/
+        theorem card : (Finset.range 5).card = 5 := by
+          simp
+
+        end Check
+        EOT
+        lean -DwarningAsError=true -o out/Proofs.olean -i out/Proofs.ilean Proofs.lean
+        test -s out/Proofs.olean
+        LEAN_PATH=/tmp/proofs/out leanchecker --verbose Proofs
+        # Mathlib resolves from the toolchain library directory, with no
+        # LEAN_PATH set. `--deps` lists the direct imports only.
+        lean --deps Proofs.lean > deps.txt
+        grep -q '^/usr/lib/lean/Mathlib/Tactic/Ring\.olean$' deps.txt
+        grep -q '^/usr/lib/lean/Mathlib/Data/Finset/Card\.olean$' deps.txt
+
+        cat > Audit.lean <<'EOT'
+        import Proofs
+
+        #print axioms Check.square
+        #print axioms Check.below
+        #print axioms Check.power
+        #print axioms Check.prime
+        #print axioms Check.positive
+        #print axioms Check.card
+        EOT
+        LEAN_PATH=/tmp/proofs/out lean -DwarningAsError=true Audit.lean > axioms.txt
+        cat axioms.txt
+        test "$(wc -l < axioms.txt)" -eq 6
+        # Only the three classical axioms may appear; sorryAx in particular may not.
+        if grep -vqE "^'Check\.[a-z]+' depends on axioms: \[(propext|Classical\.choice|Quot\.sound)(, (propext|Classical\.choice|Quot\.sound))*\]$" axioms.txt; then
+          echo "unexpected axioms"; exit 1
+        fi
+    - name: The whole library imports into one process
+      runs: |
+        mkdir -p /tmp/all && cd /tmp/all
+        cat > All.lean <<'EOT'
+        import Mathlib
+
+        set_option autoImplicit false
+
+        example : (2 : ℝ) + 2 = 4 := by
+          norm_num
+        EOT
+        lean -DwarningAsError=true All.lean
+    - name: A Lake project imports Mathlib without a require
+      runs: |
+        mkdir -p /tmp/lake && cd /tmp/lake
+        lake new demo lib > /dev/null
+        cd demo
+        cat > Demo/Basic.lean <<'EOT'
+        import Mathlib.Tactic.Ring
+
+        set_option autoImplicit false
+
+        /-- A ring identity proved against the installed Mathlib. -/
+        theorem cube (a b : ℤ) : (a + b) ^ 3 = a ^ 3 + 3 * a ^ 2 * b + 3 * a * b ^ 2 + b ^ 3 := by
+          ring
+        EOT
+        # No `require` in the lakefile: Lake treats Mathlib as an external
+        # library, exactly like Init and Std.
+        grep -vq 'require' lakefile.toml
+        lake build --wfail
+        test -f .lake/build/lib/lean/Demo/Basic.olean
+    - name: A false identity is rejected
+      runs: |
+        mkdir -p /tmp/wrong && cd /tmp/wrong
+        cat > Wrong.lean <<'EOT'
+        import Mathlib.Tactic.Ring
+
+        example (a b : ℤ) : (a + b) ^ 2 = a ^ 2 + b ^ 2 := by
+          ring
+        EOT
+        if lean Wrong.lean > wrong.txt 2>&1; then
+          echo "expected ring to fail on a false identity"; exit 1
+        fi
+        grep -q 'ring' wrong.txt
+        grep -q 'Wrong.lean:' wrong.txt

@@ -1,0 +1,148 @@
+package:
+  name: leangz
+  version: "0.1.21"
+  epoch: 4 # move from enterprise-packages to os
+  description: Compressor for Lean 4 .olean files
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      # The crate builds both tools; leantar is split out because the Lean
+      # toolchain needs only it.
+      - leantar=${{package.full-version}}
+
+vars:
+  glibc-version: "2.44"
+  rust-version: "1.100"
+
+environment:
+  contents:
+    packages:
+      - glibc-${{vars.glibc-version}}-dev
+      - rust-${{vars.rust-version}}
+  environment:
+    # The most optimized release profile: whole-program LTO in a single
+    # codegen unit on top of opt-level 3. Both tools are CPU-bound (zstd and
+    # olean traversal), so the longer link pays for itself on every Mathlib
+    # cache fetch.
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+    CARGO_PROFILE_RELEASE_LTO: fat
+    CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/digama0/leangz
+      tag: v${{package.version}}
+      expected-commit: ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc
+
+  - uses: cargo/build
+    with:
+      opts: --release --locked
+      output: leangz
+
+  - uses: upstream-tests/cargo-test
+
+  - uses: strip
+
+subpackages:
+  - name: leantar
+    description: Archiver for Lake build artifacts (.ltar), the format Mathlib's cache uses
+    pipeline:
+      - runs: |
+          install -Dm755 target/release/leantar -t "${{targets.contextdir}}/usr/bin"
+      - uses: strip
+    test:
+      environment:
+        contents:
+          packages:
+            - lean4
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: leantar
+        - uses: test/tw/help-check
+          with:
+            bins: leantar
+            help-flag: --help
+        - name: Archive a Lake build and restore it byte for byte
+          runs: |
+            mkdir -p /tmp/ltar && cd /tmp/ltar
+            lake new demo > /dev/null
+            cd demo
+            lake build > /dev/null
+            lib=.lake/build/lib/lean
+            test -f "${lib}/Demo.trace"
+            # Mathlib's cache packs a module's Lake trace together with its build outputs.
+            leantar demo.ltar "${lib}/Demo.trace" "${lib}/Demo.olean" "${lib}/Demo.ilean" -c "git=demo@test"
+            test -s demo.ltar
+            leantar -k demo.ltar > comments.txt
+            grep -qx 'git=demo@test' comments.txt
+            mkdir restored
+            leantar -x -C restored demo.ltar
+            for f in Demo.olean Demo.ilean; do
+              cmp "${lib}/${f}" "restored/${lib}/${f}"
+            done
+            # The trace is regenerated from the archived dependency hash rather
+            # than copied, so it is checked for content, not byte equality.
+            test -s "restored/${lib}/Demo.trace"
+            grep -q depHash "restored/${lib}/Demo.trace"
+            # The JSON form of the file list is what `lake exe cache get` feeds it.
+            mkdir restored-json
+            printf '["demo.ltar"]' | leantar -x -j -C restored-json -
+            cmp "${lib}/Demo.olean" "restored-json/${lib}/Demo.olean"
+        - name: Refuse a corrupted archive
+          runs: |
+            cd /tmp/ltar/demo
+            head -c 200 demo.ltar > corrupt.ltar
+            mkdir corrupt
+            if leantar -x -C corrupt corrupt.ltar > corrupt.txt 2>&1; then
+              echo "expected leantar to reject a truncated archive"; exit 1
+            fi
+            test ! -e corrupt/.lake/build/lib/lean/Demo.olean
+
+update:
+  enabled: true
+  github:
+    identifier: digama0/leangz
+    strip-prefix: v
+    use-tag: true
+    tag-filter-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - lean4
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Compress toolchain and freshly compiled .olean files and restore them byte for byte
+      runs: |
+        mkdir -p /tmp/lgz && cd /tmp/lgz
+        # A module from the installed toolchain.
+        leangz -o Prelude.lgz /usr/lib/lean/Init/Prelude.olean > compress.txt
+        test -s Prelude.lgz
+        # leangz reports the total olean size, the total lgz size, and the ratio.
+        grep -Eq '^[0-9]+ / [0-9]+ = [0-9.]+$' compress.txt
+        leangz -x -o Prelude.olean Prelude.lgz
+        cmp /usr/lib/lean/Init/Prelude.olean Prelude.olean
+        # A module holding numerals past 64 bits, so the bignum encoding the
+        # packaged toolchain writes (Lean's own, not GMP) goes through leangz.
+        cat > Big.lean <<'EOT'
+        set_option autoImplicit false
+
+        /-- Numerals that do not fit in a machine word. -/
+        def big : List Nat := [2 ^ 70, 3 ^ 100, 10 ^ 40]
+        EOT
+        lean -o Big.olean Big.lean
+        leangz -o Big.lgz Big.olean > /dev/null
+        leangz -x -o Big.roundtrip.olean Big.lgz
+        cmp Big.olean Big.roundtrip.olean
+    - name: Reject input that is not an .olean file
+      runs: |
+        cd /tmp/lgz
+        printf 'not an olean\n' > text.olean
+        if leangz -o text.lgz text.olean > bad.txt 2>&1; then
+          echo "expected leangz to reject a file without the olean header"; exit 1
+        fi

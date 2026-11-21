@@ -1,0 +1,145 @@
+package:
+  name: php-8.6-pecl-sqlsrv
+  version: "5.14.0"
+  epoch: 0
+  description: "Provides PHP ${{vars.phpMM}} Microsoft Drivers for SQL Server (SQLSRV) - PECL"
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - php-${{vars.phpMM}}
+  resources:
+    cpu: "1"
+    memory: 5Gi
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^php-(\d+\.\d+)-.*$
+    replace: "$1"
+    to: phpMM
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - bash
+      - binutils
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cmake
+      - gcc
+      - glibc-2.44-dev
+      - libtool
+      - php-${{vars.phpMM}}-dev
+      - unixodbc-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/microsoft/msphpsql
+      tag: "v${{package.version}}"
+      expected-commit: 4bf7dc0e29af7c2a61b0fecfc69b223507c62f86
+
+  - runs: |
+      cd source
+      bash ./packagize.sh
+
+  - working-directory: source/sqlsrv
+    uses: pecl/phpize
+
+  - working-directory: source/sqlsrv
+    uses: autoconf/make
+
+  - working-directory: source/sqlsrv
+    uses: pecl/install
+    with:
+      extension: "sqlsrv"
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: microsoft/msphpsql
+    strip-prefix: v
+    tag-filter-prefix: v
+
+test:
+  pipeline:
+    - name: Verify the extension loads and reports the packaged version
+      runs: |
+        # Nothing is installed for this test besides the package, so php is
+        # here through the package's own dependency. phpversion() returns
+        # false when PHP has not loaded sqlsrv.
+        php -r '
+          $want = "${{package.version}}";
+          $got = phpversion("sqlsrv");
+          if ($got !== $want) {
+            fwrite(STDERR, "sqlsrv reports version " . var_export($got, true) . ", expected $want\n");
+            exit(1);
+          }
+          echo "sqlsrv $got\n";
+        '
+    - name: Verify the extension works without a server
+      runs: |
+        # A test has no SQL Server and no Microsoft ODBC driver, so these
+        # checks use what the installed extension does without them. The
+        # first two groups follow upstream's sqlsrv_ini_numeric.phpt and
+        # sqlsrv_stream_invalid_options.phpt (test/functional/sqlsrv), the
+        # tests of the two changes that msphpsql 5.14.0 made for PHP 8.6.
+        # check() and not die(): die() with a string argument exits with
+        # status 0.
+        php \
+          -d sqlsrv.WarningsReturnAsErrors=08 \
+          -d sqlsrv.LogSeverity=0x4 \
+          -d sqlsrv.LogSubsystems=0 \
+          -d sqlsrv.ClientBufferMaxKBSize=02000 <<'EOF'
+        <?php
+        function check(bool $ok, string $what): void {
+            if (!$ok) { echo "FAIL: $what\n"; exit(1); }
+            echo "ok: $what\n";
+        }
+
+        // Settings. The values given with -d reach the extension at the
+        // start of the request, read as numbers in base 0: 08 is 0, 0x4 is
+        // 4 and 02000 is 1024.
+        check(sqlsrv_get_config("WarningsReturnAsErrors") === false, "ini: WarningsReturnAsErrors=08 reads as false");
+        check(sqlsrv_get_config("LogSeverity") === 4, "ini: LogSeverity=0x4 reads as 4");
+        check(sqlsrv_get_config("LogSubsystems") === 0, "ini: LogSubsystems=0 reads as 0");
+        check(sqlsrv_get_config("ClientBufferMaxKBSize") === 1024, "ini: ClientBufferMaxKBSize=02000 reads as 1024");
+        check(sqlsrv_configure("WarningsReturnAsErrors", true) === true, "configure: WarningsReturnAsErrors is accepted");
+        check(sqlsrv_get_config("WarningsReturnAsErrors") === true, "configure: WarningsReturnAsErrors is now true");
+        check(sqlsrv_configure("ClientBufferMaxKBSize", 2048) === true, "configure: ClientBufferMaxKBSize is accepted");
+        check(sqlsrv_get_config("ClientBufferMaxKBSize") === 2048, "configure: ClientBufferMaxKBSize is now 2048");
+
+        // Streams. Only the extension itself opens a sqlsrv stream. fopen()
+        // with the include-path flag passes an option to the opener, which
+        // must refuse it with a warning, with PHP's default context and
+        // with an explicit one.
+        $warnings = [];
+        set_error_handler(function (int $severity, string $message) use (&$warnings): bool {
+            $warnings[] = $severity === E_WARNING
+                && str_contains($message, "no options except REPORT_ERRORS may be specified with a sqlsrv stream");
+            return true;
+        });
+        $default_context = fopen("sqlsrv://invalid", "rb", true);
+        $explicit_context = fopen("sqlsrv://invalid", "rb", true, stream_context_create());
+        restore_error_handler();
+        check($default_context === false && $explicit_context === false, "stream: fopen() of sqlsrv:// with an option fails");
+        check($warnings === [true, true], "stream: each refusal raises the opener's warning");
+
+        // Connection. sqlsrv_connect() goes through the unixODBC driver
+        // manager and stops where it needs the Microsoft ODBC driver, which
+        // this package does not depend on: the extension's own error -49,
+        // raised before any use of the network.
+        $conn = sqlsrv_connect("127.0.0.1");
+        check($conn === false, "connect: fails without the Microsoft ODBC driver");
+        $errors = sqlsrv_errors();
+        check(is_array($errors) && $errors[0]["SQLSTATE"] === "IMSSP" && $errors[0]["code"] === -49,
+            "connect: the error is IMSSP -49");
+        check(str_contains($errors[0]["message"], "requires the Microsoft ODBC Driver for SQL Server"),
+            "connect: the message names the missing driver");
+        EOF
+    - uses: test/tw/ldd-check

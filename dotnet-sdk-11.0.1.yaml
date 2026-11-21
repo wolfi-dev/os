@@ -1,7 +1,7 @@
 package:
   name: dotnet-sdk-11.0.1
   version: "11.0.100"
-  epoch: 2
+  epoch: 3
   description: ".NET SDK ${{package.version}}"
   copyright:
     - license: MIT
@@ -113,20 +113,26 @@ pipeline:
           sys.exit(f"release.json is for {m['tag']} at {m['sourceVersion']}, not {tag} at {head}")
       EOF
 
-  # dotnet-11's OpenSSL patches, copied from os/dotnet-11/ unchanged: keep the
-  # two copies identical. With them and DistroAgnosticOpenSsl (below), the
-  # NativeAOT runtime pack this build makes loads OpenSSL the way the dotnet-11
-  # runtime does: through the dlopen shim, which prefers libssl.so.4 and
-  # honours DOTNET_OPENSSL_VERSION_OVERRIDE (the -ossl35 images document it).
-  # The SDK's two NativeAOT tools are linked against that pack. Not git am, as
-  # in dotnet-11: the SDK records the commit it is built from (sdk/.version,
-  # every assembly's informational version), and a commit made here exists
-  # nowhere upstream and changes with every build.
+  # dotnet-11's patches, copied from os/dotnet-11/ unchanged: keep the two
+  # copies identical. The SDK's two NativeAOT tools are linked against the
+  # NativeAOT runtime pack this build makes, so they carry this build's
+  # runtime code, and a patch that only dotnet-11 has does not reach them.
+  # With 0001, 0002 and DistroAgnosticOpenSsl (below), that pack loads OpenSSL
+  # the way the dotnet-11 runtime does: through the dlopen shim, which prefers
+  # libssl.so.4 and honours DOTNET_OPENSSL_VERSION_OVERRIDE (the -ossl35
+  # images document it). With 0003, its default PKCS#12 export uses AES-256
+  # instead of Triple DES, which Chainguard's OpenSSL does not offer by
+  # default: `dotnet dev-certs https` (in libaspnetcoretools.so) saves its
+  # certificate through that export. Not git am, as in dotnet-11: the SDK
+  # records the commit it is built from (sdk/.version, every assembly's
+  # informational version), and a commit made here exists nowhere upstream
+  # and changes with every build.
   - uses: patch
     with:
       patches: |
         0001-Prefer-OpenSSL-4-over-OpenSSL-3-in-the-portable-Open.patch
         0002-Add-DistroAgnosticOpenSsl-option-to-build-the-runtim.patch
+        0003-Export-PKCS-12-with-AES-256-instead-of-3DES-by-defau.patch
 
   - runs: |
       if [ ${{build.arch}} = "aarch64" ]; then
@@ -290,6 +296,7 @@ test:
         # OpenSSL 3 next to OpenSSL 4, as in the -ossl35 images, for the
         # DOTNET_OPENSSL_VERSION_OVERRIDE step.
         - libssl3
+        - openssl-${{vars.openssl-version}} # the openssl CLI reads dev-certs' PKCS#12 export back
   pipeline:
     - uses: test/tw/ldd-check
     - name: Bootstrap-bundled host pack alignment
@@ -393,7 +400,8 @@ test:
         # dotnet-user-jwts is one of the SDK's ahead-of-time compiled tools
         # (libaspnetcoretools.so; the CLI's libdotnet-aot.so is the other).
         # Every dotnet command loads libdotnet-aot.so; the tools of
-        # libaspnetcoretools.so run only here and in the libssl step below.
+        # libaspnetcoretools.so run only here, in the dev-certs step and in
+        # the libssl step below.
         # Signing a token (HMAC-SHA256) takes it through OpenSSL. grep's output
         # is discarded: the token must stay out of the log, where the build
         # system's scrubber redacts a JWT as a secret and reports the live log
@@ -401,6 +409,33 @@ test:
         dotnet new web -o JwtApp --force
         dotnet user-jwts create --project JwtApp -o token |
           grep -E '^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' >/dev/null
+    - name: dotnet dev-certs https saves, checks and exports its certificate
+      runs: |
+        # dotnet-dev-certs is another tool of libaspnetcoretools.so. It saves
+        # a new certificate by exporting it with X509ContentType.Pkcs12 and
+        # loading the result into the X509Store, and -ep exports it the same
+        # way. That export is runtime code compiled into the tool, so the
+        # installed dotnet-${{vars.major-version}} runtime does not decide
+        # what it writes: this recipe's patch 0003 does. With the upstream
+        # default, Triple DES, both commands fail with error:0308010C
+        # (unsupported) unless CHAINGUARD_LEGACY_ENABLE_DES=1, so the variable
+        # must not be set here. The SDK's first run, in the steps above, may
+        # already have created a certificate: remove it, so that dev-certs
+        # creates and saves one here. The same step is in dotnet-11, for the
+        # tool that dotnet-11-sdk ships.
+        unset CHAINGUARD_LEGACY_ENABLE_DES
+        dotnet dev-certs https --clean
+        if ! dotnet dev-certs https --verbose > dev-certs.txt 2>&1; then
+          cat dev-certs.txt
+          exit 1
+        fi
+        cat dev-certs.txt
+        grep -F 'Finished saving certificate to the store.' dev-certs.txt
+        dotnet dev-certs https --check
+        dotnet dev-certs https -ep dev.pfx -p pw
+        openssl pkcs12 -info -noout -in dev.pfx -passin pass:pw > dev.txt 2>&1
+        cat dev.txt
+        grep -F 'Shrouded Keybag: PBES2, PBKDF2, AES-256-CBC, Iteration 2000, PRF hmacWithSHA256' dev.txt
     - name: The NativeAOT tools carry this recipe's OpenSSL shim
       runs: |
         # Each NativeAOT-compiled file carries the crypto shim of the

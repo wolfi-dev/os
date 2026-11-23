@@ -1,0 +1,132 @@
+package:
+  name: pg_cron-19
+  version: "1.6.8"
+  epoch: 0
+  description: PostgreSQL 19 extension for running jobs on a schedule using cron syntax
+  copyright:
+    - license: PostgreSQL
+  annotations:
+    # Postgres extension; llvm pinned lockstep with postgres for JIT bitcode ABI.
+    toolchain-stream-reconcile-optout: true
+
+var-transforms:
+  - from: ${{package.name}}
+    match: '^pg_cron-(\d+)$'
+    replace: $1
+    to: pg-version
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - clang-19
+      - glibc-2.44-dev
+      - llvm-19
+      - postgresql-${{vars.pg-version}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/citusdata/pg_cron
+      expected-commit: 5cedfa472ccc83567aa23ec645925ed8489a7797
+      tag: v${{package.version}}
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: citusdata/pg_cron
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - postgresql-${{vars.pg-version}}
+        - postgresql-${{vars.pg-version}}-client
+        - shadow
+        - sudo-rs
+        - glibc-locales
+        - wait-for-it
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+  pipeline:
+    - name: Initialize PostgreSQL database
+      runs: |
+        useradd $PGUSER
+        echo -n $PGPASSWORD 2>&1 > /tmp/pwfile
+        sudo -u $PGUSER initdb --pwfile=/tmp/pwfile -D /tmp/pgdata --auth=md5 2>&1
+    - name: Test pg_cron extension
+      runs: |
+        sudo -u $PGUSER pg_ctl start -w -D /tmp/pgdata -o "--shared_preload_libraries=pg_cron --unix_socket_directories=/tmp" -l /tmp/pgdata/log 2>&1
+
+        # Wait for PostgreSQL to be ready
+        wait-for-it localhost:5432 -t 4
+
+        # Test extension creation and basic functionality
+        psql -h /tmp -d postgres -U postgres --set ON_ERROR_STOP=1 << 'EOF'
+        -- Create the pg_cron extension
+        CREATE EXTENSION pg_cron;
+
+        -- Verify extension is installed
+        SELECT * FROM pg_extension WHERE extname = 'pg_cron';
+
+        -- Test scheduling a simple job (but don't wait for execution)
+        SELECT cron.schedule('test-job', '* * * * *', 'SELECT 1');
+
+        -- Verify job was scheduled
+        SELECT jobname, schedule, command FROM cron.job WHERE jobname = 'test-job';
+
+        -- Test unscheduling the job
+        SELECT cron.unschedule('test-job');
+
+        -- Verify job was removed
+        SELECT COUNT(*) FROM cron.job WHERE jobname = 'test-job';
+
+        -- Test cron.job_run_details view exists
+        SELECT COUNT(*) FROM cron.job_run_details;
+        EOF
+
+        # Validate SQL output: verify extension is installed
+        ext_count=$(psql -h /tmp -d postgres -U postgres --set ON_ERROR_STOP=1 -t -A -c "SELECT COUNT(*) FROM pg_extension WHERE extname = 'pg_cron';")
+        if [ "$ext_count" -ne 1 ]; then
+          echo "FAIL: pg_cron extension not found (count=$ext_count)"
+          exit 1
+        fi
+        echo "PASS: pg_cron extension is installed"
+
+        # Validate: schedule a job and verify it exists
+        psql -h /tmp -d postgres -U postgres --set ON_ERROR_STOP=1 -t -A -c "SELECT cron.schedule('validate-job', '* * * * *', 'SELECT 1');"
+        job_count=$(psql -h /tmp -d postgres -U postgres --set ON_ERROR_STOP=1 -t -A -c "SELECT COUNT(*) FROM cron.job WHERE jobname = 'validate-job';")
+        if [ "$job_count" -ne 1 ]; then
+          echo "FAIL: validate-job not found after scheduling (count=$job_count)"
+          exit 1
+        fi
+        echo "PASS: job was scheduled successfully"
+
+        # Validate: unschedule the job and verify it's removed
+        psql -h /tmp -d postgres -U postgres --set ON_ERROR_STOP=1 -t -A -c "SELECT cron.unschedule('validate-job');"
+        job_count=$(psql -h /tmp -d postgres -U postgres --set ON_ERROR_STOP=1 -t -A -c "SELECT COUNT(*) FROM cron.job WHERE jobname = 'validate-job';")
+        if [ "$job_count" -ne 0 ]; then
+          echo "FAIL: validate-job still exists after unschedule (count=$job_count)"
+          exit 1
+        fi
+        echo "PASS: job was unscheduled successfully"
+
+        # Check for any errors in PostgreSQL logs
+        if grep -E '(ERROR|FATAL)' /tmp/pgdata/log | grep -Ev '(no COPY in progress|could not connect to|could not send|the database system is not yet accepting connections|database system is shutting|error reading result of streaming command|database system is starting up)'; then
+          echo "PostgreSQL errors found in logs"
+          exit 1
+        fi
+
+        # Cleanup: Stop PostgreSQL
+        sudo -u $PGUSER pg_ctl stop -D /tmp/pgdata -m fast
+    - uses: test/tw/ldd-check

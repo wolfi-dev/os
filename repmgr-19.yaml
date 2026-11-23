@@ -1,0 +1,158 @@
+package:
+  name: repmgr-19
+  version: "5.5.1"
+  epoch: 0
+  description: "A lightweight replication manager for PostgreSQL"
+  copyright:
+    - license: GPL-3.0-only
+  dependencies:
+    provides:
+      - repmgr=${{package.full-version}}
+    runtime:
+      - libpq-19
+      - merged-usrsbin
+      - pgaudit-19
+      - postgresql-19
+      - postgresql-19-client
+      - wolfi-baselayout
+  resources:
+    cpu: 16
+    memory: 16Gi
+  annotations:
+    # Postgres extension; llvm pinned lockstep with postgres for JIT bitcode ABI.
+    toolchain-stream-reconcile-optout: true
+
+environment:
+  contents:
+    packages:
+      - autoconf
+      - automake
+      - build-base
+      - ca-certificates-bundle
+      - clang-19
+      - curl-dev
+      - docbook-xml
+      - flex
+      - git
+      - glibc-2.44-dev
+      - json-c-dev
+      - krb5-dev
+      - libedit-dev
+      - libpq-19
+      - libxml2-dev
+      - libxslt-dev
+      - linux-pam-dev
+      - lz4-dev
+      - openssl-hardened-${{vars.openssl-version}}-dev
+      - postgresql-19-dev
+      - readline-dev
+      - wolfi-base
+      - zstd-dev
+
+var-transforms:
+  - from: ${{package.name}}
+    match: "repmgr-(.+)"
+    replace: "$1"
+    to: major-postgresql-version
+
+vars:
+  openssl-version: "4.0"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/EnterpriseDB/repmgr
+      tag: v${{package.version}}
+      expected-commit: 8ade49d1fd19ab245202628750d9f5ca92d69487
+
+  # Remove once upstream builds against PostgreSQL 19:
+  # https://github.com/EnterpriseDB/repmgr/issues/916
+  - uses: patch
+    with:
+      patches: build-as-c11.patch
+
+  - uses: autoconf/configure
+    with:
+      opts: --sbindir=/usr/bin
+
+  - uses: autoconf/make
+
+  - uses: autoconf/make-install
+
+  - name: Symlink repmgr binaries
+    runs: |
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      ln -sf /usr/libexec/postgresql${{vars.major-postgresql-version}}/repmgr ${{targets.destdir}}/usr/bin/repmgr
+      ln -sf /usr/libexec/postgresql${{vars.major-postgresql-version}}/repmgrd ${{targets.destdir}}/usr/bin/repmgrd
+
+  - uses: strip
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - rc*
+  github:
+    identifier: EnterpriseDB/repmgr
+    use-tag: true
+    strip-prefix: v
+    tag-filter-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        - shadow
+        - sudo-rs
+        - glibc-locales
+    environment:
+      PGDATA: /tmp/test_db
+      PGUSER: repmgruser
+      PGPASS: repmgrpassword
+      PGDB: repmgr_test
+  pipeline:
+    - uses: test/tw/ldd-check
+    - name: Test repmgr
+      runs: |
+        useradd repmgruser
+        echo "${PGUSER}:${PGPASS}" | chpasswd
+        sudo -u ${PGUSER} initdb -D ${PGDATA}
+        sudo -u ${PGUSER} pg_ctl -D ${PGDATA} -l /tmp/logfile start
+        sudo -u ${PGUSER} createdb ${PGDB}
+        sudo -u ${PGUSER} psql -d ${PGDB} -c "GRANT ALL PRIVILEGES ON SCHEMA public TO ${PGUSER};"
+        echo "host replication ${PGUSER} 127.0.0.1/32 md5" | sudo tee -a ${PGDATA}/pg_hba.conf
+        echo "host replication ${PGUSER} ::1/128 md5" | sudo tee -a ${PGDATA}/pg_hba.conf
+        echo "wal_level = replica" | sudo tee -a ${PGDATA}/postgresql.conf
+        echo "archive_mode = on" | sudo tee -a ${PGDATA}/postgresql.conf
+        echo "max_wal_senders = 5" | sudo tee -a ${PGDATA}/postgresql.conf
+        echo "hot_standby = on" | sudo tee -a ${PGDATA}/postgresql.conf
+        sudo -u ${PGUSER} pg_ctl -D ${PGDATA} restart
+        cat <<EOF | sudo tee /etc/repmgr.conf
+        node_id=1
+        node_name=primary_node
+        conninfo='host=localhost port=5432 user=${PGUSER} dbname=${PGDB} password=${PGPASS}'
+        data_directory='${PGDATA}'
+        log_file='/tmp/repmgr_primary.log'
+        EOF
+        sudo chown ${PGUSER}:${PGUSER} /etc/repmgr.conf
+        sudo -u ${PGUSER} repmgr -f /etc/repmgr.conf primary register
+        sudo -u ${PGUSER} pg_basebackup -D /tmp/test_db_standby -R -X stream -c fast -U ${PGUSER} -h localhost
+        echo "primary_conninfo = 'host=localhost port=5432 user=${PGUSER} password=${PGPASS} application_name=standby_node'" \
+        | sudo tee -a /tmp/test_db_standby/postgresql.auto.conf
+        echo "port = 5433" | sudo tee -a /tmp/test_db_standby/postgresql.auto.conf
+        sudo chown -R ${PGUSER}:${PGUSER} /tmp/test_db_standby
+        sudo -u ${PGUSER} pg_ctl -D /tmp/test_db_standby -l /tmp/logfile_standby start
+        until PGPASSWORD=${PGPASS} psql -p 5433 -U ${PGUSER} -d ${PGDB} -c "SELECT 1" >/dev/null 2>&1; do
+          echo "Waiting for standby to be ready..."
+          sleep 2
+        done
+        cat <<EOF | sudo tee /etc/repmgr_standby.conf
+        node_id=2
+        node_name=standby_node
+        conninfo='host=localhost port=5433 user=${PGUSER} dbname=${PGDB} password=${PGPASS}'
+        data_directory='/tmp/test_db_standby'
+        log_file='/tmp/repmgr_standby.log'
+        EOF
+        sudo chown ${PGUSER}:${PGUSER} /etc/repmgr_standby.conf
+        sudo -u ${PGUSER} repmgr -f /etc/repmgr_standby.conf standby register --upstream-node-id=1
+        sudo -u ${PGUSER} repmgr cluster show
+        sudo -u ${PGUSER} pg_ctl -D ${PGDATA} stop

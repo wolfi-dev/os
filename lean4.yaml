@@ -1,0 +1,713 @@
+package:
+  name: lean4
+  version: "4.36.0"
+  epoch: 2 # move from enterprise-packages to os
+  description: Lean 4 theorem prover and functional programming language toolchain
+  copyright:
+    - license: Apache-2.0
+    # mimalloc is compiled into the Lean runtime.
+    - license: MIT
+  # Lean bootstraps twice (stage 0, then stage 1) and compiles thousands of
+  # generated C files with -O3 each time. Moving from 15 to 31 CPUs cut the
+  # build from 14 to 11 minutes (CI, 2026-09-20). Memory must be sized for the
+  # guest, not the host metric: with 31 jobs a 32 GiB VM failed to fork lean
+  # and clang ("resource exhausted"), while 48 GiB passed.
+  resources:
+    cpu: "32"
+    memory: 64Gi
+  test-resources:
+    cpu: "4"
+    memory: 6Gi
+  dependencies:
+    runtime:
+      # leanmake is a bash script that drives make with /usr/share/lean/lean.mk.
+      - bash
+      # bv_decide runs the cadical binary installed next to lean.
+      - cadical
+      # The installed leanc compiles Lean-generated C with clang. clang pulls in
+      # gcc (libstdc++-dev, binutils) and glibc-dev, which leanc also needs.
+      - clang-${{vars.llvm-version}}
+      # lake fetches git dependencies.
+      - git
+      # leanc links every Lean program with -lgmp.
+      - gmp-dev
+      # Mathlib's cache tooling runs leantar from the toolchain's bin directory
+      # ($(lean --print-prefix)/bin/leantar), where upstream toolchains bundle it.
+      - leantar
+      # leanc links every Lean program with -luv (libuv found via pkg-config).
+      - libuv-dev
+      # leanc links with -fuse-ld=lld.
+      - lld-${{vars.llvm-version}}
+      - make
+      # leanc links every Lean program with /usr/lib/libssl.so and libcrypto.so.
+      - openssl-${{vars.openssl-version}}-dev
+      # Std.Time resolves TZ=Area/City against /usr/share/zoneinfo.
+      - tzdata
+
+vars:
+  llvm-version: "23"
+  openssl-version: "4.0"
+  # Pinned in Lean's top-level CMakeLists.txt (FetchContent GIT_TAG vX.Y.Z).
+  # Upstream notes that even small mimalloc version changes affect Lean's
+  # performance measurably, so the exact pin matters.
+  mimalloc-version: "3.4.5"
+
+environment:
+  contents:
+    packages:
+      - bash
+      - build-base
+      - busybox
+      - clang-${{vars.llvm-version}}
+      - cmake
+      - git
+      - glibc-2.44-dev
+      - gmp-dev
+      - libuv-dev
+      - lld-${{vars.llvm-version}}
+      - openssl-${{vars.openssl-version}}-dev
+      - pkgconf
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/leanprover/lean4
+      tag: v${{package.version}}
+      expected-commit: 611c117bfaf7b7ae1cfcf246ce6fba31e8f509e9
+
+  # Std.Time reads /etc/localtime unconditionally when TZ is unset, and no
+  # Wolfi package installs that file, so `lean --server` dies on startup in a
+  # container ("Watchdog error: no such file or directory ... /etc/localtime").
+  # Fall back to UTC the way the C library does. Upstream: leanprover/lean4#12869.
+  - uses: patch
+    with:
+      patches: tzdb-utc-fallback.patch
+
+  # Lean's CMake clones mimalloc at configure time, and builds CaDiCaL and
+  # downloads a prebuilt leantar unless it is told where they are. mimalloc is
+  # checked out pinned by commit at the exact path the build expects; cadical
+  # and leantar come from their own packages. The build never reaches the
+  # network.
+  - uses: git-checkout
+    with:
+      repository: https://github.com/microsoft/mimalloc
+      tag: v${{vars.mimalloc-version}}
+      expected-commit: acf2fdd329f9dc2a7ffe3f12a133fe7175e39378
+      destination: build/release/mimalloc/src/mimalloc
+
+  - name: Verify the mimalloc pin matches upstream
+    runs: |
+      # A version bump that moves Lean without moving this pin must fail here
+      # rather than silently build against the wrong allocator.
+      grep -qE "GIT_TAG v${{vars.mimalloc-version}}$" CMakeLists.txt
+
+  - name: Configure
+    runs: |
+      # Lean accepts only Makefile generators, so the cmake/configure pipeline
+      # (which hardcodes Ninja) cannot be used.
+      #
+      # Stage 0 receives only STAGE0_-prefixed and a fixed set of variables;
+      # everything else on the command line reaches stage 1 (the shipped build).
+      # Anything stage 0 must also honor is therefore passed twice: the compiler,
+      # CCACHE, and INSTALL_LEANTAR (stage 0 otherwise copies leantar into its
+      # bin/, which fails when the file is absent and would be installed over
+      # the leantar package's copy when it is present).
+      #
+      # CADICAL and LEANTAR name the binaries the cadical and leantar runtime
+      # dependencies install; neither is needed to build Lean itself, and
+      # INSTALL_CADICAL=OFF and INSTALL_LEANTAR=OFF keep the toolchain from
+      # installing its own copies over them.
+      #
+      # Performance: RELEASE gives -O3 -DNDEBUG in both stages. mimalloc, the
+      # small-object allocator, -Bsymbolic, mmap'd .olean loading, hidden
+      # visibility, lld, and --gc-sections are upstream's release defaults and
+      # are pinned explicitly here. -DUSE_GMP=ON matches upstream releases: every
+      # .olean header records the bignum encoding (src/library/module.cpp), so a
+      # non-GMP toolchain rejects every upstream-built .olean, including the
+      # ones Mathlib's `lake exe cache get` downloads.
+      #
+      # Deliberately not used: -march (the package must run on any x86_64 or
+      # aarch64 host); LTO and PGO (the compile and link flags set here are baked
+      # into the installed leanc and the same objects form the static archives
+      # every `lake build` links, so LTO would force a whole-stdlib LTO link and
+      # an exact LLVM bitcode version onto every user program); -fno-plt (with
+      # clang 22 on aarch64 under the distro's -mbranch-protection=standard, the
+      # stage 1 binaries built with it died with SIGILL on every invocation on
+      # C4A/Axion nodes, while the stage 0 binaries built without it ran the
+      # whole stage 1 build on the same nodes).
+      #
+      # CMAKE_AR is pinned because lean.mk records it for `leanmake lib`.
+      workdir=$(pwd)
+      cmake -S . -B build/release -G "Unix Makefiles" \
+        -DCMAKE_BUILD_TYPE=RELEASE \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_AR=/usr/bin/ar \
+        -DSTAGE0_CMAKE_C_COMPILER=clang \
+        -DSTAGE0_CMAKE_CXX_COMPILER=clang++ \
+        -DLEANC_CC=clang \
+        -DUSE_GMP=ON \
+        -DUSE_MIMALLOC=ON \
+        -DLEAN_MI_SECURE=0 \
+        -DCUSTOM_ALLOCATORS=ON \
+        -DBSYMBOLIC=ON \
+        -DMMAP=ON \
+        -DFETCHCONTENT_SOURCE_DIR_MIMALLOC="${workdir}/build/release/mimalloc/src/mimalloc" \
+        -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+        -DCADICAL=/usr/bin/cadical \
+        -DINSTALL_CADICAL=OFF \
+        -DLEANTAR=/usr/bin/leantar \
+        -DINSTALL_LEANTAR=OFF \
+        -DSTAGE0_INSTALL_LEANTAR=OFF \
+        -DINSTALL_LICENSE=OFF \
+        -DCCACHE=OFF \
+        -DSTAGE0_CCACHE=OFF
+
+  - name: Build stage 0, stage 1, and stage 2
+    runs: |
+      # Upstream releases ship stage 2 (make -C build stage2); the job count is
+      # computed in a shellcheck-clean way rather than interpolated into opts.
+      jobs=$(nproc)
+      VERBOSE=1 cmake --build build/release --parallel "${jobs}" --target stage2
+
+  - name: Install stage 2
+    runs: |
+      # The top-level install target installs only stage 1, so run the stage 2
+      # install directly, as upstream does.
+      make -C build/release/stage2 install DESTDIR="${{targets.destdir}}"
+      install -Dm644 LICENSE LICENSES -t "${{targets.destdir}}/usr/share/licenses/${{package.name}}"
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-src
+    description: Lean 4 standard library sources for go-to-definition in the language server
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.contextdir}}/usr/src"
+          mv "${{targets.destdir}}/usr/src/lean" "${{targets.contextdir}}/usr/src/lean"
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/src/lean/Init/Prelude.lean
+              /usr/src/lean/Lean/Elab/Command.lean
+              /usr/src/lean/lake/Lake/Build/Actions.lean
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - -rc\d+$
+    - ^vcustom
+  github:
+    identifier: leanprover/lean4
+    strip-prefix: v
+    use-tag: true
+    tag-filter-prefix: v
+
+# Every Lean example below is held to the same bar as production Lean: any
+# warning is an error (-DwarningAsError=true, lake build --wfail), no sorry,
+# no native_decide, explicit imports, autoImplicit off, and a docstring on
+# every definition. The files named Bad, Wrong, and Broken fail on purpose.
+test:
+  environment:
+    contents:
+      packages:
+        - busybox
+        - git
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: |
+          lean
+          lake
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          lean
+          lake
+    - name: Toolchain layout and build stamp
+      runs: |
+        mkdir -p /tmp/layout && cd /tmp/layout
+        prefix=$(lean --print-prefix)
+        libdir=$(lean --print-libdir)
+        test "${prefix}" = /usr
+        test "${libdir}" = /usr/lib/lean
+        lean --githash > githash.txt
+        grep -Eq '^[0-9a-f]{40}$' githash.txt
+        lean --version > version.txt
+        grep -qi release version.txt
+        # The solver and the cache archiver must sit in the toolchain's bin
+        # directory, where bv_decide and Mathlib's cache tool look for them.
+        test -x "${prefix}/bin/cadical"
+        cadical --version
+        test -x "${prefix}/bin/leantar"
+        leantar --version
+        # leanc must resolve the system clang, not a bundled compiler.
+        leanc -v --version > leanc.txt 2>&1
+        grep -q '^clang ' leanc.txt
+    - name: unfold reduces matches on constructors
+      runs: |
+        mkdir -p /tmp/pack && cd /tmp/pack
+        cat > Pack.lean <<'EOF'
+        module
+
+        import all Init.Data.OfScientific
+
+        set_option autoImplicit false
+
+        namespace Check
+
+        open Float.Model
+
+        /-- `unfold` reduces `pack` on a `zero` constructor to that branch. -/
+        theorem pack_zero (spec : Format) (s : UnpackedFloat.Sign) : UnpackedFloat.pack spec (.zero s) = UnpackedFloat.packedZero spec s := by
+          unfold UnpackedFloat.pack
+          guard_target =ₛ UnpackedFloat.packedZero spec s = UnpackedFloat.packedZero spec s
+          rfl
+
+        /-- `unfold` reduces `pack` on a `finite` constructor and exposes that branch's `let`s. -/
+        theorem pack_finite (spec : Format) (s : UnpackedFloat.Sign) (m : Nat) (e : Int) (h : 0 < m) :
+            UnpackedFloat.pack spec (.finite s m e h) = UnpackedFloat.pack spec (.finite s m e h) := by
+          conv => lhs; unfold UnpackedFloat.pack
+          extract_lets mantbits biasedexp
+          rfl
+
+        end Check
+        EOF
+        lean -DwarningAsError=true Pack.lean
+    - name: The shipped library was written by the shipped compiler
+      runs: |
+        # The shipped library must be written by the shipped compiler, as in upstream
+        # releases (stage 2): its .olean headers carry the release version, the
+        # release githash, and the GMP bignum flag. A stage 1 library carries the
+        # stage 0 bootstrap compiler's version and githash instead.
+        olean="/usr/lib/lean/Init.olean"
+        version=$(dd if="${olean}" bs=1 skip=7 count=33 2> /dev/null | tr -d '\000')
+        githash=$(dd if="${olean}" bs=1 skip=40 count=40 2> /dev/null)
+        flags=$(dd if="${olean}" bs=1 skip=6 count=1 2> /dev/null | od -An -tu1 | tr -d ' ')
+        expected=$(lean --githash)
+        echo "Init.olean: version=${version} githash=${githash} flags=${flags}"
+        test "${version}" = "${{package.version}}"
+        test "${githash}" = "${expected}"
+        test "${flags}" = 1
+    - name: Kernel, elaborator, independent kernel re-check, and axiom audit
+      runs: |
+        mkdir -p /tmp/proofs/out && cd /tmp/proofs
+        cat > Proofs.lean <<'EOF'
+        import Std.Data.HashMap
+
+        set_option autoImplicit false
+
+        namespace Proofs
+
+        /-- The length of a replicated list is the replication count, by induction. -/
+        theorem length_replicate {α : Type} (n : Nat) (a : α) :
+            (List.replicate n a).length = n := by
+          induction n with
+          | zero => rfl
+          | succ k ih => simp only [List.replicate, List.length_cons, ih]
+
+        /-- A linear bound that `omega` discharges. -/
+        theorem linear (x y : Nat) (h : x < y) : 2 * x + 1 ≤ 2 * y := by
+          omega
+
+        /-- A closed computation the kernel checks through `decide`. -/
+        theorem small : (List.range 10).foldl (· + ·) 0 = 45 := by
+          decide
+
+        /-- Doubling a natural number. -/
+        def double (n : Nat) : Nat := 2 * n
+
+        /-- `double` distributes over addition. -/
+        theorem double_add (a b : Nat) : double (a + b) = double a + double b := by
+          unfold double
+          omega
+
+        /-- Looks `k` up in a two-entry `Std.HashMap`. -/
+        def lookup (k : Nat) : Option String :=
+          (((∅ : Std.HashMap Nat String).insert 1 "one").insert 2 "two").get? k
+
+        end Proofs
+        EOF
+        lean -DwarningAsError=true -o out/Proofs.olean -i out/Proofs.ilean Proofs.lean
+        test -s out/Proofs.olean
+        LEAN_PATH=/tmp/proofs/out leanchecker --verbose Proofs
+
+        # The audit lives outside the proof module so the module stays free of
+        # debug commands.
+        cat > Audit.lean <<'EOF'
+        import Proofs
+
+        #print axioms Proofs.length_replicate
+        #print axioms Proofs.linear
+        #print axioms Proofs.small
+        #print axioms Proofs.double_add
+        EOF
+        LEAN_PATH=/tmp/proofs/out lean -DwarningAsError=true Audit.lean > axioms.txt
+        cat axioms.txt
+        if grep -q sorryAx axioms.txt; then
+          echo "a proof depends on sorryAx"; exit 1
+        fi
+        grep -q 'length_replicate' axioms.txt
+
+        # The compiled module is importable through LEAN_PATH, its definitions
+        # compute, and --deps resolves both it and the installed stdlib.
+        cat > Use.lean <<'EOF'
+        import Proofs
+
+        set_option autoImplicit false
+
+        example : Proofs.double 21 = 42 := by
+          decide
+
+        /-- Prints a lookup through the imported module. -/
+        def main : IO Unit :=
+          IO.println (repr (Proofs.lookup 2))
+        EOF
+        LEAN_PATH=/tmp/proofs/out lean -DwarningAsError=true --run Use.lean > use.txt
+        grep -qx 'some "two"' use.txt
+        LEAN_PATH=/tmp/proofs/out lean --deps Use.lean > deps.txt
+        grep -q 'out/Proofs.olean' deps.txt
+        grep -q '^/usr/lib/lean/' deps.txt
+
+        # A false theorem must fail with a located error.
+        cat > Bad.lean <<'EOF'
+        theorem bad : (1 : Nat) = 2 := rfl
+        EOF
+        if lean Bad.lean > bad.txt 2>&1; then
+          echo "expected Bad.lean to fail"; exit 1
+        fi
+        grep -q 'Bad.lean:1:' bad.txt
+        grep -qi 'error' bad.txt
+    - name: Bignum arithmetic without GMP, interpreted and compiled
+      runs: |
+        mkdir -p /tmp/big && cd /tmp/big
+        cat > Big.lean <<'EOF'
+        set_option autoImplicit false
+
+        /-- The factorial function. -/
+        def fact : Nat → Nat
+          | 0 => 1
+          | n + 1 => (n + 1) * fact n
+
+        /-- Prints arithmetic results well past 64 and 128 bits. -/
+        def main : IO Unit := do
+          IO.println (2 ^ 128)
+          IO.println ((2 ^ 200 + 1) % 7)
+          IO.println (fact 50)
+          IO.println ((-(2 ^ 64) : Int) - 1)
+          IO.println (Nat.gcd (2 ^ 100 * 3) (2 ^ 70 * 5))
+          IO.println ((10 ^ 40 : Nat) / 10 ^ 20)
+          IO.println ((2 ^ 64 : Nat) - 1 + 1 == 2 ^ 64)
+          IO.println (decide (2 ^ 128 = 340282366920938463463374607431768211456))
+        EOF
+        cat > expected.txt <<'EOF'
+        340282366920938463463374607431768211456
+        5
+        30414093201713378043612608166064768844377641568960512000000000000
+        -18446744073709551617
+        1180591620717411303424
+        100000000000000000000
+        true
+        true
+        EOF
+        lean -DwarningAsError=true --run Big.lean > interpreted.txt
+        cmp expected.txt interpreted.txt
+
+        # Same program through the C backend, leanc, and a static link with
+        # only the package's runtime dependencies present.
+        lean -DwarningAsError=true --c=big.c Big.lean
+        leanc -o big big.c
+        ./big > compiled.txt
+        cmp expected.txt compiled.txt
+    - name: Lean compiler library at run time
+      runs: |
+        mkdir -p /tmp/json && cd /tmp/json
+        cat > Sum.lean <<'EOF'
+        import Lean.Data.Json
+
+        set_option autoImplicit false
+
+        /-- Sums the natural numbers in the `values` array of a JSON document. -/
+        def sumValues (doc : String) : Except String Nat := do
+          let json ← Lean.Json.parse doc
+          let values ← json.getObjVal? "values"
+          let items ← values.getArr?
+          items.foldlM (fun acc item => do
+            let n ← item.getNat?
+            pure (acc + n)) 0
+
+        /-- Prints the sum for a fixed document. -/
+        def main : IO Unit := do
+          match sumValues "{\"values\": [1, 2, 3, 4, 5]}" with
+          | .ok n => IO.println n
+          | .error e => throw (IO.userError e)
+        EOF
+        lean -DwarningAsError=true --run Sum.lean > sum.txt
+        grep -qx 15 sum.txt
+    - name: Local time zone resolution with and without /etc/localtime
+      runs: |
+        mkdir -p /tmp/zone && cd /tmp/zone
+        cat > Zone.lean <<'EOF'
+        import Std.Time
+
+        set_option autoImplicit false
+
+        /-- Prints the identifier and UTC offset of the local zone's initial rule. -/
+        def main : IO Unit := do
+          let rules ← Std.Time.Database.TZdb.default.getLocalZoneRules
+          IO.println rules.initialLocalTimeType.identifier
+          IO.println (repr rules.initialLocalTimeType.gmtOffset)
+        EOF
+        # The test image has no /etc/localtime: with TZ unset the patched
+        # fallback must yield UTC instead of an IO error.
+        test ! -e /etc/localtime
+        lean -DwarningAsError=true --run Zone.lean > default.txt
+        grep -qx 'UTC' default.txt
+        grep -qx '{ second := 0 }' default.txt
+        # TZ names resolve through tzdata; the offset is Sao Paulo's initial LMT rule.
+        TZ=America/Sao_Paulo lean --run Zone.lean > saopaulo.txt
+        grep -qx '{ second := -11188 }' saopaulo.txt
+        # An explicit TZ that cannot be resolved still fails loudly.
+        if TZ=Not/AZone lean --run Zone.lean > bad.txt 2>&1; then
+          echo "expected TZ=Not/AZone to fail"; exit 1
+        fi
+        grep -q 'not found' bad.txt
+    - name: leanc links plain C against the Lean runtime and reports link errors
+      runs: |
+        mkdir -p /tmp/leanc && cd /tmp/leanc
+        printf 'int main(void) { return 0; }\n' > ok.c
+        leanc -o ok ok.c
+        ./ok
+        printf 'extern int nope(void);\nint main(void) { return nope(); }\n' > undefined.c
+        if leanc -o undefined undefined.c > link.txt 2>&1; then
+          echo "expected the link to fail"; exit 1
+        fi
+        grep -q 'nope' link.txt
+    - name: Lake end to end with a path dependency and precompiled modules
+      runs: |
+        mkdir -p /tmp/lake && cd /tmp/lake
+        lake new demo
+        lake new demolib lib
+        cd demo
+        lake build --wfail
+        lake exe demo > hello.txt
+        grep -qx 'Hello, world!' hello.txt
+        lake env lean --version > version.txt
+        grep -q '${{package.version}}' version.txt
+
+        cat > lakefile.toml <<'EOF'
+        name = "demo"
+        version = "0.1.0"
+        defaultTargets = ["demo"]
+
+        [[require]]
+        name = "demolib"
+        path = "../demolib"
+
+        [[lean_lib]]
+        name = "Demo"
+        precompileModules = true
+
+        [[lean_exe]]
+        name = "demo"
+        root = "Main"
+        EOF
+        cat > Main.lean <<'EOF'
+        import Demo
+        import Demolib
+
+        set_option autoImplicit false
+
+        /-- Greets with one string from each library. -/
+        def main : IO Unit :=
+          IO.println s!"Hello, {Demolib.hello} and {Demo.hello}!"
+        EOF
+        # Give each library a distinct greeting so the path dependency is
+        # observably linked in.
+        cat > ../demolib/Demolib/Basic.lean <<'EOF'
+        namespace Demolib
+
+        /-- The greeting contributed by the dependency. -/
+        def hello : String := "demolib"
+
+        end Demolib
+        EOF
+        cat > Demo/Basic.lean <<'EOF'
+        namespace Demo
+
+        /-- The greeting contributed by the root package. -/
+        def hello : String := "demo"
+
+        end Demo
+        EOF
+        lake update
+        lake build --wfail
+        lake exe demo > greeting.txt
+        grep -qx 'Hello, demolib and demo!' greeting.txt
+        # precompileModules forces leanc to produce a shared library.
+        find .lake/build -name '*.so' > shared.txt
+        test -s shared.txt
+
+        # A project with a type error must fail to build.
+        cd /tmp/lake && lake new broken && cd broken
+        printf 'def x : Nat := "not a Nat"\n' > Broken/Basic.lean
+        if lake build > broken.txt 2>&1; then
+          echo "expected the build to fail"; exit 1
+        fi
+        grep -q 'error' broken.txt
+    - name: FFI through an extern_lib built by Lake
+      runs: |
+        mkdir -p /tmp/ffi && cd /tmp/ffi
+        cat > lakefile.lean <<'EOF'
+        import Lake
+        open System Lake DSL
+
+        package ffi
+
+        lean_lib FFI
+
+        @[default_target]
+        lean_exe ffitest where
+          root := `Main
+
+        target ffi.o pkg : FilePath := do
+          let oFile := pkg.buildDir / "c" / "ffi.o"
+          let srcJob ← inputTextFile <| pkg.dir / "ffi.c"
+          let weakArgs := #["-I", (← getLeanIncludeDir).toString]
+          buildO oFile srcJob weakArgs #["-fPIC"] "clang" getLeanTrace
+
+        extern_lib libleanffi pkg := do
+          let ffiO ← ffi.o.fetch
+          let name := nameToStaticLib "leanffi"
+          buildStaticLib (pkg.staticLibDir / name) #[ffiO]
+        EOF
+        cat > FFI.lean <<'EOF'
+        set_option autoImplicit false
+
+        /-- Adds two 32-bit integers in C. -/
+        @[extern "my_add"]
+        opaque myAdd : UInt32 → UInt32 → UInt32
+        EOF
+        cat > Main.lean <<'EOF'
+        import FFI
+
+        set_option autoImplicit false
+
+        /-- Prints the sum computed in C. -/
+        def main : IO Unit := IO.println s!"{myAdd 40 2}"
+        EOF
+        cat > ffi.c <<'EOF'
+        #include <lean/lean.h>
+
+        LEAN_EXPORT uint32_t my_add(uint32_t a, uint32_t b) { return a + b; }
+        EOF
+        lake build --wfail
+        lake exe ffitest > sum.txt
+        grep -qx 42 sum.txt
+    - name: bv_decide runs CaDiCaL and checks its LRAT proof
+      runs: |
+        mkdir -p /tmp/bv && cd /tmp/bv
+        cat > Good.lean <<'EOF'
+        import Std.Tactic.BVDecide
+
+        set_option autoImplicit false
+
+        example (x y : BitVec 64) : x &&& y = y &&& x := by
+          bv_decide
+
+        /-- Doubling a bitvector equals adding it to itself. -/
+        theorem double_is_add (x : BitVec 16) : x * 2 = x + x := by
+          bv_decide
+        EOF
+        lean -DwarningAsError=true Good.lean
+        cat > Wrong.lean <<'EOF'
+        import Std.Tactic.BVDecide
+
+        example (x y : BitVec 8) : x + y = x := by
+          bv_decide
+        EOF
+        if lean Wrong.lean > wrong.txt 2>&1; then
+          echo "expected bv_decide to refute the goal"; exit 1
+        fi
+        grep -qi 'counterexample' wrong.txt
+    - name: Language server handshake and diagnostics over LSP
+      runs: |
+        mkdir -p /tmp/lsp && cd /tmp/lsp
+        printf 'theorem bad : (1 : Nat) = 2 := rfl\n' > Bad.lean
+        # The feeder sends the handshake, waits (bounded) for the diagnostics to
+        # appear in the captured server output, then shuts the server down, so
+        # the test is not timing based. The pipeline's status is captured rather
+        # than fatal so the server's output is always printed before asserting.
+        cat > feeder.sh <<'EOF'
+        #!/bin/sh
+        set -e
+        send() {
+          printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"
+        }
+        send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":"file:///tmp/lsp","capabilities":{}}}'
+        send '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+        send '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/lsp/Bad.lean","languageId":"lean4","version":1,"text":"theorem bad : (1 : Nat) = 2 := rfl\n"}}}'
+        waited=0
+        while [ "${waited}" -lt 90 ] && ! grep -q 'textDocument/publishDiagnostics' server.txt 2> /dev/null; do
+          sleep 1
+          waited=$((waited + 1))
+        done
+        send '{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}'
+        sleep 2
+        send '{"jsonrpc":"2.0","method":"exit","params":null}'
+        EOF
+        status=0
+        sh feeder.sh 2> /dev/null | timeout 180 lean --server > server.txt 2> server.err || status=$?
+        echo "lean --server pipeline status: ${status}"
+        echo "--- server.err ---"
+        cat server.err
+        echo "--- server.txt (first 3000 bytes) ---"
+        head -c 3000 server.txt
+        echo
+        test "${status}" -eq 0
+        # The watchdog must not log errors (it did when /etc/localtime was missing).
+        test ! -s server.err
+        grep -q '"capabilities"' server.txt
+        grep -q 'textDocument/publishDiagnostics' server.txt
+        grep -q '"severity":1' server.txt
+    - name: leanmake builds a binary with lean.mk
+      runs: |
+        mkdir -p /tmp/leanmake && cd /tmp/leanmake
+        cat > Demo.lean <<'EOF'
+        set_option autoImplicit false
+
+        /-- Prints a fixed line. -/
+        def main : IO Unit := IO.println "leanmake ok"
+        EOF
+        leanmake bin PKG=Demo
+        ./build/bin/Demo > out.txt
+        grep -qx 'leanmake ok' out.txt
+    - name: Multithreaded runtime and elaboration
+      runs: |
+        mkdir -p /tmp/par && cd /tmp/par
+        cat > Par.lean <<'EOF'
+        set_option autoImplicit false
+
+        /-- The sum of the first `n` natural numbers, computed by a fold. -/
+        def work (n : Nat) : Nat := (List.range n).foldl (· + ·) 0
+
+        /-- Runs `work` on eight tasks and one spawned thread and prints the results. -/
+        def main : IO Unit := do
+          let tasks ← (List.range 8).mapM fun i => IO.asTask (pure (work (1000 * (i + 1))))
+          let results ← tasks.mapM fun t => IO.ofExcept t.get
+          IO.println results
+          let t := Task.spawn fun _ => work 5000
+          IO.println t.get
+        EOF
+        cat > expected.txt <<'EOF'
+        [499500, 1999000, 4498500, 7998000, 12497500, 17997000, 24496500, 31996000]
+        12497500
+        EOF
+        lean -DwarningAsError=true --threads=4 --run Par.lean > got.txt
+        cmp expected.txt got.txt
+        lean -DwarningAsError=true --threads=4 /tmp/proofs/Proofs.lean

@@ -1,7 +1,7 @@
 package:
   name: qemu
   version: "11.1.3"
-  epoch: 3 # build against ceph-21-dev; ceph-20 moved to enterprise-packages
+  epoch: 4 # split data/tools/dev out of the main package; drop unbuilt-target firmware
   description: "fast processor emulator"
   copyright:
     - license: GPL-2.0
@@ -10,6 +10,9 @@ package:
       - ${{package.name}}-ipxe
       - ${{package.name}}-system-aarch64
       - ${{package.name}}-system-x86_64
+      # helpers (qemu-ga, qemu-pr-helper, qemu-bridge-helper, ...) used to be
+      # files of this package; consumers of "qemu" keep getting them
+      - ${{package.name}}-tools
       - ${{package.name}}-utils
       - glib
       - merged-varrun
@@ -124,6 +127,31 @@ pipeline:
       # contain a single LOAD segment marked RWE which triggers security scanners
       rm -f ${{targets.destdir}}/usr/share/qemu/openbios-sparc32
       rm -f ${{targets.destdir}}/usr/share/qemu/openbios-sparc64
+      # Firmware, ROMs and device trees for targets outside --target-list
+      # (x86_64-softmmu,aarch64-softmmu). QEMU installs every blob regardless
+      # of the target list. Nothing in either emulator loads these:
+      #   edk2 arm (32-bit), riscv, loongarch64 and their descriptors; alpha
+      #   palcode; hppa; ppc (openbios, slof, skiboot, pnv-pnor, vof, u-boot
+      #   e500/sam460, qemu_vga.ndrv); riscv opensbi; s390; sparc
+      #   (cgthree/tcx); the Windows-installer bitmap; dtb/ (ppc440, pegasos,
+      #   microblaze boards).
+      # Kept on purpose: edk2-i386-* (libvirt runs i686 guests with
+      # qemu-system-x86_64), npcm7xx/npcm8xx and ast27x0 boot ROMs (arm
+      # machines in qemu-system-aarch64), pxe-*.rom and vgabios-qxl/virtio
+      # (loaded by names built at runtime, by older machine types/modules).
+      cd ${{targets.destdir}}/usr/share/qemu
+      rm -f edk2-arm-code.fd \
+            edk2-riscv-code.fd edk2-riscv-vars.fd \
+            edk2-loongarch64-code.fd edk2-loongarch64-vars.fd \
+            firmware/60-edk2-arm.json firmware/60-edk2-riscv64.json \
+            firmware/60-edk2-loongarch64.json \
+            palcode-clipper hppa-firmware.img \
+            openbios-ppc slof.bin skiboot.lid pnv-pnor.bin vof.bin vof-nvram.bin \
+            u-boot.e500 u-boot-sam460.bin qemu_vga.ndrv \
+            opensbi-riscv32-generic-fw_dynamic.bin opensbi-riscv64-generic-fw_dynamic.bin \
+            s390-ccw.img 'QEMU,cgthree.bin' 'QEMU,tcx.bin' qemu-nsis.bmp
+      rm -rf dtb
+      cd -
       # ship the man pages (qemu-doc) but not the HTML manual
       rm -rf ${{targets.destdir}}/usr/share/doc/qemu
       rmdir ${{targets.destdir}}/usr/share/doc
@@ -280,7 +308,16 @@ subpackages:
     description: "QEMU x86 system"
     dependencies:
       runtime:
-        - ${{package.name}}=${{package.full-version}}
+        # keymaps, BIOS/option ROMs; not ${{package.name}} itself, which
+        # depends on both emulators and so would install the other arch
+        - ${{package.name}}-data=${{package.full-version}}
+        # used to come with ${{package.name}}: qemu has no --runstatedir
+        - merged-varrun
+        # name the provider of so:libslirp.so.0: qemu 11.0.0-r0..11.0.3-r0
+        # vendored libslirp and still provide it, and without the old
+        # ${{package.name}}=<version> pin apko picks such an old qemu
+        # (both emulators, conflicting files) over libslirp
+        - libslirp
         - ${{package.name}}-ipxe
         - ${{package.name}}-edk2-x86_64
         # modules must match the exact build they were compiled with
@@ -296,6 +333,16 @@ subpackages:
           packages:
             - curl
       pipeline:
+        - name: "does not install the aarch64 emulator or its firmware"
+          runs: |
+            set -euo pipefail
+            for f in /usr/bin/qemu-system-aarch64 /usr/share/qemu/edk2-aarch64-code.fd; do
+              if [ -e "$f" ]; then
+                echo "FAIL: $f is installed with qemu-system-x86_64"
+                exit 1
+              fi
+            done
+            echo "PASS: qemu-system-x86_64 alone does not pull aarch64"
         - uses: test/tw/ver-check
           with:
             bins: qemu-system-x86_64
@@ -347,7 +394,24 @@ subpackages:
 
           # i386 vars are same as format as x86_64, but this is easier for consumer.
           cp "${{targets.destdir}}"/usr/share/qemu/edk2-i386-vars.fd "${{targets.subpkgdir}}"/usr/share/qemu/edk2-x86_64-vars.fd
+
+          # the i386 firmware too: libvirt runs i686 guests with
+          # qemu-system-x86_64, and the x86_64 descriptors name edk2-i386-vars.fd
+          for f in edk2-i386-code.fd edk2-i386-secure-code.fd edk2-i386-vars.fd; do
+            mv "${{targets.destdir}}"/usr/share/qemu/$f "${{targets.subpkgdir}}"/usr/share/qemu/
+          done
+          # the descriptors live with the firmware they name, so installing
+          # this package alone gives libvirt working UEFI auto-selection
+          mkdir -p "${{targets.subpkgdir}}"/usr/share/qemu/firmware
+          for d in 50-edk2-i386-secure 50-edk2-x86_64-secure 60-edk2-i386 60-edk2-x86_64; do
+            mv "${{targets.destdir}}"/usr/share/qemu/firmware/$d.json "${{targets.subpkgdir}}"/usr/share/qemu/firmware/
+          done
     test:
+      environment:
+        contents:
+          packages:
+            - jq
+            - ${{package.name}}-system-x86_64
       pipeline:
         - uses: test/tw/contains-files
           with:
@@ -355,12 +419,61 @@ subpackages:
               /usr/share/qemu/edk2-x86_64-code.fd
               /usr/share/qemu/edk2-x86_64-secure-code.fd
               /usr/share/qemu/edk2-x86_64-vars.fd
+              /usr/share/qemu/edk2-i386-code.fd
+              /usr/share/qemu/edk2-i386-secure-code.fd
+              /usr/share/qemu/edk2-i386-vars.fd
+              /usr/share/qemu/firmware/50-edk2-i386-secure.json
+              /usr/share/qemu/firmware/50-edk2-x86_64-secure.json
+              /usr/share/qemu/firmware/60-edk2-i386.json
+              /usr/share/qemu/firmware/60-edk2-x86_64.json
+        - name: "every installed firmware descriptor resolves"
+          runs: |
+            set -euo pipefail
+            # libvirt picks UEFI firmware from these; a descriptor naming a
+            # missing file breaks <os firmware='efi'> auto-selection
+            n=0
+            for d in /usr/share/qemu/firmware/*.json; do
+              for k in executable nvram-template; do
+                f=$(jq -r ".mapping[\"$k\"].filename" "$d")
+                [ -f "$f" ] || { echo "FAIL: $d: $k $f missing"; exit 1; }
+              done
+              n=$((n+1))
+            done
+            [ "$n" -eq 4 ] || { echo "FAIL: expected 4 descriptors, found $n"; exit 1; }
+            echo "PASS: $n descriptors resolve"
+        - name: "OVMF from the x86_64 descriptor boots to the UEFI boot manager"
+          runs: |
+            set -euo pipefail
+            d=/usr/share/qemu/firmware/60-edk2-x86_64.json
+            code=$(jq -r '.mapping.executable.filename' $d)
+            cp "$(jq -r '.mapping["nvram-template"].filename' $d)" vars.fd
+            timeout 300 qemu-system-x86_64 -machine q35 -m 256M -nodefaults \
+              -display none -serial file:ovmf.log -no-reboot \
+              -drive if=pflash,format=raw,readonly=on,file="$code" \
+              -drive if=pflash,format=raw,file=vars.fd &
+            pid=$!
+            for i in $(seq 1 290); do
+              grep -qa "BdsDxe" ovmf.log 2>/dev/null && break
+              sleep 1
+            done
+            kill $pid 2>/dev/null || true
+            grep -qa "BdsDxe" ovmf.log || { echo "FAIL: no UEFI boot manager output"; cat ovmf.log; exit 1; }
+            echo "PASS: OVMF reached BdsDxe"
 
   - name: ${{package.name}}-system-aarch64
     description: "QEMU aarch64 system"
     dependencies:
       runtime:
-        - ${{package.name}}=${{package.full-version}}
+        # keymaps, BIOS/option ROMs; not ${{package.name}} itself, which
+        # depends on both emulators and so would install the other arch
+        - ${{package.name}}-data=${{package.full-version}}
+        # used to come with ${{package.name}}: qemu has no --runstatedir
+        - merged-varrun
+        # name the provider of so:libslirp.so.0: qemu 11.0.0-r0..11.0.3-r0
+        # vendored libslirp and still provide it, and without the old
+        # ${{package.name}}=<version> pin apko picks such an old qemu
+        # (both emulators, conflicting files) over libslirp
+        - libslirp
         - ${{package.name}}-ipxe
         - ${{package.name}}-edk2-aarch64
         # modules must match the exact build they were compiled with
@@ -376,6 +489,16 @@ subpackages:
           packages:
             - curl
       pipeline:
+        - name: "does not install the x86_64 emulator or its firmware"
+          runs: |
+            set -euo pipefail
+            for f in /usr/bin/qemu-system-x86_64 /usr/share/qemu/edk2-x86_64-code.fd; do
+              if [ -e "$f" ]; then
+                echo "FAIL: $f is installed with qemu-system-aarch64"
+                exit 1
+              fi
+            done
+            echo "PASS: qemu-system-aarch64 alone does not pull x86_64"
         - uses: test/tw/ver-check
           with:
             bins: qemu-system-aarch64
@@ -421,15 +544,65 @@ subpackages:
           mkdir -p "${{targets.subpkgdir}}"/usr/share/qemu
           mv "${{targets.destdir}}"/usr/share/qemu/edk2-aarch64-code.fd "${{targets.subpkgdir}}"/usr/share/qemu/
 
-          # arm vars are same as format as aarch64, but this is easier for consumer.
-          cp "${{targets.destdir}}"/usr/share/qemu/edk2-arm-vars.fd "${{targets.subpkgdir}}"/usr/share/qemu/edk2-aarch64-vars.fd
+          # arm vars are same as format as aarch64; the 32-bit arm firmware
+          # itself is not shipped (no qemu-system-arm is built), so take the
+          # vars template under its aarch64 name instead of copying it
+          mv "${{targets.destdir}}"/usr/share/qemu/edk2-arm-vars.fd "${{targets.subpkgdir}}"/usr/share/qemu/edk2-aarch64-vars.fd
+
+          # the descriptor lives with the firmware it names; upstream points
+          # its nvram-template at edk2-arm-vars.fd, which is not shipped
+          mkdir -p "${{targets.subpkgdir}}"/usr/share/qemu/firmware
+          sed 's|/usr/share/qemu/edk2-arm-vars.fd|/usr/share/qemu/edk2-aarch64-vars.fd|' \
+            "${{targets.destdir}}"/usr/share/qemu/firmware/60-edk2-aarch64.json \
+            > "${{targets.subpkgdir}}"/usr/share/qemu/firmware/60-edk2-aarch64.json
+          rm "${{targets.destdir}}"/usr/share/qemu/firmware/60-edk2-aarch64.json
+          grep -q edk2-aarch64-vars.fd "${{targets.subpkgdir}}"/usr/share/qemu/firmware/60-edk2-aarch64.json
     test:
+      environment:
+        contents:
+          packages:
+            - jq
+            - ${{package.name}}-system-aarch64
       pipeline:
         - uses: test/tw/contains-files
           with:
             files: |
               /usr/share/qemu/edk2-aarch64-code.fd
               /usr/share/qemu/edk2-aarch64-vars.fd
+              /usr/share/qemu/firmware/60-edk2-aarch64.json
+        - name: "every installed firmware descriptor resolves"
+          runs: |
+            set -euo pipefail
+            # libvirt picks UEFI firmware from these; a descriptor naming a
+            # missing file breaks <os firmware='efi'> auto-selection
+            n=0
+            for d in /usr/share/qemu/firmware/*.json; do
+              for k in executable nvram-template; do
+                f=$(jq -r ".mapping[\"$k\"].filename" "$d")
+                [ -f "$f" ] || { echo "FAIL: $d: $k $f missing"; exit 1; }
+              done
+              n=$((n+1))
+            done
+            [ "$n" -eq 1 ] || { echo "FAIL: expected 1 descriptors, found $n"; exit 1; }
+            echo "PASS: $n descriptors resolve"
+        - name: "edk2 from the aarch64 descriptor boots to the UEFI boot manager"
+          runs: |
+            set -euo pipefail
+            d=/usr/share/qemu/firmware/60-edk2-aarch64.json
+            code=$(jq -r '.mapping.executable.filename' $d)
+            cp "$(jq -r '.mapping["nvram-template"].filename' $d)" vars.fd
+            timeout 300 qemu-system-aarch64 -machine virt -cpu max -m 512M -nodefaults \
+              -display none -serial file:edk2.log -no-reboot \
+              -drive if=pflash,format=raw,readonly=on,file="$code" \
+              -drive if=pflash,format=raw,file=vars.fd &
+            pid=$!
+            for i in $(seq 1 290); do
+              grep -qa "BdsDxe" edk2.log 2>/dev/null && break
+              sleep 1
+            done
+            kill $pid 2>/dev/null || true
+            grep -qa "BdsDxe" edk2.log || { echo "FAIL: no UEFI boot manager output"; cat edk2.log; exit 1; }
+            echo "PASS: edk2 aarch64 reached BdsDxe"
 
   - name: ${{package.name}}-modules-spice
     description: "QEMU SPICE display and USB redirection modules"
@@ -572,6 +745,120 @@ subpackages:
             fi
             echo "PASS: no block-rbd.so"
 
+  # Keymaps, BIOS/option ROMs and the remaining shared blobs, used by both
+  # system emulators. Split from the main package so that each emulator can
+  # depend on it without depending on (and installing) the other emulator.
+  - name: ${{package.name}}-data
+    description: "QEMU keymaps, BIOS and option ROMs"
+    dependencies:
+      replaces:
+        # these files moved here from the main package
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          # every descriptor moved to the edk2 subpackage that owns its
+          # firmware, or was deleted with it; fail the build if one is left
+          rmdir "${{targets.destdir}}"/usr/share/qemu/firmware
+          mkdir -p "${{targets.subpkgdir}}"/usr/share
+          mv "${{targets.destdir}}"/usr/share/qemu "${{targets.subpkgdir}}"/usr/share/
+          mv "${{targets.destdir}}"/usr/share/applications "${{targets.subpkgdir}}"/usr/share/
+          mv "${{targets.destdir}}"/usr/share/icons "${{targets.subpkgdir}}"/usr/share/
+    test:
+      pipeline:
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/share/qemu/bios-256k.bin
+              /usr/share/qemu/vgabios-stdvga.bin
+              /usr/share/qemu/vgabios-qxl.bin
+              /usr/share/qemu/kvmvapic.bin
+              /usr/share/qemu/linuxboot_dma.bin
+              /usr/share/qemu/keymaps/en-us
+              /usr/share/qemu/npcm7xx_bootrom.bin
+              /usr/share/qemu/ast27x0_bootrom.bin
+        - name: "no firmware for unbuilt targets, no descriptors"
+          runs: |
+            set -euo pipefail
+            cd /usr/share/qemu
+            for f in edk2-arm-code.fd edk2-arm-vars.fd edk2-riscv-code.fd \
+                     edk2-loongarch64-code.fd openbios-ppc slof.bin s390-ccw.img \
+                     palcode-clipper hppa-firmware.img opensbi-riscv64-generic-fw_dynamic.bin \
+                     dtb firmware; do
+              if [ -e "$f" ]; then echo "FAIL: $f is shipped"; exit 1; fi
+            done
+            echo "PASS: only x86_64/aarch64 blobs"
+
+  # Host-side helpers: guest agent, persistent-reservation and MSR helpers,
+  # bridge helper, keymap/EDID generators, Windows crash-dump converter.
+  - name: ${{package.name}}-tools
+    description: "QEMU helper tools"
+    dependencies:
+      runtime:
+        # used to come with ${{package.name}}: qemu has no --runstatedir,
+        # and qemu-ga/qemu-pr-helper write under /var/run
+        - merged-varrun
+      replaces:
+        # these files moved here from the main package
+        - ${{package.name}}
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/bin "${{targets.subpkgdir}}"/usr/libexec
+          for i in elf2dmp qemu-edid qemu-ga qemu-keymap qemu-pr-helper; do
+            mv "${{targets.destdir}}"/usr/bin/$i "${{targets.subpkgdir}}"/usr/bin/
+          done
+          # qemu-vmsr-helper (RAPL MSR access) is built only for x86_64 hosts
+          if [ "${{build.arch}}" = x86_64 ]; then
+            mv "${{targets.destdir}}"/usr/bin/qemu-vmsr-helper "${{targets.subpkgdir}}"/usr/bin/
+          fi
+          mv "${{targets.destdir}}"/usr/libexec/qemu-bridge-helper "${{targets.subpkgdir}}"/usr/libexec/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/ver-check
+          with:
+            bins: qemu-ga qemu-pr-helper
+        - uses: test/tw/help-check
+          with:
+            bins: qemu-ga qemu-pr-helper
+        - uses: test/tw/help-check
+          with:
+            bins: elf2dmp
+            help-flag: ""
+        - uses: test/tw/help-check
+          with:
+            bins: qemu-keymap
+            help-flag: -h
+        - runs: |
+            set -euo pipefail
+            qemu-edid version
+            qemu-edid help
+            test -x /usr/libexec/qemu-bridge-helper
+            # built only for x86_64 hosts
+            if [ "$(uname -m)" = x86_64 ]; then
+              test -x /usr/bin/qemu-vmsr-helper
+            fi
+
+  # libfdt (from QEMU's bundled dtc) and the TCG plugin header; nothing in
+  # the runtime needs them
+  - name: ${{package.name}}-dev
+    description: "QEMU plugin header and bundled libfdt"
+    dependencies:
+      replaces:
+        # these files moved here from the main package
+        - ${{package.name}}
+    pipeline:
+      - uses: split/dev
+    test:
+      pipeline:
+        - uses: test/tw/devpackage
+        - uses: test/pkgconf
+        - uses: test/tw/contains-files
+          with:
+            files: |
+              /usr/include/qemu-plugin.h
+              /usr/include/libfdt.h
+              /usr/lib/libfdt.a
+
   - name: ${{package.name}}-user
     description: "QEMU user binaries"
     pipeline:
@@ -682,31 +969,44 @@ subpackages:
             done
 
 test:
+  environment:
+    contents:
+      packages:
+        - jq
   pipeline:
-    - uses: test/tw/ldd-check
-    - uses: test/pkgconf
-    - uses: test/tw/ver-check
-      with:
-        bins: qemu-ga qemu-pr-helper
-    - uses: test/tw/help-check
-      with:
-        bins: qemu-ga qemu-pr-helper
-    - uses: test/tw/help-check
-      with:
-        bins: elf2dmp
-        help-flag: ""
-    - uses: test/tw/help-check
-      with:
-        bins: qemu-keymap
-        help-flag: -h
+    - uses: test/tw/emptypackage
+    # the main package is a meta package; this checks that installing it
+    # still gives everything it used to (both emulators, helpers, utils,
+    # firmware with working descriptors)
     - runs: |
         set -euo pipefail
-        for i in /usr/bin/qemu-system-*; do
-          $i --help
+        for i in qemu-system-x86_64 qemu-system-aarch64; do
+          $i --help >/dev/null
           $i --version
         done
-        qemu-edid version
-        qemu-edid help
+        for i in qemu-ga qemu-pr-helper qemu-keymap qemu-edid elf2dmp qemu-img; do
+          command -v $i
+        done
+        # built only for x86_64 hosts
+        if [ "$(uname -m)" = x86_64 ]; then
+          command -v qemu-vmsr-helper
+        fi
+        test -x /usr/libexec/qemu-bridge-helper
+    - name: "every installed firmware descriptor resolves"
+      runs: |
+        set -euo pipefail
+        # libvirt picks UEFI firmware from these; a descriptor naming a
+        # missing file breaks <os firmware='efi'> auto-selection
+        n=0
+        for d in /usr/share/qemu/firmware/*.json; do
+          for k in executable nvram-template; do
+            f=$(jq -r ".mapping[\"$k\"].filename" "$d")
+            [ -f "$f" ] || { echo "FAIL: $d: $k $f missing"; exit 1; }
+          done
+          n=$((n+1))
+        done
+        [ "$n" -eq 5 ] || { echo "FAIL: expected 5 descriptors, found $n"; exit 1; }
+        echo "PASS: $n descriptors resolve"
 
 update:
   enabled: true

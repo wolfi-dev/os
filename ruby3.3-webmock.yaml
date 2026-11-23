@@ -1,0 +1,199 @@
+package:
+  name: ruby3.3-webmock
+  version: "3.38.0"
+  epoch: 0
+  description: Library for stubbing and setting expectations on HTTP requests in Ruby tests
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - ruby${{vars.rubyMM}}-addressable
+      - ruby${{vars.rubyMM}}-crack
+      - ruby${{vars.rubyMM}}-hashdiff
+      - ruby-${{vars.rubyMM}}
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - glibc-${{vars.glibc-version}}-dev
+      - ruby-${{vars.rubyMM}}
+      - ruby-${{vars.rubyMM}}-dev
+
+vars:
+  gem: webmock
+  glibc-version: "2.44"
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^ruby(\d\.\d+)-.*
+    replace: $1
+    to: rubyMM
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/bblimke/webmock
+      tag: v${{package.version}}
+      expected-commit: eacd7cabde04efbb302c48d00c317edfa9111f6c
+
+  - uses: ruby/build
+    with:
+      gem: ${{vars.gem}}
+
+  - uses: ruby/install
+    with:
+      gem: ${{vars.gem}}
+      version: ${{package.version}}
+
+  - uses: ruby/clean
+
+test:
+  pipeline:
+    - uses: test/tw/gem-check
+    - uses: test/tw/gem-installed
+    # webmock installs no executable, so test/tw/ver-check has no binary to run;
+    # instead the loaded library constant must agree with the installed gemspec.
+    - name: WebMock::VERSION matches the installed gemspec
+      runs: |
+        ruby -e '
+          require "webmock"
+          spec = Gem.loaded_specs.fetch("webmock")
+          raise "loaded #{spec.full_gem_path}" unless $LOADED_FEATURES.any? { |f| f.start_with?(spec.full_gem_path) }
+          raise "VERSION #{WebMock::VERSION} != gemspec #{spec.version}" unless WebMock::VERSION == spec.version.to_s
+          puts "webmock #{WebMock::VERSION}"
+        ' | grep -E "^webmock [0-9]+\.[0-9]+\.[0-9]+"
+    - name: Stub Net::HTTP requests and match on method, headers and body
+      runs: |
+        ruby <<'EOF'
+        require "webmock"
+        require "net/http"
+        require "json"
+        include WebMock::API
+        WebMock.enable!
+
+        stub_request(:get, "http://api.example.test/items/1")
+          .with(headers: { "Accept" => "application/json" })
+          .to_return(status: 200, body: '{"id":1,"name":"widget"}',
+                     headers: { "Content-Type" => "application/json" })
+
+        uri = URI("http://api.example.test/items/1")
+        req = Net::HTTP::Get.new(uri, "Accept" => "application/json")
+        res = Net::HTTP.start(uri.host, uri.port) { |h| h.request(req) }
+        raise "status #{res.code}" unless res.code == "200"
+        raise "content-type #{res['Content-Type']}" unless res["Content-Type"] == "application/json"
+        raise "body #{res.body}" unless JSON.parse(res.body)["name"] == "widget"
+
+        stub_request(:post, "http://api.example.test/items")
+          .with(body: { "name" => "gadget" })
+          .to_return(status: 201, body: "created")
+        post = Net::HTTP.post(URI("http://api.example.test/items"),
+                              '{"name":"gadget"}', "Content-Type" => "application/json")
+        raise "post status #{post.code}" unless post.code == "201"
+        raise "post body #{post.body}" unless post.body == "created"
+
+        # A POST whose body does not match the stub must not be served by it.
+        begin
+          Net::HTTP.post(URI("http://api.example.test/items"),
+                         '{"name":"other"}', "Content-Type" => "application/json")
+          raise "mismatched body was served by the stub"
+        rescue WebMock::NetConnectNotAllowedError => e
+          raise "unexpected message: #{e.message}" unless e.message.include?("Unregistered request")
+        end
+
+        registry = WebMock::RequestRegistry.instance
+        get_count = registry.times_executed(a_request(:get, "http://api.example.test/items/1"))
+        raise "GET executed #{get_count} times" unless get_count == 1
+        post_count = registry.times_executed(
+          a_request(:post, "http://api.example.test/items").with(body: { "name" => "gadget" }))
+        raise "POST executed #{post_count} times" unless post_count == 1
+
+        WebMock.reset!
+        after = registry.times_executed(a_request(:get, "http://api.example.test/items/1"))
+        raise "registry not reset" unless after == 0
+        puts "stubbing OK"
+        EOF
+    - name: URI templates, regex matching, errors and timeouts
+      runs: |
+        ruby <<'EOF'
+        require "webmock"
+        require "net/http"
+        require "addressable/template"
+        include WebMock::API
+        WebMock.enable!
+
+        stub_request(:get, Addressable::Template.new("http://tmpl.example.test/users/{id}"))
+          .to_return(body: "user")
+        raise "template" unless Net::HTTP.get(URI("http://tmpl.example.test/users/42")) == "user"
+
+        stub_request(:any, /regex\.example\.test/).to_return(body: "regex")
+        raise "regex" unless Net::HTTP.get(URI("http://regex.example.test/anything")) == "regex"
+
+        stub_request(:get, "http://boom.example.test/").to_raise(Errno::ECONNREFUSED)
+        begin
+          Net::HTTP.get(URI("http://boom.example.test/"))
+          raise "to_raise did not raise"
+        rescue Errno::ECONNREFUSED
+        end
+
+        stub_request(:get, "http://slow.example.test/").to_timeout
+        begin
+          Net::HTTP.get(URI("http://slow.example.test/"))
+          raise "to_timeout did not time out"
+        rescue Net::OpenTimeout
+        end
+
+        stub_request(:get, "http://seq.example.test/")
+          .to_return({ body: "first" }, { body: "second" })
+        bodies = 2.times.map { Net::HTTP.get(URI("http://seq.example.test/")) }
+        raise "sequence #{bodies.inspect}" unless bodies == %w[first second]
+        puts "matchers OK"
+        EOF
+    - name: Real connections are blocked, localhost can be allowed
+      runs: |
+        ruby <<'EOF'
+        require "webmock"
+        require "net/http"
+        require "socket"
+        include WebMock::API
+        WebMock.enable!
+        WebMock.disable_net_connect!
+
+        # No connection is attempted, so this needs no network egress.
+        begin
+          Net::HTTP.get(URI("http://unstubbed.example.test/path"))
+          raise "unstubbed request was not blocked"
+        rescue WebMock::NetConnectNotAllowedError => e
+          raise "unexpected message: #{e.message}" unless e.message.include?("Real HTTP connections are disabled")
+          raise "missing stub hint" unless e.message.include?("stub_request(:get, \"http://unstubbed.example.test/path\")")
+        end
+
+        # Minimal loopback HTTP server to prove allow_localhost lets a real request through.
+        server = TCPServer.new("127.0.0.1", 0)
+        port = server.addr[1]
+        Thread.new do
+          client = server.accept
+          while (line = client.gets) && line != "\r\n"; end
+          client.write "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nreal"
+          client.close
+        end
+
+        begin
+          Net::HTTP.get(URI("http://127.0.0.1:#{port}/"))
+          raise "localhost request was not blocked"
+        rescue WebMock::NetConnectNotAllowedError
+        end
+
+        WebMock.disable_net_connect!(allow_localhost: true)
+        body = Net::HTTP.get(URI("http://127.0.0.1:#{port}/"))
+        raise "real body #{body.inspect}" unless body == "real"
+        puts "net connect OK"
+        EOF
+
+update:
+  enabled: true
+  github:
+    identifier: bblimke/webmock
+    strip-prefix: v
+    use-tag: true

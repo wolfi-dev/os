@@ -1,7 +1,7 @@
 package:
   name: dotnet-sdk-11.0.1
   version: "11.0.100"
-  epoch: 1
+  epoch: 3
   description: ".NET SDK ${{package.version}}"
   copyright:
     - license: MIT
@@ -54,12 +54,11 @@ environment:
       # -artifacts subpackage, the previously source-built packages under
       # /usr/share/dotnet/artifacts, which --with-sdk and --with-packages
       # consume. The dotnet-11 packages supply the host, the runtimes and the
-      # targeting packs that SDK runs on. They reach the product too: while
-      # they carry the runtime version being built, the SDK's NativeAOT tools
-      # are linked against their NativeAOT runtime pack (see the user-jwts
-      # test). Every one is pinned (vars.bootstrap-*-version): the SDK's own
-      # dependencies on them are unversioned, so any one left floating pulls
-      # the newest 11.0.x runtime in.
+      # targeting packs that SDK runs on. Their runtime and host packs of the
+      # version being built would reach the product, so the build step
+      # removes them (see there). Every one is pinned (vars.bootstrap-*-version):
+      # the SDK's own dependencies on them are unversioned, so any one left
+      # floating pulls the newest 11.0.x runtime in.
       - ${{package.name}}-artifacts=${{vars.bootstrap-sdk-version}}
       - ${{package.name}}=${{vars.bootstrap-sdk-version}}
       - aspnet-${{vars.major-version}}-runtime=${{vars.bootstrap-runtime-version}}
@@ -114,6 +113,27 @@ pipeline:
           sys.exit(f"release.json is for {m['tag']} at {m['sourceVersion']}, not {tag} at {head}")
       EOF
 
+  # dotnet-11's patches, copied from os/dotnet-11/ unchanged: keep the two
+  # copies identical. The SDK's two NativeAOT tools are linked against the
+  # NativeAOT runtime pack this build makes, so they carry this build's
+  # runtime code, and a patch that only dotnet-11 has does not reach them.
+  # With 0001, 0002 and DistroAgnosticOpenSsl (below), that pack loads OpenSSL
+  # the way the dotnet-11 runtime does: through the dlopen shim, which prefers
+  # libssl.so.4 and honours DOTNET_OPENSSL_VERSION_OVERRIDE (the -ossl35
+  # images document it). With 0003, its default PKCS#12 export uses AES-256
+  # instead of Triple DES, which Chainguard's OpenSSL does not offer by
+  # default: `dotnet dev-certs https` (in libaspnetcoretools.so) saves its
+  # certificate through that export. Not git am, as in dotnet-11: the SDK
+  # records the commit it is built from (sdk/.version, every assembly's
+  # informational version), and a commit made here exists nowhere upstream
+  # and changes with every build.
+  - uses: patch
+    with:
+      patches: |
+        0001-Prefer-OpenSSL-4-over-OpenSSL-3-in-the-portable-Open.patch
+        0002-Add-DistroAgnosticOpenSsl-option-to-build-the-runtim.patch
+        0003-Export-PKCS-12-with-AES-256-instead-of-3DES-by-defau.patch
+
   - runs: |
       if [ ${{build.arch}} = "aarch64" ]; then
         # Dotnet does not have support for PAC/BTI which Axion uses
@@ -140,10 +160,38 @@ pipeline:
       export XDG_RUNTIME_DIR=/tmp/xdg-runtime
       mkdir -m 0700 -p "$XDG_RUNTIME_DIR"
 
+      # The pinned dotnet-11-targeting-pack and aspnet-11-targeting-pack
+      # install the bootstrap runtime's packs under /${{vars.prefix}}/packs,
+      # and the SDK takes a pack from there when it has the version asked
+      # for. So whenever the bootstrap carries the version this tree builds
+      # (every rebuild at the same version, and every build after the pins
+      # move to the tree's version), the SDK's NativeAOT tools
+      # (libdotnet-aot.so, libaspnetcoretools.so) would be linked against
+      # dotnet-11's NativeAOT runtime pack instead of the one this build
+      # makes, and this recipe's patches would not reach them. Remove the
+      # runtime and host packs of the versions this tag builds (release.json,
+      # checked above, names them): the SDK then restores them, and the VMR
+      # takes a package this build makes from this build's output only. The
+      # reference packs stay: they carry reference assemblies, not the
+      # runtime's code, and the bootstrap SDK reads the prune package data of
+      # its own runtime version from them (it fails with NETSDK1226
+      # without). Packs of other versions stay too.
+      runtime_version=$(python3 -c 'import json; print(json.load(open("release.json"))["runtimeVersion"])')
+      aspnetcore_version=$(python3 -c 'import json; print(json.load(open("release.json"))["aspNetCoreVersion"])')
+      for d in /${{vars.prefix}}/packs/Microsoft.NETCore.App.Runtime.*/"$runtime_version" \
+          /${{vars.prefix}}/packs/Microsoft.NETCore.App.Host.*/"$runtime_version" \
+          /${{vars.prefix}}/packs/Microsoft.AspNetCore.App.Runtime.*/"$aspnetcore_version"; do
+        if [ -d "$d" ]; then
+          echo "Removing the bootstrap's $d: this build makes that version"
+          rm -rf "$d"
+        fi
+      done
+
       # Build .NET from the bootstrap SDK and its artifacts, with the tag's
       # official build id (build.sh refuses --release-manifest in a git
       # checkout). System libraries replace every compression library the
-      # runtime vendors (zstd is new in .NET 11).
+      # runtime vendors (zstd is new in .NET 11). For DistroAgnosticOpenSsl,
+      # see the patch step above.
       official_build_id=$(python3 -c 'import json; print(json.load(open("release.json"))["officialBuildId"])')
       ./build.sh \
         --with-sdk /${{vars.prefix}} \
@@ -157,6 +205,7 @@ pipeline:
         /p:MinimalConsoleLogOutput=true \
         /p:SkipPortableRuntimeBuild=true \
         /p:UseSystemLibs=+brotli+rapidjson+zlib+libunwind+zstd \
+        /p:DistroAgnosticOpenSsl=true \
         /p:PublishReadyToRunCrossgen2ExtraArgs="--parallelism=1 --instruction-set=base"
 
       mkdir -p ${{targets.contextdir}}/${{vars.prefix}}
@@ -238,11 +287,16 @@ test:
   environment:
     contents:
       packages:
+        - binutils # readelf, for the NativeAOT tools' OpenSSL binding
         # The host by name, as dotnet-sdk-10.0.4 does: a test environment that
         # reaches `dotnet` only through the runtime subpackages stops resolving
         # once a newer host is in the index (dotnet-sdk-10.0.1's did when
         # dotnet-11 appeared, SUB3-27).
         - dotnet-${{vars.major-version}}
+        # OpenSSL 3 next to OpenSSL 4, as in the -ossl35 images, for the
+        # DOTNET_OPENSSL_VERSION_OVERRIDE step.
+        - libssl3
+        - openssl-${{vars.openssl-version}} # the openssl CLI reads dev-certs' PKCS#12 export back
   pipeline:
     - uses: test/tw/ldd-check
     - name: Bootstrap-bundled host pack alignment
@@ -345,19 +399,128 @@ test:
       runs: |
         # dotnet-user-jwts is one of the SDK's ahead-of-time compiled tools
         # (libaspnetcoretools.so; the CLI's libdotnet-aot.so is the other).
-        # When the bootstrap carries the runtime version being built, the SDK
-        # build links them against the bootstrap's NativeAOT runtime pack
-        # (dotnet-${{vars.major-version}}-targeting-pack), not the one it has
-        # just built, so they bind OpenSSL the way that pack does: through the
-        # runtime's dlopen shim instead of a link to libssl. Every dotnet
-        # command loads libdotnet-aot.so, but no other test runs a tool from
-        # libaspnetcoretools.so. Signing a token (HMAC-SHA256) takes it
-        # through OpenSSL. grep's output is discarded: the token must stay out
-        # of the log, where the build system's scrubber redacts a JWT as a
-        # secret and reports the live log as degraded.
+        # Every dotnet command loads libdotnet-aot.so; the tools of
+        # libaspnetcoretools.so run only here, in the dev-certs step and in
+        # the libssl step below.
+        # Signing a token (HMAC-SHA256) takes it through OpenSSL. grep's output
+        # is discarded: the token must stay out of the log, where the build
+        # system's scrubber redacts a JWT as a secret and reports the live log
+        # as degraded.
         dotnet new web -o JwtApp --force
         dotnet user-jwts create --project JwtApp -o token |
           grep -E '^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' >/dev/null
+    - name: dotnet dev-certs https saves, checks and exports its certificate
+      runs: |
+        # dotnet-dev-certs is another tool of libaspnetcoretools.so. It saves
+        # a new certificate by exporting it with X509ContentType.Pkcs12 and
+        # loading the result into the X509Store, and -ep exports it the same
+        # way. That export is runtime code compiled into the tool, so the
+        # installed dotnet-${{vars.major-version}} runtime does not decide
+        # what it writes: this recipe's patch 0003 does. With the upstream
+        # default, Triple DES, both commands fail with error:0308010C
+        # (unsupported) unless CHAINGUARD_LEGACY_ENABLE_DES=1, so the variable
+        # must not be set here. The SDK's first run, in the steps above, may
+        # already have created a certificate: remove it, so that dev-certs
+        # creates and saves one here. The same step is in dotnet-11, for the
+        # tool that dotnet-11-sdk ships.
+        unset CHAINGUARD_LEGACY_ENABLE_DES
+        dotnet dev-certs https --clean
+        if ! dotnet dev-certs https --verbose > dev-certs.txt 2>&1; then
+          cat dev-certs.txt
+          exit 1
+        fi
+        cat dev-certs.txt
+        grep -F 'Finished saving certificate to the store.' dev-certs.txt
+        dotnet dev-certs https --check
+        dotnet dev-certs https -ep dev.pfx -p pw
+        openssl pkcs12 -info -noout -in dev.pfx -passin pass:pw > dev.txt 2>&1
+        cat dev.txt
+        grep -F 'Shrouded Keybag: PBES2, PBKDF2, AES-256-CBC, Iteration 2000, PRF hmacWithSHA256' dev.txt
+    - name: The NativeAOT tools carry this recipe's OpenSSL shim
+      runs: |
+        # Each NativeAOT-compiled file carries the crypto shim of the
+        # NativeAOT runtime pack it was linked against. The build removes the
+        # bootstrap's runtime packs of the version it makes and builds its own
+        # with DistroAgnosticOpenSsl, so each file must load OpenSSL through
+        # the dlopen shim (no DT_NEEDED on libssl or libcrypto), and its shim
+        # must have been compiled by this recipe (source paths under
+        # /home/build), not by dotnet-${{vars.major-version}}'s (under
+        # /usr/src/dotnet-${{vars.major-version}}, its -ffile-prefix-map). The
+        # paths do not tell this build from an earlier build of this package:
+        # once the pins name a revision built with the shim, the bootstrap's
+        # -artifacts pack has the same marks. What keeps that pack out is the
+        # VMR, which takes a package this build makes from this build's output
+        # only.
+        sdk=/usr/share/dotnet/sdk/${{package.version}}
+        for f in "$sdk"/libdotnet-aot.so "$sdk"/DotnetTools/aspnetcoretools/*/tools/any/*/libaspnetcoretools.so; do
+          if [ ! -f "$f" ]; then
+            echo "missing: $f"
+            exit 1
+          fi
+          echo "$f:"
+          readelf -d "$f" > dynamic.txt
+          if ! grep -F '(NEEDED)' dynamic.txt; then
+            echo "readelf found no DT_NEEDED entries in $f"
+            exit 1
+          fi
+          if grep -E '\[lib(ssl|crypto)\.so' dynamic.txt; then
+            echo "$f links OpenSSL instead of loading it through the shim"
+            exit 1
+          fi
+          if ! n=$(grep -cF /home/build/src/runtime/src/native/libs/System.Security.Cryptography.Native/ "$f"); then
+            echo "$f carries no crypto shim compiled by this recipe"
+            exit 1
+          fi
+          echo "crypto shim source paths under /home/build: $n"
+          if grep -qF /usr/src/dotnet-${{vars.major-version}}/ "$f"; then
+            echo "$f carries dotnet-${{vars.major-version}}'s crypto shim, not this build's"
+            exit 1
+          fi
+        done
+    - name: The NativeAOT tools choose libssl as the runtime does
+      runs: |
+        # The shim in the NativeAOT tools picks libssl the way the
+        # dotnet-${{vars.major-version}} runtime's does. libssl3 is installed
+        # next to OpenSSL 4 here, as in the -ossl35 images. With
+        # DOTNET_OPENSSL_VERSION_OVERRIDE=3 or 4, which those images document,
+        # the processes that `dotnet user-jwts create` runs must load that
+        # libssl and never the other. Without the variable they must load
+        # libssl.so.4: dotnet-${{vars.major-version}}'s patch 0001 (upstream
+        # 11.0 prefers libssl.so.3). LD_DEBUG=libs lists the libraries each
+        # process initialises; each check asks for at least one process with
+        # the expected libssl, and none with the other. The token stays out of
+        # the log, as in the token step above: grep -c prints only a count.
+        dotnet new web -o OverrideApp --force
+        # check <the variable's value, empty to leave it unset> <N of the
+        # libssl.so.N that must load> <N of the one that must not>
+        check() {
+          if [ -n "$1" ]; then
+            export DOTNET_OPENSSL_VERSION_OVERRIDE="$1"
+          else
+            unset DOTNET_OPENSSL_VERSION_OVERRIDE
+          fi
+          what="DOTNET_OPENSSL_VERSION_OVERRIDE=${1:-(unset)}"
+          if ! LD_DEBUG=libs dotnet user-jwts create --project OverrideApp -o token > token.txt 2> ld.txt; then
+            sed -n '/^ *[0-9][0-9]*:/!p' ld.txt
+            echo "$what: dotnet user-jwts create failed"
+            exit 1
+          fi
+          if ! grep -cE '^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' token.txt; then
+            echo "$what: no token from dotnet user-jwts create"
+            exit 1
+          fi
+          if ! grep -E "calling init: .*/libssl\.so\.$2\$" ld.txt; then
+            echo "$what: no process loaded libssl.so.$2"
+            exit 1
+          fi
+          if grep -E "calling init: .*/libssl\.so\.$3\$" ld.txt; then
+            echo "$what: a process loaded libssl.so.$3"
+            exit 1
+          fi
+        }
+        check 3 3 4
+        check 4 4 3
+        check "" 4 3
 
 update:
   enabled: true

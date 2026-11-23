@@ -1,0 +1,230 @@
+package:
+  name: cadical
+  version: "3.1.0"
+  epoch: 1 # move from enterprise-packages to os
+  description: CaDiCaL simplified satisfiability solver
+  copyright:
+    - license: MIT
+
+vars:
+  glibc-version: "2.44"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - glibc-${{vars.glibc-version}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/arminbiere/cadical
+      tag: rel-${{package.version}}
+      expected-commit: 6b3d70b9ce00ecbce3f829bab76d185f0e92618c
+
+  - name: Configure
+    runs: |
+      # configure is upstream's own script, not autoconf: it writes
+      # build/makefile, probes for closefrom, unlocked stdio, and flexible
+      # array members, and adds -O3. There is no prefix and no install target.
+      ./configure
+
+  - name: Build
+    runs: |
+      make -C build -j"$(nproc)"
+
+  - name: Install
+    runs: |
+      # cadical is the solver; mobical is its model-based API tester.
+      install -Dm755 build/cadical build/mobical -t "${{targets.destdir}}/usr/bin"
+      install -Dm644 build/libcadical.a -t "${{targets.destdir}}/usr/lib"
+      install -Dm644 src/cadical.hpp src/ccadical.h src/ipasir.h -t "${{targets.destdir}}/usr/include"
+      install -Dm644 LICENSE -t "${{targets.destdir}}/usr/share/licenses/${{package.name}}"
+
+  - uses: upstream-tests/make-check
+    with:
+      dir: build
+      target: test
+      harness: custom
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-dev
+    description: CaDiCaL headers and static library for the C++, C, and IPASIR interfaces
+    pipeline:
+      - uses: split/dev
+    test:
+      environment:
+        contents:
+          packages:
+            - build-base
+            - glibc-${{vars.glibc-version}}-dev
+      pipeline:
+        - name: Link a C++ program against libcadical
+          runs: |
+            mkdir -p /tmp/dev && cd /tmp/dev
+            cat > solve.cpp <<'EOT'
+            #include <cadical.hpp>
+            #include <cstdio>
+            #include <cstring>
+
+            int main() {
+              if (std::strcmp(CaDiCaL::Solver::version(), "${{package.version}}") != 0) return 2;
+              CaDiCaL::Solver s;
+              // (x1 v x2) & (-x1) forces x2.
+              s.add(1); s.add(2); s.add(0);
+              s.add(-1); s.add(0);
+              if (s.solve() != 10 || s.val(2) < 0) return 1;
+              // Adding (-x2) makes it unsatisfiable.
+              s.add(-2); s.add(0);
+              if (s.solve() != 20) return 1;
+              std::puts("ok");
+              return 0;
+            }
+            EOT
+            g++ -o solve solve.cpp -lcadical
+            ./solve | grep -qx ok
+        - name: Link a C program through the C and IPASIR interfaces
+          runs: |
+            mkdir -p /tmp/dev && cd /tmp/dev
+            cat > csolve.c <<'EOT'
+            #include <ccadical.h>
+            #include <ipasir.h>
+            #include <stdio.h>
+            #include <string.h>
+
+            int main(void) {
+              if (strstr(ccadical_signature(), "${{package.version}}") == NULL) return 2;
+              CCaDiCaL *s = ccadical_init();
+              ccadical_add(s, 1); ccadical_add(s, 0);
+              ccadical_add(s, -1); ccadical_add(s, 2); ccadical_add(s, 0);
+              if (ccadical_solve(s) != 10 || ccadical_val(s, 2) < 0) return 1;
+              ccadical_release(s);
+              void *p = ipasir_init();
+              ipasir_add(p, 1); ipasir_add(p, 0);
+              ipasir_add(p, -1); ipasir_add(p, 0);
+              if (ipasir_solve(p) != 20) return 1;
+              ipasir_release(p);
+              puts("ok");
+              return 0;
+            }
+            EOT
+            gcc -o csolve csolve.c -lcadical -lstdc++ -lm
+            ./csolve | grep -qx ok
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    # Only rel-<major>.<minor>.<patch> tags are releases. Upstream also has
+    # rel-06w (a pre-semver snapshot) and rel-X.Y.Z-rcN release candidates.
+    - -rc
+    - ^rel-[0-9]+[a-z]
+  github:
+    identifier: arminbiere/cadical
+    strip-prefix: rel-
+    tag-filter-prefix: rel-
+
+test:
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: |
+          cadical
+          mobical
+    - uses: test/tw/help-check
+      with:
+        bins: |
+          cadical
+          mobical
+        help-flag: -h
+    - name: Solve a satisfiable formula and print its model
+      runs: |
+        mkdir -p /tmp/sat && cd /tmp/sat
+        # (x1 v x2) & (-x1 v x2) & (x1 v -x2) has the single model x1 = x2 = true.
+        cat > sat.cnf <<'EOT'
+        p cnf 2 3
+        1 2 0
+        -1 2 0
+        1 -2 0
+        EOT
+        # cadical exits 10 for SAT and 20 for UNSAT.
+        status=0
+        cadical -q sat.cnf > sat.out || status=$?
+        test "${status}" -eq 10
+        grep -qx 's SATISFIABLE' sat.out
+        grep -qx 'v 1 2 0' sat.out
+    - name: Refute a formula with the flags Lean's bv_decide passes and emit an LRAT proof
+      runs: |
+        mkdir -p /tmp/unsat && cd /tmp/unsat
+        cat > unsat.cnf <<'EOT'
+        p cnf 2 4
+        1 2 0
+        -1 2 0
+        1 -2 0
+        -1 -2 0
+        EOT
+        status=0
+        cadical --lrat --binary=false --quiet --shrink=0 --unsat unsat.cnf proof.lrat > unsat.out || status=$?
+        test "${status}" -eq 20
+        grep -qx 's UNSATISFIABLE' unsat.out
+        test -s proof.lrat
+        # The final LRAT step derives the empty clause: "<id> 0 <hints> 0".
+        tail -n 1 proof.lrat | grep -Eq '^[0-9]+ 0( -?[0-9]+)+ 0$'
+        # The counterexample mode must still find models where they exist.
+        status=0
+        cadical --lrat --binary=false --quiet --shrink=0 --sat /tmp/sat/sat.cnf sat.lrat > sat.out 2>&1 || status=$?
+        test "${status}" -eq 10
+    - name: Refute a pigeonhole instance
+      runs: |
+        mkdir -p /tmp/php && cd /tmp/php
+        # Six pigeons into five holes: every pigeon gets a hole, no hole holds two.
+        pigeons=6
+        holes=5
+        var() { echo $(( ($1 - 1) * holes + $2 )); }
+        {
+          echo "p cnf $((pigeons * holes)) $((pigeons + holes * pigeons * (pigeons - 1) / 2))"
+          p=1
+          while [ "${p}" -le "${pigeons}" ]; do
+            h=1
+            line=""
+            while [ "${h}" -le "${holes}" ]; do
+              line="${line} $(var "${p}" "${h}")"
+              h=$((h + 1))
+            done
+            echo "${line# } 0"
+            p=$((p + 1))
+          done
+          h=1
+          while [ "${h}" -le "${holes}" ]; do
+            p=1
+            while [ "${p}" -lt "${pigeons}" ]; do
+              q=$((p + 1))
+              while [ "${q}" -le "${pigeons}" ]; do
+                echo "-$(var "${p}" "${h}") -$(var "${q}" "${h}") 0"
+                q=$((q + 1))
+              done
+              p=$((p + 1))
+            done
+            h=$((h + 1))
+          done
+        } > php.cnf
+        status=0
+        cadical -q php.cnf > php.out || status=$?
+        test "${status}" -eq 20
+        grep -qx 's UNSATISFIABLE' php.out
+    - name: Reject malformed input
+      runs: |
+        mkdir -p /tmp/bad && cd /tmp/bad
+        printf 'p cnf 1 1\n1 2 0\n' > bad.cnf
+        if cadical -q bad.cnf > bad.out 2>&1; then
+          echo "expected cadical to reject a literal above the declared maximum"; exit 1
+        fi
+        grep -qi 'error' bad.out
+    - name: Exercise the solver API with mobical
+      runs: |
+        mkdir -p /tmp/mobical && cd /tmp/mobical
+        # Three generated API traces starting from a fixed seed, so the run is reproducible.
+        mobical -L 3 20260920

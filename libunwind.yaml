@@ -1,7 +1,7 @@
 package:
   name: libunwind
   version: "1.8.3"
-  epoch: 9 # rebuild to publish libunwind-source
+  epoch: 10
   description: "Portable and efficient C programming interface (API) to determine the call-chain of a program"
   copyright:
     - license: MIT
@@ -29,6 +29,10 @@ pipeline:
       expected-commit: 7bda80a564cddc5b215a84509026030cf16dfd94
       cherry-picks: |
         master/b67d508a93bf1ba231c18dce3894cfee25c16e0d: Fix bad prototype for malloc() in test
+
+  - uses: patch
+    with:
+      patches: libunwind-validate-pipe-race.patch
 
   - runs: autoreconf -i
 
@@ -100,6 +104,332 @@ test:
 
         gcc $(pkg-config --cflags libunwind) test.c -o test $(pkg-config --libs libunwind)
         ./test
+    - name: Test the first unwinding of several threads at once
+      runs: |
+        tee first-use.c <<'EOF'
+        /*
+         * To check that an address is readable, libunwind 1.8 writes one byte
+         * from it into a pipe, which it opens when it checks its first address.
+         * In 1.8.0 to 1.8.3, two threads that got there at the same moment could
+         * each open the pipe and close the other's. unw_step() then failed, or
+         * SIGPIPE ended the process (libunwind/libunwind#715).
+         *
+         * The parent never unwinds, so in every child the pipe is not open yet,
+         * and the child's threads take their first unw_step() together. The
+         * race is rare where there are few CPUs, hence the number of processes.
+         * Whether few or many threads meet it more often depends on the machine,
+         * so the children take turns with 8 and 32.
+         */
+        #define UNW_LOCAL_ONLY
+        #include <libunwind.h>
+        #include <pthread.h>
+        #include <stdio.h>
+        #include <sys/wait.h>
+        #include <unistd.h>
+
+        #define PROCESSES 6000
+        #define MAX_THREADS 32
+
+        static pthread_barrier_t barrier;
+
+        static void *first_step(void *failed) {
+            unw_cursor_t cursor;
+            unw_context_t context;
+
+            unw_getcontext(&context);
+            unw_init_local(&cursor, &context);
+            pthread_barrier_wait(&barrier);
+            /* This function has a caller, so the step must find a frame. */
+            if (unw_step(&cursor) <= 0)
+                *(int *)failed = 1;
+            return NULL;
+        }
+
+        static int child(int count) {
+            pthread_t threads[MAX_THREADS];
+            int failed[MAX_THREADS] = {0};
+            int i, result = 0;
+
+            /* A child that hangs is ended by SIGALRM (signal 14). */
+            alarm(10);
+            pthread_barrier_init(&barrier, NULL, count);
+            for (i = 0; i < count; i++)
+                if (pthread_create(&threads[i], NULL, first_step, &failed[i]) != 0)
+                    return 2;
+            for (i = 0; i < count; i++) {
+                pthread_join(threads[i], NULL);
+                result |= failed[i];
+            }
+            return result;
+        }
+
+        int main() {
+            int i, status;
+
+            for (i = 0; i < PROCESSES; i++) {
+                pid_t pid = fork();
+                if (pid < 0) {
+                    perror("fork");
+                    return 1;
+                }
+                if (pid == 0)
+                    _exit(child(i % 2 ? MAX_THREADS : MAX_THREADS / 4));
+                if (waitpid(pid, &status, 0) != pid) {
+                    perror("waitpid");
+                    return 1;
+                }
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    fprintf(stderr, "process %d of %d failed in its first unw_step(): %s %d\n", i + 1, PROCESSES,
+                            WIFSIGNALED(status) ? "ended by signal" : "exit status",
+                            WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
+                    return 1;
+                }
+            }
+
+            printf("%d processes of %d or %d threads each took their first unw_step()\n", PROCESSES, MAX_THREADS / 4, MAX_THREADS);
+            return 0;
+        }
+        EOF
+
+        gcc $(pkg-config --cflags libunwind) first-use.c -o first-use $(pkg-config --libs libunwind)
+        ./first-use
+    - name: Test unwinding in a signal handler during the first unwinding
+      runs: |
+        tee first-use-signal.c <<'EOF'
+        /*
+         * unw_step() may be called in a signal handler (unw_step(3)). Here a
+         * timer signal arrives while the process takes its first unw_step(),
+         * which is when libunwind opens its pipe, and the handler takes an
+         * unw_step() of its own. A libunwind that makes the handler wait for
+         * the thread it interrupted hangs there, as one does that opens the
+         * pipe under pthread_once() with signals not blocked.
+         *
+         * The delay of the timer goes from 0 to 100 microseconds in steps of
+         * 100 nanoseconds, one value per child, so that the signal arrives at
+         * every point of that first step in some child.
+         */
+        #define UNW_LOCAL_ONLY
+        #include <libunwind.h>
+        #include <signal.h>
+        #include <stdio.h>
+        #include <string.h>
+        #include <sys/wait.h>
+        #include <time.h>
+        #include <unistd.h>
+
+        #define PROCESSES 3000
+
+        static volatile sig_atomic_t handled, handler_failed;
+
+        static void handler(int signal) {
+            unw_cursor_t cursor;
+            unw_context_t context;
+
+            unw_getcontext(&context);
+            unw_init_local(&cursor, &context);
+            if (unw_step(&cursor) < 0)
+                handler_failed = 1;
+            handled = 1;
+        }
+
+        static int child(long delay) {
+            struct sigaction action;
+            struct sigevent event;
+            struct itimerspec timeout;
+            timer_t timer;
+            unw_cursor_t cursor;
+            unw_context_t context;
+            int i, result;
+
+            /* A child that hangs is ended by SIGALRM (signal 14). */
+            alarm(10);
+            memset(&action, 0, sizeof action);
+            action.sa_handler = handler;
+            memset(&event, 0, sizeof event);
+            event.sigev_notify = SIGEV_SIGNAL;
+            event.sigev_signo = SIGUSR1;
+            if (sigaction(SIGUSR1, &action, NULL) != 0 || timer_create(CLOCK_MONOTONIC, &event, &timer) != 0)
+                return 2;
+
+            unw_getcontext(&context);
+            unw_init_local(&cursor, &context);
+            memset(&timeout, 0, sizeof timeout);
+            timeout.it_value.tv_nsec = delay;
+            if (timer_settime(timer, 0, &timeout, NULL) != 0)
+                return 2;
+            result = unw_step(&cursor);
+
+            /* The signal may arrive after the step: wait for it, one second at most. */
+            for (i = 0; i < 1000 && !handled; i++)
+                usleep(1000);
+            /* Exit status 1: this step found no frame. 3: the handler's step
+               failed. 4: the signal did not arrive. */
+            if (result <= 0)
+                return 1;
+            if (handler_failed)
+                return 3;
+            return handled ? 0 : 4;
+        }
+
+        int main() {
+            int i, status;
+
+            for (i = 0; i < PROCESSES; i++) {
+                /* A delay of 0 would switch the timer off. */
+                long delay = 1 + (i * 100L) % 100000;
+                pid_t pid = fork();
+                if (pid < 0) {
+                    perror("fork");
+                    return 1;
+                }
+                if (pid == 0)
+                    _exit(child(delay));
+                if (waitpid(pid, &status, 0) != pid) {
+                    perror("waitpid");
+                    return 1;
+                }
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    fprintf(stderr, "process %d of %d failed with a signal %ld ns into its first unw_step(): %s %d\n", i + 1, PROCESSES, delay,
+                            WIFSIGNALED(status) ? "ended by signal" : "exit status",
+                            WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
+                    return 1;
+                }
+            }
+
+            printf("%d processes unwound in a signal handler during their first unw_step()\n", PROCESSES);
+            return 0;
+        }
+        EOF
+
+        gcc $(pkg-config --cflags libunwind) first-use-signal.c -o first-use-signal $(pkg-config --libs libunwind)
+        ./first-use-signal
+    - name: Test the first unwinding after the pipe could not be opened
+      runs: |
+        tee first-use-no-descriptor.c <<'EOF'
+        /*
+         * When no descriptor is free, libunwind cannot open its pipe, and an
+         * unw_step() that needs it may fail. Once descriptors are free again,
+         * the steps that follow must work. Up to 1.8.3 the pipe counted as
+         * opened from then on, and the threads that came next raced to
+         * re-open it, as in the first test above.
+         *
+         * When the threads start, exactly two descriptors are free, which is
+         * room for one pipe: a thread that tries to open a second pipe while
+         * another thread has opened the first finds no descriptor for it. The
+         * numbers of processes and of threads are chosen as in the first test.
+         */
+        #define UNW_LOCAL_ONLY
+        #include <errno.h>
+        #include <fcntl.h>
+        #include <libunwind.h>
+        #include <pthread.h>
+        #include <stdio.h>
+        #include <sys/resource.h>
+        #include <sys/wait.h>
+        #include <unistd.h>
+
+        #define PROCESSES 3000
+        #define MAX_THREADS 32
+
+        static pthread_barrier_t barrier;
+
+        static void *first_step(void *failed) {
+            unw_cursor_t cursor;
+            unw_context_t context;
+
+            unw_getcontext(&context);
+            unw_init_local(&cursor, &context);
+            pthread_barrier_wait(&barrier);
+            if (unw_step(&cursor) <= 0)
+                *(int *)failed = 1;
+            return NULL;
+        }
+
+        static int child(int count) {
+            pthread_t threads[MAX_THREADS];
+            struct rlimit limit;
+            unw_cursor_t cursor;
+            unw_context_t context;
+            int failed[MAX_THREADS] = {0};
+            int low[2], probe[2], fd, full, i, result = 0;
+
+            /* A child that hangs is ended by SIGALRM (signal 14). */
+            alarm(10);
+            unw_getcontext(&context);
+            unw_init_local(&cursor, &context);
+
+            /* The two lowest descriptors that are free: 3 and 4, unless the
+               process inherited more than 0, 1 and 2. Exit status 2, here and
+               below: the set-up did not work. */
+            if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
+                return 2;
+            for (fd = 0, i = 0; i < 2; fd++) {
+                if ((rlim_t)fd >= limit.rlim_cur)
+                    return 2;
+                if (fcntl(fd, F_GETFD) == -1)
+                    low[i++] = fd;
+            }
+
+            /* With the limit at the first of them, nothing can be opened. */
+            limit.rlim_cur = low[0];
+            if (setrlimit(RLIMIT_NOFILE, &limit) != 0 || pipe(probe) == 0)
+                return 2;
+            /* This step cannot open the pipe. Whether it finds a frame all the
+               same depends on the architecture, so its result is not judged. */
+            unw_step(&cursor);
+
+            /* With the limit just above the second of them, one pipe can be
+               opened and nothing else. */
+            limit.rlim_cur = low[1] + 1;
+            if (setrlimit(RLIMIT_NOFILE, &limit) != 0 || pipe(probe) != 0)
+                return 2;
+            full = dup(probe[0]) == -1 && errno == EMFILE;
+            close(probe[0]);
+            close(probe[1]);
+            if (!full)
+                return 2;
+
+            pthread_barrier_init(&barrier, NULL, count);
+            for (i = 0; i < count; i++)
+                if (pthread_create(&threads[i], NULL, first_step, &failed[i]) != 0)
+                    return 2;
+            for (i = 0; i < count; i++) {
+                pthread_join(threads[i], NULL);
+                result |= failed[i];
+            }
+            return result;
+        }
+
+        int main() {
+            int i, status;
+
+            for (i = 0; i < PROCESSES; i++) {
+                pid_t pid = fork();
+                if (pid < 0) {
+                    perror("fork");
+                    return 1;
+                }
+                if (pid == 0)
+                    _exit(child(i % 2 ? MAX_THREADS : MAX_THREADS / 4));
+                if (waitpid(pid, &status, 0) != pid) {
+                    perror("waitpid");
+                    return 1;
+                }
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    fprintf(stderr, "process %d of %d failed after the pipe could not be opened: %s %d\n", i + 1, PROCESSES,
+                            WIFSIGNALED(status) ? "ended by signal" : "exit status",
+                            WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
+                    return 1;
+                }
+            }
+
+            printf("%d processes of %d or %d threads each unwound after the pipe could not be opened\n", PROCESSES, MAX_THREADS / 4, MAX_THREADS);
+            return 0;
+        }
+        EOF
+
+        gcc $(pkg-config --cflags libunwind) first-use-no-descriptor.c -o first-use-no-descriptor $(pkg-config --libs libunwind)
+        ./first-use-no-descriptor
 
 update:
   enabled: true

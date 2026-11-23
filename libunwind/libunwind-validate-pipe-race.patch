@@ -1,0 +1,79 @@
+Open libunwind's address-validation pipe under a lock.
+
+To check that an address is readable, libunwind writes one byte from it into
+a pipe. Since v1.8.0 (commit ec03043244082b8f552881ba9fb790aa49c85468,
+"Simplified address validation") it opens that pipe on first use behind an
+atomic flag. The flag only says that some thread has started to open the
+pipe. A second thread that validates an address in that window finds the flag
+set and no descriptors, takes the "re-open closed pipe" branch, and the two
+threads then close and replace each other's descriptors. A write fails, the
+address is reported invalid and unw_step() returns an error for a frame that
+is fine, or the process gets SIGPIPE (libunwind/libunwind#715). The .NET
+runtime treats the failed step as fatal (dotnet/runtime#130577, #134044).
+
+With this patch the first opening happens under a lock, and the flag is set
+only when the pipe is open. The lock is taken the way libunwind takes its
+other locks, with all signals blocked (lock_acquire()). tdep_init() does the
+same for the library's own initialisation, and 1.7 opened this pipe there. So:
+
+- A thread that needs the pipe while another thread opens it waits for that
+  thread.
+- A signal handler that unwinds cannot interrupt the thread that holds the
+  lock, so unw_step() stays safe in a signal handler, as unw_step(3) promises.
+  Opening the pipe under pthread_once() without blocking signals, as the copy
+  of libunwind inside the .NET runtime does (dotnet/runtime#97817), is not: the
+  handler would wait for the thread it interrupted.
+- When pipe2() fails because no descriptor is free, the flag stays clear and
+  the next caller tries again, under the lock.
+
+Nothing else changes. The "re-open closed pipe" branch is as it was. A child
+that is forked while another thread holds this lock inherits it locked, as it
+does libunwind's other locks.
+
+Upstream fixed the first-use race on master by giving every thread a pipe of
+its own (libunwind/libunwind#993, commit 346fefe1845c, in no release). That
+pipe is never closed, so a process leaks two descriptors for every thread
+that unwinds and exits. This patch keeps the single pipe of v1.8.3.
+
+--- a/src/mi/Gaddress_validator.c
++++ b/src/mi/Gaddress_validator.c
+@@ -38,7 +38,8 @@
+ #include <stdatomic.h>
+ 
+ 
+-static atomic_flag _unw_address_validator_initialized = ATOMIC_FLAG_INIT;
++static atomic_bool _unw_address_validator_initialized = false;
++static define_lock (_unw_address_validator_lock);
+ static int _mem_validate_pipe[2] = {-1, -1};
+ 
+ #ifdef HAVE_PIPE2
+@@ -104,9 +105,27 @@
+   int ret = -1;
+   ssize_t bytes = 0;
+ 
+-  if (unlikely (!atomic_flag_test_and_set(&_unw_address_validator_initialized)))
++  if (unlikely (!atomic_load (&_unw_address_validator_initialized)))
+     {
+-      if (_open_pipe () != 0)
++      intrmask_t saved_mask;
++      int status = 0;
++
++      /* Open the pipe under a lock, and say that it is open only when it is:
++       * a thread that needs the pipe while another thread is opening it waits
++       * for that thread instead of using descriptors that are not there yet.
++       * Like libunwind's other locks, this one is held with all signals
++       * blocked, so a signal handler that unwinds cannot interrupt the thread
++       * that holds it. If the pipe cannot be opened, the next caller tries
++       * again. */
++      lock_acquire (&_unw_address_validator_lock, saved_mask);
++      if (!atomic_load (&_unw_address_validator_initialized))
++        {
++          status = _open_pipe ();
++          if (status == 0)
++            atomic_store (&_unw_address_validator_initialized, true);
++        }
++      lock_release (&_unw_address_validator_lock, saved_mask);
++      if (status != 0)
+         {
+           return false;
+         }

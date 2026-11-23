@@ -1,8 +1,8 @@
 package:
   name: theseus-proved-port
-  version: "0.4.12"
+  version: "0.4.13"
   epoch: 0
-  description: The proved-port kit, the coverage counter (verus-count) and make targets that proved Rust ports share
+  description: The proved-port kit, the coverage counter (verus-count), the kit's Go tools and make targets that proved Rust ports share
   copyright:
     - license: Apache-2.0
   dependencies:
@@ -12,6 +12,7 @@ package:
       - make
 
 vars:
+  go-version: "1.27"
   rust-version: "1.100"
 
 environment:
@@ -23,6 +24,7 @@ environment:
       - cargo-auditable
       - git
       - glibc-2.44-dev
+      - go-${{vars.go-version}}
       - rust-${{vars.rust-version}}
 
 pipeline:
@@ -30,13 +32,42 @@ pipeline:
     with:
       repository: https://github.com/chainguard-project-theseus/proved-port
       tag: v${{package.version}}
-      expected-commit: 85c55bbe5984852106afcab9dd8332bece7763a3
+      expected-commit: 165b96767e20b23aae3b18990d2c49bbeb4747e7
 
   - uses: cargo/build
     with:
       modroot: kit/count
       output: verus-count
       opts: --locked --release
+
+  # The kit's Go tools, installed beside verus-count under the names
+  # kit/install.sh gives them: fncmp, stats, seams and calls are too
+  # generic for /usr/bin. Each module uses only the standard library.
+  # go/build/v2 takes the toolchain from the environment's
+  # go-${{vars.go-version}}.
+  - uses: go/build/v2
+    with:
+      modroot: kit/perf/codegen/fncmp
+      packages: .
+      output: proved-port-fncmp
+
+  - uses: go/build/v2
+    with:
+      modroot: kit/perf/stats
+      packages: .
+      output: proved-port-stats
+
+  - uses: go/build/v2
+    with:
+      modroot: kit/verus/seams
+      packages: .
+      output: proved-port-seams
+
+  - uses: go/build/v2
+    with:
+      modroot: kit/checks/calls
+      packages: .
+      output: proved-port-calls
 
   # The layout kit/install.sh and kit/installed-test.sh give: kit/make and
   # all of kit/templates under /usr/share/proved-port, kit/CHANGELOG.md
@@ -92,6 +123,146 @@ test:
     - name: version
       runs: |
         verus-count --version | grep -Fx "verus-count ${{package.version}}"
+    # Each Go tool exits 2 on a bad flag and prints its own usage
+    # (kit/installed-test.sh checks the same of a source install).
+    - name: the kit's Go tools
+      runs: |
+        for t in fncmp stats seams calls; do
+          test -x "/usr/bin/proved-port-$t"
+          rc=0
+          proved-port-$t -no-such-flag > "out-$t" 2>&1 || rc=$?
+          [ "$rc" = 2 ] || { cat "out-$t"; echo "proved-port-$t exited $rc, want 2"; exit 1; }
+          grep -q '^usage:' "out-$t" || { cat "out-$t"; exit 1; }
+        done
+        # Grep the saved output: the steps run under pipefail, so piping a
+        # tool that exits 2 would fail the step.
+        grep -q 'stats md5 LOG' out-stats
+        grep -q '^usage: seams ' out-seams
+        grep -q '^usage: fncmp OLD NEW' out-fncmp
+        grep -q '^usage: calls -rules RULES WORKFLOW' out-calls
+    # Each Go tool on real input, with a passing and a failing case,
+    # under coverage profiling (one window per binary).
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/proved-port-fncmp
+    - name: proved-port-fncmp compares two dumps
+      runs: |
+        mkdir -p fncmp
+        cd fncmp
+        # Two objdump dumps: f is the same, g's immediate changes (reloc-only),
+        # h's instruction changes (changed); a file that is no dump is refused.
+        printf '\nold.so:\tfile format elf64-x86-64\n\n\nDisassembly of section .text:\n\n0000000000001000 <f>:\n    1000:\tadd    %%rsi,%%rdi\n    1003:\tret\n\n0000000000001010 <g>:\n    1010:\tmov    $0x1,%%eax\n    1015:\tret\n\n0000000000001020 <h>:\n    1020:\tsub    %%rsi,%%rdi\n    1023:\tret\n' > old.txt
+        printf '\nnew.so:\tfile format elf64-x86-64\n\n\nDisassembly of section .text:\n\n0000000000002000 <f>:\n    2000:\tadd    %%rsi,%%rdi\n    2003:\tret\n\n0000000000002010 <g>:\n    2010:\tmov    $0x2,%%eax\n    2015:\tret\n\n0000000000002020 <h>:\n    2020:\txor    %%rsi,%%rdi\n    2023:\tret\n' > new.txt
+        proved-port-fncmp old.txt new.txt > diff.out
+        cat diff.out
+        grep -Fx 'functions old 3 new 3: exact 1, reloc-only 1, padding-only 0, erratum-stub 0, changed 1' diff.out
+        grep -Fx '### changed: h (2 insns) vs baseline h (2 insns)' diff.out
+        grep -Fx '   +xor %rsi,%rdi' diff.out
+        proved-port-fncmp old.txt old.txt > self.out
+        cat self.out
+        grep -Fx 'functions old 3 new 3: exact 3, reloc-only 0, padding-only 0, erratum-stub 0, changed 0' self.out
+        printf 'not a dump\n' > bad.txt
+        rc=0
+        proved-port-fncmp old.txt bad.txt > bad.out 2>&1 || rc=$?
+        cat bad.out
+        [ "$rc" = 1 ]
+        grep -F 'no functions' bad.out
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        min-coverage: 1
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/proved-port-stats
+    - name: proved-port-stats summarizes repetitions
+      runs: |
+        mkdir -p stats
+        cd stats
+        # Three rounds of two arms on one row: med takes each median, cmp
+        # marks B against A, ahead counts the rows B is below A on, and a
+        # repeated round is refused.
+        printf 'g\tr\tA\t1\t100\t50\ng\tr\tA\t2\t102\t52\ng\tr\tA\t3\t101\t51\ng\tr\tB\t1\t90\t60\ng\tr\tB\t2\t91\t61\ng\tr\tB\t3\t92\t62\n' > reps.tsv
+        proved-port-stats med reps.tsv > med.tsv
+        cat med.tsv
+        printf 'g\tr\tA\t101\t51\ng\tr\tB\t91\t61\n' > want-med.tsv
+        cmp med.tsv want-med.tsv
+        proved-port-stats cmp -t B -r A reps.tsv > cmp.out
+        cat cmp.out
+        printf 'g\tr\t-10\t-\t-9.901\t2.198\t+10\t+19.608\t3.922\tI- C+\n' > want-cmp.tsv
+        cmp cmp.out want-cmp.tsv
+        proved-port-stats ahead -pairs B:A med.tsv > ahead.out
+        cat ahead.out
+        printf 'g\tB\t1\t1\t0\n' > want-ahead.tsv
+        cmp ahead.out want-ahead.tsv
+        printf 'g\tr\tA\t1\t100\t50\n' >> reps.tsv
+        rc=0
+        proved-port-stats med reps.tsv > dup.out 2>&1 || rc=$?
+        cat dup.out
+        [ "$rc" = 1 ]
+        grep -F 'repeated group, row, arm and round' dup.out
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        min-coverage: 1
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/proved-port-seams
+    - name: proved-port-seams writes and checks a ledger
+      runs: |
+        mkdir -p seams
+        cd seams
+        # A one-file port with one external_body function: -write writes its
+        # ledger, -check passes on it, and fails once the function's contract
+        # changes under the ledger.
+        mkdir -p port/src port/verus
+        printf 'ledger\tverus/ledger\nsource\tsrc\ncommand\tproved-port-seams -write\ntool\tKani\ntool\tnone (assumption)\nassumption-tool\tnone (assumption)\ncategory\tpanic/abort\tKani\nguess\tpanic/abort\tbody=panic!\n' > port/verus/seams.rules
+        printf 'verus! {\n#[verifier::external_body]\npub fn f(x: u8) -> u8\n    ensures x == 0,\n{\n    panic!("no")\n}\n}\n' > port/src/lib.rs
+        proved-port-seams -C port -write
+        cat port/verus/ledger/src/lib.rs.md
+        grep -F 'panic/abort' port/verus/ledger/src/lib.rs.md
+        proved-port-seams -C port -check
+        proved-port-seams -C port > totals.out
+        cat totals.out
+        sed 's/x == 0/x == 1/' port/src/lib.rs > lib.rs.new
+        mv lib.rs.new port/src/lib.rs
+        rc=0
+        proved-port-seams -C port -check > stale.out 2>&1 || rc=$?
+        cat stale.out
+        [ "$rc" = 1 ]
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        min-coverage: 1
+    - uses: xcover/profile
+      with:
+        executable-path: /usr/bin/proved-port-calls
+    - name: proved-port-calls checks a resolved configuration
+      runs: |
+        mkdir -p calls
+        cd calls
+        # A resolved configuration with one check that runs `make verus` with
+        # the kit installed: a call line for it passes; a forbid line for a
+        # path its step names, and a call line for a target it does not run,
+        # fail.
+        printf '{"jobs":{"verus":{"environment":{"packages":["theseus-proved-port~0.4","make"]},"steps":[{"cmd":["make","verus"]}],"triggers":["TRIGGER_PRESUBMIT"]}}}\n' > explain.json
+        printf 'call verus verus\n' > ok.rules
+        proved-port-calls -rules ok.rules explain.json > ok.out 2>&1
+        cat ok.out
+        printf 'call verus kani\n' > missing.rules
+        rc=0
+        proved-port-calls -rules missing.rules explain.json > missing.out 2>&1 || rc=$?
+        cat missing.out
+        [ "$rc" = 1 ]
+        printf '{"jobs":{"verus":{"environment":{"packages":["theseus-proved-port~0.4","make"]},"steps":[{"cmd":["make","verus"]},{"cmd":["sh","verus/count.sh"]}],"triggers":["TRIGGER_PRESUBMIT"]}}}\n' > copy.json
+        printf 'call verus verus\nforbid verus/count.sh\n' > forbid.rules
+        rc=0
+        proved-port-calls -rules forbid.rules copy.json > forbid.out 2>&1 || rc=$?
+        cat forbid.out
+        [ "$rc" = 1 ]
+    - uses: xcover/stop
+    - uses: xcover/ensure
+      with:
+        min-coverage: 1
     - name: installed make targets, templates and KIT
       runs: |
         kit=/usr/share/proved-port

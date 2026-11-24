@@ -1,0 +1,86 @@
+From 0216672911cc18221178bdae727cd3f7c83a36e7 Mon Sep 17 00:00:00 2001
+From: Dimitri John Ledkov <dimitri.ledkov@surgut.co.uk>
+Date: Tue, 24 Nov 2026 19:17:35 +0000
+Subject: [PATCH] rsa: set OAEP digest, before padding mode with OpenSSL
+
+Given
+
+    OAEP = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+
+Pyca currently sets OAEP padding mode, then OAEP MD, and then MGF1 in
+that order for all backends.
+
+RSA OAEP RFC defaults to SHA-1 for OAEP MD, and hash in
+MGF1. BoringSSL, LibreSSL, AWS-LC and OpenSSl 1.x all require padding
+mode OAEP to be set before setting MD & MGF1 digests.
+
+OpenSSL 3.x+ has a one-shot context API to set all OAEP params in one
+call, and preffers to set MD digest, before setting the OAEP padding
+mode. Otherwise, provider does a redundant implicit SHA-1 digest
+fetch, if OAEP MD is not yet set, when OAEP mode is configured. If one
+plans on using SHA256, a redundant SHA-1 digest fetch should be fairly
+quick and harmless.
+
+Unless, you are stuck with a validated provider developed in 2025, and
+put in production in 2026, which doesn't offer SHA-1 digest. And the
+above sequence, results in failure to configure OAEP context and lots
+of sadness. This typically doesn't affect code coded for OpenSSL
+provider/param APIs, as they usually use PARAM array to set all
+security parameters in one shot. Which OpenSSL 3.x+ does in its
+preffered order.
+
+Maybe people shouldn't be using OAEP at all, and this misfeature
+should also be fixed in OpenSSL (will submit a separate a bug about
+that), but in the meantime reordering OAEP settings calls for OpenSSL
+backend would help a lot.
+
+This setting OAEP digests first ahead of OAEP padding mode for OpenSSL
+backend, in most cases will be a no-op; or will safe on redudant
+fetch; or will actually make things work with OpenSSLs configured at
+runtime with providers lacking SHA-1.
+
+I hope this patch is small enough enough / non-intrusive enough, to be
+considered for merging.
+---
+ CHANGELOG.rst               |  4 ++++
+ src/rust/src/backend/rsa.rs | 17 +++++++++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/src/rust/src/backend/rsa.rs b/src/rust/src/backend/rsa.rs
+index 3b259b4d0..56d70d815 100644
+--- a/src/rust/src/backend/rsa.rs
++++ b/src/rust/src/backend/rsa.rs
+@@ -128,6 +128,16 @@ fn setup_encryption_ctx(
+         ));
+     };
+ 
++    // LibreSSL, BoringSSL and AWS-LC reject the OAEP digests and label until
++    // the padding is OAEP. OpenSSL 3 accepts them first; there the padding is
++    // set after them, below. With OpenSSL setting digests first, can avoid
++    // implicit redundant SHA-1 fetch. And it can also prevent runtime failure
++    // when SHA-1 is blocked for compliance reasons, and SHA-2 is intended
++    #[cfg(any(
++        CRYPTOGRAPHY_IS_LIBRESSL,
++        CRYPTOGRAPHY_IS_BORINGSSL,
++        CRYPTOGRAPHY_IS_AWSLC
++    ))]
+     ctx.set_rsa_padding(padding_enum)?;
+ 
+     if padding_enum == openssl::rsa::Padding::PKCS1_OAEP {
+@@ -164,6 +174,13 @@ fn setup_encryption_ctx(
+         }
+     }
+ 
++    #[cfg(not(any(
++        CRYPTOGRAPHY_IS_LIBRESSL,
++        CRYPTOGRAPHY_IS_BORINGSSL,
++        CRYPTOGRAPHY_IS_AWSLC
++    )))]
++    ctx.set_rsa_padding(padding_enum)?;
++
+     Ok(())
+ }
+ 
+-- 
+2.53.0
+

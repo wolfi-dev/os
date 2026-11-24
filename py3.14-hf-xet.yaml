@@ -1,0 +1,136 @@
+package:
+  name: py3.14-hf-xet
+  version: "1.8.0"
+  epoch: 0
+  description: Fast transfer of large files with the Hugging Face Hub
+  copyright:
+    - license: Apache-2.0
+  resources:
+    cpu: "4"
+    memory: 13Gi
+
+vars:
+  glibc-version: "2.44"
+  openssl-version: "4.0"
+  # Major of the libssl/libcrypto soname the extension must link; keep in step with openssl-version.
+  openssl-soversion: "4"
+  pypi-package: hf-xet
+  import: hf_xet
+  python-version: "3.14"
+  rust-version: "1.100"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - cargo-auditable
+      - glibc-${{vars.glibc-version}}-dev
+      # openssl-${{vars.openssl-version}}-dev: hardened's no-deprecated configuration.h FTBFS the openssl
+      # crate (116 errors: AES_set_encrypt_key, DH_new, EC_KEY_new, ...).
+      - openssl-${{vars.openssl-version}}-dev
+      - py${{vars.python-version}}-build-base
+      - py${{vars.python-version}}-maturin
+      - py${{vars.python-version}}-pytest # upstream-tests: test runner
+      - py${{vars.python-version}}-pytest-timeout # upstream-tests: per-test timeout
+      - rust-${{vars.rust-version}}
+  environment:
+    # Belt-and-braces against openssl-sys vendoring its own copy.
+    OPENSSL_NO_VENDOR: "1"
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/huggingface/xet-core
+      tag: v${{package.version}}
+      expected-commit: e551f0a75f989b8ee1a474c5f83c80ad4903f84d
+
+  - working-directory: hf_xet
+    runs: |
+      # rustls statically links a non-FIPS AWS-LC into the extension module;
+      # native-tls links the system OpenSSL instead. Both deps need
+      # default-features off, which only the manifest can express.
+      cargo add hf-xet --path ../xet_pkg --rename xet-pkg \
+        --no-default-features --features python,native-tls
+      cargo add xet-client --path ../xet_client --no-default-features
+
+  - runs: |
+      # This is in workspace.dependencies so our tooling (and `cargo add`)
+      # can't update it
+      sed -i 's/jsonwebtoken = "9.3"/jsonwebtoken = "10.3"/' Cargo.toml
+
+  - working-directory: hf_xet
+    uses: py/pip-build-install
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: upstream-tests/pytest
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: huggingface/xet-core
+    strip-prefix: v
+
+test:
+  environment:
+    contents:
+      packages:
+        # ldd + rust-audit-info, for the TLS-backend assertions below
+        - posix-libc-utils
+        - rust-audit-info
+  pipeline:
+    - uses: test/tw/pip-check
+    - uses: test/tw/ldd-check
+    - uses: python/import
+      with:
+        python: python${{vars.python-version}}
+        imports: |
+          import ${{vars.import}}
+    - name: Verify the TLS backend is the system OpenSSL
+      runs: |
+        # __file__ is maturin's generated __init__.py, not the extension
+        pkgdir=$(python${{vars.python-version}} -c 'import hf_xet; print(hf_xet.__path__[0])')
+        so="$pkgdir/hf_xet.abi3.so"
+        [ -f "$so" ] || { echo "extension module not found under $pkgdir"; exit 1; }
+
+        # reqwest must use native-tls against the system OpenSSL
+        deps=$(ldd "$so")
+        echo "$deps"
+        for lib in libssl.so.${{vars.openssl-soversion}} libcrypto.so.${{vars.openssl-soversion}}; do
+          case "$deps" in
+            *"$lib"*) ;;
+            *) echo "$lib missing from DT_NEEDED - the rustls backend is back"; exit 1 ;;
+          esac
+        done
+
+        # and no statically linked crypto came along with it
+        for blob in aws_lc_ ring_core_; do
+          if grep -q "$blob" "$so"; then
+            echo "statically linked crypto present: $blob"
+            exit 1
+          fi
+        done
+    - name: Verify the compiled crate set has no static TLS stack
+      runs: |
+        pkgdir=$(python${{vars.python-version}} -c 'import hf_xet; print(hf_xet.__path__[0])')
+        rust-audit-info "$pkgdir/hf_xet.abi3.so" > audit.json
+        python${{vars.python-version}} <<'EOF'
+        import json
+
+        names = {p["name"] for p in json.load(open("audit.json"))["packages"]}
+        want = {"native-tls", "openssl", "openssl-sys"}
+        deny = {"rustls", "aws-lc-rs", "aws-lc-sys", "ring"}
+
+        missing = sorted(want - names)
+        assert not missing, f"native-tls backend not compiled in: {missing}"
+
+        found = sorted(deny & names)
+        assert not found, f"static TLS/crypto crates compiled in: {found}"
+
+        print(f"crate set OK ({len(names)} crates, native-tls, no rustls/aws-lc/ring)")
+        EOF

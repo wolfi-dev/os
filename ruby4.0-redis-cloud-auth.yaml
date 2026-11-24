@@ -1,0 +1,88 @@
+package:
+  name: ruby4.0-redis-cloud-auth
+  version: "0.2.0"
+  epoch: 0
+  description: Rotating-token cloud identity authentication for Redis via redis-client middleware
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - ruby${{vars.rubyMM}}-logger
+      - ruby${{vars.rubyMM}}-redis-client
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - ca-certificates-bundle
+      - git
+      - ruby-${{vars.rubyMM}}
+      - ruby-${{vars.rubyMM}}-dev
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 862dd7d93c66d2779fe8258ba1f86947156ca1ce
+      repository: https://gitlab.com/gitlab-org/ruby/gems/redis-cloud-auth
+      tag: ${{package.version}}
+
+  - uses: ruby/build
+    with:
+      gem: ${{vars.gem}}
+
+  - uses: ruby/install
+    with:
+      gem: ${{vars.gem}}
+      version: ${{package.version}}
+
+  - uses: ruby/clean
+
+vars:
+  gem: redis-cloud-auth
+
+update:
+  enabled: true
+  git: {}
+
+var-transforms:
+  - from: ${{package.name}}
+    match: ^ruby(\d\.\d+)-.*
+    replace: $1
+    to: rubyMM
+
+test:
+  pipeline:
+    - uses: test/tw/gem-check
+      with:
+        require: redis_cloud_auth
+    - name: Token credential and redis-client middleware registration
+      runs: |
+        ruby <<-EOF
+        require 'redis_cloud_auth'
+
+        raise "VERSION is #{RedisCloudAuth::VERSION}" unless RedisCloudAuth::VERSION == "${{package.version}}"
+
+        # A fake provider stands in for a cloud token endpoint, so no network is used.
+        RedisCloudAuth.registry.register_provider(:fake) do |_descriptor|
+          Object.new.tap do |p|
+            p.define_singleton_method(:call) { ["user", "token-abc"] }
+            p.define_singleton_method(:expires_at) { nil }
+          end
+        end
+
+        credential = RedisCloudAuth.credential({ provider: :fake })
+        # Sidekiq marshals redis config, so the credential must survive a round trip.
+        restored = Marshal.load(Marshal.dump(credential))
+        raise "restored credential returned #{restored.call.inspect}" unless restored.call == "token-abc"
+
+        # An unknown provider must surface as a redis-client connection error.
+        begin
+          RedisCloudAuth.credential({ provider: :missing }).call
+          raise "unknown provider did not raise"
+        rescue RedisClient::CannotConnectError => e
+          raise "unexpected message: #{e.message}" unless e.message.include?("unknown Redis credentials provider")
+        end
+
+        RedisCloudAuth.register!
+        puts "redis_cloud_auth token credential and middleware OK"
+        EOF

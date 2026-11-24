@@ -1,7 +1,7 @@
 package:
   name: ffmpeg-9.1
   version: "9.1"
-  epoch: 0 # rebuild to publish ffmpeg-9.0-source
+  epoch: 1 # runtime-depend on glibc-iconv-common (F-217)
   description: ffmpeg multimedia library
   copyright:
     - license: GPL-2.0-or-later AND LGPL-2.1-or-later
@@ -133,7 +133,6 @@ data:
     items:
       # NOTE: Update numbers to match on new releases
       # NOTE: In order to figure out the new numbers, look at the build logs of the make-install pipeline step
-      libavcodec63: libavcodec.so.63
       libavdevice63: libavdevice.so.63
       libavfilter12: libavfilter.so.12
       libavformat63: libavformat.so.63
@@ -142,6 +141,29 @@ data:
       libswscale10: libswscale.so.10
 
 subpackages:
+  # libavcodec is outside the range so that only it carries the glibc-iconv-common
+  # dependency: it and libavformat are the libraries that import iconv_open, and
+  # libavformat links libavcodec. Update the soname here too on new releases.
+  - name: ${{package.name}}-libavcodec63
+    description: "libavcodec.so.63 library"
+    dependencies:
+      runtime:
+        - glibc-iconv-common # calls iconv_open for non-UTF-8 charsets; glibc builds in only UTF-8/UCS/ASCII
+      provides:
+        - libavcodec63=${{package.full-version}}
+      provider-priority: 5
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib
+          mv "${{targets.destdir}}"/usr/lib/libavcodec.so.63* "${{targets.subpkgdir}}"/usr/lib/
+    test:
+      pipeline:
+        - uses: test/tw/ldd-check
+        - uses: test/tw/soversion-check
+        - uses: test/tw/virtualpackage
+          with:
+            virtual-pkg-name: "libavcodec63"
+
   - range: libraries
     name: ${{package.name}}-${{range.key}}
     description: "${{range.value}} library"
@@ -279,3 +301,13 @@ test:
         # Generate and verify a 1-second, 128x128 VP9 test video using libvpx
         ffmpeg -f lavfi -i testsrc=duration=1:size=128x128:rate=30 -c:v libvpx-vp9 -b:v 1M out_vp9.webm
         test -f out_vp9.webm
+    - name: "-sub_charenc CP1250 subtitles (glibc-iconv-common)"
+      runs: |
+        # Without glibc-iconv-common this conversion fails (glibc builds in only UTF-8, UCS-2/4 and ASCII).
+        [ ! -e /usr/lib/gconv/gconv-modules.d/gconv-modules-extra.conf ] || { echo "FAIL: full glibc-iconv is in the test environment, so this test cannot catch a missing glibc-iconv-common dependency"; exit 1; }
+        # The test tooling (help-check pulls man-db and groff) brings glibc-iconv-common into most test environments, so also check the dependency itself.
+        apk info -R ${{package.name}}-libavcodec63 | grep -qx glibc-iconv-common || { echo "FAIL: ${{package.name}}-libavcodec63 does not runtime-depend on glibc-iconv-common"; exit 1; }
+        printf '1\r\n00:00:01,000 --> 00:00:02,000\r\n\xbf\xf3\xb3w\r\n' > /tmp/s.srt
+        rm -f /tmp/o.srt
+        ffmpeg -loglevel error -sub_charenc CP1250 -i /tmp/s.srt /tmp/o.srt
+        grep -q "$(printf '\xc5\xbc\xc3\xb3\xc5\x82w')" /tmp/o.srt || { echo "FAIL: subtitle text not converted"; exit 1; }

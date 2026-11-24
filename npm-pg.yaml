@@ -1,0 +1,210 @@
+package:
+  name: npm-pg
+  version: "8.23.1"
+  epoch: 0
+  description: PostgreSQL client for Node.js
+  copyright:
+    # pg and most of its bundled dependencies are MIT; pg-int8 and split2
+    # are ISC.
+    - license: MIT AND ISC
+  dependencies:
+    runtime:
+      - nodejs
+  resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  module: pg
+  nodejs-version: "26"
+  postgres-version: "18"
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - nodejs-${{vars.nodejs-version}}
+      - npm
+      - yarn
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 0980cefebe0ae461da8883703be049fe13ca96cf
+      repository: https://github.com/brianc/node-postgres
+      tag: pg@${{package.version}}
+
+  # auth/npm downloads chainctl into /usr/local/bin, which no package in this
+  # small environment creates.
+  - runs: mkdir -p /usr/local/bin
+
+  - uses: auth/npm
+
+  # Yarn 1 keeps the token auth/npm set up away from the tarballs of unscoped
+  # packages unless always-auth is set, and they are then refused with a 401.
+  - runs: echo "always-auth=true" >>"$HOME/.npmrc"
+
+  - name: Compile the TypeScript packages
+    runs: |
+      yarn install --frozen-lockfile --ignore-scripts
+      yarn build
+
+  - name: Install the module with its production dependencies
+    runs: |
+      # pg is one package of a yarn workspace. Some of its dependencies are
+      # its neighbours in this repository, and the others sit in the one
+      # node_modules directory that the whole workspace shares, next to
+      # everything the other packages need. Gather what pg itself needs.
+      node - "packages/${{vars.module}}" "${{targets.destdir}}/usr/lib/node_modules/${{vars.module}}" <<'EOF'
+      const { execFileSync } = require("node:child_process");
+      const fs = require("node:fs");
+      const os = require("node:os");
+      const path = require("node:path");
+
+      const [source, target] = process.argv.slice(2);
+      const workspace = fs.realpathSync("packages");
+      const tarballs = fs.mkdtempSync(path.join(os.tmpdir(), "pack-"));
+
+      // Node's own search: the nearest node_modules directory with the module.
+      function locate(name, from) {
+        for (let dir = from; ; dir = path.dirname(dir)) {
+          const candidate = path.join(dir, "node_modules", name);
+          if (fs.existsSync(candidate)) return fs.realpathSync(candidate);
+          if (dir === path.dirname(dir)) throw new Error(`${name}, which ${from} needs, is not installed`);
+        }
+      }
+
+      function install(dir, dest) {
+        fs.mkdirSync(dest, { recursive: true });
+        if (dir.startsWith(workspace + path.sep)) {
+          // A package of this repository: npm pack gathers the files it publishes.
+          const output = execFileSync("npm", ["pack", "--pack-destination", tarballs], { cwd: dir, encoding: "utf8" });
+          const tarball = path.join(tarballs, output.trim().split("\n").pop());
+          execFileSync("tar", ["-xzf", tarball, "-C", dest, "--strip-components=1"]);
+        } else {
+          fs.cpSync(dir, dest, { recursive: true });
+        }
+      }
+
+      // They all share one node_modules directory, which has room for only
+      // one version of each.
+      const installed = new Map();
+      function installDependencies(dir) {
+        const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+        for (const name of Object.keys({ ...manifest.dependencies, ...manifest.optionalDependencies })) {
+          const found = locate(name, dir);
+          if (installed.has(name)) {
+            if (installed.get(name) !== found) throw new Error(`two versions of ${name} are needed`);
+            continue;
+          }
+          installed.set(name, found);
+          install(found, path.join(target, "node_modules", name));
+          installDependencies(found);
+        }
+      }
+
+      const root = fs.realpathSync(source);
+      install(root, target);
+      installDependencies(root);
+      console.log(`dependencies: ${[...installed.keys()].sort().join(" ")}`);
+      EOF
+
+      # The license sits at the top of the repository, not in the package.
+      install -m 0644 LICENSE "${{targets.destdir}}/usr/lib/node_modules/${{vars.module}}/LICENSE"
+
+update:
+  enabled: true
+  github:
+    identifier: brianc/node-postgres
+    strip-prefix: pg@
+    tag-filter-prefix: pg@
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - nodejs-${{vars.nodejs-version}}
+        - postgresql-${{vars.postgres-version}}
+        - postgresql-${{vars.postgres-version}}-client
+        - shadow
+        - sudo-rs
+    environment:
+      # Where npm keeps modules that are installed for every project.
+      NODE_PATH: /usr/lib/node_modules
+  pipeline:
+    - name: Query a PostgreSQL server
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          set -euo pipefail
+          # PostgreSQL refuses to run as root.
+          useradd --no-create-home pgtest
+          mkdir -p /tmp/pg-test/data /tmp/pg-test/run
+          chown pgtest /tmp/pg-test/data /tmp/pg-test/run
+          sudo -u pgtest initdb -D /tmp/pg-test/data --encoding=UTF8 --locale=C
+          cat >>/tmp/pg-test/data/postgresql.conf <<'EOF'
+          listen_addresses = ''
+          unix_socket_directories = '/tmp/pg-test/run'
+          EOF
+          # The superuser sets the server up, and greeter logs in with a
+          # password, which the module has to answer with SCRAM-SHA-256.
+          cat >/tmp/pg-test/data/pg_hba.conf <<'EOF'
+          local  all  pgtest   peer
+          local  all  greeter  scram-sha-256
+          EOF
+        start: sudo -u pgtest /usr/bin/postgres -D /tmp/pg-test/data
+        expected_output: |
+          starting PostgreSQL
+          listening on Unix socket
+          database system is ready to accept connections
+        error_strings: |
+          FATAL:
+          PANIC:
+        post: |
+          set -euo pipefail
+          sudo -u pgtest psql --no-psqlrc -v ON_ERROR_STOP=1 -h /tmp/pg-test/run -d postgres <<'EOF'
+          CREATE ROLE greeter LOGIN PASSWORD 'only for this test';
+          CREATE DATABASE hello_world OWNER greeter;
+          EOF
+          node <<'EOF' | tee /tmp/pg-test/client.log
+          const assert = require("node:assert/strict");
+          const { Client } = require("pg");
+
+          async function main() {
+            const client = new Client({
+              host: "/tmp/pg-test/run",
+              database: "hello_world",
+              user: "greeter",
+              password: "only for this test",
+            });
+            await client.connect();
+            try {
+              await client.query(
+                "CREATE TABLE greetings (id integer PRIMARY KEY, message text NOT NULL)"
+              );
+              // Values travel apart from the statement, which the server prepares.
+              const inserted = await client.query(
+                "INSERT INTO greetings VALUES ($1, $2)",
+                [1, "Hello, world!"]
+              );
+              assert.equal(inserted.rowCount, 1);
+
+              const result = await client.query(
+                "SELECT id, message FROM greetings WHERE id = $1",
+                [1]
+              );
+              assert.deepEqual(result.fields.map((field) => field.name), ["id", "message"]);
+              assert.deepEqual(result.rows, [{ id: 1, message: "Hello, world!" }]);
+              console.log(`greeting: ${result.rows[0].message}`);
+            } finally {
+              await client.end();
+            }
+          }
+
+          main().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          EOF
+          grep -Fx 'greeting: Hello, world!' /tmp/pg-test/client.log

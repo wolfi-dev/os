@@ -1,0 +1,128 @@
+package:
+  name: npm-mysql2
+  version: "3.24.6"
+  epoch: 0
+  description: MySQL and MariaDB client for Node.js
+  copyright:
+    # mysql2 and most of its bundled dependencies are MIT; long is
+    # Apache-2.0.
+    - license: MIT AND Apache-2.0
+  dependencies:
+    runtime:
+      - nodejs
+  resources:
+    cpu: "1"
+    memory: 1Gi
+
+vars:
+  mariadb-version: "13.1"
+  module: mysql2
+  nodejs-version: "26"
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - nodejs-${{vars.nodejs-version}}
+      - npm
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 7f65d9af6e2cc87fea33cce9319c11faf266363a
+      repository: https://github.com/sidorares/node-mysql2
+      tag: v${{package.version}}
+
+  # auth/npm downloads chainctl into /usr/local/bin, which no package in this
+  # small environment creates.
+  - runs: mkdir -p /usr/local/bin
+
+  - uses: auth/npm
+
+  - name: Install the module with its production dependencies
+    runs: |
+      # The dependencies upstream locked, without the development ones and
+      # without the type declarations it names as a peer.
+      npm ci --omit=dev --omit=peer
+
+      # npm pack gathers the files upstream publishes.
+      npm pack
+      module_dir="${{targets.destdir}}/usr/lib/node_modules/${{vars.module}}"
+      mkdir -p "$module_dir"
+      tar -xzf "${{vars.module}}-${{package.version}}.tgz" -C "$module_dir" --strip-components=1
+      cp -a node_modules "$module_dir/"
+
+update:
+  enabled: true
+  github:
+    identifier: sidorares/node-mysql2
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - mariadb-${{vars.mariadb-version}}
+        - nodejs-${{vars.nodejs-version}}
+    environment:
+      # Where npm keeps modules that are installed for every project.
+      NODE_PATH: /usr/lib/node_modules
+  pipeline:
+    - name: Query a MariaDB server
+      uses: test/daemon-check-output
+      with:
+        setup: |
+          set -euo pipefail
+          mkdir -p /tmp/mysql2-test/data /tmp/mysql2-test/run
+          mariadb-install-db --user=root --datadir=/tmp/mysql2-test/data \
+            --auth-root-authentication-method=normal --skip-test-db
+        start: /usr/bin/mariadbd --user=root --datadir=/tmp/mysql2-test/data --socket=/tmp/mysql2-test/run/mariadbd.sock --pid-file=/tmp/mysql2-test/run/mariadbd.pid --skip-networking
+        expected_output: |
+          Starting MariaDB
+          InnoDB: Completed initialization of buffer pool
+          ready for connections
+        error_strings: |
+          [[]ERROR[]]
+        post: |
+          set -euo pipefail
+          node <<'EOF' | tee /tmp/mysql2-test/client.log
+          const assert = require("node:assert/strict");
+          const mysql = require("mysql2/promise");
+
+          async function main() {
+            const conn = await mysql.createConnection({
+              socketPath: "/tmp/mysql2-test/run/mariadbd.sock",
+              user: "root",
+            });
+            try {
+              await conn.query("CREATE DATABASE hello_world");
+              await conn.changeUser({ database: "hello_world" });
+              await conn.query(
+                "CREATE TABLE greetings (id integer PRIMARY KEY, message text NOT NULL)"
+              );
+              // execute() prepares the statement on the server, query() does not.
+              const [inserted] = await conn.execute(
+                "INSERT INTO greetings VALUES (?, ?)",
+                [1, "Hello, world!"]
+              );
+              assert.equal(inserted.affectedRows, 1);
+
+              const [rows, fields] = await conn.execute(
+                "SELECT id, message FROM greetings WHERE id = ?",
+                [1]
+              );
+              assert.deepEqual(fields.map((field) => field.name), ["id", "message"]);
+              assert.deepEqual(rows, [{ id: 1, message: "Hello, world!" }]);
+              console.log(`greeting: ${rows[0].message}`);
+            } finally {
+              await conn.end();
+            }
+          }
+
+          main().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          EOF
+          grep -Fx 'greeting: Hello, world!' /tmp/mysql2-test/client.log

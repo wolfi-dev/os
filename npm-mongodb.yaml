@@ -1,0 +1,132 @@
+package:
+  name: npm-mongodb
+  version: "7.9.1"
+  epoch: 0
+  description: The official MongoDB driver for Node.js
+  copyright:
+    # The driver, bson and mongodb-connection-string-url are Apache-2.0.
+    # Most of the other bundled dependencies are MIT; webidl-conversions
+    # is BSD-2-Clause.
+    - license: Apache-2.0 AND MIT AND BSD-2-Clause
+  dependencies:
+    runtime:
+      - nodejs
+  resources:
+    cpu: "2"
+    memory: 4Gi
+
+vars:
+  module: mongodb
+  nodejs-version: "26"
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - nodejs-${{vars.nodejs-version}}
+      - npm
+
+pipeline:
+  - uses: git-checkout
+    with:
+      expected-commit: 7a75a3c18e472d03b2e16a16d2d563c4f676dac4
+      repository: https://github.com/mongodb/node-mongodb-native
+      # The documentation and the tests are 2 GB of the working tree, and the
+      # build needs neither. Files at the top level are always checked out.
+      sparse-paths: |
+        etc
+        src
+      tag: v${{package.version}}
+
+  # auth/npm downloads chainctl into /usr/local/bin, which no package in this
+  # small environment creates.
+  - runs: mkdir -p /usr/local/bin
+
+  - uses: auth/npm
+
+  - name: Compile the TypeScript sources
+    runs: |
+      npm ci
+      # What upstream's prepare script runs before publishing: it compiles
+      # the sources into lib/ and rolls the type declarations up into
+      # mongodb.d.ts.
+      npm run build:dts
+
+  - name: Install the module with its production dependencies
+    runs: |
+      # Leave the dependencies upstream locked, without the development ones.
+      # npm keeps the directories it has emptied.
+      npm prune --omit=dev
+      find node_modules -type d -empty -delete
+
+      # npm pack gathers the files upstream publishes.
+      npm pack
+      module_dir="${{targets.destdir}}/usr/lib/node_modules/${{vars.module}}"
+      mkdir -p "$module_dir"
+      tar -xzf "${{vars.module}}-${{package.version}}.tgz" -C "$module_dir" --strip-components=1
+      cp -a node_modules "$module_dir/"
+
+update:
+  enabled: true
+  github:
+    identifier: mongodb/node-mongodb-native
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - nodejs-${{vars.nodejs-version}}
+    environment:
+      # Where npm keeps modules that are installed for every project.
+      NODE_PATH: /usr/lib/node_modules
+  pipeline:
+    - name: Round-trip a document, parse a connection string and fail to reach a closed port
+      runs: |
+        node <<'EOF'
+        const assert = require("node:assert/strict");
+        const { BSON, MongoClient, MongoServerSelectionError } = require("mongodb");
+
+        const document = {
+          _id: new BSON.ObjectId(),
+          message: "Hello, world!",
+          count: 42,
+          ratio: 0.5,
+          tags: ["a", "b"],
+          nested: { ok: true, nothing: null },
+        };
+        const bytes = BSON.serialize(document);
+        assert.equal(bytes.readInt32LE(0), bytes.length, "not a BSON document");
+        const decoded = BSON.deserialize(bytes);
+        assert.equal(BSON.EJSON.stringify(decoded), BSON.EJSON.stringify(document));
+        console.log(`round trip: ${decoded.message}`);
+
+        async function main() {
+          const parsed = new MongoClient(
+            "mongodb://greeter:secret@127.0.0.1:27017/hello_world?tls=true&authMechanism=SCRAM-SHA-256"
+          );
+          assert.deepEqual(parsed.options.hosts.map(String), ["127.0.0.1:27017"]);
+          assert.equal(parsed.options.dbName, "hello_world");
+          assert.equal(parsed.options.credentials.username, "greeter");
+          assert.equal(parsed.options.credentials.mechanism, "SCRAM-SHA-256");
+          assert.equal(parsed.options.tls, true);
+          console.log(`parsed: ${parsed.options.hosts[0]}/${parsed.options.dbName}`);
+
+          // Nothing listens on port 1, so the driver has to give up, and say why.
+          const client = new MongoClient(
+            "mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=1000"
+          );
+          try {
+            await assert.rejects(client.db("admin").command({ ping: 1 }), MongoServerSelectionError);
+            console.log("refused: MongoServerSelectionError");
+          } finally {
+            await client.close();
+          }
+        }
+
+        main().catch((err) => {
+          console.error(err);
+          process.exit(1);
+        });
+        EOF

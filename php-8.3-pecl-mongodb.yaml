@@ -1,7 +1,7 @@
 package:
   name: php-8.3-pecl-mongodb
   version: "2.5.8"
-  epoch: 0 # openssl: 3.6->4.0
+  epoch: 1 # stop libmongoc switching on ECH GREASE
   description: "PHP ${{vars.phpMM}} MongoDB driver - PECL"
   copyright:
     - license: Apache-2.0
@@ -52,6 +52,14 @@ pipeline:
       expected-commit: af2aae91b8140114c1cf0ed894cbf1ac715e77a9
 
   - runs: git submodule update --init
+
+  # libmongoc keeps its SSL_CTX options in an int, so SSL_OP_ALL sign-extends
+  # and switches on ECH GREASE under OpenSSL 4.0. The FIPS provider cannot
+  # generate one, and there every TLS connection fails. Upstream still has
+  # the int as of libmongoc 2.5.9, the release bundled here.
+  - uses: patch
+    with:
+      patches: libmongoc-ssl-ctx-options-uint64.patch
 
   - name: phpize and configure
     runs: |
@@ -118,6 +126,74 @@ test:
 
         echo "All MongoDB driver tests passed\n";
         ?>
+        EOF
+    - name: Verify TLS connections offer no ECH extension
+      runs: |
+        # Guards libmongoc-ssl-ctx-options-uint64.patch: with the SSL_CTX
+        # options sign-extended, OpenSSL 4.0 adds an ECH GREASE extension to
+        # every ClientHello. This reads the driver's own ClientHello.
+        php <<'EOF'
+        <?php
+        function fail(string $message): never
+        {
+            echo "ERROR: $message\n";
+            exit(1);
+        }
+
+        // The kernel completes the connection and holds what the driver
+        // sends until this script accepts it, so one process plays both ends.
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        if ($server === false) {
+            fail("cannot listen: $errstr");
+        }
+        $address = stream_socket_get_name($server, false);
+
+        $manager = new MongoDB\Driver\Manager(
+            "mongodb://$address/?tls=true&connectTimeoutMS=1000&serverSelectionTimeoutMS=1000"
+        );
+        try {
+            $manager->executeCommand('admin', new MongoDB\Driver\Command(['ping' => 1]));
+            fail('a command succeeded against a server that never answers');
+        } catch (MongoDB\Driver\Exception\ConnectionException $e) {
+            echo "The driver gave up, as it should: {$e->getMessage()}\n";
+        }
+
+        $conn = stream_socket_accept($server, 1);
+        if ($conn === false) {
+            fail('the driver never connected');
+        }
+        $record = '';
+        while (strlen($record) < 5 || strlen($record) < 5 + unpack('n', $record, 3)[1]) {
+            $chunk = fread($conn, 16384);
+            if ($chunk === '' || $chunk === false) {
+                break;
+            }
+            $record .= $chunk;
+        }
+        // A handshake record (22) that holds a ClientHello (1).
+        if (strlen($record) < 44 || ord($record[0]) !== 22 || ord($record[5]) !== 1) {
+            fail('expected a ClientHello, got: ' . bin2hex(substr($record, 0, 16)));
+        }
+
+        // Skip record header (5), handshake header (4), version (2) and random (32).
+        $pos = 43;
+        $pos += 1 + ord($record[$pos]);              // session id
+        $pos += 2 + unpack('n', $record, $pos)[1];   // cipher suites
+        $pos += 1 + ord($record[$pos]);              // compression methods
+        $end = $pos + 2 + unpack('n', $record, $pos)[1];
+        $extensions = [];
+        for ($pos += 2; $pos < $end; $pos += 4 + unpack('n', $record, $pos + 2)[1]) {
+            $extensions[] = unpack('n', $record, $pos)[1];
+        }
+
+        // supported_versions shows that the parse is sound.
+        if (!in_array(0x002b, $extensions, true)) {
+            fail('no supported_versions extension: the ClientHello was misparsed');
+        }
+        if (in_array(0xfe0d, $extensions, true)) {
+            fail('the ClientHello offers encrypted_client_hello');
+        }
+        echo "ClientHello offers no ECH extension\n";
         EOF
     - uses: test/tw/ldd-check
 

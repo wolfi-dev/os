@@ -2,7 +2,7 @@
 package:
   name: glibc-2.44
   version: "2.44"
-  epoch: 24 # test/compiler/howdy
+  epoch: 25 # glibc-iconv-common: split common charsets out of glibc-iconv
   description: "the GNU C library"
   copyright:
     - license: LGPL-2.1-or-later
@@ -67,6 +67,12 @@ vars:
   # We remove unnecessary charsets that could otherwise increase the
   # attack surface of the package.
   charsets-to-remove: "IBM1390 IBM1399"
+  # gconv modules shipped in ${{package.name}}-iconv-common: Unicode, the ISO-8859 and
+  # Windows code pages, common DOS/Cyrillic/Thai/Mac sets and the main CJK encodings.
+  # The rest (EBCDIC, ISO-2022-CN/-KR, rare national sets) stay in ${{package.name}}-iconv.
+  iconv-common-modules: "ANSI_X3.110 CP1252 ISO8859-1 ISO8859-15 UNICODE UTF-16 UTF-32 UTF-7 ISO8859-2 ISO8859-3 ISO8859-4 ISO8859-5 ISO8859-6 ISO8859-7 ISO8859-8 ISO8859-9 ISO8859-10 ISO8859-11 ISO8859-13 ISO8859-14 ISO8859-16 CP1250 CP1251 CP1253 CP1254 CP1255 CP1256 CP1257 CP1258 IBM437 IBM850 IBM852 IBM866 KOI8-R KOI8-U TIS-620 MACINTOSH SJIS CP932 EUC-JP ISO-2022-JP EUC-KR UHC GBK GB18030 EUC-CN BIG5 BIG5HKSCS"
+  # CJK table libraries the common modules link against.
+  iconv-common-libs: "libGB libJIS libKSC"
 
 var-transforms:
   # Turn a version of 2.44 into a provider-priority of
@@ -622,6 +628,104 @@ subpackages:
             fi
             echo "PASS: floor <= $ver and binary runs"
 
+  - name: "${{package.name}}-iconv-common"
+    description: "GLIBC iconv modules for common character sets, and the iconv tools"
+    pipeline:
+      - runs: |
+          g="${{targets.destdir}}/usr/lib/gconv"
+          c="${{targets.subpkgdir}}/usr/lib/gconv"
+          mkdir -p "$c/gconv-modules.d" "${{targets.subpkgdir}}/usr/bin"
+
+          for m in ${{vars.iconv-common-modules}} ${{vars.iconv-common-libs}}; do
+            mv "$g/$m.so" "$c/"
+          done
+          # The core configuration (glibc's own minimal set) goes with the common modules.
+          mv "$g/gconv-modules" "$c/"
+
+          # Split gconv-modules-extra.conf: module lines whose shared object moved here,
+          # and aliases that point at one of their names (or a core module), go to
+          # gconv-modules-common.conf; everything else stays in the extra file.
+          extra="$g/gconv-modules.d/gconv-modules-extra.conf"
+          awk -v list="${{vars.iconv-common-modules}}" \
+              -v common="$c/gconv-modules.d/gconv-modules-common.conf" \
+              -v rest="$extra.new" '
+            BEGIN {
+              n = split(list, a, " ")
+              for (i = 1; i <= n; i++) want[a[i]] = 1
+              print "# Modules for common character sets, split out of gconv-modules-extra.conf." > common
+            }
+            FNR == 1 { f++ }
+            f < 3 {
+              if ($1 == "module" && (f == 1 || ($4 in want))) {
+                if ($2 != "INTERNAL") name[$2] = 1
+                if ($3 != "INTERNAL") name[$3] = 1
+              }
+              next
+            }
+            $1 == "module" { if ($4 in want) print > common; else print > rest; next }
+            $1 == "alias"  { if ($3 in name) print > common; else print > rest; next }
+            { print > rest }
+          ' "$c/gconv-modules" "$extra" "$extra"
+          mv "$extra.new" "$extra"
+
+          mv "${{targets.destdir}}"/usr/bin/iconvconfig "${{targets.subpkgdir}}"/usr/bin
+          mv "${{targets.destdir}}"/usr/bin/iconv "${{targets.subpkgdir}}"/usr/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              iconvconfig
+              iconv
+        - name: Common character sets convert without the full iconv set
+          runs: |
+            set -euo pipefail
+            check() {
+              # $1 charset, $2 input bytes (printf format), $3 expected UTF-8 (printf format)
+              got=$(printf "$2" | iconv -f "$1" -t UTF-8)
+              want=$(printf "$3")
+              [ "$got" = "$want" ] || { echo "FAIL: $1 gave '$got', want '$want'"; exit 1; }
+              printf "$3" | iconv -f UTF-8 -t "$1" >/dev/null || { echo "FAIL: UTF-8 to $1"; exit 1; }
+              echo "PASS: $1"
+            }
+            check SHIFT_JIS '\x93\xfa\x96\x7b' '\xe6\x97\xa5\xe6\x9c\xac'
+            check CP932 '\x93\xfa\x96\x7b' '\xe6\x97\xa5\xe6\x9c\xac'
+            check EUC-JP '\xc6\xfc\xcb\xdc' '\xe6\x97\xa5\xe6\x9c\xac'
+            check ISO-2022-JP '\x1b$BF|K\\\x1b(B' '\xe6\x97\xa5\xe6\x9c\xac'
+            check GBK '\xd6\xd0\xce\xc4' '\xe4\xb8\xad\xe6\x96\x87'
+            check GB18030 '\xd6\xd0\xce\xc4' '\xe4\xb8\xad\xe6\x96\x87'
+            check EUC-CN '\xd6\xd0\xce\xc4' '\xe4\xb8\xad\xe6\x96\x87'
+            check BIG5 '\xa4\xa4\xa4\xe5' '\xe4\xb8\xad\xe6\x96\x87'
+            check EUC-KR '\xc7\xd1\xb1\xdb' '\xed\x95\x9c\xea\xb8\x80'
+            check ISO-8859-1 '\xe9' '\xc3\xa9'
+            check ISO-8859-2 '\xb1' '\xc4\x85'
+            check ISO-8859-15 '\xa4' '\xe2\x82\xac'
+            check CP1250 '\xb9' '\xc4\x85'
+            check CP1251 '\xc0' '\xd0\x90'
+            check CP1252 '\x80' '\xe2\x82\xac'
+            check KOI8-R '\xe1' '\xd0\x90'
+            check CP850 '\x82' '\xc3\xa9'
+            check CP437 '\x82' '\xc3\xa9'
+            check UTF-16LE 'A\x00' 'A'
+            check UTF-32BE '\x00\x00\x00A' 'A'
+        - name: Rarer character sets are not in the common set
+          runs: |
+            set -euo pipefail
+            for ch in EBCDIC-US ISO-2022-CN-EXT ISO-2022-KR; do
+              if printf 'A' | iconv -f UTF-8 -t "$ch" >/dev/null 2>&1; then
+                echo "FAIL: $ch is available with only the common set"; exit 1
+              fi
+              echo "PASS: $ch not available"
+            done
+    dependencies:
+      provides:
+        - glibc-iconv-common=${{package.full-version}}
+      runtime:
+        - merged-lib
+        - merged-sbin
+        - merged-usrsbin
+        - wolfi-baselayout
+
   - name: "${{package.name}}-iconv"
     description: "GLIBC iconv tables"
     pipeline:
@@ -633,10 +737,6 @@ subpackages:
 
           mkdir -p "${{targets.subpkgdir}}"/usr/lib
           mv "${{targets.destdir}}"/usr/lib/gconv "${{targets.subpkgdir}}"/usr/lib/
-
-          mkdir -p "${{targets.subpkgdir}}"/usr/bin
-          mv "${{targets.destdir}}"/usr/bin/iconvconfig "${{targets.subpkgdir}}"/usr/bin
-          mv "${{targets.destdir}}"/usr/bin/iconv "${{targets.subpkgdir}}"/usr/bin
     test:
       pipeline:
         - uses: test/tw/help-check
@@ -659,10 +759,17 @@ subpackages:
                 exit 1
               fi
             done
+        - name: Character sets outside the common set convert with the full set
+          runs: |
+            set -euo pipefail
+            [ "$(printf '\xc1' | iconv -f EBCDIC-US -t UTF-8)" = "A" ]
+            printf 'A' | iconv -f UTF-8 -t ISO-2022-KR >/dev/null
+            echo "PASS: EBCDIC-US and ISO-2022-KR"
     dependencies:
       provides:
         - glibc-iconv=${{package.full-version}}
       runtime:
+        - ${{package.name}}-iconv-common=${{package.full-version}}
         - merged-lib
         - merged-sbin
         - merged-usrsbin
@@ -1225,6 +1332,7 @@ test:
           glibc-abi-report
           glibc-dev
           glibc-iconv
+          glibc-iconv-common
           glibc-locale-ca
           glibc-locale-de
           glibc-locale-en

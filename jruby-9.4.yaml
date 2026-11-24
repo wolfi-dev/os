@@ -1,7 +1,7 @@
 package:
   name: jruby-9.4
-  version: "9.4.15.0"
-  epoch: 9 # rebuild to publish jruby-9.4-source
+  version: "9.4.16.0"
+  epoch: 0 # rebuild to publish jruby-9.4-source
   description: JRuby, an implementation of Ruby on the JVM
   copyright:
     - license: LGPL-2.0-or-later
@@ -26,41 +26,27 @@ pipeline:
     with:
       repository: https://github.com/jruby/jruby
       tag: ${{package.version}}
-      expected-commit: 6114208a317732f8ad54d6cd3a06a46fcde03a08
+      expected-commit: 946cd0de3280fea70eadfdd2732536b0dfeaf511
 
   # JRuby uses polyglot-maven-plugin (.mvn/extensions.xml) so Maven reads
   # lib/pom.rb directly — lib/pom.xml is generated and ignored as input.
   # jruby-openssl vendors Bouncy Castle, so its version is the only lever on the
-  # bcprov/bcpkix/bctls/bcutil jars that land in lib/ruby/stdlib. 0.16.2 vendors
-  # 1.85, which closes the 28 July 2026 coordinated Bouncy Castle release. Stay
-  # on the 0.16 line: 0.19.x relocates the jars from lib/ to vendor/ inside the
-  # gem, which breaks jar-dependencies' literal versioned-path resolution.
+  # bcprov/bcpkix/bctls/bcutil jars that land in lib/ruby/stdlib. 0.16.2+ vendors
+  # 1.85 or later, which closes the 28 July 2026 coordinated Bouncy Castle
+  # release (GHSA-p93r-85wp-75v3). Stay on the 0.16 line: 0.19.x relocates the
+  # jars from lib/ to vendor/ inside the gem, which breaks jar-dependencies'
+  # literal versioned-path resolution.
   #
-  # Use the guarded sed pipeline rather than a bare `sed -i`: this step
-  # previously matched '0.15.4' long after upstream had moved to '0.16.0',
-  # so it silently did nothing and we shipped Bouncy Castle 1.84 believing
-  # otherwise. The pipeline fails the build when the pattern is absent, so
-  # the next upstream bump breaks loudly instead of becoming a no-op.
-  - name: bump jruby-openssl to pull in Bouncy Castle 1.85 (GHSA-p93r-85wp-75v3)
-    uses: sed
-    with:
-      path: lib/pom.rb
-      pattern: |-
-        \['jruby-openssl', '0\.16\.0'\]
-      replacement: |-
-        ['jruby-openssl', '0.16.2']
-
-  # uri is a default gem, so its spec lives in specifications/default/. A
-  # `gem install` would add a second, non-default spec and leave the vulnerable
-  # uri-0.12.4.gemspec in place, so the default_gems entry is edited instead.
-  - name: bump uri to 0.12.5 to fix CVE-2025-61594
-    uses: sed
-    with:
-      path: lib/pom.rb
-      pattern: |-
-        \['uri', '0\.12\.4'\]
-      replacement: |-
-        ['uri', '0.12.5']
+  # As of 9.4.16.0 upstream ships jruby-openssl 0.16.3 (Bouncy Castle 1.86),
+  # uri 0.12.5 (CVE-2025-61594) and net-imap 0.6.7 itself, so the earlier sed
+  # bumps are no longer needed. This guard replaces them: it fails the build
+  # when upstream's lib/pom.rb drifts away from the fixed versions, so a future
+  # bump breaks loudly instead of silently shipping a vulnerable gem.
+  - name: verify fixed jruby-openssl, uri and net-imap versions are pinned upstream
+    runs: |
+      grep -F "['jruby-openssl', '0.16.3']" lib/pom.rb
+      grep -F "['uri', '0.12.5']" lib/pom.rb
+      grep -F "['net-imap', '0.6.7']" lib/pom.rb
 
   - runs: |
       export JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk
@@ -91,28 +77,18 @@ pipeline:
         ln -sf "/usr/share/jruby/bin/${binary}" "${{targets.contextdir}}/usr/bin/${binary}"
       done
 
-  - name: Upgrade net-imap to fix GHSA-46q3-7gv7-qmgg, GHSA-8p34-64r3-mwg8, GHSA-c4fp-cxrr-mj66
+  - name: Verify net-imap is past GHSA-46q3-7gv7-qmgg, GHSA-8p34-64r3-mwg8, GHSA-c4fp-cxrr-mj66
     runs: |
+      # Upstream 9.4.16.0 bundles net-imap 0.6.7, which is newer than the
+      # 0.5.15 fix for these advisories. Fail the build if the vulnerable
+      # 0.2.5 copy (shipped by older jruby dists) is present, or if the
+      # fixed version is not.
       home="${{targets.contextdir}}/usr/share/jruby"
-      gemdir="$home/lib/ruby/gems/shared"
-      export JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk
-      export PATH="$home/bin:$PATH"
-      # Install the patched net-imap 0.5.15 (fixes GHSA-46q3-7gv7-qmgg,
-      # GHSA-8p34-64r3-mwg8, GHSA-c4fp-cxrr-mj66; requires ruby >= 3.1,
-      # satisfied by jruby 9.4's ruby 3.1.x compatibility).
-      gem install net-imap \
-        --install-dir "$gemdir" \
-        --no-document \
-        --version "0.5.15"
-      # Remove the pre-bundled vulnerable net-imap 0.2.5 (the only copy
-      # shipped by the jruby dist; earlier patched versions never exist in
-      # a fresh build context).
-      gem uninstall net-imap \
-        --install-dir "$gemdir" \
-        --version "0.2.5" \
-        --ignore-dependencies --executables --force
-      # Fail the build if the fixed version is not present.
-      test -e "$gemdir"/specifications/net-imap-0.5.15.gemspec
+      if [ -n "$(find "$home" -name 'net-imap-0.2.5*' | head -n1)" ]; then
+        echo "vulnerable net-imap 0.2.5 is still present" >&2
+        exit 1
+      fi
+      test -n "$(find "$home" -name 'net-imap-0.6.7*' | head -n1)"
 
 subpackages:
   - name: ${{package.name}}-default-ruby

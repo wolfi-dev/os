@@ -1,0 +1,148 @@
+package:
+  name: elan
+  version: "4.4.0"
+  epoch: 0
+  description: Lean toolchain manager, which installs Lean releases and selects one per project from its lean-toolchain file
+  copyright:
+    - license: Apache-2.0 OR MIT
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+  resources:
+    cpu: "8"
+    memory: 8Gi
+  test-resources:
+    cpu: "1"
+    memory: 1Gi
+
+vars:
+  glibc-version: "2.44"
+  openssl-version: "4.0"
+  rust-version: "1.100"
+
+environment:
+  environment:
+    OPENSSL_NO_VENDOR: "1"
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - cargo-auditable
+      # curl-sys links the system libcurl when pkg-config finds it, and builds
+      # its bundled copy otherwise.
+      - curl-dev
+      - glibc-${{vars.glibc-version}}-dev
+      - openssl-${{vars.openssl-version}}-dev
+      - rust-${{vars.rust-version}}
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/leanprover/elan
+      tag: v${{package.version}}
+      expected-commit: 3cc76985a1becb3c03cd65c1c5007e6f186ae474
+
+  # elan is one binary that acts on the name it runs as: `elan` is the
+  # toolchain manager, `elan-init` sets up ELAN_HOME, and any other name
+  # (lean, lake, ...) is a proxy to the selected toolchain. no-self-update
+  # leaves upgrades to apk.
+  - uses: cargo/build
+    with:
+      output: elan-init
+      opts: --release --features no-self-update --bin elan-init
+
+  # Only `elan` goes on the PATH. elan-init puts the lean and lake proxies in
+  # $ELAN_HOME/bin, so they never shadow /usr/bin/lean from the lean4 package.
+  - runs: |
+      ln -s elan-init "${{targets.destdir}}"/usr/bin/elan
+      install -Dm644 LICENSE-APACHE LICENSE-MIT -t "${{targets.destdir}}"/usr/share/licenses/${{package.name}}
+
+  - uses: strip
+
+update:
+  enabled: true
+  github:
+    identifier: leanprover/elan
+    strip-prefix: v
+    use-tag: true
+
+test:
+  environment:
+    contents:
+      packages:
+        - binutils
+  pipeline:
+    - uses: test/tw/ldd-check
+    - uses: test/tw/ver-check
+      with:
+        bins: elan elan-init
+    - name: Downloads use the system libcurl, which handles TLS
+      runs: |
+        readelf --dynamic /usr/bin/elan-init > dynamic.txt
+        grep NEEDED dynamic.txt
+        grep -q 'NEEDED.*\[libcurl\.so\.4\]' dynamic.txt
+        # A vendored openssl-src build would embed its version banner.
+        if grep -aqE 'OpenSSL [0-9]+\.[0-9]+\.[0-9]+' /usr/bin/elan-init; then
+          echo "elan-init carries a vendored OpenSSL"; exit 1
+        fi
+    - name: Self-update is disabled
+      runs: |
+        export ELAN_HOME="$(mktemp -d)"
+        elan-init -y --no-modify-path --default-toolchain none
+        if elan self update > out.txt 2>&1; then
+          cat out.txt; echo "elan self update should be disabled"; exit 1
+        fi
+        cat out.txt
+        grep -F 'self-update is disabled' out.txt
+    - name: elan-init sets up ELAN_HOME with proxies and no toolchain
+      runs: |
+        export ELAN_HOME="$(mktemp -d)"
+        elan-init -y --no-modify-path --default-toolchain none
+        for b in elan lean lake; do
+          test -x "${ELAN_HOME}/bin/${b}"
+        done
+        elan toolchain list | tee list.txt
+        grep -F 'no installed toolchains' list.txt
+    - name: A linked toolchain serves the proxies and lean-toolchain files
+      runs: |
+        export ELAN_HOME="$(mktemp -d)"
+        elan-init -y --no-modify-path --default-toolchain none
+        export PATH="${ELAN_HOME}/bin:${PATH}"
+
+        # A stand-in toolchain with only bin/lean and bin/lake, which is all
+        # elan checks for and runs.
+        tc="$(mktemp -d)"
+        mkdir -p "${tc}/bin"
+        printf '#!/bin/sh\necho "stand-in lean $*"\n' > "${tc}/bin/lean"
+        printf '#!/bin/sh\necho "stand-in lake $*"\n' > "${tc}/bin/lake"
+        chmod +x "${tc}/bin/lean" "${tc}/bin/lake"
+
+        tc2="$(mktemp -d)"
+        mkdir -p "${tc2}/bin"
+        printf '#!/bin/sh\necho "second lean $*"\n' > "${tc2}/bin/lean"
+        chmod +x "${tc2}/bin/lean"
+
+        elan toolchain link standin "${tc}"
+        elan toolchain link second "${tc2}"
+        elan default standin
+        lean --version > out.txt
+        grep -F 'stand-in lean --version' out.txt
+        lake build > out.txt
+        grep -F 'stand-in lake build' out.txt
+
+        # A project's lean-toolchain file overrides the default.
+        proj="$(mktemp -d)"
+        echo second > "${proj}/lean-toolchain"
+        (cd "${proj}" && lean --version) > out.txt
+        grep -F 'second lean --version' out.txt
+        (cd "${proj}" && elan show) > out.txt
+        cat out.txt
+        grep -F "second (overridden by" out.txt
+    - name: The proxies fail when no toolchain is selected
+      runs: |
+        export ELAN_HOME="$(mktemp -d)"
+        elan-init -y --no-modify-path --default-toolchain none
+        if "${ELAN_HOME}/bin/lean" --version > out.txt 2>&1; then
+          cat out.txt; echo "lean with no toolchain should fail"; exit 1
+        fi
+        cat out.txt

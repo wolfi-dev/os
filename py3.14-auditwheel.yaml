@@ -1,0 +1,154 @@
+package:
+  name: py3.14-auditwheel
+  version: "6.8.2"
+  epoch: 0
+  description: auditing and relabeling of PEP 600 Linux wheels
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - patchelf
+      - py${{vars.python-version}}-packaging
+      - py${{vars.python-version}}-pyelftools
+  resources:
+    cpu: "3"
+    memory: 11Gi
+  test-resources:
+    cpu: "1"
+    memory: 12Gi
+
+vars:
+  pypi-package: auditwheel
+  glibc-version: "2.44"
+  import: auditwheel
+  python-version: "3.14"
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - busybox
+      - glibc-${{vars.glibc-version}}-dev
+      - py${{vars.python-version}}-flit-core
+      - py${{vars.python-version}}-pip
+      - python-${{vars.python-version}}-base
+      - wolfi-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/pypa/auditwheel
+      tag: ${{package.version}}
+      expected-commit: 26d25b5fa7fff2fe976a7c7c00423dcdc1334349
+
+  - uses: py/pip-build-install
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-bin
+    description: Executable binaries for ${{vars.pypi-package}} installed for python${{vars.python-version}}
+    dependencies:
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+    pipeline:
+      - uses: split/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: auditwheel
+
+  - name: ${{package.name}}-manylinux-check
+    description: auditwheel-manylinux-check for python${{vars.python-version}}, checks ELF files against a manylinux policy
+    dependencies:
+      runtime:
+        - ${{package.name}}-bin
+    pipeline:
+      - runs: |
+          install -Dm755 auditwheel-manylinux-check.py \
+            ${{targets.contextdir}}/usr/bin/auditwheel-manylinux-check
+          sed -i "1s|^#!.*|#!/usr/bin/python${{vars.python-version}}|" \
+            ${{targets.contextdir}}/usr/bin/auditwheel-manylinux-check
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: auditwheel-manylinux-check
+        - name: exit codes and verdicts
+          runs: |
+            # A tag auditwheel does not know is a usage error
+            rc=0
+            auditwheel-manylinux-check manylinux_x /usr/bin/python${{vars.python-version}} || rc=$?
+            [ "$rc" -eq 2 ]
+
+            # Nothing to check when every path is a non-ELF file
+            rc=0
+            auditwheel-manylinux-check manylinux_2_28 /etc/os-release > out.txt 2>&1 || rc=$?
+            [ "$rc" -eq 1 ]
+            grep -F "no ELF files found" out.txt
+
+            # Any interpreter built against glibc 2.28 or newer needs symbols
+            # above manylinux_2_17's glibc 2.17. The check must fail no matter
+            # which python the test environment installs.
+            rc=0
+            auditwheel-manylinux-check manylinux_2_17 /usr/bin/python${{vars.python-version}} > out.txt || rc=$?
+            [ "$rc" -eq 1 ]
+            grep -F "FAIL[manylinux]: /usr/bin/python${{vars.python-version}}" out.txt
+            grep -F "1 failed" out.txt
+
+            # Paths arrive on stdin without a leading slash, as apk lists them
+            rc=0
+            printf 'usr/bin/python${{vars.python-version}}\n\n' | auditwheel-manylinux-check manylinux_2_17 > out.txt || rc=$?
+            [ "$rc" -eq 1 ]
+            grep -F "FAIL[manylinux]: /usr/bin/python${{vars.python-version}}" out.txt
+
+            # Skipping the ISA check leaves the symbol version verdict in place
+            rc=0
+            auditwheel-manylinux-check --disable-isa-ext-check manylinux_2_17 /usr/bin/python${{vars.python-version}} > out.txt || rc=$?
+            [ "$rc" -eq 1 ]
+            grep -F "FAIL[manylinux]: /usr/bin/python${{vars.python-version}}" out.txt
+            grep -F "too-recent versioned symbols" out.txt
+            ! grep -F "ISA extensions" out.txt
+
+            # Excluding a library the file does not link has no effect
+            rc=0
+            auditwheel-manylinux-check --exclude 'libnotlinked.so.*' manylinux_2_17 /usr/bin/python${{vars.python-version}} > out.txt || rc=$?
+            [ "$rc" -eq 1 ]
+            grep -F "FAIL[manylinux]: /usr/bin/python${{vars.python-version}}" out.txt
+
+            # zlib needs nothing newer than GLIBC_2.14, so the check passes
+            libz=$(readlink -f /usr/lib/libz.so.1)
+            auditwheel-manylinux-check --disable-isa-ext-check manylinux_2_28 "$libz" > out.txt
+            grep -F "PASS[manylinux]: $libz" out.txt
+            grep -F "1 passed, 0 failed" out.txt
+
+            # A library listed alongside the checked files is excluded from
+            # their audit by name stem. apk lists a package's own libraries
+            # this way.
+            libpython=$(readlink -f /usr/lib/libpython${{vars.python-version}}.so.1.0)
+            rc=0
+            auditwheel-manylinux-check manylinux_2_17 /usr/bin/python${{vars.python-version}} "$libpython" > out.txt || rc=$?
+            [ "$rc" -eq 1 ]
+            grep -F "excluding shared libraries shipped alongside the checked files: libpython${{vars.python-version}}.so*" out.txt
+
+update:
+  enabled: true
+  ignore-regex-patterns:
+    - a
+    - b
+    - rc
+    - post
+  github:
+    identifier: pypa/auditwheel
+
+test:
+  pipeline:
+    - uses: test/tw/pip-check
+    - uses: python/import
+      with:
+        python: python${{vars.python-version}}
+        imports: |
+          import ${{vars.import}}

@@ -1,0 +1,1255 @@
+name: Ruby upstream test suite (rspec, minitest, test-unit)
+
+description: |
+  Runs a Ruby gem's upstream test suite (rspec specs, or minitest/test-unit
+  tests) against the gem that was just installed into the current
+  (sub)package. Use it after ruby/install (and ruby/clean), before `strip`.
+  Run it after install, so the package holds only what the build produced,
+  and the suite tests what ships.
+
+  What is tested: the tests come from the source tree, the code under test
+  from the destdir. The workspace (minus melange-out/) is copied to a
+  scratch directory inside the workspace, and in that copy each of the
+  gem's require_paths (usually lib/) is replaced by a link to the
+  installed gem's directory under ${{targets.contextdir}}. A spec helper's
+  $LOAD_PATH.unshift("../lib") or `require "foo"` therefore loads the
+  installed files (compiled extensions included). GEM_PATH puts the
+  destdir's gem directory first, then the system's, so the installed gem
+  is the one RubyGems activates; GEM_HOME is an empty scratch directory.
+  Every ruby process of the run loads a small hook (RUBYOPT) that records
+  $LOADED_FEATURES at exit; the step fails if nothing was loaded from the
+  installed gem, if anything was loaded from the build tree or from the
+  gem's top-level ext/ in the source copy (test fixtures that a suite
+  compiles elsewhere are fine), or if a system copy of the same gem was
+  loaded instead: from another gem directory, or, for a default gem
+  (securerandom, base64, ...), Ruby's own library copy (a file under
+  rubylibdir, rubyarchdir or the site/vendor library dirs that the
+  installed gem also ships). There is
+  no opt-out: a default gem whose suite also loads Ruby's own copy cannot
+  be gated, and the step fails closed.
+
+  Runner (`runner: auto`): rspec when spec/ holds *_spec.rb files that use
+  rspec (RSpec, require "rspec" or describe) and none of spec/ requires or
+  subclasses minitest or test-unit; otherwise minitest or test-unit when
+  test/ (or tests/) holds test_*.rb, *_test.rb, spec_*.rb or *_spec.rb
+  files, chosen by which framework those files subclass (Minitest::Test/Spec
+  or Test::Unit::TestCase), else require. Both spec/ and test/, a spec/
+  that does not look like rspec only, or a test/ where that does not
+  decide it, fail the step: set `runner` (and `paths`). Directories named
+  fixtures, fixture or data are test data: they are not searched for test
+  files or framework hints, and neither are heredoc bodies; for spec/ only
+  *_spec.rb, spec_helper.rb and support/ files count. The suite is run
+  directly, not through rake or bundler, so a Rakefile's or Gemfile's
+  development tooling (rubocop, simplecov, bundler/gem_tasks) is not
+  needed:
+    - rspec: `rspec --format progress` plus a recording formatter, from
+      the project's .rspec options and default path (spec/), or `paths`.
+      The step's --format options replace .rspec's.
+    - minitest: each test file (test/**/test_*.rb, *_test.rb, spec_*.rb,
+      *_spec.rb, minus test_helper(s).rb, spec_helper(s).rb and helper.rb,
+      or `paths`) is required with lib/ and test/ on the load path, under
+      Minitest.autorun, with a recording reporter added in
+      Minitest.init_plugins (minitest 5 and 6, also under MT_NO_PLUGINS=1).
+    - test-unit: the same files under test-unit's autorunner, with each
+      test's outcome recorded from the shared TestResult.
+  rspec (ruby${MM}-rspec) is not pulled in by this pipeline: the caller
+  adds it, the gem's runtime dependencies and its test requirements to
+  environment.contents.packages, each marked `# upstream-tests:`.
+  minitest and test-unit are bundled with ruby.
+
+  Test order: rspec (when .rspec asks for random order) and minitest
+  shuffle tests by a seed. The seed is fixed per package version: the
+  first 16 bits of sha256("<package.name> <package.version>"). minitest
+  reads it as SEED and prints it ("Run options: --seed N"). rspec takes its
+  default seed from Kernel.rand, which the hook seeds with it, so rspec
+  prints a different number ("Randomized with seed M") that is just as
+  fixed for the version. The hook seeds only the runner process: ruby
+  processes that the tests start keep their own random seeds, so that they
+  do not all pick the same ports or temporary names. Neither changes
+  whether a suite runs in random or defined order. Why: a gate runs on
+  every rebuild (CVE fixes, toolchain bumps), not only on version bumps.
+  With a random
+  seed, a suite with an order-dependent bug passes on its PR and later
+  fails an unrelated rebuild of the same version at random, which nobody
+  can act on (seen with rubyzip and pry). A per-version seed keeps
+  rebuilds of a version reproducible, still changes the order on every
+  version bump (when order bugs are worth finding), and reproduces any
+  failure exactly. The epoch is not part of it, so an epoch bump keeps the
+  order. A caller's own --seed or --order in `args` wins. test-unit
+  runs in a fixed (alphabetical) order and is not affected.
+
+  Environment: HOME and TMPDIR point into the scratch directory; LANG is
+  C.UTF-8 unless LANG or LC_ALL is set; SPEC_OPTS and
+  RUBYGEMS_GEMDEPS are unset; the destdir's usr/bin is first on PATH.
+
+  Network: none at test time. The test process tree runs in a new, empty
+  network namespace with only loopback up, set up from ruby (Fiddle
+  unshare(2) and an SIOCSIFFLAGS ioctl), no extra packages. It needs
+  CAP_SYS_ADMIN, which the build has as root in melange's VM; where that
+  fails, the step goes on without it and says so (netns=unavailable and
+  the reason on the summary line). http(s)_proxy point at a closed
+  loopback port either way, so that clients using proxies fail fast.
+
+  Leftover processes: the step is a child subreaper (prctl), so every
+  process of the run stays its descendant, also a daemon that left the
+  session and closed its stdio; orphans are reaped as they exit. When the
+  runner exits, its process group and all remaining descendants are
+  killed (helper servers the tests left running). The step then waits at
+  most a few seconds for the output to end, so a leftover cannot hold it
+  until overall-timeout.
+
+  The suite is a hard gate, run once (no retries). The step fails if:
+    - a test fails or errors, a pending rspec example passes, or an rspec
+      spec file fails to load (errors outside of examples),
+    - the suite did not reach its end:
+      - rspec wrote no summary, its example count differs from the
+        recorded examples, or fewer examples were recorded than rspec
+        planned to run after filters (--fail-fast stops early),
+      - minitest or test-unit wrote no end-of-run record (the minitest
+        reporter's report after its suite loop returned, test-unit's
+        finished run), or its count differs from the recorded tests.
+      A test or the code under test that calls exit ends the run early
+      (minitest and test-unit let that through), and so does an Interrupt
+      or SIGINT, after which minitest still reports. Only the runner
+      process records results (not a child that a test forks),
+    - the runner is killed by a signal (a crash or abort), or
+      overall-timeout hits,
+    - the runner exits non-zero with no failing test (a test file that
+      fails to load under minitest or test-unit stops the run). When the
+      only failures are ignored ones, a non-zero exit passes only if the
+      suite reached its end and its end-of-run record counts a failure,
+    - a result record is malformed (a test process killed while writing
+      it),
+    - the suite did not really run: no results, no test passed, or fewer
+      than min-run-percent (default 5) of the tests ran (ran = passed +
+      failed; skipped = rspec pending/skip, minitest skip, test-unit
+      pend/omit),
+    - an `ignore` entry matches no test,
+    - the origin check above fails, or the run changed any file in
+      ${{targets.contextdir}}.
+
+  Prints the runner's output, then:
+    UPSTREAM-TESTS-FAIL <package>: <test> [<file:line>]   (one per failing test)
+    UPSTREAM-TESTS <package>: duration=<n>s runner=<rspec|minitest|test-unit> netns=<isolated|unavailable (...)>
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [ignored=<n>]
+    UPSTREAM-TESTS <package>: FAILED: <reasons>   (when the gate fails)
+  Test names: rspec examples by full description ("Foo#bar returns 1"),
+  minitest and test-unit tests as Class#test_name. On failure, a HINT
+  line names features tests could not load ("cannot load such file --
+  webmock") with a guessed package name (ruby${MM}-webmock).
+
+  Examples:
+    - uses: ruby/build
+      with:
+        gem: ${{vars.gem}}
+    - uses: ruby/install
+      with:
+        gem: ${{vars.gem}}
+        version: ${{package.version}}
+    - uses: ruby/clean
+    - uses: upstream-tests/ruby-test
+
+  Named exceptions go in ignore, one per line: an rspec example's or
+  example group's full description, or a minitest/test-unit Class#test
+  or Class (all its tests). Ignored tests still run; a failing one is
+  reported as IGNORE, a passing one with a warning (stale exception?), and
+  an entry that matches no test fails the step. Every exception needs a
+  comment in the calling package explaining why and a
+  `TODO(upstream-tests): ...` to remove it:
+    # These examples resolve rubygems.org; the build sandbox has no network.
+    # TODO(upstream-tests): stub the lookup upstream.
+    - uses: upstream-tests/ruby-test
+      with:
+        ignore: |
+          Foo::Client fetches the index
+          TestRemote#test_download
+
+needs:
+  packages:
+    - busybox
+
+inputs:
+  ruby:
+    description: |
+      Interpreter to run the suite with, e.g. ruby or ruby3.4. CRuby (MRI)
+      only: the step fails with JRuby (no fork).
+    default: ruby
+  dir:
+    description: |
+      Gem source directory (where the .gemspec, spec/ and test/ are),
+      relative to the workspace: ruby/build's dir, or the
+      working-directory of the block that runs ruby/build.
+    default: "."
+  gem:
+    description: |
+      Name of the installed gem under test. Empty: the only gem installed
+      in the destdir (the step fails if there are several).
+    default: ""
+  runner:
+    description: auto, rspec, minitest or test-unit (see the description).
+    default: auto
+  paths:
+    description: |
+      Space-separated test files, directories or globs, relative to dir.
+      rspec: passed to rspec (empty: .rspec and spec/). minitest and
+      test-unit: the files to load (directories are searched for
+      test_*.rb, *_test.rb, spec_*.rb and *_spec.rb); empty: test/ or
+      tests/.
+    default: ""
+  args:
+    description: |
+      Extra runner arguments, parsed as shell words, e.g. `--tag ~slow`
+      for rspec or `--seed 1` for minitest. Not --format/--require
+      (rspec); use ignore for named exceptions.
+    default: ""
+  ignore:
+    description: |
+      Tests whose failures are allowed, one per line (see the
+      description). Each one needs a comment and TODO in the caller.
+    default: ""
+  overall-timeout:
+    description: Wall-clock limit for the whole run, in seconds.
+    default: "3600"
+  min-run-percent:
+    description: |
+      Minimum share of the tests that must actually run (not skip), in
+      percent. A gem whose suite mostly skips by default sets it lower,
+      with a comment and a TODO(upstream-tests).
+    default: "5"
+
+pipeline:
+  - name: upstream-tests (ruby)
+    runs: |
+      h=$(mktemp -d)
+      mkdir -p "$h/lib/minitest"
+      cat > "$h/paths" <<'UPSTREAM_TESTS_RUBY_EOF'
+      ${{inputs.paths}}
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/args" <<'UPSTREAM_TESTS_RUBY_EOF'
+      ${{inputs.args}}
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/ignore" <<'UPSTREAM_TESTS_RUBY_EOF'
+      ${{inputs.ignore}}
+      UPSTREAM_TESTS_RUBY_EOF
+      trap 'rm -rf "$h"' EXIT
+      cat > "$h/hook.rb" <<'UPSTREAM_TESTS_RUBY_EOF'
+      # Loaded into every ruby process of the test run (RUBYOPT=-r...). Records
+      # the files the process loaded, for the import-origin check. Requires
+      # nothing, so that it cannot load or activate a gem before the suite does.
+      # It also seeds Kernel.rand with the per-version seed, so rspec's default seed
+      # (rand(0xFFFF)) is the same on every rebuild of a version; see "Test order"
+      # in the pipeline description for why. Only in the runner process (its pid is
+      # in UPSTREAM_TESTS_RUBY_RUNNER_PID): processes that the tests start keep their
+      # own random seeds, so that they do not all pick the same ports or temp names.
+      if (upstream_tests_ruby_seed = ENV["UPSTREAM_TESTS_RUBY_SEED"]) && upstream_tests_ruby_seed =~ /\A\d+\z/ &&
+         ENV["UPSTREAM_TESTS_RUBY_RUNNER_PID"] == Process.pid.to_s
+        srand(Integer(upstream_tests_ruby_seed, 10))
+      end
+      if (upstream_tests_ruby_dir = ENV["UPSTREAM_TESTS_RUBY_RESULTS"]) && !upstream_tests_ruby_dir.empty?
+        at_exit do
+          begin
+            File.open(File.join(upstream_tests_ruby_dir, "features-#{Process.pid}.txt"), "a") do |f|
+              $LOADED_FEATURES.each { |p| f.puts(p) }
+            end
+          rescue SystemCallError, IOError
+            # No features file: the origin check then fails closed.
+          end
+        end
+      end
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/record.rb" <<'UPSTREAM_TESTS_RUBY_EOF'
+      # Result records, one line per test: status, then base64 fields (name,
+      # location, enclosing groups/classes joined by newlines). Runners also write
+      # one end-of-run line when the suite reaches its end: rspec's summary, and
+      # "done <tests> <passed 1|0>" for minitest and test-unit. Only the runner
+      # process records (its pid is in UPSTREAM_TESTS_RUBY_RUNNER_PID): a test that
+      # forks and exits in the child unwinds through the recorder there, and must
+      # not add a record. Requires nothing.
+      module UpstreamTestsRuby
+        module Record
+          def self.file
+            @file ||= begin
+              f = File.open(File.join(ENV.fetch("UPSTREAM_TESTS_RUBY_RESULTS"), "results-#{Process.pid}.tsv"), "a")
+              f.sync = true
+              f
+            end
+          end
+
+          def self.b64(s)
+            [s.to_s].pack("m0")
+          end
+
+          def self.runner?
+            ENV["UPSTREAM_TESTS_RUBY_RUNNER_PID"] == Process.pid.to_s
+          end
+
+          def self.test(status, name, location, groups)
+            return unless runner?
+            file.puts([status, b64(name), b64(location), b64(groups.join("\n"))].join("\t"))
+          end
+
+          def self.line(*fields)
+            return unless runner?
+            file.puts(fields.join("\t"))
+          end
+
+          def self.done(tests, passed)
+            line("done", tests, passed ? 1 : 0)
+          end
+        end
+      end
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/rspec.rb" <<'UPSTREAM_TESTS_RUBY_EOF'
+      # rspec formatter (--require + --format): records the number of examples
+      # rspec plans to run (start, after tag filters), each example's outcome,
+      # and the summary's count of errors outside examples (spec files that fail
+      # to load, errors in before(:suite)/after(:suite) hooks). The summary's
+      # example count only counts started examples, so a run that --fail-fast
+      # stops early still matches it; the planned count does not.
+      require File.join(__dir__, "record.rb")
+
+      module UpstreamTestsRuby
+        class RSpecRecorder
+          RSpec::Core::Formatters.register self, :start, :example_passed, :example_failed,
+                                           :example_pending, :dump_summary
+
+          def initialize(_output); end
+
+          def start(n)
+            Record.line("start", n.count)
+          end
+
+          def example_passed(n)
+            rec("pass", n.example)
+          end
+
+          def example_failed(n)
+            rec("fail", n.example)
+          end
+
+          # A pending example that passes is reported through example_failed.
+          def example_pending(n)
+            rec("skip", n.example)
+          end
+
+          def dump_summary(s)
+            outside = s.respond_to?(:errors_outside_of_examples_count) ? s.errors_outside_of_examples_count : 0
+            Record.line("summary", s.example_count, s.failure_count, s.pending_count, outside)
+          end
+
+          private
+
+          def rec(status, ex)
+            groups = ex.example_group.parent_groups.map { |g| g.metadata[:full_description].to_s }
+            loc = ex.metadata[:location].to_s.sub(%r{\A\./}, "")
+            Record.test(status, ex.full_description, loc, groups)
+          end
+        end
+      end
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/minitest-loader.rb" <<'UPSTREAM_TESTS_RUBY_EOF'
+      # Runs minitest test files: ARGV is passed to minitest, the files to load
+      # are listed (one per line) in $UPSTREAM_TESTS_RUBY_FILES.
+      files = File.read(ENV.fetch("UPSTREAM_TESTS_RUBY_FILES")).split("\n")
+      require "minitest"
+      require "minitest/upstream_tests_ruby_plugin"
+      # Add the recorder whenever minitest initialises its plugins, so it does
+      # not depend on plugin discovery (minitest 6 does none; minitest 5 skips it
+      # under MT_NO_PLUGINS=1, which some test helpers set).
+      module UpstreamTestsRuby
+        module MinitestInitHook
+          def init_plugins(options)
+            super
+            plugin_upstream_tests_ruby_init(options)
+          end
+        end
+      end
+      Minitest.singleton_class.prepend(UpstreamTestsRuby::MinitestInitHook)
+      Minitest.autorun
+      files.each { |f| require File.expand_path(f) }
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/test-unit-loader.rb" <<'UPSTREAM_TESTS_RUBY_EOF'
+      # Runs test-unit test files: ARGV is passed to test-unit's autorunner, the
+      # files to load are listed (one per line) in $UPSTREAM_TESTS_RUBY_FILES.
+      files = File.read(ENV.fetch("UPSTREAM_TESTS_RUBY_FILES")).split("\n")
+      require "test/unit"
+      require File.join(__dir__, "record.rb")
+
+      module UpstreamTestsRuby
+        # Classifies each test by what it added to the shared TestResult.
+        module TestUnitRecorder
+          def run(result, &block)
+            before = [result.error_count, result.failure_count, result.pending_count, result.omission_count]
+            super
+          ensure
+            after = [result.error_count, result.failure_count, result.pending_count, result.omission_count]
+            d = after.zip(before).map { |a, b| a - b }
+            status = if d[0] > 0 then "error"
+                     elsif d[1] > 0 then "fail"
+                     elsif d[2] > 0 || d[3] > 0 then "skip"
+                     else "pass"
+                     end
+            klass = self.class.name.to_s
+            loc = (m = self.class.instance_method(method_name) rescue nil) ? Array(m.source_location).join(":") : ""
+            name = "#{klass}##{method_name}"
+            label = respond_to?(:data_label) ? data_label : nil
+            name += "[#{label}]" if label
+            Record.test(status, name, loc, [klass])
+          end
+        end
+      end
+      module UpstreamTestsRuby
+        # Records that the run reached its end, with test-unit's own count of
+        # tests run. Not from the FINISHED event: test-unit sends that from an
+        # ensure, also when a test calls exit (SystemExit passes through).
+        module TestUnitDone
+          def run(*args, **kwargs, &block)
+            result = super
+            Record.done(result.run_count, result.passed?) if result.is_a?(Test::Unit::TestResult)
+            result
+          end
+        end
+      end
+      require "test/unit/ui/testrunnermediator"
+      Test::Unit::TestCase.prepend(UpstreamTestsRuby::TestUnitRecorder)
+      Test::Unit::UI::TestRunnerMediator.prepend(UpstreamTestsRuby::TestUnitDone)
+      files.each { |f| require File.expand_path(f) }
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/lib/minitest/upstream_tests_ruby_plugin.rb" <<'UPSTREAM_TESTS_RUBY_EOF'
+      # minitest plugin: records each test's outcome, and a done line from the
+      # reporter's report when the run completed. minitest also reports after an
+      # Interrupt (which it rescues, "Interrupted. Exiting..."), so completion is
+      # taken from the suite loop (run_all_suites in minitest 6, __run in 5)
+      # returning; a test that calls exit ends the process before the report.
+      # The count is minitest's own (its statistics reporter), not ours.
+      # The loader calls its init from Minitest.init_plugins; minitest 5's plugin
+      # discovery may also find it on the load path (added once either way).
+      require File.join(__dir__, "..", "..", "record.rb")
+
+      module UpstreamTestsRuby
+        module MinitestCompletion
+          %i[run_all_suites __run].each do |m|
+            next unless Minitest.respond_to?(m, true)
+            define_method(m) do |*args, **kwargs, &block|
+              result = super(*args, **kwargs, &block)
+              UpstreamTestsRuby::MinitestRecorder.completed = true
+              result
+            end
+          end
+        end
+
+        class MinitestRecorder < Minitest::AbstractReporter
+          class << self
+            attr_accessor :completed
+          end
+
+          def initialize(composite)
+            super()
+            @composite = composite
+          end
+
+          def record(r)
+            klass = r.respond_to?(:klass) ? r.klass : r.class.name
+            status = if r.skipped? then "skip"
+                     elsif r.passed? then "pass"
+                     elsif r.error? then "error"
+                     else "fail"
+                     end
+            loc = r.respond_to?(:source_location) ? Array(r.source_location).join(":") : ""
+            Record.test(status, "#{klass}##{r.name}", loc, [klass.to_s])
+            @tests = @tests.to_i + 1
+            @faults = @faults.to_i + 1 if %w[fail error].include?(status)
+          end
+
+          def report
+            return unless self.class.completed
+            stats = @composite.respond_to?(:reporters) && @composite.reporters.grep(Minitest::StatisticsReporter).first
+            Record.done(stats ? stats.count : @tests.to_i, @faults.to_i.zero?)
+          end
+        end
+      end
+
+      Minitest.singleton_class.prepend(UpstreamTestsRuby::MinitestCompletion)
+
+      module Minitest
+        def self.plugin_upstream_tests_ruby_init(_options)
+          return if @upstream_tests_ruby_added
+          @upstream_tests_ruby_added = true
+          reporter << UpstreamTestsRuby::MinitestRecorder.new(reporter)
+        end
+      end
+      UPSTREAM_TESTS_RUBY_EOF
+      cat > "$h/main.rb" <<'UPSTREAM_TESTS_RUBY_EOF'
+      # upstream-tests/ruby-test: runs a gem's own test suite against the copy
+      # installed in the destdir and gates the build on it. See the pipeline's
+      # description for the contract. Run by the build's ruby, outside the test
+      # environment (no RUBYOPT hook, normal GEM_PATH).
+      require "digest"
+      require "fileutils"
+      require "rbconfig"
+      require "shellwords"
+
+      module UpstreamTestsRuby
+        class Gate
+          CALLER = "upstream-tests/ruby-test"
+          TEST_FILE_GLOBS = ["**/test_*.rb", "**/*_test.rb", "**/spec_*.rb", "**/*_spec.rb"].freeze
+          HELPER_BASENAMES = %w[test_helper.rb test_helpers.rb helper.rb spec_helper.rb spec_helpers.rb].freeze
+          MINITEST_CLASS_RE = /<\s*(?:::)?Mini[Tt]est::(?:Test|Spec|Unit::TestCase)\b/
+          MINITEST_REQUIRE_RE = /^\s*require\s*\(?\s*["']minitest(?:\/autorun|\/spec|\/test)?["']/
+          TEST_UNIT_CLASS_RE = /<\s*(?:::)?Test::Unit::TestCase\b/
+          TEST_UNIT_REQUIRE_RE = /^\s*require\s*\(?\s*["']test(?:\/unit|-unit)["']/
+          MINITEST_RE = Regexp.union(MINITEST_CLASS_RE, MINITEST_REQUIRE_RE)
+          TEST_UNIT_RE = Regexp.union(TEST_UNIT_CLASS_RE, TEST_UNIT_REQUIRE_RE)
+          RSPEC_RE = /\bRSpec\b|^\s*require\s*\(?\s*["']rspec(?:\/[\w\/]+)?["']|^\s*describe\b/
+          # Directories of test data, not tests: never searched for test files or
+          # framework hints (a spec/fixtures/ file may well require minitest).
+          DATA_DIRS = %w[fixtures fixture data].freeze
+          HEREDOC_RE = /<<([~-]?)(["'`]?)([A-Za-z_]\w*)\2/
+          # How long the step waits for the output pipe to close once the runner
+          # has exited and its leftover processes were killed.
+          LEFTOVER_GRACE = 5
+
+          def initialize(argv)
+            opts = {}
+            argv.each_slice(2) { |k, v| opts[k.sub(/\A--/, "")] = v.to_s }
+            @pkg = opts.fetch("package")
+            @destdir = File.expand_path(opts.fetch("destdir"))
+            @helpers = File.expand_path(opts.fetch("helpers"))
+            @gem = opts.fetch("gem").strip
+            @dir = opts.fetch("dir").strip
+            @runner = opts.fetch("runner").strip
+            @paths = Shellwords.split(File.read(opts.fetch("paths-file")))
+            @args = Shellwords.split(File.read(opts.fetch("args-file")))
+            @ignore = File.read(opts.fetch("ignore-file")).split("\n").map(&:strip)
+                          .reject { |l| l.empty? || l.start_with?("#") }
+            @overall_timeout = Integer(opts.fetch("overall-timeout"), 10)
+            @min_run_percent = Integer(opts.fetch("min-run-percent"), 10)
+            @seed = Integer(opts.fetch("seed"), 10)
+            @ruby = RbConfig.ruby
+            @mm = "#{RbConfig::CONFIG["MAJOR"]}.#{RbConfig::CONFIG["MINOR"]}"
+            @why = []
+          rescue KeyError, ArgumentError => e
+            die("bad arguments: #{e.message}")
+          end
+
+          def say(msg)
+            $stdout.puts("#{CALLER}: #{msg}")
+            $stdout.flush
+          end
+
+          def die(msg)
+            $stdout.puts("#{CALLER}: ERROR: #{msg}")
+            $stdout.puts("UPSTREAM-TESTS #{@pkg}: FAILED: #{msg}")
+            exit 1
+          end
+
+          def run
+            # The step forks the runner into its own session and network
+            # namespace, and reads /proc: CRuby (MRI) only. JRuby (whose `ruby`
+            # may be the one on PATH) has no fork.
+            unless RUBY_ENGINE == "ruby" && Process.respond_to?(:fork)
+              die("the interpreter #{@ruby} is #{RUBY_ENGINE} #{RUBY_ENGINE_VERSION}#{Process.respond_to?(:fork) ? "" : " without fork"}; this step runs suites with CRuby (MRI) only: set ruby to a CRuby interpreter, or do not use it for a JRuby gem")
+            end
+            die("#{@destdir} does not exist; call this after the gem is installed (ruby/install)") unless File.directory?(@destdir)
+            @workspace = Dir.pwd
+            @src = File.expand_path(@dir, @workspace)
+            die("dir '#{@dir}' does not exist") unless File.directory?(@src)
+            find_spec
+            detect_runner
+            check_framework
+            setup_scratch
+            before = snapshot(@destdir)
+            start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            rc, output = execute
+            duration = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - start).round
+            after = snapshot(@destdir)
+            judge(rc, output, duration, before, after)
+          rescue StandardError, ScriptError => e
+            # Never end the step without the summary's reason line.
+            die("internal error: #{e.class}: #{e.message} (#{Array(e.backtrace).first})")
+          ensure
+            cleanup
+          end
+
+          # The single gem installed into the destdir, or the one named by `gem`.
+          def find_spec
+            gemdir = File.join(@destdir, Gem.default_dir)
+            @gemdir = gemdir
+            paths = Dir.glob(File.join(gemdir, "specifications", "*.gemspec"))
+            specs = paths.map { |p| Gem::Specification.load(p) }.compact
+            die("no installed gem in #{gemdir}/specifications; call this after ruby/install") if specs.empty?
+            if @gem.empty?
+              if specs.size > 1
+                die("several gems installed (#{specs.map(&:full_name).join(", ")}); set gem")
+              end
+              @spec = specs.first
+            else
+              @spec = specs.find { |s| s.name == @gem }
+              die("gem '#{@gem}' is not installed in #{gemdir} (installed: #{specs.map(&:full_name).join(", ")})") unless @spec
+            end
+            @gem_path = @spec.full_gem_path
+            die("installed gem directory #{@gem_path} is missing") unless File.directory?(@gem_path)
+          end
+
+          def spec_files(base)
+            d = File.join(base, "spec")
+            File.directory?(d) ? without_data(Dir.glob(File.join(d, "**", "*_spec.rb")), d) : []
+          end
+
+          # Files under a DATA_DIRS directory below base dropped.
+          def without_data(files, base)
+            files.reject { |f| f.delete_prefix(base + "/").split("/")[0..-2].any? { |c| DATA_DIRS.include?(c) } }
+          end
+
+          # A Ruby file's text without the bodies of its heredocs, so that code
+          # a spec writes out as a string does not count as what it requires.
+          def code_of(path)
+            out = []
+            ends = []
+            File.read(path, mode: "rb").each_line do |l|
+              unless ends.empty?
+                ends.shift if l.strip == ends.first
+                next
+              end
+              out << l
+              l.scan(HEREDOC_RE) { |_, _, id| ends << id }
+            end
+            out.join
+          end
+
+          def test_dir(base)
+            %w[test tests].find do |t|
+              d = File.join(base, t)
+              File.directory?(d) && !test_files_in(d).empty?
+            end
+          end
+
+          def test_files_in(d)
+            files = TEST_FILE_GLOBS.flat_map { |g| Dir.glob(File.join(d, g)) }.uniq
+                                   .reject { |f| HELPER_BASENAMES.include?(File.basename(f)) }
+            without_data(files, d).sort
+          end
+
+          # minitest or test-unit, by what the test files subclass, then by what
+          # they require; nil when that does not decide it.
+          def framework_of(d)
+            cls = { "minitest" => 0, "test-unit" => 0 }
+            req = { "minitest" => 0, "test-unit" => 0 }
+            without_data(Dir.glob(File.join(d, "**", "*.rb")), d).each do |f|
+              s = code_of(f)
+              cls["minitest"] += s.scan(MINITEST_CLASS_RE).size
+              cls["test-unit"] += s.scan(TEST_UNIT_CLASS_RE).size
+              req["minitest"] += s.scan(MINITEST_REQUIRE_RE).size
+              req["test-unit"] += s.scan(TEST_UNIT_REQUIRE_RE).size
+            end
+            [cls, req].each do |h|
+              return "minitest" if h["minitest"] > 0 && h["test-unit"].zero?
+              return "test-unit" if h["test-unit"] > 0 && h["minitest"].zero?
+              return nil if h.values.all?(&:positive?)
+            end
+            nil
+          end
+
+          # spec/ means rspec only when its spec files, spec_helper.rb and
+          # support/ files use rspec (RSpec, require "rspec", describe) and none
+          # requires or subclasses minitest or test-unit (minitest/spec also uses
+          # describe and *_spec.rb files). Data directories and heredoc bodies
+          # are not looked at.
+          def spec_dir_framework
+            rspec = other = false
+            d = File.join(@src, "spec")
+            files = Dir.glob(["**/*_spec.rb", "**/spec_helper.rb", "support/**/*.rb"], base: d).map { |f| File.join(d, f) }
+            without_data(files.uniq, d).each do |f|
+              s = code_of(f)
+              rspec ||= s.match?(RSPEC_RE)
+              other ||= s.match?(MINITEST_RE) || s.match?(TEST_UNIT_RE)
+            end
+            die("spec/ requires or subclasses minitest or test-unit; set runner (and paths) to choose") if other
+            die("cannot tell which framework spec/ uses (no RSpec, require \"rspec\" or describe); set runner") unless rspec
+            "rspec"
+          end
+
+          def detect_runner
+            unless %w[auto rspec minitest test-unit].include?(@runner)
+              die("runner must be auto, rspec, minitest or test-unit (got '#{@runner}')")
+            end
+            @testdir = test_dir(@src)
+            return unless @runner == "auto"
+            has_spec = !spec_files(@src).empty?
+            if has_spec && @testdir
+              die("both spec/ (rspec) and #{@testdir}/ have tests; set runner (and paths) to choose")
+            elsif has_spec
+              @runner = spec_dir_framework
+            elsif @testdir
+              fw = framework_of(File.join(@src, @testdir))
+              die("cannot tell whether #{@testdir}/ uses minitest or test-unit (both or neither are subclassed/required); set runner") unless fw
+              @runner = fw
+            else
+              die("no tests found in '#{@dir}' (no spec/**/*_spec.rb, no test/**/test_*.rb, *_test.rb, spec_*.rb or *_spec.rb); set dir to the gem's source directory (ruby/build's dir or working-directory), or runner and paths")
+            end
+          end
+
+          def check_framework
+            need = { "rspec" => "rspec-core", "minitest" => "minitest", "test-unit" => "test-unit" }.fetch(@runner)
+            Gem::Specification.find_by_name(need)
+          rescue Gem::MissingSpecError
+            die("#{@runner} needs the #{need} gem, which is not installed; add ruby#{@mm}-#{need == "rspec-core" ? "rspec" : need} to environment.contents.packages")
+          end
+
+          def setup_scratch
+            @scratch = File.join(@workspace, ".upstream-tests-ruby.#{Process.pid}")
+            FileUtils.rm_rf(@scratch)
+            FileUtils.mkdir_p(@scratch)
+            skip = [File.basename(@scratch)]
+            rel = @destdir.delete_prefix(@workspace + "/")
+            skip << rel.split("/").first if rel != @destdir
+            @copy = File.join(@scratch, "src")
+            FileUtils.mkdir_p(@copy)
+            Dir.children(@workspace).each do |e|
+              next if skip.include?(e)
+              FileUtils.cp_r(File.join(@workspace, e), @copy, preserve: true)
+            end
+            @run_dir = File.expand_path(@src.delete_prefix(@workspace).delete_prefix("/"), @copy)
+            # The source tree's require paths (lib/) become links to the
+            # installed gem's, so that both `require "foo"` and a spec helper's
+            # $LOAD_PATH.unshift("../lib") load the installed code.
+            @pinned = []
+            @spec.require_paths.each do |rp|
+              installed = File.join(@gem_path, rp)
+              next unless File.directory?(installed)
+              here = File.join(@run_dir, rp)
+              FileUtils.rm_rf(here)
+              FileUtils.mkdir_p(File.dirname(here))
+              File.symlink(installed, here)
+              @pinned << rp
+            end
+            die("none of the gem's require_paths (#{@spec.require_paths.join(", ")}) is installed in #{@gem_path}") if @pinned.empty?
+            @results = File.join(@scratch, "results")
+            %w[results home tmp gemhome].each { |d| FileUtils.mkdir_p(File.join(@scratch, d)) }
+          end
+
+          def cleanup
+            return unless @scratch && File.exist?(@scratch)
+            system("chmod", "-R", "u+w", @scratch, out: File::NULL, err: File::NULL)
+            FileUtils.rm_rf(@scratch)
+          end
+
+          def snapshot(root)
+            out = {}
+            Dir.glob("**/*", File::FNM_DOTMATCH, base: root).each do |rel|
+              next if rel.end_with?("/.") || rel == "."
+              p = File.join(root, rel)
+              st = File.lstat(p)
+              out[rel] = if st.symlink? then "l:#{File.readlink(p)}"
+                         elsif st.file? then "f:#{st.mode.to_s(8)}:#{Digest::SHA256.file(p).hexdigest}"
+                         elsif st.directory? then "d:#{st.mode.to_s(8)}"
+                         else "o:#{st.mode.to_s(8)}"
+                         end
+            end
+            out
+          end
+
+          def files_to_run
+            if @paths.empty?
+              die("no test directory for #{@runner}; set paths") unless @testdir
+              return test_files_in(File.join(@run_dir, @testdir))
+            end
+            @paths.flat_map do |p|
+              full = File.expand_path(p, @run_dir)
+              if File.directory?(full) then test_files_in(full)
+              elsif File.file?(full) then [full]
+              else Dir.glob(full).sort.tap { |g| die("paths entry '#{p}' matches nothing") if g.empty? }
+              end
+            end.uniq
+          end
+
+          # Globs are expanded here, so that a pattern that matches nothing fails
+          # rather than reaching rspec as a literal path.
+          def rspec_paths
+            @paths.flat_map do |p|
+              next [p] unless p.match?(/[*?\[{]/)
+              g = Dir.glob(p, base: @run_dir).sort
+              die("paths entry '#{p}' matches nothing") if g.empty?
+              g
+            end
+          end
+
+          def command
+            case @runner
+            when "rspec"
+              [@ruby, Gem.bin_path("rspec-core", "rspec"),
+               "--require", File.join(@helpers, "rspec.rb"),
+               "--format", "progress", "--format", "UpstreamTestsRuby::RSpecRecorder",
+               "--no-color", *@args, *rspec_paths]
+            else
+              files = files_to_run
+              die("no test files to run") if files.empty?
+              list = File.join(@scratch, "files.txt")
+              File.write(list, files.join("\n") + "\n")
+              @env["UPSTREAM_TESTS_RUBY_FILES"] = list
+              @nfiles = files.size
+              libs = ["-I", "lib"]
+              libs += ["-I", @testdir] if @testdir
+              if @runner == "minitest"
+                [@ruby, *libs, "-I", File.join(@helpers, "lib"), File.join(@helpers, "minitest-loader.rb"), *@args]
+              else
+                [@ruby, *libs, File.join(@helpers, "test-unit-loader.rb"), *@args]
+              end
+            end
+          end
+
+          def environment
+            home = (Dir.home rescue nil)
+            system_paths = Gem.path.reject { |p| home && p.start_with?(home + "/") }
+            env = {
+              "GEM_HOME" => File.join(@scratch, "gemhome"),
+              "GEM_PATH" => ([@gemdir] + system_paths).uniq.join(":"),
+              "HOME" => File.join(@scratch, "home"),
+              "TMPDIR" => File.join(@scratch, "tmp"),
+              "PATH" => [File.join(@destdir, "usr", "bin"), ENV.fetch("PATH", "/usr/bin:/bin")].join(":"),
+              "RUBYOPT" => ["-r#{File.join(@helpers, "hook.rb")}", ENV["RUBYOPT"]].compact.join(" "),
+              "UPSTREAM_TESTS_RUBY_RESULTS" => @results,
+              "SPEC_OPTS" => nil,
+              "RUBYGEMS_GEMDEPS" => nil,
+              "http_proxy" => "http://127.0.0.1:9", "https_proxy" => "http://127.0.0.1:9",
+              "HTTP_PROXY" => "http://127.0.0.1:9", "HTTPS_PROXY" => "http://127.0.0.1:9",
+              "no_proxy" => "localhost,127.0.0.1,::1", "NO_PROXY" => "localhost,127.0.0.1,::1",
+            }
+            env["LANG"] = "C.UTF-8" if (ENV["LANG"].to_s + ENV["LC_ALL"].to_s).empty?
+            # Fixed seed per package version (see "Test order" in the description).
+            # rspec takes its default seed from Kernel.rand, which hook.rb seeds;
+            # minitest reads SEED. Neither turns on random order: a suite that runs in
+            # defined order keeps it. A --seed or --order in `args` still wins.
+            env["UPSTREAM_TESTS_RUBY_SEED"] = @seed.to_s
+            env["SEED"] = @seed.to_s
+            env
+          end
+
+          # In the child: a new network namespace with only loopback up. If
+          # loopback cannot be brought up, go back to the original namespace
+          # (setns), so the suite never runs without loopback.
+          def isolate_network(status)
+            unshared = false
+            require "fiddle"
+            require "socket"
+            libc = Fiddle.dlopen(nil)
+            unshare = Fiddle::Function.new(libc["unshare"], [Fiddle::TYPE_INT], Fiddle::TYPE_INT)
+            setns = Fiddle::Function.new(libc["setns"], [Fiddle::TYPE_INT, Fiddle::TYPE_INT], Fiddle::TYPE_INT)
+            orig = File.open("/proc/self/ns/net")
+            if unshare.call(0x40000000) != 0 # CLONE_NEWNET
+              return status.puts("unavailable (unshare: #{SystemCallError.new(Fiddle.last_error).message})")
+            end
+            unshared = true
+            begin
+              s = Socket.new(:INET, :DGRAM)
+              ifr = ["lo"].pack("a16") + ("\0" * 24)
+              s.ioctl(0x8913, ifr) # SIOCGIFFLAGS
+              flags = ifr[16, 2].unpack1("s")
+              ifr[16, 2] = [flags | 0x1 | 0x40].pack("s") # IFF_UP | IFF_RUNNING
+              s.ioctl(0x8914, ifr) # SIOCSIFFLAGS
+              s.close
+            rescue StandardError => e
+              if setns.call(orig.fileno, 0x40000000) != 0
+                raise "loopback: #{e.message}; setns back failed: #{SystemCallError.new(Fiddle.last_error).message}"
+              end
+              return status.puts("unavailable (loopback: #{e.class}: #{e.message})")
+            ensure
+              orig.close
+            end
+            status.puts("isolated")
+          rescue LoadError, StandardError => e
+            return status.puts("unavailable (#{e.class}: #{e.message})") unless unshared
+            status.puts("FATAL #{e.class}: #{e.message}")
+            status.close
+            exit!(97)
+          end
+
+          def execute
+            @env = environment
+            cmd = command
+            say("runner=#{@runner} gem=#{@spec.full_name} installed=#{@gem_path} pinned=#{@pinned.join(",")}")
+            say("command: #{cmd.map { |a| Shellwords.escape(a) }.join(" ")}")
+            become_subreaper
+            out_r, out_w = IO.pipe
+            st_r, st_w = IO.pipe
+            pid = fork do
+              out_r.close
+              st_r.close
+              Process.setsid
+              isolate_network(st_w)
+              st_w.close
+              $stdout.reopen(out_w)
+              $stderr.reopen(out_w)
+              Dir.chdir(@run_dir)
+              # hook.rb seeds Kernel.rand, and record.rb writes results, only in
+              # this process (exec keeps the pid).
+              exec(@env.merge("UPSTREAM_TESTS_RUBY_RUNNER_PID" => Process.pid.to_s), *cmd, in: File::NULL, close_others: true)
+            end
+            out_w.close
+            st_w.close
+            @netns = st_r.read.strip
+            st_r.close
+            @netns = "unavailable (no status)" if @netns.empty?
+            if @netns.start_with?("FATAL")
+              Process.wait(pid)
+              die("could not set up the test process: #{@netns}")
+            end
+            output = []
+            timed_out = false
+            killer = Thread.new do
+              sleep @overall_timeout
+              timed_out = true
+              begin
+                Process.kill("TERM", -pid)
+                sleep 10
+                Process.kill("KILL", -pid)
+              rescue Errno::ESRCH
+              end
+            end
+            # The suite's output is bytes in any encoding; read it as binary so
+            # that a non-UTF-8 line (or a US-ASCII default external) cannot break
+            # the scan below.
+            out_r.binmode
+            # Read in a thread and wait for the runner here: a background process
+            # that the tests left running (a helper server) inherits the output
+            # pipe, and must not keep the step waiting once the runner is done.
+            reader = Thread.new do
+              out_r.each_line do |l|
+                $stdout.write(l)
+                output << l if output.size < 20_000 && l.match?(/cannot load such file|LoadError|bundler\/setup/)
+              end
+            rescue IOError
+              # out_r closed below after the grace period.
+            end
+            # As a subreaper this process inherits the orphans of the run (a
+            # daemon whose parent exited): reap them while waiting, so that a
+            # test that stops a daemon sees it gone, not a zombie.
+            status = nil
+            until status
+              wpid, st = Process.wait2(-1)
+              status = st if wpid == pid
+            end
+            killer.kill
+            killed = kill_leftovers(pid)
+            unless reader.join(LEFTOVER_GRACE)
+              killed |= kill_leftovers(pid)
+              unless reader.join(2)
+                say("WARNING: the output pipe was still open #{LEFTOVER_GRACE + 2}s after #{@runner} exited; stopped reading it (output after this point is lost)")
+                out_r.close
+                reader.join
+              end
+            end
+            $stdout.flush
+            out_r.close unless out_r.closed?
+            say("killed #{killed.size} leftover process(es) that the tests started and left running") unless killed.empty?
+            rc = status.exitstatus || (128 + status.termsig.to_i)
+            @why << "timed out after #{@overall_timeout}s (overall-timeout)" if timed_out
+            # A run that dies on a signal (a crash in a native extension, an
+            # abort) did not finish, whatever was recorded before it died.
+            @why << "#{@runner} was killed by signal #{status.termsig} (a crash or abort): the suite did not finish" if status.signaled? && !timed_out
+            [rc, output]
+          end
+
+          # Makes this process a child subreaper (prctl PR_SET_CHILD_SUBREAPER),
+          # so that every process of the test run stays its descendant, also a
+          # daemon that left the session (setsid), cleaned its environment and
+          # closed its stdio: orphans are reparented here, not to init.
+          def become_subreaper
+            require "fiddle"
+            libc = Fiddle.dlopen(nil)
+            prctl = Fiddle::Function.new(libc["prctl"], [Fiddle::TYPE_INT] + [Fiddle::TYPE_LONG] * 4, Fiddle::TYPE_INT)
+            return true if prctl.call(36, 1, 0, 0, 0).zero? # PR_SET_CHILD_SUBREAPER
+            say("WARNING: prctl(PR_SET_CHILD_SUBREAPER): #{SystemCallError.new(Fiddle.last_error).message}; processes that leave the test's process group may outlive the step")
+            false
+          rescue LoadError, StandardError => e
+            say("WARNING: cannot become a subreaper (#{e.class}: #{e.message}); processes that leave the test's process group may outlive the step")
+            false
+          end
+
+          # The live (not zombie) descendants of this process, from /proc.
+          def descendants
+            kids = Hash.new { |h, k| h[k] = [] }
+            Dir.children("/proc").grep(/\A\d+\z/).each do |d|
+              stat = begin
+                File.read("/proc/#{d}/stat")
+              rescue SystemCallError
+                next
+              end
+              f = stat[(stat.rindex(")") + 2)..].split # state ppid ...
+              kids[f[1].to_i] << d.to_i unless f[0] == "Z"
+            end
+            out = []
+            queue = [Process.pid]
+            while (p = queue.shift)
+              kids[p].each do |c|
+                out << c
+                queue << c
+              end
+            end
+            out
+          end
+
+          def reap
+            loop { break unless Process.wait(-1, Process::WNOHANG) }
+          rescue Errno::ECHILD
+            # No children left.
+          end
+
+          # Once the runner has exited: kills and reaps whatever the run left
+          # behind, the runner's process group and every remaining descendant
+          # (as a subreaper, that is every process of the run). Returns their
+          # pids.
+          def kill_leftovers(pgid)
+            killed = []
+            20.times do
+              pids = descendants
+              [-pgid, *pids].each do |p|
+                Process.kill("KILL", p)
+                killed << p if p > 0
+              rescue Errno::ESRCH, Errno::EPERM
+              end
+              reap
+              break if pids.empty?
+              sleep 0.05
+            end
+            reap
+            killed.uniq
+          end
+
+          STATUSES = %w[pass fail error skip].freeze
+
+          # Strict base64, or nil when the field is not valid base64.
+          def decode(f)
+            f.unpack1("m0").force_encoding(Encoding::UTF_8)
+          rescue ArgumentError
+            nil
+          end
+
+          # Test records, end-of-run records (rspec's summary, minitest's and
+          # test-unit's done), and the malformed lines (a process killed while
+          # writing one: no newline, a cut base64 field), which the gate counts
+          # instead of reading as tests.
+          def read_results
+            tests = []
+            summaries = []
+            dones = []
+            starts = []
+            malformed = []
+            Dir.glob(File.join(@results, "results-*.tsv")).sort.each do |f|
+              File.foreach(f).with_index(1) do |l, n|
+                fields = l.chomp.split("\t", -1)
+                ints = fields.drop(1).all? { |x| x.match?(/\A\d+\z/) }
+                if !l.end_with?("\n")
+                  malformed << "#{File.basename(f)}:#{n}"
+                elsif fields[0] == "summary" && fields.size == 5 && ints
+                  summaries << fields.drop(1).map(&:to_i)
+                elsif fields[0] == "done" && fields.size == 3 && ints
+                  dones << fields.drop(1).map(&:to_i)
+                elsif fields[0] == "start" && fields.size == 2 && ints
+                  starts << fields[1].to_i
+                elsif STATUSES.include?(fields[0]) && fields.size == 4 && (d = fields.drop(1).map { |x| decode(x) }).none?(&:nil?)
+                  tests << { status: fields[0], name: d[0], loc: d[1], groups: d[2].split("\n") }
+                else
+                  malformed << "#{File.basename(f)}:#{n}"
+                end
+              end
+            end
+            [tests, summaries, dones, malformed, starts]
+          end
+
+          def relative(loc)
+            loc.delete_prefix(@run_dir + "/")
+          end
+
+          def ignored?(t, entry)
+            t[:name] == entry || t[:name].start_with?("#{entry}[") || t[:groups].include?(entry)
+          end
+
+          def origin_check
+            feats = Dir.glob(File.join(@results, "features-*.txt")).flat_map { |f| File.readlines(f, chomp: true) }.uniq
+            real = feats.filter_map { |p| File.realpath(p) rescue nil }.uniq
+            roots = [@gem_path]
+            roots << @spec.extension_dir if @spec.respond_to?(:extension_dir) && @spec.extension_dir
+            roots = roots.map { |r| File.realpath(r) rescue r }
+            under = ->(p, r) { p == r || p.start_with?(r + "/") }
+            mine = real.select { |p| roots.any? { |r| under.(p, r) } }
+            installed = mine.size
+            so = mine.count { |p| p.end_with?(".#{RbConfig::CONFIG["DLEXT"]}") }
+            scratch = File.realpath(@scratch)
+            workspace = File.realpath(@workspace)
+            destroot = File.realpath(@destdir)
+            tree = real.select { |p| under.(p, workspace) && !under.(p, scratch) && !under.(p, destroot) }
+            # The gem's own ext/ (not test fixtures that a suite compiles, such
+            # as ffi's spec/ffi/embed-test/ext).
+            src_ext = File.join(File.realpath(@run_dir), "ext")
+            copy_ext = real.select { |p| under.(p, src_ext) }
+            system_copy = real.select do |p|
+              Gem.path.any? { |gp| p.match?(%r{\A#{Regexp.escape(gp)}/(gems|extensions/[^/]+/[^/]+)/#{Regexp.escape(@spec.name)}-\d}) }
+            end
+            # Ruby's own copy of a default gem (securerandom, benchmark, ...):
+            # a file loaded from the ruby library directories whose relative
+            # path the installed gem also ships.
+            libdirs = %w[rubylibdir rubyarchdir sitelibdir sitearchdir vendorlibdir vendorarchdir]
+                      .filter_map { |k| RbConfig::CONFIG[k] }.reject(&:empty?)
+                      .filter_map { |d| File.realpath(d) rescue nil }.uniq
+            gem_dirs = @spec.require_paths.map { |rp| File.join(@gem_path, rp) }
+            gem_dirs << @spec.extension_dir if @spec.respond_to?(:extension_dir) && @spec.extension_dir
+            system_copy += real.select do |p|
+              libdirs.any? do |d|
+                under.(p, d) && gem_dirs.any? { |g| File.file?(File.join(g, p.delete_prefix(d + "/"))) }
+              end
+            end
+            say("origin: #{installed} file(s) loaded from the installed gem (#{so} compiled extension(s)), #{real.size} in all")
+            if feats.empty?
+              @why << "no loaded-feature records: the test processes did not run the hook"
+            elsif installed.zero?
+              @why << "nothing was loaded from the installed gem (#{@gem_path})"
+            end
+            unless tree.empty?
+              @why << "#{tree.size} file(s) loaded from the build tree instead of the destdir (e.g. #{tree.first})"
+            end
+            unless copy_ext.empty?
+              @why << "#{copy_ext.size} file(s) loaded from the source's ext/ instead of the installed gem (e.g. #{copy_ext.first})"
+            end
+            unless system_copy.empty?
+              @why << "a system copy of #{@spec.name} was loaded (e.g. #{system_copy.first}), not the one being built"
+            end
+          end
+
+          def judge(rc, output, duration, before, after)
+            tests, summaries, dones, malformed, starts = read_results
+            pass = tests.count { |t| t[:status] == "pass" }
+            skip = tests.count { |t| t[:status] == "skip" }
+            failing = tests.select { |t| %w[fail error].include?(t[:status]) }
+            outside = summaries.sum { |s| s[3].to_i }
+            nfail = 0
+            ignored = 0
+            failing.each do |t|
+              label = t[:name] + (t[:loc].empty? ? "" : " [#{relative(t[:loc])}]") + (t[:status] == "error" ? " [error]" : "")
+              if @ignore.any? { |e| ignored?(t, e) }
+                puts "IGNORE #{@pkg}: #{label}"
+                ignored += 1
+              else
+                puts "UPSTREAM-TESTS-FAIL #{@pkg}: #{label}"
+                nfail += 1
+              end
+            end
+            if outside > 0
+              puts "UPSTREAM-TESTS-FAIL #{@pkg}: #{outside} error(s) outside of examples (a spec file failed to load, or a suite hook failed)"
+              @why << "#{outside} rspec error(s) outside of examples"
+            end
+            unless malformed.empty?
+              @why << "#{malformed.size} malformed result record(s) (e.g. #{malformed.first}): a test process was killed while writing, the results cannot be trusted"
+            end
+            # Each runner writes its end-of-run record (rspec's summary, the
+            # minitest reporter's report, test-unit's finished run) only when the
+            # run reaches the end. A test or the code under test that calls exit
+            # stops the run early (both minitest and test-unit let SystemExit
+            # through), so a missing record, or one that counts other tests than
+            # were recorded, means the suite stopped early: never pass on that.
+            # Each record is [tests, passed (1|0)].
+            ends = if @runner == "rspec"
+                     summaries.map { |s| [s[0], (s[1] + s[3]).zero? ? 1 : 0] }
+                   else
+                     dones
+                   end
+            reported = ends.sum { |e| e[0] }
+            if ends.empty?
+              @why << "#{@runner} did not reach its end-of-run #{@runner == "rspec" ? "summary" : "report"}: the run ended before the suite finished (a test or the code under test called exit or raised Interrupt, or the process died)"
+            elsif reported != tests.size
+              @why << "#{@runner} reported #{reported} test(s) but #{tests.size} were recorded"
+            end
+            # rspec: also every example it planned (start, after filters) must
+            # have been recorded; --fail-fast or an abort stops short of that.
+            if @runner == "rspec" && !ends.empty?
+              planned = starts.sum
+              if starts.empty?
+                @why << "rspec did not report how many examples it planned to run"
+              elsif planned != tests.size
+                @why << "rspec planned #{planned} example(s) but #{tests.size} were recorded: the run stopped early (--fail-fast, or an abort)"
+              end
+            end
+            finished = !ends.empty? && reported == tests.size && (@runner != "rspec" || (!starts.empty? && starts.sum == tests.size))
+            @ignore.each do |e|
+              hits = tests.select { |t| ignored?(t, e) }
+              if hits.empty?
+                @why << "ignore entry '#{e}' matches no test (stale or misspelt exception)"
+              elsif hits.none? { |t| %w[fail error].include?(t[:status]) }
+                say("WARNING: ignore entry '#{e}' did not fail (stale exception?)")
+              end
+            end
+            @why << "#{nfail} non-ignored failing test(s)" if nfail > 0
+            if tests.empty?
+              @why << "no test results recorded: the suite did not run"
+            elsif pass.zero?
+              @why << "no test passed (skip=#{skip}): the suite did not really run"
+            end
+            ran = pass + failing.size
+            if !tests.empty? && ran * 100 < @min_run_percent * (ran + skip)
+              @why << "only #{ran} of #{ran + skip} tests ran (min-run-percent #{@min_run_percent})"
+            end
+            # Ignored failures make the runner exit non-zero, which is excused
+            # only when the suite finished and its own end-of-run record says it
+            # failed; any other non-zero exit with no failing test fails.
+            if rc != 0 && nfail.zero? && outside.zero?
+              if ignored.zero?
+                @why << "#{@runner} exited #{rc} with no failing test"
+              elsif !finished || ends.none? { |e| e[1].zero? }
+                @why << "#{@runner} exited #{rc}, and the ignored failures do not explain it (the suite did not finish, or its end-of-run record counts no failure)"
+              end
+            end
+            if rc.zero? && nfail > 0
+              @why << "#{@runner} exited 0 although tests failed"
+            end
+            origin_check
+            if before != after
+              changed = (before.keys | after.keys).reject { |k| before[k] == after[k] }
+              @why << "the run changed #{changed.size} path(s) in the destdir (e.g. #{changed.first(5).join(", ")})"
+            end
+            puts "UPSTREAM-TESTS #{@pkg}: duration=#{duration}s runner=#{@runner} netns=#{@netns}"
+            extra = ignored > 0 ? " ignored=#{ignored}" : ""
+            puts "UPSTREAM-TESTS #{@pkg}: pass=#{pass} fail=#{failing.size + outside} skip=#{skip}#{extra}"
+            hint(output) unless @why.empty?
+            return if @why.empty?
+            puts "UPSTREAM-TESTS #{@pkg}: FAILED: #{@why.join("; ")}"
+            exit 1
+          end
+
+          def hint(output)
+            feats = output.join.scan(/cannot load such file -- ([^\s("'`]+)/).flatten.uniq
+            return if feats.empty?
+            guesses = feats.first(10).map do |f|
+              top = f.split("/").first
+              # test-unit-ruby-core ships the ruby/ruby test helpers that the
+              # default gems' suites load.
+              top = "test-unit-ruby-core" if %w[envutil core_assertions find_executable].include?(top)
+              "#{f} (ruby#{@mm}-#{top}?)"
+            end
+            say("HINT: tests could not load: #{guesses.join(", ")}; add the packages that provide them (the gem's runtime dependencies and test requirements) to environment.contents.packages")
+          end
+        end
+      end
+
+      UpstreamTestsRuby::Gate.new(ARGV).run
+      UPSTREAM_TESTS_RUBY_EOF
+      if ! command -v "${{inputs.ruby}}" >/dev/null 2>&1; then
+        echo "upstream-tests/ruby-test: '${{inputs.ruby}}' not found; add ruby-\${MM} (the build's ruby) to environment.contents.packages or set ruby" >&2
+        exit 1
+      fi
+      # Fixed seed per package version, so rebuilds of a version run the suite in
+      # the same order (see "Test order" in the description for why).
+      seed=$(printf '%s %s' "${{package.name}}" "${{package.version}}" | sha256sum | cut -c1-4)
+      seed=$((0x$seed))
+      "${{inputs.ruby}}" "$h/main.rb" \
+        --package "${{package.name}}" \
+        --seed "$seed" \
+        --destdir "${{targets.contextdir}}" \
+        --helpers "$h" \
+        --gem "${{inputs.gem}}" \
+        --dir "${{inputs.dir}}" \
+        --runner "${{inputs.runner}}" \
+        --paths-file "$h/paths" \
+        --args-file "$h/args" \
+        --ignore-file "$h/ignore" \
+        --overall-timeout "${{inputs.overall-timeout}}" \
+        --min-run-percent "${{inputs.min-run-percent}}"

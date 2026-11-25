@@ -1,0 +1,228 @@
+package:
+  name: py3.14-spdx-tools
+  version: "0.8.5"
+  epoch: 0
+  description: SPDX parser and tools.
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - py${{vars.python-version}}-beartype
+      - py${{vars.python-version}}-click
+      - py${{vars.python-version}}-license-expression
+      - py${{vars.python-version}}-ply
+      - py${{vars.python-version}}-pyyaml
+      - py${{vars.python-version}}-rdflib
+      - py${{vars.python-version}}-semantic-version
+      - py${{vars.python-version}}-uritools
+      - py${{vars.python-version}}-xmltodict
+  resources:
+    cpu: "3"
+    memory: 3Gi
+
+vars:
+  pypi-package: spdx-tools
+  import: spdx_tools.common
+  python-version: "3.14"
+
+environment:
+  contents:
+    packages:
+      - py${{vars.python-version}}-build-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/spdx/tools-python
+      tag: v${{package.version}}
+      expected-commit: cef432adee09dbff2eedf7e33e4aa8be7c11ccfd
+
+  - uses: patch
+    with:
+      patches: performance.patch
+
+  - uses: py/pip-build-install
+    with:
+      python: python${{vars.python-version}}
+
+  - uses: strip
+
+subpackages:
+  - name: ${{package.name}}-bin
+    description: Executable binaries for ${{vars.pypi-package}} installed for python${{vars.python-version}}
+    dependencies:
+      runtime:
+        - ${{package.name}}=${{package.full-version}}
+    pipeline:
+      - uses: split/bin
+    test:
+      pipeline:
+        - uses: test/tw/help-check
+          with:
+            bins: |
+              pyspdxtools
+              pyspdxtools3
+        - name: parse, deduplicate and validate relationships
+          runs: |
+            # documentDescribes and hasFiles imply DESCRIBES and CONTAINS
+            # relationships that the relationships list already has.
+            # performance.patch changes how the parser finds those existing
+            # relationships, directly or inverted, to skip adding them again.
+            # Explicit entries are kept as given.
+            cat > doc.spdx.json <<'EOF'
+            {
+              "spdxVersion": "SPDX-2.3",
+              "dataLicense": "CC0-1.0",
+              "SPDXID": "SPDXRef-DOCUMENT",
+              "name": "test",
+              "documentNamespace": "https://example.com/spdx/test",
+              "creationInfo": {
+                "created": "2026-01-01T00:00:00Z",
+                "creators": ["Tool: melange-test"]
+              },
+              "documentDescribes": ["SPDXRef-Package"],
+              "packages": [
+                {
+                  "SPDXID": "SPDXRef-Package",
+                  "name": "pkg",
+                  "downloadLocation": "NOASSERTION",
+                  "filesAnalyzed": true,
+                  "packageVerificationCode": {
+                    "packageVerificationCodeValue": "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+                  },
+                  "hasFiles": ["SPDXRef-File"]
+                }
+              ],
+              "files": [
+                {
+                  "SPDXID": "SPDXRef-File",
+                  "fileName": "./a.txt",
+                  "checksums": [
+                    {
+                      "algorithm": "SHA1",
+                      "checksumValue": "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+                    }
+                  ]
+                }
+              ],
+              "relationships": [
+                {
+                  "spdxElementId": "SPDXRef-DOCUMENT",
+                  "relationshipType": "DESCRIBES",
+                  "relatedSpdxElement": "SPDXRef-Package"
+                },
+                {
+                  "spdxElementId": "SPDXRef-Package",
+                  "relationshipType": "CONTAINS",
+                  "relatedSpdxElement": "SPDXRef-File"
+                },
+                {
+                  "spdxElementId": "SPDXRef-File",
+                  "relationshipType": "CONTAINED_BY",
+                  "relatedSpdxElement": "SPDXRef-Package"
+                }
+              ]
+            }
+            EOF
+            pyspdxtools -i doc.spdx.json
+            pyspdxtools -i doc.spdx.json -o out.spdx
+            cat out.spdx
+            [ "$(grep -c '^Relationship: SPDXRef-DOCUMENT DESCRIBES SPDXRef-Package$' out.spdx)" -eq 1 ]
+
+            cat > rels.py <<'EOF'
+            import sys
+            from spdx_tools.spdx.parser.parse_anything import parse_file
+            from spdx_tools.spdx.validation.document_validator import validate_full_spdx_document
+
+            doc = parse_file(sys.argv[1])
+            got = sorted(
+                (r.spdx_element_id, r.relationship_type.name, str(r.related_spdx_element_id))
+                for r in doc.relationships
+            )
+            want = sorted(tuple(x.split(":")) for x in sys.argv[2:])
+            print(got)
+            assert got == want, f"relationships {got}, expected {want}"
+            messages = validate_full_spdx_document(doc)
+            assert not messages, messages
+            EOF
+
+            # Direct match: hasFiles CONTAINS and documentDescribes DESCRIBES
+            # are already listed, so nothing is added.
+            python${{vars.python-version}} rels.py doc.spdx.json \
+              SPDXRef-DOCUMENT:DESCRIBES:SPDXRef-Package \
+              SPDXRef-Package:CONTAINS:SPDXRef-File \
+              SPDXRef-File:CONTAINED_BY:SPDXRef-Package
+
+            # Inverted match: only CONTAINED_BY is listed, so the hasFiles
+            # CONTAINS is not added. DESCRIBES comes from documentDescribes.
+            python${{vars.python-version}} - <<'EOF'
+            import json
+            d = json.load(open("doc.spdx.json"))
+            d["relationships"] = [
+                r for r in d["relationships"] if r["relationshipType"] == "CONTAINED_BY"
+            ]
+            json.dump(d, open("inverted.spdx.json", "w"))
+            EOF
+            python${{vars.python-version}} rels.py inverted.spdx.json \
+              SPDXRef-DOCUMENT:DESCRIBES:SPDXRef-Package \
+              SPDXRef-File:CONTAINED_BY:SPDXRef-Package
+        - name: validate a document with no relationships
+          runs: |
+            # SPDX needs a DESCRIBES relationship unless the document has a
+            # single package, so this is the smallest valid relationship set.
+            cat > empty.spdx.json <<'EOF'
+            {
+              "spdxVersion": "SPDX-2.3",
+              "dataLicense": "CC0-1.0",
+              "SPDXID": "SPDXRef-DOCUMENT",
+              "name": "empty",
+              "documentNamespace": "https://example.com/spdx/empty",
+              "creationInfo": {
+                "created": "2026-01-01T00:00:00Z",
+                "creators": ["Tool: melange-test"]
+              },
+              "packages": [
+                {
+                  "SPDXID": "SPDXRef-Package",
+                  "name": "pkg",
+                  "downloadLocation": "NOASSERTION",
+                  "filesAnalyzed": false
+                }
+              ]
+            }
+            EOF
+            pyspdxtools -i empty.spdx.json -o empty.spdx
+            cat empty.spdx
+            if grep -F 'Relationship:' empty.spdx; then
+              echo "FAIL: unexpected relationship in empty.spdx"
+              exit 1
+            fi
+        - name: reject a relationship to an undefined SPDX ID
+          runs: |
+            sed 's/"relatedSpdxElement": "SPDXRef-Package"/"relatedSpdxElement": "SPDXRef-Missing"/' \
+              doc.spdx.json > bad.spdx.json 2>/dev/null || {
+              echo "doc.spdx.json from the previous step is missing"; exit 1; }
+            if pyspdxtools -i bad.spdx.json > bad.out 2>&1; then
+              cat bad.out
+              echo "FAIL: pyspdxtools accepted an undefined SPDX ID"
+              exit 1
+            fi
+            cat bad.out
+            grep -F 'SPDXRef-Missing' bad.out
+
+update:
+  enabled: true
+  github:
+    identifier: spdx/tools-python
+    strip-prefix: v
+
+test:
+  pipeline:
+    - uses: test/tw/pip-check
+    - uses: python/import
+      with:
+        python: python${{vars.python-version}}
+        imports: |
+          import ${{vars.import}}
+          import spdx_tools.spdx.parser.parse_anything
+          import spdx_tools.spdx.validation.document_validator

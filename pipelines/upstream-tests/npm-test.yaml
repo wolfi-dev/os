@@ -1,0 +1,904 @@
+name: Node.js upstream test suite (npm test)
+
+description: |
+  Runs a Node.js project's own unit test suite (the runner its package.json
+  `test` script calls: jest, vitest, mocha or `node --test`) as a hard
+  build gate. Use it after the last step that installs or copies the build
+  output into the package, before `strip`. Run it after install, so the
+  package holds only what the build produced.
+
+  Isolation: the step copies the workspace (minus melange-out/ and
+  .libraries.token) to a scratch directory on disk under
+  /var/cache/melange/upstream-tests-npm, installs the test dependencies
+  there and runs the suite there. The install and `setup` use the build's
+  HOME and package-manager caches, like the build's own install. The
+  development dependencies never reach the workspace or
+  ${{targets.outdir}}: the step records every file under
+  ${{targets.outdir}} (path, type, mode, size, mtime, sha256 or link
+  target) before and after, and fails if anything changed. The scratch
+  directory is removed afterwards.
+
+  Test dependencies (network): the step installs the project's full
+  dependency set (devDependencies included) from its lockfile in the copy:
+  `npm ci --include=dev` (package-lock.json or npm-shrinkwrap.json) or
+  `pnpm install --frozen-lockfile` (pnpm-lock.yaml). yarn is not supported
+  yet: a yarn.lock fails the step until a caller needs it and backtests it.
+  The lockfile is looked up in `dir`, then in its parents up to the
+  workspace root (npm and pnpm workspaces install at the root). The install
+  is the step's only network access, and it uses the same registry
+  configuration as the build: the step fails unless the registry is
+  Chainguard Libraries (libraries.cgr.dev), so the caller must run
+  `- uses: auth/npm` earlier (before its own install step, as the
+  node-package skill requires; the lockfile hashes it rewrote are the ones
+  installed here). Install scripts stay off (--ignore-scripts on the
+  command line for npm and pnpm, whatever the environment says), as in
+  the build. `install-args` adds options the build's own install used
+  (e.g. --legacy-peer-deps), and `setup` runs the build's own post-install
+  commands in the test tree (e.g. `npx --no-install patch-package`), so the
+  test tree's node_modules match the build's. `setup` runs with no network
+  (unshare -n, like the suite) under `sh -e -o pipefail`; a setup command
+  that needs a download fails.
+
+  The suite (no network): the runner runs in a new network namespace with
+  only loopback up (unshare -n plus `ip link set lo up`, from the
+  util-linux-misc and iproute2 packages this pipeline adds), so tests that
+  reach out fail fast instead of hanging. If the namespace cannot be
+  created, the step fails: it never runs `setup` or a suite with network.
+  HOME, TMPDIR
+  and XDG_CACHE_HOME point into the
+  scratch directory; CI=true; NODE_ENV is unset unless the script sets it.
+
+  Runner detection (runner: auto): the `script` (default `test`) from
+  package.json, after following `npm run X`, `npm test`, `pnpm [run] X` and
+  `yarn [run] X` aliases, must be one command: no &&, ||, ;, |, redirection,
+  $ or backquotes (`npm run lint && jest` does not qualify: point `script`
+  at the script that runs only the unit suite, e.g. `test:unit`, or set
+  `runner` and `args`). Leading VAR=value assignments, `cross-env`, `npx`
+  and the coverage wrappers `c8` and `nyc` (with their options) are
+  dropped or kept as environment; coverage is not a test result, and a
+  coverage threshold must not fail the gate. The first remaining word
+  names the runner:
+    jest     --ci --json --outputFile=<results> --coverage=false
+             (any --watch, --watchAll, --coverage, --collectCoverage dropped)
+    vitest   run --reporter=default --reporter=json
+             --outputFile.json=<results> --coverage.enabled=false
+             (watch/dev subcommands, --watch, --ui, --coverage*,
+             --reporter*, --outputFile* dropped)
+    mocha    --reporter json --reporter-option output=<results>
+             (mocha 9.1.0 or later; --reporter/-R, --reporter-option(s)/-O,
+             --watch/-w dropped; _mocha and ts-mocha too)
+    node     node --test only: --test-reporter=spec to stdout plus
+             --test-reporter=tap to <results>
+             (--experimental-test-coverage, --test-coverage-*,
+             --test-reporter*, --watch dropped)
+  The rest of the script's words are kept as written (globs expand as npm's
+  /bin/sh would), then `args` is appended. Any other runner (jasmine, tap,
+  ava, karma, a custom `node run_tests.js`, turbo, nx, wireit, run-s) fails
+  the step with the resolved command; set `runner` and `args` if one of
+  the four above can run the suite, or leave the step out.
+  With `runner` set, the command is the runner plus `args` (node: `node
+  --test` plus `args`); `script` is not read. Leading VAR=value words in
+  `args` are then environment for the runner, as in a package.json script.
+
+  The suite is a hard gate, run once: no retries (jest's
+  retryTimes or mocha's --retries in upstream config are the project's
+  own; do not add them). The step fails if:
+    - a test that is not in `ignore` fails, or a test file fails to load
+      or run (jest/vitest suite error, mocha hook failure, a node --test
+      file that crashes, exits non-zero outside its tests or throws after a
+      test ended); suite errors are never ignorable,
+    - the runner exits non-zero with no failing test in its results
+      (unhandled error, config error, coverage threshold left on in
+      config), or `overall-timeout` hits,
+    - the runner exits non-zero, a test in `ignore` failed, and the
+      runner's results do not show the ignored failures as the only cause
+      (jest: no runtime-error suites, interruption or open handles, and
+      as many failed tests as ignored; mocha: as many failures as ignored
+      and that exit code; node --test: as many failed or cancelled as
+      ignored). vitest's results do not record unhandled errors, so with
+      vitest an ignored failure never excuses a non-zero exit,
+    - the results file is missing or cannot be parsed,
+    - the suite did not run: no test passed (node --test: only passing
+      leaf tests count, not a passing point named after a file that defines
+      no tests, nor a parent test whose subtests all skipped),
+    - an `ignore` entry matches no test in the results (remove stale
+      exceptions),
+    - `installed` is set and the installed package does not match the
+      tree the tests ran in (below),
+    - the run changed anything under ${{targets.outdir}}.
+
+  Prints the runner's own output, then:
+    UPSTREAM-TESTS <package>: runner=<r> install=<i> netns=isolated installed=<verified|unchecked>
+    UPSTREAM-TESTS <package>: duration=<n>s
+    UPSTREAM-TESTS-FAIL <package>: <file>::<full test title>   (one per failing test)
+    UPSTREAM-TESTS-FAIL <package>: <file> [suite]              (file failed to load or run)
+    IGNORE <package>: <file>::<full test title>                (ignored failure)
+    UPSTREAM-TESTS <package>: pass=<n> fail=<n> skip=<n> [ignored=<n>]
+    UPSTREAM-TESTS <package>: FAILED: <reasons>                (when the gate fails)
+  <file> is relative to `dir`; the full title is the describe/suite titles
+  and the test title joined by single spaces (jest fullName, mocha
+  fullTitle; node --test subtest names). skip counts skipped, pending,
+  todo and disabled tests. fail counts failing tests plus suite errors.
+
+  installed: the directory the package ships the project in, inside
+  ${{targets.contextdir}} (e.g. /usr/lib/node_modules/eslint or
+  /usr/share/foo). When set, before the suite runs the step checks that
+  every file installed there (outside its node_modules) that also exists in
+  the test tree is byte-identical to it, and that every dependency
+  installed under it (each node_modules/<name>/package.json, at any depth)
+  is in the test tree at the same version. So the tests ran the code and
+  dependency versions that ship, not something the build changed later.
+  Leave it empty for frontends that ship only bundled assets; the
+  configuration line then says installed=unchecked.
+
+  Examples:
+    - uses: auth/npm
+    - runs: |
+        npm ci
+        npm run build
+        npm prune --omit=dev
+        mkdir -p ${{targets.destdir}}/usr/share/foo
+        cp -a dist node_modules package.json ${{targets.destdir}}/usr/share/foo/
+    - uses: upstream-tests/npm-test
+      with:
+        installed: /usr/share/foo
+    - uses: strip
+
+    # package.json "test" runs lint first: "npm run lint && npm run test:unit"
+    - uses: upstream-tests/npm-test
+      with:
+        script: test:unit
+
+  Named exceptions go in ignore: one per line, the test as the FAIL line
+  prints it (<file>::<full title>) or just the full title. Each ignored test
+  still runs; its failure is reported as IGNORE. Every exception needs a
+  comment in the calling package explaining why and a
+  `TODO(upstream-tests): ...` to remove it:
+    # "fetches the schema" downloads from example.org; the build has no network.
+    # TODO(upstream-tests): mock the request upstream and drop it.
+    - uses: upstream-tests/npm-test
+      with:
+        ignore: |
+          test/schema.test.js::schema loader fetches the schema
+
+needs:
+  packages:
+    - busybox
+    - iproute2
+    - util-linux-misc
+
+inputs:
+  dir:
+    description: |
+      Project directory (holding the package.json whose script runs the
+      suite), relative to the workspace. The suite runs from here.
+    default: "."
+  install:
+    description: |
+      auto (default: npm or pnpm from the lockfile found in dir or a
+      parent), npm, or pnpm.
+    default: auto
+  install-args:
+    description: |
+      Extra arguments for the install command, the ones the build's own
+      install used, e.g. --legacy-peer-deps. Shell words: split on
+      whitespace, globs expand (deliberately, so several options can be
+      passed, as with `args`).
+    default: ""
+  install-env:
+    description: |
+      Space-separated VAR=value words exported for the install and setup,
+      the environment the build's own install step sets (e.g.
+      PNPM_CONFIG_PM_ON_FAIL=ignore). Not for the suite.
+    default: ""
+  setup:
+    description: |
+      Shell commands run in the install directory after the install and
+      before the suite: the build's own post-install steps (e.g.
+      npx --no-install patch-package), or the pre-test steps upstream's CI
+      runs (e.g. copying a sample .env). Each needs a comment in the caller
+      naming where it comes from. Empty runs nothing.
+    default: ""
+  script:
+    description: |
+      package.json script whose command runs the suite (runner: auto only),
+      e.g. test:unit when `test` also runs lint or e2e tests.
+    default: test
+  runner:
+    description: |
+      auto (detect from `script`), or jest, vitest, mocha or node to run
+      that runner directly with `args` (node means `node --test`).
+    default: auto
+  args:
+    description: |
+      Extra runner arguments, appended to the command (shell words; globs
+      expand). Not reporter, output-file, watch or coverage options: the
+      step sets those.
+    default: ""
+  ignore:
+    description: |
+      Failing tests to allow, one per line: <file>::<full title> or the
+      full title. Each one needs a comment and TODO in the caller.
+    default: ""
+  installed:
+    description: |
+      Directory the project is installed in, inside the (sub)package,
+      e.g. /usr/lib/node_modules/foo. When set, the step checks the
+      installed files and dependency versions match the tree tested.
+    default: ""
+  node-options:
+    description: |
+      NODE_OPTIONS for the suite only (appended to any NODE_OPTIONS in the
+      environment), for a Node runtime default the suite predates, e.g.
+      --no-webstorage when Node's global localStorage shadows jsdom's.
+      Needs a comment and TODO in the caller, like ignore.
+    default: ""
+  overall-timeout:
+    description: |
+      Wall-clock limit for the whole suite run, in seconds (named like the
+      other upstream-tests pipelines; jest and mocha per-test timeouts stay
+      the project's own). At most 1800: a suite
+      that needs longer is out of budget (upstream-tests skill, Cost), and
+      a cap keeps a runaway or hostile test from holding a builder.
+    default: "600"
+
+pipeline:
+  - name: upstream-tests (npm test)
+    runs: |
+      PKG="${{package.name}}"
+      export PKG
+      dir="${{inputs.dir}}"
+      install="${{inputs.install}}"
+      script="${{inputs.script}}"
+      runner="${{inputs.runner}}"
+      installed="${{inputs.installed}}"
+      limit="${{inputs.overall-timeout}}"
+      nodeopts="${{inputs.node-options}}"
+      outdir="${{targets.outdir}}"
+      contextdir="${{targets.contextdir}}"
+      args=$(cat <<'UPSTREAM_TESTS_NPM_ARGS'
+      ${{inputs.args}}
+      UPSTREAM_TESTS_NPM_ARGS
+      )
+      iargs=$(cat <<'UPSTREAM_TESTS_NPM_IARGS'
+      ${{inputs.install-args}}
+      UPSTREAM_TESTS_NPM_IARGS
+      )
+      ienv="${{inputs.install-env}}"
+      setup=$(cat <<'UPSTREAM_TESTS_NPM_SETUP'
+      ${{inputs.setup}}
+      UPSTREAM_TESTS_NPM_SETUP
+      )
+      ignore=$(cat <<'UPSTREAM_TESTS_NPM_IGNORE'
+      ${{inputs.ignore}}
+      UPSTREAM_TESTS_NPM_IGNORE
+      )
+      fail() {
+        echo "UPSTREAM-TESTS ${PKG}: FAILED: $*"
+        exit 1
+      }
+      case "$install" in
+        auto|npm|pnpm) ;;
+        *) fail "install must be auto, npm or pnpm, not '$install'" ;;
+      esac
+      case "$runner" in
+        auto|jest|vitest|mocha|node) ;;
+        *) fail "runner must be auto, jest, vitest, mocha or node, not '$runner'" ;;
+      esac
+      case "$limit" in
+        ''|*[!0-9]*) fail "overall-timeout must be a number of seconds, not '$limit'" ;;
+      esac
+      [ "$limit" -ge 1 ] && [ "$limit" -le 1800 ] || fail "overall-timeout must be between 1 and 1800 seconds, not $limit"
+      command -v node >/dev/null || fail "no node in the build environment (add the nodejs-<major> stream the build uses)"
+      ws=$(pwd)
+      [ -f "$ws/$dir/package.json" ] || fail "no package.json in '$dir'"
+      if [ -n "$installed" ]; then
+        [ -d "$contextdir/$installed" ] || fail "installed: '$installed' is not a directory in ${contextdir}"
+      fi
+
+      mkdir -p /var/cache/melange/upstream-tests-npm
+      scratch=$(mktemp -d /var/cache/melange/upstream-tests-npm/run.XXXXXX)
+      trap 'chmod -R u+w "$scratch" 2>/dev/null; rm -rf "$scratch"' EXIT
+      mkdir "$scratch/src" "$scratch/home" "$scratch/tmp" "$scratch/cache" "$scratch/bin"
+      helper="$scratch/bin/npm-test.js"
+      cat > "$helper" <<'UPSTREAM_TESTS_NPM_JS'
+      'use strict';
+      const fs = require('fs');
+      const path = require('path');
+      const crypto = require('crypto');
+      const env = process.env;
+      const PKG = env.PKG;
+      const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+
+      function walk(root, rel, cb, skip) {
+        let ents;
+        try { ents = fs.readdirSync(path.join(root, rel), { withFileTypes: true }); } catch (e) { return; }
+        ents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        for (const e of ents) {
+          const r = rel ? rel + '/' + e.name : e.name;
+          if (skip && skip(r, e)) continue;
+          cb(r, e);
+          if (e.isDirectory()) walk(root, r, cb, skip);
+        }
+      }
+
+      // snapshot <dir>: one line per entry: type mode size mtime hash|target path
+      function snapshot(root) {
+        const out = [];
+        walk(root, '', (r) => {
+          const p = path.join(root, r);
+          const st = fs.lstatSync(p);
+          let t = '?', h = '-';
+          if (st.isSymbolicLink()) { t = 'l'; h = fs.readlinkSync(p); }
+          else if (st.isDirectory()) { t = 'd'; }
+          else if (st.isFile()) { t = 'f'; h = crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'); }
+          out.push([t, (st.mode & 0o7777).toString(8), st.isDirectory() ? 0 : st.size, Math.floor(st.mtimeMs), h, JSON.stringify(r)].join(' '));
+        });
+        process.stdout.write(out.join('\n') + '\n');
+      }
+
+      // Shell words with their raw text. Operators outside quotes are refused.
+      function tokenize(s) {
+        const toks = [];
+        let i = 0;
+        const n = s.length;
+        while (i < n) {
+          while (i < n && /[ \t]/.test(s[i])) i++;
+          if (i >= n) break;
+          const start = i;
+          let val = '';
+          while (i < n && !/[ \t]/.test(s[i])) {
+            const c = s[i];
+            if (c === "'") {
+              const j = s.indexOf("'", i + 1);
+              if (j < 0) throw new Error('unbalanced quote');
+              val += s.slice(i + 1, j); i = j + 1;
+            } else if (c === '"') {
+              let j = i + 1;
+              while (j < n && s[j] !== '"') {
+                if (s[j] === '$' || s[j] === '`') throw new Error("'" + s[j] + "' substitution");
+                if (s[j] === '\\' && j + 1 < n) { val += s[j + 1]; j += 2; } else { val += s[j++]; }
+              }
+              if (j >= n) throw new Error('unbalanced quote');
+              i = j + 1;
+            } else if (c === '\\') {
+              if (i + 1 >= n) throw new Error('trailing backslash');
+              val += s[i + 1]; i += 2;
+            } else if ('&|;<>`()$\n\r'.includes(c)) {
+              throw new Error("shell operator '" + (c === '\n' ? '\\n' : c) + "'");
+            } else { val += c; i++; }
+          }
+          toks.push({ raw: s.slice(start, i), val });
+        }
+        return toks;
+      }
+
+      const RUNNERS = { jest: 'jest', vitest: 'vitest', mocha: 'mocha', _mocha: 'mocha', 'ts-mocha': 'mocha', node: 'node' };
+      const UNSUPPORTED = ['jasmine', 'tap', 'ava', 'karma', 'tape', 'lab', 'playwright', 'cypress', 'turbo', 'nx', 'lerna', 'wireit', 'run-s', 'run-p', 'npm-run-all', 'grunt', 'gulp', 'ember', 'hereby', 'poku', 'uvu', 'qunit', 'nodeunit', 'jasmine-node', 'tsx'];
+      const isAssign = (v) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(v);
+
+      function resolve() {
+        const pj = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+        const scripts = pj.scripts || {};
+        const out = env.RESULTS;
+        const argToks = tokenize((env.ARGS || '').replace(/[\r\n]+/g, ' '));
+        let toks = [];
+        const envs = [];
+        let runner = env.RUNNER;
+        if (runner !== 'auto') {
+          while (argToks.length && isAssign(argToks[0].val)) envs.push(argToks.shift());
+          toks = runner === 'node' ? [{ raw: 'node', val: 'node' }, { raw: '--test', val: '--test' }] : [{ raw: runner, val: runner }];
+        } else {
+          let name = env.SCRIPT;
+          let s = scripts[name];
+          if (typeof s !== 'string') throw new Error("package.json has no '" + name + "' script; set script: or runner:");
+          const chain = [name];
+          let tail = [];
+          for (let depth = 0; ; depth++) {
+            if (depth > 8) throw new Error('script aliases nest too deep: ' + chain.join(' -> '));
+            try { toks = tokenize(s); } catch (e) {
+              throw new Error("script '" + name + "' (" + JSON.stringify(s) + ') is not a single command (' + e.message + '); set script: to the script that runs only the unit suite, or runner: and args:');
+            }
+            toks = toks.concat(tail); tail = [];
+            let changed = true;
+            while (changed && toks.length) {
+              changed = false;
+              while (toks.length && isAssign(toks[0].val)) { envs.push(toks.shift()); changed = true; }
+              const w = toks.length ? toks[0].val : '';
+              if (w === 'cross-env' || w === 'cross-env-shell') { toks.shift(); changed = true; }
+              else if (w === 'npx') { toks.shift(); while (toks.length && toks[0].val.startsWith('-')) toks.shift(); changed = true; }
+              else if (w === 'c8' || w === 'nyc') {
+                toks.shift();
+                while (toks.length && !(toks[0].val in RUNNERS) && !['npm', 'pnpm', 'yarn', 'npx', 'cross-env'].includes(toks[0].val) && !UNSUPPORTED.includes(toks[0].val)) toks.shift();
+                changed = true;
+              }
+            }
+            if (!toks.length) throw new Error("script '" + name + "' has no command");
+            const w = toks[0].val;
+            let target = null, rest = [];
+            if (w === 'npm') {
+              const sub = toks[1] && toks[1].val;
+              if (sub === 'test' || sub === 't' || sub === 'tst') { target = 'test'; rest = toks.slice(2); }
+              else if (sub === 'run' || sub === 'run-script' || sub === 'rum' || sub === 'urn') { target = toks[2] && toks[2].val; rest = toks.slice(3); }
+              else throw new Error("script '" + name + "' runs 'npm " + (sub || '') + "', not a script alias");
+              rest = rest.filter((t) => !['-s', '--silent', '--if-present'].includes(t.val));
+              const dd = rest.findIndex((t) => t.val === '--');
+              if (rest.some((t, i) => t.val.startsWith('-') && (dd < 0 || i < dd))) throw new Error("script '" + name + "' passes npm options (" + JSON.stringify(s) + '); set runner: and args:');
+              rest = dd < 0 ? [] : rest.slice(dd + 1);
+            } else if (w === 'pnpm' || w === 'yarn') {
+              let i = 1;
+              if (toks[i] && toks[i].val === 'run') i++;
+              const t = toks[i] && toks[i].val;
+              if (t && t in scripts) { target = t; rest = toks.slice(i + 1).filter((x) => x.val !== '--'); }
+              else if (t && t in RUNNERS) { toks = toks.slice(i); }
+              else throw new Error("script '" + name + "' runs '" + w + ' ' + (t || '') + "', which is not a script in package.json");
+            }
+            if (target === null) break;
+            if (typeof scripts[target] !== 'string') throw new Error("script '" + name + "' runs script '" + target + "', which package.json does not define");
+            chain.push(target);
+            name = target; s = scripts[target]; tail = rest;
+          }
+          const w = toks[0].val;
+          if (!(w in RUNNERS)) {
+            const why = UNSUPPORTED.includes(w) ? 'runner ' + w + ' is not supported by upstream-tests/npm-test' : "'" + w + "' is not a recognised test runner";
+            throw new Error(why + ' (script ' + chain.join(' -> ') + ': ' + toks.map((t) => t.raw).join(' ') + '); set runner: and args: if jest, vitest, mocha or node --test can run the suite');
+          }
+          runner = RUNNERS[w];
+          if (runner === 'node' && !toks.some((t) => t.val === '--test')) {
+            throw new Error("script runs '" + toks.map((t) => t.raw).join(' ') + "', a custom node script, not node --test");
+          }
+        }
+        let bin = toks[0];
+        let rest = toks.slice(1).concat(argToks);
+        const dropped = [];
+        const drop = (pred, withValue) => {
+          const keep = [];
+          for (let i = 0; i < rest.length; i++) {
+            const v = rest[i].val;
+            const m = pred(v);
+            if (m) { dropped.push(rest[i].raw); if (m === 'value' && i + 1 < rest.length) { dropped.push(rest[i + 1].raw); i++; } continue; }
+            keep.push(rest[i]);
+          }
+          rest = keep;
+        };
+        const ins = [];
+        if (runner === 'jest') {
+          drop((v) => (['--coverage', '--collectCoverage', '--watch', '--watchAll', '--json', '--ci'].includes(v) || /^--(coverage|collectCoverage|watch|watchAll|json|ci|outputFile)=/.test(v)) ? true : v === '--outputFile' ? 'value' : false);
+          ins.push('--ci', '--json', '--outputFile=' + out, '--coverage=false');
+        } else if (runner === 'vitest') {
+          if (rest.length && ['run', 'watch', 'dev'].includes(rest[0].val)) { if (rest[0].val !== 'run') dropped.push(rest[0].raw); rest.shift(); }
+          drop((v) => {
+            if (v === '--reporter' || v === '--outputFile' || /^--outputFile\.[a-z-]+$/.test(v)) return 'value';
+            return ['--watch', '--ui', '--run', '--coverage'].includes(v) || /^--(watch|ui|coverage|reporter|outputFile)[.=]/.test(v);
+          });
+          ins.push('run', '--reporter=default', '--reporter=json', '--outputFile.json=' + out, '--coverage.enabled=false');
+        } else if (runner === 'mocha') {
+          drop((v) => (['--reporter', '-R', '--reporter-option', '--reporter-options', '-O'].includes(v) ? 'value' : (['--watch', '-w'].includes(v) || /^--(reporter|reporter-options?|watch)=/.test(v))));
+          ins.push('--reporter', 'json', '--reporter-option', 'output=' + out);
+        } else if (runner === 'node') {
+          drop((v) => (v === '--test-reporter' || v === '--test-reporter-destination') ? 'value' : (v === '--experimental-test-coverage' || v === '--watch' || /^--(test-coverage-[a-z-]+|test-reporter|test-reporter-destination|watch|watch-path)(=|$)/.test(v)));
+          ins.push('--test-reporter=spec', '--test-reporter-destination=stdout', '--test-reporter=tap', '--test-reporter-destination=' + out);
+        }
+        if (runner === 'mocha') {
+          let j;
+          try { j = require.resolve('mocha/lib/reporters/json.js', { paths: [process.cwd()] }); } catch (e) { throw new Error('mocha is not installed in the test tree'); }
+          if (!/reporterOption|reporterOptions/.test(fs.readFileSync(j, 'utf8')) || !/output/.test(fs.readFileSync(j, 'utf8'))) {
+            throw new Error('mocha in the test tree is older than 9.1.0 (its json reporter has no output option)');
+          }
+        }
+        const cmd = envs.map((t) => t.raw).concat([bin.raw], ins.map(q), rest.map((t) => t.raw)).join(' ');
+        process.stdout.write(runner + '\n' + cmd + '\n' + (dropped.length ? dropped.join(' ') : '-') + '\n');
+      }
+
+      function relf(f) {
+        if (!f) return '?';
+        const r = path.relative(env.PROJ, f);
+        return r.startsWith('..') ? f : r;
+      }
+
+      function parseTap(text) {
+        // node --test TAP: a subtest's points are indented 4 spaces per level
+        // and come before their parent's point. Leaf tests are the points
+        // with no children that are not describe() suites; pass counts
+        // passing leaves (`# pass` also counts a parent test whose subtests
+        // all skipped), fail and skip come from the summary comments. A
+        // top-level childless point named after a test file is the file
+        // itself, not a test: node --test reports a file that defines no
+        // tests as a passing point and a file that crashed (or exited
+        // non-zero outside its tests) as a failing one. An error thrown
+        // after a test or hook ended is only a top-level `# Error: ...
+        // generated asynchronous activity after the test ended` diagnostic
+        // (with no file point when the file also has a failing test); it is
+        // a suite error too. Other `# Error:` comments can be a test's own
+        // stderr.
+        const lines = text.split('\n');
+        const tests = [];
+        const names = [];
+        const kids = [];
+        const sum = {};
+        const asyncErrors = [];
+        for (let k = 0; k < lines.length; k++) {
+          const l = lines[k];
+          const ind = l.match(/^ */)[0].length;
+          const depth = Math.floor(ind / 4);
+          const b = l.slice(ind);
+          let m;
+          if ((m = b.match(/^# Subtest: (.*)$/))) { names[depth] = m[1]; names.length = depth + 1; continue; }
+          if (depth === 0 && (m = b.match(/^# (tests|suites|pass|fail|cancelled|skipped|todo) (\d+)$/))) { sum[m[1]] = +m[2]; continue; }
+          // Match Node's fixed tail, not the subject in front of it: "A
+          // resource", "Test "<name>"" or "Test hook "<type>"", each with or
+          // without " at <file>:<line>:<col>".
+          if (ind === 0 && (m = b.match(/^# Error: ((.*?) generated asynchronous activity after the test ended\..*)$/))) {
+            const at = m[2].match(/ at (.+?):\d+:\d+$/);
+            asyncErrors.push({ file: at ? relf(path.resolve(env.PROJ, at[1])) : '(outside any test)', message: m[1] });
+            continue;
+          }
+          if (!(m = b.match(/^(not ok|ok) \d+ - (.*?)(?: # (SKIP|TODO)\b.*)?$/i))) continue;
+          const t = { depth, name: m[2].replace(/\\#/g, '#'), ok: m[1] === 'ok', dir: (m[3] || '').toUpperCase(), suite: false, file: null };
+          t.full = names.slice(0, depth).concat([t.name]).join(' ');
+          t.children = kids[depth + 1] || [];
+          kids.length = depth + 1;
+          (kids[depth] = kids[depth] || []).push(t);
+          if (lines[k + 1] !== undefined && /^ *---$/.test(lines[k + 1])) {
+            for (let j = k + 2; j < lines.length && !/^ *\.\.\.$/.test(lines[j]); j++) {
+              const y = lines[j].trim();
+              if (/^type: '?suite'?$/.test(y)) t.suite = true;
+              const lm = y.match(/^location: '(.*):\d+:\d+'$/);
+              if (lm) t.file = lm[1];
+            }
+          }
+          names.length = depth;
+          tests.push(t);
+        }
+        if (!('pass' in sum) || !('fail' in sum)) throw new Error('no node --test summary (# pass / # fail) in the TAP results');
+        const fileLevel = (t) => {
+          if (t.depth !== 0 || t.suite || t.children.length) return false;
+          try { return fs.statSync(path.resolve(env.PROJ, t.name)).isFile(); } catch (e) { return false; }
+        };
+        for (const t of tests) if (fileLevel(t)) { t.fileLevel = true; t.file = t.file || path.resolve(env.PROJ, t.name); }
+        const leaf = (t) => !t.suite && !t.fileLevel && t.children.length === 0;
+        const bad = (t) => !t.ok && !t.dir;
+        return {
+          pass: tests.filter((t) => leaf(t) && t.ok && !t.dir).length,
+          fail: sum.fail + (sum.cancelled || 0) + asyncErrors.length,
+          skip: (sum.skipped || 0) + (sum.todo || 0),
+          tests: tests.filter(leaf).map((t) => ({ file: relf(t.file), title: t.full, status: bad(t) ? 'fail' : (t.dir || !t.ok) ? 'skip' : 'pass' })),
+          failing: tests.filter((t) => leaf(t) && bad(t)).map((t) => ({ file: relf(t.file), title: t.full })),
+          // A failing suite or parent test with no failing child failed on its
+          // own: a hook. A failing file-level point is a file that crashed
+          // on load or exited non-zero. None of these can be ignored.
+          suiteErrors: tests.filter((t) => !leaf(t) && bad(t) && (t.fileLevel || !t.children.some(bad))).map((t) => (t.fileLevel ? { file: relf(t.file), message: 'file failed to load or run' } : { file: relf(t.file) + ' (' + t.full + ')' })).concat(asyncErrors),
+        };
+      }
+
+      function parseJestLike(j) {
+        if (!j || !Array.isArray(j.testResults)) throw new Error('results have no testResults array');
+        const tests = [], suiteErrors = [];
+        for (const f of j.testResults) {
+          const file = relf(f.name || f.testFilePath);
+          const ar = f.assertionResults || f.testResults || [];
+          for (const a of ar) {
+            const title = a.fullName || (a.ancestorTitles || []).concat([a.title]).join(' ');
+            const st = a.status === 'passed' ? 'pass' : a.status === 'failed' ? 'fail' : 'skip';
+            tests.push({ file, title, status: st, message: (a.failureMessages || []).join('\n').replace(/\u001b\[[0-9;]*m/g, '') });
+          }
+          const failedInFile = ar.some((a) => a.status === 'failed');
+          if ((f.status === 'failed' && !failedInFile) || (f.testExecError && !failedInFile)) {
+            suiteErrors.push({ file, message: (f.message || (f.testExecError && f.testExecError.message) || '').split('\n').slice(0, 20).join('\n') });
+          }
+        }
+        return { tests, suiteErrors, raw: j };
+      }
+
+      // mocha's json reporter keeps an error's own properties; a message can be
+      // empty for errors that carry their detail elsewhere (stack, code, body).
+      function errText(err) {
+        if (!err) return '';
+        if (err.message) return String(err.message);
+        if (err.stack) return String(err.stack).split('\n').slice(0, 6).join('\n');
+        const j = JSON.stringify(err);
+        return j && j !== '{}' ? j.slice(0, 500) : '';
+      }
+
+      function parseMocha(j) {
+        if (!j || !j.stats || !Array.isArray(j.passes) || !Array.isArray(j.failures)) throw new Error('results are not mocha json reporter output');
+        const tests = [], suiteErrors = [];
+        for (const t of j.passes) tests.push({ file: relf(t.file), title: t.fullTitle, status: 'pass' });
+        for (const t of j.pending || []) tests.push({ file: relf(t.file), title: t.fullTitle, status: 'skip' });
+        for (const t of j.failures) {
+          if (/^"(before|after) (all|each)" hook/.test(t.title || '')) suiteErrors.push({ file: relf(t.file) + ' (' + t.fullTitle + ')', message: errText(t.err) });
+          else tests.push({ file: relf(t.file), title: t.fullTitle, status: 'fail', message: errText(t.err) });
+        }
+        return { tests, suiteErrors, raw: j };
+      }
+
+      function onlyIgnored(res, rc, ignored) {
+        const r = res.raw || {};
+        if (env.RUNNER === 'node') return res.fail === ignored ? true : 'TAP counts ' + res.fail + ' failed or cancelled, ' + ignored + ' ignored';
+        if (env.RUNNER === 'mocha') {
+          if (r.stats.failures !== ignored) return 'mocha counts ' + r.stats.failures + ' failures, ' + ignored + ' ignored';
+          // mocha exits with the number of failures.
+          return rc === Math.min(ignored, 255) ? true : 'mocha exits with its failure count (' + ignored + '), not ' + rc;
+        }
+        if (env.RUNNER === 'jest') {
+          if (r.numRuntimeErrorTestSuites) return r.numRuntimeErrorTestSuites + ' test suite(s) failed to run';
+          if (r.wasInterrupted) return 'the run was interrupted';
+          if (Array.isArray(r.openHandles) && r.openHandles.length) return r.openHandles.length + ' open handle(s)';
+          return r.numFailedTests === ignored ? true : 'jest counts ' + r.numFailedTests + ' failed tests, ' + ignored + ' ignored';
+        }
+        return env.RUNNER + ' results do not record unhandled errors, so a non-zero exit with ignored failures cannot be confirmed';
+      }
+
+      function report() {
+        const rc = +env.RC;
+        const ignore = (env.IGNORE || '').split('\n').map((s) => s.trim()).filter(Boolean);
+        const why = [];
+        let res = null;
+        try {
+          if (!fs.existsSync(env.RESULTS) || fs.statSync(env.RESULTS).size === 0) throw new Error('the runner wrote no results file');
+          const text = fs.readFileSync(env.RESULTS, 'utf8');
+          if (env.RUNNER === 'node') res = parseTap(text);
+          else if (env.RUNNER === 'mocha') res = parseMocha(JSON.parse(text));
+          else res = parseJestLike(JSON.parse(text));
+        } catch (e) {
+          why.push('cannot read the ' + env.RUNNER + ' results (' + e.message + '; runner exit ' + rc + ')');
+        }
+        let pass = 0, fail = 0, skip = 0, ignored = 0;
+        if (res) {
+          let failing;
+          if (env.RUNNER === 'node') {
+            pass = res.pass; skip = res.skip; failing = res.failing;
+          } else {
+            pass = res.tests.filter((t) => t.status === 'pass').length;
+            skip = res.tests.filter((t) => t.status === 'skip').length;
+            failing = res.tests.filter((t) => t.status === 'fail');
+          }
+          const matches = (t, e) => e === t.title || e === t.file + '::' + t.title;
+          const used = new Set();
+          for (const e of ignore) if (res.tests.some((t) => matches(t, e))) used.add(e);
+          let nfail = 0;
+          for (const t of failing) {
+            const hit = ignore.find((e) => matches(t, e));
+            if (hit) { console.log('IGNORE ' + PKG + ': ' + t.file + '::' + t.title); ignored++; }
+            else {
+              console.log('UPSTREAM-TESTS-FAIL ' + PKG + ': ' + t.file + '::' + t.title);
+              if (t.message) console.log('    ' + t.message.split('\n').slice(0, 6).join('\n    '));
+              nfail++;
+            }
+          }
+          for (const s of res.suiteErrors) {
+            console.log('UPSTREAM-TESTS-FAIL ' + PKG + ': ' + s.file + ' [suite]');
+            if (s.message) console.log('    ' + s.message.split('\n').join('\n    '));
+            nfail++;
+          }
+          fail = env.RUNNER === 'node' ? res.fail : failing.length + res.suiteErrors.length;
+          if (env.RUNNER === 'node' && fail > 0 && failing.length + res.suiteErrors.length === 0) {
+            console.log('UPSTREAM-TESTS-FAIL ' + PKG + ': ' + fail + ' test(s) failed or were cancelled (the TAP names none)');
+            nfail++;
+          }
+          if (nfail > 0) why.push(nfail + ' non-ignored failing test(s) or suite error(s)');
+          for (const e of ignore) if (!used.has(e)) why.push('ignore entry matches no test: ' + JSON.stringify(e));
+          for (const e of ignore) {
+            if (used.has(e) && !failing.some((t) => matches(t, e))) console.log('UPSTREAM-TESTS-WARN ' + PKG + ': ignored test passed: ' + e);
+          }
+          if (pass === 0) why.push('no tests passed (the suite did not run)');
+          if (rc !== 0 && nfail === 0) {
+            if (ignored === 0) why.push('runner exited ' + rc + ' with no failing test in its results');
+            else {
+              // An ignored failure may explain a non-zero exit only when the
+              // runner's own results show it is the only cause.
+              const c = onlyIgnored(res, rc, ignored);
+              if (c !== true) why.push('runner exited ' + rc + ' and its results do not show the ignored failure(s) as the only cause (' + c + ')');
+            }
+          }
+        }
+        if (rc === 124 || rc >= 128) why.push('timed out or killed (exit ' + rc + ', limit ' + env.LIMIT + 's)');
+        const extra = ignored ? ' ignored=' + ignored : '';
+        console.log('UPSTREAM-TESTS ' + PKG + ': pass=' + pass + ' fail=' + fail + ' skip=' + skip + extra);
+        if (why.length) { console.log('UPSTREAM-TESTS ' + PKG + ': FAILED: ' + why.join('; ')); process.exit(1); }
+      }
+
+      function pkgVersions(root, start) {
+        const set = new Map();
+        const nm = path.join(root, start);
+        if (!fs.existsSync(nm)) return set;
+        walk(nm, '', (r, e) => {
+          if (!e.isFile() || e.name !== 'package.json') return;
+          const parts = r.split('/');
+          const d = parts.length - 2;
+          const isPkg = (d >= 0 && parts[d - 1] === 'node_modules') || (d >= 1 && parts[d - 2] === 'node_modules' && parts[d - 1].startsWith('@')) || d === 0 || (d === 1 && parts[0].startsWith('@'));
+          if (!isPkg) return;
+          try {
+            const j = JSON.parse(fs.readFileSync(path.join(nm, r), 'utf8'));
+            if (j.name && j.version) set.set(j.name + '@' + j.version, r);
+          } catch (err) { /* not a package manifest */ }
+        }, (r, e) => e.isSymbolicLink());
+        return set;
+      }
+
+      // verify <installed dir> <project dir in the test tree> <install root>
+      function verify(inst, proj, iroot) {
+        const bad = [];
+        let same = 0, only = 0;
+        walk(inst, '', (r, e) => {
+          const a = path.join(inst, r), b = path.join(proj, r);
+          if (e.isDirectory()) return;
+          let sb;
+          try { sb = fs.lstatSync(b); } catch (err) { only++; return; }
+          if (e.isSymbolicLink()) {
+            if (!sb.isSymbolicLink() || fs.readlinkSync(a) !== fs.readlinkSync(b)) bad.push(r); else same++;
+          } else if (e.isFile()) {
+            if (!sb.isFile() || !fs.readFileSync(a).equals(fs.readFileSync(b))) bad.push(r); else same++;
+          }
+        }, (r) => r === 'node_modules');
+        const shipped = pkgVersions(inst, 'node_modules');
+        const tested = new Map([...pkgVersions(proj, 'node_modules'), ...pkgVersions(iroot, 'node_modules')]);
+        const missing = [...shipped.keys()].filter((k) => !tested.has(k));
+        for (const r of bad.slice(0, 20)) console.log('UPSTREAM-TESTS-FAIL ' + PKG + ': installed file differs from the tested tree: ' + r);
+        for (const k of missing.slice(0, 20)) console.log('UPSTREAM-TESTS-FAIL ' + PKG + ': ships ' + k + ' (' + shipped.get(k) + '), not in the tested tree');
+        console.log('UPSTREAM-TESTS ' + PKG + ': installed files identical=' + same + ' differ=' + bad.length + ' installed-only=' + only + ' deps shipped=' + shipped.size + ' missing-from-test-tree=' + missing.length);
+        if (same === 0) { console.log('UPSTREAM-TESTS ' + PKG + ': FAILED: no installed file matches the tested tree; is installed: the project directory?'); process.exit(1); }
+        if (bad.length || missing.length) { console.log('UPSTREAM-TESTS ' + PKG + ': FAILED: the tested tree is not what ships (' + bad.length + ' differing file(s), ' + missing.length + ' dependency version(s) missing)'); process.exit(1); }
+      }
+
+      // registry <npmrc>...: the registry the first file that sets one names
+      // (pnpm's precedence: project .npmrc, then the user's), else npm's default.
+      function registry(files) {
+        for (const f of files) {
+          let text;
+          try { text = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+          let reg = null;
+          for (const l of text.split('\n')) {
+            const m = l.match(/^\s*registry\s*=\s*(\S+)\s*$/);
+            if (m) reg = m[1];
+          }
+          if (reg) { process.stdout.write(reg + '\n'); return; }
+        }
+        process.stdout.write('https://registry.npmjs.org/\n');
+      }
+
+      const [mode, ...av] = process.argv.slice(2);
+      try {
+        if (mode === 'snapshot') snapshot(av[0]);
+        else if (mode === 'resolve') resolve();
+        else if (mode === 'report') report();
+        else if (mode === 'verify') verify(av[0], av[1], av[2]);
+        else if (mode === 'registry') registry(av);
+        else throw new Error('unknown mode ' + mode);
+      } catch (e) {
+        process.stderr.write(e.message + '\n');
+        process.exit(2);
+      }
+      UPSTREAM_TESTS_NPM_JS
+
+      node "$helper" snapshot "$outdir" > "$scratch/before.txt" || fail "cannot record ${outdir}"
+
+      # Copy the workspace, minus the package output and the Libraries token.
+      for e in "$ws"/.[!.]* "$ws"/..?* "$ws"/*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        case "$e" in
+          "$ws/.libraries.token") continue ;;
+        esac
+        if [ "$(realpath "$e")" = "$(realpath "$outdir")" ]; then
+          continue
+        fi
+        cp -a "$e" "$scratch/src/"
+      done
+      proj="$scratch/src/$dir"
+      export npm_config_update_notifier=false
+
+      # Find the lockfile: dir, then its parents up to the copy root.
+      iroot="$proj"
+      lock=""
+      d="$proj"
+      while :; do
+        for f in package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock; do
+          if [ -f "$d/$f" ]; then lock="$f"; iroot="$d"; break 2; fi
+        done
+        [ "$(realpath "$d")" = "$(realpath "$scratch/src")" ] && break
+        d=$(dirname "$d")
+      done
+      if [ "$install" = auto ]; then
+        case "$lock" in
+          package-lock.json|npm-shrinkwrap.json) install=npm ;;
+          pnpm-lock.yaml) install=pnpm ;;
+          yarn.lock) fail "yarn (yarn.lock) is not supported yet; add it to this pipeline with a backtest when a caller needs it" ;;
+          *) fail "no lockfile (package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml) in '$dir' or its parents" ;;
+        esac
+      fi
+      registry_ok() {
+        case "$1" in
+          https://libraries.cgr.dev/*) return 0 ;;
+        esac
+        fail "the $install registry is '$1', not Chainguard Libraries; add '- uses: auth/npm' before the build's install step"
+      }
+      cd "$iroot"
+      # Unset again before the suite.
+      for kv in $ienv; do
+        case "$kv" in
+          [A-Za-z_]*=*) export "$kv" ;;
+          *) fail "install-env: '$kv' is not VAR=value" ;;
+        esac
+      done
+      case "$install" in
+        npm)
+          [ -n "$lock" ] && [ "$lock" != pnpm-lock.yaml ] && [ "$lock" != yarn.lock ] || fail "install: npm needs package-lock.json or npm-shrinkwrap.json (found '${lock:-none}')"
+          registry_ok "$(npm config get registry)"
+          env -u NODE_ENV npm ci --include=dev --ignore-scripts --no-audit --no-fund $iargs || fail "npm ci failed (exit $?)"
+          ;;
+        pnpm)
+          [ "$lock" = pnpm-lock.yaml ] || fail "install: pnpm needs pnpm-lock.yaml (found '${lock:-none}')"
+          command -v pnpm >/dev/null || fail "install: pnpm but pnpm is not in the build environment"
+          # pnpm reads the project's .npmrc and the user's, not /etc/npmrc (and
+          # pnpm 10's `config get` needs npm), so read them directly.
+          registry_ok "$(node "$helper" registry "$iroot/.npmrc" "$HOME/.npmrc")"
+          # pnpm picks its store per filesystem, and the scratch copy is on
+          # another one than the build tree: without the build's store it
+          # would not find what the build's install used (for one, the pnpm
+          # release a packageManager field switches to). Use the build's.
+          store=$(cd "$ws/$dir" && pnpm store path) || fail "pnpm store path failed in '$dir' (exit $?)"
+          env -u NODE_ENV pnpm install --frozen-lockfile --ignore-scripts --store-dir "$store" $iargs || fail "pnpm install failed (exit $?)"
+          ;;
+      esac
+      # Fail closed: setup and the suite must never run with network access.
+      if ! nserr=$(unshare -n sh -c 'ip link set lo up' 2>&1); then
+        fail "cannot create a network namespace for setup and the suite ($(echo "$nserr" | head -n 1)); refusing to run them with network access"
+      fi
+      if [ -n "$setup" ]; then
+        echo "UPSTREAM-TESTS ${PKG}: setup: $setup"
+        unshare -n sh -e -o pipefail -c "$setup" || fail "setup failed (exit $?)"
+      fi
+      for kv in $ienv; do
+        unset "${kv%%=*}"
+      done
+      cd "$proj"
+      # The install and setup ran with the build's HOME and caches, as the
+      # build's own install did (pnpm, for one, keeps the pnpm release a
+      # packageManager field selects there). The suite gets its own.
+      export HOME="$scratch/home" TMPDIR="$scratch/tmp" XDG_CACHE_HOME="$scratch/cache"
+      export CI=true
+
+      checked=unchecked
+      if [ -n "$installed" ]; then
+        node "$helper" verify "$contextdir/$installed" "$proj" "$iroot" || exit 1
+        checked=verified
+      fi
+
+      results="$scratch/results.out"
+      resolved=$(RESULTS="$results" RUNNER="$runner" SCRIPT="$script" ARGS="$args" node "$helper" resolve 2>"$scratch/resolve.err") || \
+        fail "$(cat "$scratch/resolve.err")"
+      runner=$(echo "$resolved" | sed -n 1p)
+      cmd=$(echo "$resolved" | sed -n 2p)
+      dropped=$(echo "$resolved" | sed -n 3p)
+
+      netns=isolated
+      echo "UPSTREAM-TESTS ${PKG}: runner=$runner install=$install netns=$netns installed=$checked"
+      echo "UPSTREAM-TESTS ${PKG}: command: $cmd"
+      if [ "$dropped" != - ]; then
+        echo "UPSTREAM-TESTS ${PKG}: dropped from the script: $dropped"
+      fi
+
+      unset NODE_ENV
+      if [ -n "$nodeopts" ]; then
+        NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }$nodeopts"
+        export NODE_OPTIONS
+        echo "UPSTREAM-TESTS ${PKG}: NODE_OPTIONS=$NODE_OPTIONS"
+      fi
+      PATH="$proj/node_modules/.bin:$iroot/node_modules/.bin:$PATH"
+      export PATH
+      start=$(date +%s)
+      rc=0
+      timeout "$limit" unshare -n sh -c 'ip link set lo up && exec sh -c "$1"' sh "$cmd" < /dev/null || rc=$?
+      duration=$(( $(date +%s) - start ))
+      echo "UPSTREAM-TESTS ${PKG}: duration=${duration}s"
+
+      gate=0
+      RESULTS="$results" RUNNER="$runner" RC="$rc" IGNORE="$ignore" PROJ="$proj" LIMIT="$limit" \
+        node "$helper" report || gate=1
+
+      node "$helper" snapshot "$outdir" > "$scratch/after.txt" || fail "cannot record ${outdir}"
+      if ! cmp -s "$scratch/before.txt" "$scratch/after.txt"; then
+        diff "$scratch/before.txt" "$scratch/after.txt" | head -n 50
+        fail "the test run changed ${outdir}"
+      fi
+      exit "$gate"

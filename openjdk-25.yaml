@@ -1,7 +1,7 @@
 package:
   name: openjdk-25
   version: "25.0.5.1"
-  epoch: 1 # OS-5752: wait for the javac server to exit
+  epoch: 2 # split out openjdk-25-jre-headless
   description: OpenJDK ${{vars.java-version}}
   copyright:
     - license: GPL-2.0 WITH Classpath-exception-2.0
@@ -29,6 +29,8 @@ var-transforms:
 vars:
   # SHA256 of entrypoint.sh from adoptium/containers
   cacert-entrypoint-hash: a74597bcb50fd7b64d7f0183e03ad9233335405e359bac9237d557b70401fb9e
+  # JDK that compiles the headless probe
+  probe-jdk-version: "21"
 
 environment:
   contents:
@@ -122,8 +124,8 @@ pipeline:
       # left once make has returned. A server that has not stopped after 30
       # seconds would leave the race open, so the step fails then.
       n=0
-      while [ -e build/*-server-release/make-support/javacservers/server.port ] ||
-        pidof java > /dev/null; do
+      while set -- build/*-server-release/make-support/javacservers/server.port
+        [ -e "$1" ] || pidof java > /dev/null; do
         if [ "$n" -ge 30 ]; then
           echo "the javac server has not stopped after $n seconds;" \
             "its files: $(ls build/*-server-release/make-support/javacservers/ | tr '\n' ' ')" \
@@ -164,13 +166,13 @@ pipeline:
       ln -sf . "${{targets.contextdir}}/$_java_home/jre"
 
 subpackages:
-  - name: "${{package.name}}-jre"
-    description: "OpenJDK ${{vars.java-version}} Java Runtime Environment"
+  - name: "${{package.name}}-jre-headless"
+    description: "OpenJDK ${{vars.java-version}} Java Runtime Environment (headless)"
     dependencies:
       runtime:
         - java-cacerts
+        # libawt_headless dlopens fontconfig; fonts are left to the image
         - libfontconfig1
-        - ttf-dejavu
       provider-priority: 10
     pipeline:
       - runs: |
@@ -178,6 +180,11 @@ subpackages:
 
           mkdir -p "${{targets.subpkgdir}}"/$_java_home
           cp -r build/*-server-release/images/jre/* "${{targets.subpkgdir}}"/$_java_home
+
+          # X11 and sound libraries ship in ${{package.name}}-jre
+          for lib in libawt_xawt.so libjawt.so libjsound.so libsplashscreen.so; do
+            rm "${{targets.subpkgdir}}"/$_java_home/lib/$lib
+          done
 
           # symlink to shared java cacerts store
           rm -f "${{targets.subpkgdir}}"/$_java_home/lib/security/cacerts
@@ -189,6 +196,46 @@ subpackages:
 
           # check that jdk.crypto.ec is included in image
           jimage list "${{targets.subpkgdir}}"/$_java_home/lib/modules | grep "Module: jdk.crypto.ec"
+    test:
+      environment:
+        contents:
+          packages:
+            # compiles the probe; installs to its own JAVA_HOME
+            - openjdk-${{vars.probe-jdk-version}}
+            - ttf-dejavu
+      pipeline:
+        - uses: test/tw/ldd-check
+        - name: X11 and sound libraries are not shipped
+          runs: |
+            for lib in libawt_xawt.so libjawt.so libjsound.so libsplashscreen.so; do
+              if [ -e /usr/lib/jvm/java-${{vars.java-version}}-openjdk/lib/$lib ]; then
+                echo "$lib must ship in ${{package.name}}-jre" >&2
+                exit 1
+              fi
+            done
+        - name: Headless AWT, ImageIO and fonts work
+          working-directory: headless
+          runs: |
+            /usr/lib/jvm/java-${{vars.probe-jdk-version}}-openjdk/bin/javac --release 21 -d . HeadlessProbe.java
+            unset DISPLAY
+            /usr/lib/jvm/java-${{vars.java-version}}-openjdk/bin/java -cp . HeadlessProbe
+
+  - name: "${{package.name}}-jre"
+    description: "OpenJDK ${{vars.java-version}} Java Runtime Environment"
+    dependencies:
+      runtime:
+        - ${{package.name}}-jre-headless=${{package.full-version}}
+        - libfontconfig1
+        - ttf-dejavu
+      provider-priority: 10
+    pipeline:
+      - runs: |
+          _java_home="usr/lib/jvm/java-${{vars.java-version}}-openjdk"
+
+          mkdir -p "${{targets.subpkgdir}}"/$_java_home/lib
+          for lib in libawt_xawt.so libjawt.so libjsound.so libsplashscreen.so; do
+            cp build/*-server-release/images/jre/lib/$lib "${{targets.subpkgdir}}"/$_java_home/lib/
+          done
     test:
       pipeline:
         - uses: test/tw/ldd-check
@@ -256,6 +303,44 @@ subpackages:
             virtual-pkg-name: default-jvm
             real-pkg-name: ${{subpkg.name}}
 
+  - name: "${{package.name}}-default-jvm-headless"
+    description: "Use the openjdk-${{vars.java-version}} headless JVM as the default JVM"
+    dependencies:
+      # No default-jvm provide, so depending on default-jvm never selects this package.
+      runtime:
+        - java-common-jre
+        - ${{package.name}}-jre-headless
+    pipeline:
+      - runs: |
+          mkdir -p "${{targets.subpkgdir}}"/usr/lib/jvm
+          ln -sf java-${{vars.java-version}}-openjdk "${{targets.subpkgdir}}"/usr/lib/jvm/default-jvm
+    test:
+      pipeline:
+        - name: default-jvm is the headless JRE
+          runs: |
+            test "$(readlink /usr/lib/jvm/default-jvm)" = java-${{vars.java-version}}-openjdk
+            test ! -e /usr/lib/jvm/default-jvm/lib/libawt_xawt.so
+        - uses: test/tw/ver-check
+          with:
+            bins: java
+            version: "${{vars.java-version}}.0."
+            version-flag: -version
+        - name: fontconfig, which libawt_headless dlopens, is installed
+          runs: test -e /usr/lib/libfontconfig.so.1
+        - name: No X11, sound, giflib or font files are installed
+          runs: |
+            for f in /usr/lib/libX*.so* /usr/lib/libxcb*.so* /usr/lib/libasound.so* /usr/lib/libgif.so*; do
+              if [ -e "$f" ]; then
+                echo "$f must not be in the headless closure" >&2
+                exit 1
+              fi
+            done
+            fonts=$(find /usr/share -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.pcf*' -o -name '*.pfb' \))
+            if [ -n "$fonts" ]; then
+              echo "font files must not be in the headless closure: $fonts" >&2
+              exit 1
+            fi
+
   - name: "${{package.name}}-default-jdk"
     description: "Use the openjdk-${{vars.java-version}} JVM as the default JVM with the JDK installed"
     dependencies:
@@ -266,6 +351,7 @@ subpackages:
       provides:
         - default-jdk=1.${{vars.java-version}}
         - ${{package.name}}-jre=${{package.full-version}}
+        - ${{package.name}}-jre-headless=${{package.full-version}}
     pipeline:
       - runs: |
           mkdir -p "${{targets.subpkgdir}}"/usr/lib/jvm
@@ -279,6 +365,10 @@ subpackages:
         - uses: test/virtualpackage
           with:
             virtual-pkg-name: ${{package.name}}-jre
+            real-pkg-name: ${{subpkg.name}}
+        - uses: test/virtualpackage
+          with:
+            virtual-pkg-name: ${{package.name}}-jre-headless
             real-pkg-name: ${{subpkg.name}}
 
   - name: "${{package.name}}-oci-entrypoint-compat"

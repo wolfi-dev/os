@@ -1,5 +1,5 @@
 *self_spec:
-+ %{!O:%{!O1:%{!O2:%{!O3:%{!O0:%{!Os:%{!0fast:%{!0g:%{!0z:-O2}}}}}}}}} \
++ %{!O*:-O2} \
   -fhardened \
   -Wno-error=hardened \
   -Wno-hardened \
